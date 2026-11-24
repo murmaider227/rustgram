@@ -1,0 +1,16 @@
+[package]
+name = "tg-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+tg-video = { path = "../tg-video" }
+thiserror = "2.0"
+tiny-skia = "0.11.4"
+
+[dev-dependencies]
+tempfile = "3"

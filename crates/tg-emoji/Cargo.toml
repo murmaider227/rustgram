@@ -1,0 +1,12 @@
+[package]
+name = "tg-emoji"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Noto Emoji (Apache-2.0) packed sprite atlas and egui inline emoji renderer for Rustgram"
+
+[dependencies]
+egui = "0.37.0"
+image = { version = "0.25.9", default-features = false, features = ["webp", "png"] }
+tg-text = { path = "../tg-text" }
+thiserror = "2.0.11"

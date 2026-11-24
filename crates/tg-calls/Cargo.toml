@@ -1,0 +1,16 @@
+[package]
+name = "tg-calls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Telegram 1:1 voice/video call and group call protocol core (ported from Telegram Desktop)"
+
+[dependencies]
+rand = "0.8.8"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tg-crypto = { path = "../tg-crypto" }
+tg-data = { path = "../tg-data" }
+tg-tl = { path = "../tg-tl" }
+thiserror = "2.0.21"
+zeroize = "1"

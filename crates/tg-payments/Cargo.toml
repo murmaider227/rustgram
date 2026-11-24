@@ -1,0 +1,12 @@
+[package]
+name = "tg-payments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = "1.0"
+tg-data = { path = "../tg-data" }
+tg-tl = { path = "../tg-tl" }
+thiserror = "2.0"
+url = "2.5"

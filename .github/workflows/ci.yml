@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    name: Windows (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build release binaries
+        env:
+          RUSTGRAM_API_ID: ${{ secrets.RUSTGRAM_API_ID }}
+          RUSTGRAM_API_HASH: ${{ secrets.RUSTGRAM_API_HASH }}
+        run: cargo build --release -p tg-app -p tg-updater
+
+      - name: Upload release executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustgram-windows-x64
+          path: |
+            target/release/rustgram.exe
+            target/release/rustgram-updater.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  ubuntu-core:
+    name: Ubuntu (platform-independent crates)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy (platform-independent crates)
+        run: cargo clippy --workspace --exclude tg-app --exclude tg-platform --all-targets -- -D warnings
+
+      - name: Run tests (platform-independent crates)
+        run: cargo test --workspace --exclude tg-app --exclude tg-platform

@@ -1,0 +1,715 @@
+//! `eframe::App` shell integration, `tg-ui` fonts & theme synchronization, unified
+//! `MockSession` wiring across `WindowController`, `AppNotifyTrayHost`, and `AppWebViewHost`,
+//! and persisted window geometry tracking.
+//!
+//! Port origin: `Telegram/SourceFiles/window/main_window.cpp` and `Telegram/SourceFiles/core/launcher.cpp`.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use egui::{CentralPanel, Frame, Vec2, ViewportBuilder, ViewportCommand};
+
+use crate::notifications::AppNotifyTrayHost;
+use crate::notifications::settings::{MuteValue, NotifySettingsStore};
+use crate::stand_in::backend::Backend;
+use crate::stand_in::mock_session::{MockSession, session_peers};
+use crate::stand_in::settings::{ShellSettings, WindowPosition};
+use crate::stand_in::strings::Strings;
+use crate::stand_in::types::{PeerId, PeerKind};
+use crate::startup::StartupContext;
+use crate::startup::crash_window::{CRASH_WINDOW_HEIGHT, CRASH_WINDOW_WIDTH, CrashRecoveryAction};
+use crate::startup::icon::load_window_icon;
+use crate::startup::ipc::IncomingActivation;
+use crate::startup::updater::UpdateUiAction;
+use crate::webview::AppWebViewHost;
+use crate::webview::backend::{ExternalOpener, PlatformExternalOpener, WebViewRequest};
+use crate::webview::platform_win::PlatformClipboard;
+use crate::webview::theme::build_webview_theme_params;
+use crate::window::adaptive::{WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH};
+use crate::window::controller::{RootScreen, WebViewHostRequest, WindowController};
+use crate::window::platform_shell::{
+    PlatformWindowShell, apply_initial_viewport_frame, extract_eframe_hwnd,
+};
+
+/// Launch configuration for [`run_app`].
+#[derive(Debug, Default)]
+pub struct AppConfig {
+    /// Skip intro and open straight into the signed-in mock main workspace (`--start-main`).
+    pub start_signed_in: bool,
+    /// Use real `tg-session` + `LiveSession` instead of `MockSession` (`--live` or `RUSTGRAM_LIVE=1`).
+    pub live_mode: bool,
+    /// Optional override for `CoreSettings::native_window_frame` (`false` = custom frameless bar).
+    pub native_window_frame: Option<bool>,
+    /// Optional override path for persisted shell settings JSON.
+    pub settings_path: Option<PathBuf>,
+    /// Optional live startup context (single-instance guard, crash recovery, logger, updater).
+    pub startup: Option<StartupContext>,
+}
+
+/// Top-level `eframe::App` implementation hosting [`WindowController`], [`AppNotifyTrayHost`],
+/// and [`AppWebViewHost`] over ONE shared [`MockSession`], or delegating to
+/// [`crate::live::LiveAppHost`] when launched in live mode (`--live` / `RUSTGRAM_LIVE=1`).
+pub struct TgforkApp {
+    controller: WindowController,
+    live_host: Option<crate::live::LiveAppHost>,
+    applied_theme_gen: u64,
+    notify_tray: AppNotifyTrayHost,
+    webview_host: AppWebViewHost,
+    calls_host: crate::calls::AppCallsHost,
+    startup: Option<StartupContext>,
+    initial_activations_dispatched: bool,
+    started_hidden_to_tray: bool,
+    stories: crate::stories::AppStoriesHost,
+    platform_shell: PlatformWindowShell,
+}
+
+impl TgforkApp {
+    /// Creates a new `TgforkApp` wired to one shared [`MockSession`].
+    #[must_use]
+    pub fn with_session(
+        cc: &eframe::CreationContext<'_>,
+        mock_session: MockSession,
+        settings: ShellSettings,
+        settings_path: PathBuf,
+    ) -> Self {
+        tg_ui::fonts::register_tdesktop_fonts(&cc.egui_ctx);
+
+        let handle = mock_session.handle();
+        let notify_store = build_notify_settings_store();
+        let sim_handle = handle.clone();
+        let notify_tray = AppNotifyTrayHost::with_backend(
+            Box::new(handle.clone()),
+            notify_store,
+            Box::new(move |now_unix| {
+                let _ = sim_handle.simulate_incoming_message(now_unix);
+            }),
+        );
+        let webview_host = AppWebViewHost::with_dependencies(
+            Box::new(handle),
+            Box::new(PlatformExternalOpener),
+            Box::new(PlatformClipboard),
+        );
+
+        let mut controller = WindowController::with_session(mock_session, settings, settings_path);
+        controller.theme_manager_mut().apply_to_egui(&cc.egui_ctx);
+        let applied_theme_gen = controller.theme_generation();
+
+        Self {
+            controller,
+            live_host: None,
+            applied_theme_gen,
+            notify_tray,
+            webview_host,
+            calls_host: crate::calls::AppCallsHost::new(),
+            stories: crate::stories::AppStoriesHost::new(),
+            startup: None,
+            initial_activations_dispatched: false,
+            started_hidden_to_tray: false,
+            platform_shell: PlatformWindowShell::new_win32(),
+        }
+    }
+
+    /// Creates a new `TgforkApp` running in live Telegram mode (`--live` / `RUSTGRAM_LIVE=1`)
+    /// backed by [`crate::live::LiveAppHost`] + `tg-session`.
+    #[must_use]
+    pub fn new_live(
+        cc: &eframe::CreationContext<'_>,
+        settings: ShellSettings,
+        settings_path: PathBuf,
+        working_dir: PathBuf,
+        data_name: String,
+    ) -> Self {
+        let mut live_host = crate::live::LiveAppHost::bootstrap(
+            Some(cc.egui_ctx.clone()),
+            settings.clone(),
+            settings_path.clone(),
+            working_dir,
+            data_name,
+        );
+        live_host.set_window_hwnd(crate::live::passkeys::win32_hwnd_from_window_handle(cc));
+        let mut app = Self::with_session(cc, MockSession::new(false), settings, settings_path);
+        app.live_host = Some(live_host);
+        app
+    }
+
+    /// Attaches a live [`StartupContext`] (single-instance pipe queue, crash recovery,
+    /// file logger, and background self-updater) to this app instance.
+    #[must_use]
+    pub fn with_startup(
+        mut self,
+        ctx: &egui::Context,
+        startup: StartupContext,
+        started_hidden_to_tray: bool,
+    ) -> Self {
+        startup.activation_queue.set_repaint_ctx(ctx.clone());
+        let initial_snapshot = startup.update_controller.snapshot();
+        let _ = crate::startup::apply_profile_data_paths_native(
+            &startup.plan.resolved_working_dir.path,
+            &mut self.webview_host,
+            &mut self.controller,
+        );
+        let widget_helper_path = startup.plan.widget_helper_path.clone();
+        if let Some(live) = self.live_host.as_mut() {
+            live.set_update_snapshot(initial_snapshot.clone());
+            live.set_widget_helper_path(widget_helper_path.clone());
+        }
+        self.controller.set_update_snapshot(initial_snapshot);
+        self.controller.set_widget_helper_path(widget_helper_path);
+        self.started_hidden_to_tray = started_hidden_to_tray;
+        self.startup = Some(startup);
+        self
+    }
+
+    /// Compatibility constructor accepting a legacy `Backend` and `Strings`.
+    #[must_use]
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        backend: Box<dyn Backend>,
+        _strings: Box<dyn Strings>,
+        settings: ShellSettings,
+        settings_path: PathBuf,
+    ) -> Self {
+        let start_signed_in = backend.current_user().is_some();
+        Self::with_session(
+            cc,
+            MockSession::new(start_signed_in),
+            settings,
+            settings_path,
+        )
+    }
+
+    /// Returns a mutable reference to the inner [`WindowController`].
+    pub fn controller_mut(&mut self) -> &mut WindowController {
+        &mut self.controller
+    }
+
+    fn sync_theme(&mut self, ctx: &egui::Context) {
+        let current_gen = self.controller.theme_generation();
+        if self.applied_theme_gen != current_gen {
+            self.controller.theme_manager_mut().apply_to_egui(ctx);
+            self.applied_theme_gen = current_gen;
+        }
+    }
+
+    fn track_window_geometry(&mut self, ctx: &egui::Context) {
+        let vp = ctx.input(|i| i.viewport().clone());
+        let maximized = vp.maximized.unwrap_or(false);
+        if let Some(inner) = vp.inner_rect {
+            let pos = WindowPosition {
+                x: vp.outer_rect.map(|r| r.min.x),
+                y: vp.outer_rect.map(|r| r.min.y),
+                width: inner.width(),
+                height: inner.height(),
+                maximized,
+            };
+            self.controller.note_window_position(pos);
+        }
+    }
+
+    fn dispatch_webview_requests(&mut self) {
+        let requests = self.controller.take_webview_requests();
+        if requests.is_empty() {
+            return;
+        }
+        let theme_params_json =
+            build_webview_theme_params(self.controller.theme_manager().palette()).json;
+        for req in requests {
+            match req {
+                WebViewHostRequest::OpenInstantView {
+                    url,
+                    webpage_id,
+                    fragment,
+                } => {
+                    self.webview_host
+                        .open_instant_view(&url, webpage_id, fragment.as_deref());
+                }
+                WebViewHostRequest::OpenMiniApp {
+                    bot_id,
+                    start_param,
+                } => {
+                    let bot_u64 = bot_id.max(0) as u64;
+                    let url_override = self
+                        .controller
+                        .session_backend_mut()
+                        .take_pending_mini_app_url(PeerId::from_user(bot_u64));
+                    self.webview_host.open_mini_app(WebViewRequest {
+                        bot_id: bot_u64,
+                        start_param,
+                        url_override,
+                        fullscreen: false,
+                        theme_params_json: theme_params_json.clone(),
+                    });
+                }
+                WebViewHostRequest::OpenExternalUrl(url) => {
+                    let _ = PlatformExternalOpener.open_url(&url);
+                }
+            }
+        }
+    }
+    fn process_startup_hooks(&mut self, ctx: &egui::Context) {
+        let mut incoming_batch = Vec::new();
+        let mut open_settings_now = false;
+        let mut latest_update_snapshot = None;
+
+        if let Some(startup) = self.startup.as_ref() {
+            if !self.initial_activations_dispatched {
+                self.initial_activations_dispatched = true;
+                open_settings_now = startup.plan.open_settings_on_start;
+                if !startup.plan.initial_urls.is_empty()
+                    || !startup.plan.initial_send_paths.is_empty()
+                {
+                    incoming_batch.push(IncomingActivation {
+                        urls: startup.plan.initial_urls.clone(),
+                        send_paths: startup.plan.initial_send_paths.clone(),
+                        show: false,
+                        quit: false,
+                    });
+                }
+            }
+
+            incoming_batch.extend(startup.activation_queue.drain());
+            latest_update_snapshot = Some(startup.update_controller.snapshot());
+        }
+
+        if let Some(snap) = latest_update_snapshot {
+            if let Some(live) = self.live_host.as_mut() {
+                live.set_update_snapshot(snap);
+            } else {
+                self.controller.set_update_snapshot(snap);
+            }
+        }
+        let update_prefs_change = if let Some(live) = self.live_host.as_mut() {
+            live.take_update_prefs_change()
+        } else {
+            self.controller.take_update_prefs_change()
+        };
+        if let Some((auto_update, install_beta)) = update_prefs_change
+            && let Some(startup) = self.startup.as_ref()
+            && let Err(err) = crate::settings::advanced::propagate_update_preferences(
+                Some(&startup.plan.resolved_working_dir.path),
+                auto_update,
+                install_beta,
+                Some(&startup.update_controller),
+            )
+        {
+            tracing::warn!(%err, "failed to persist update preferences");
+        }
+        if open_settings_now {
+            if let Some(live) = self.live_host.as_mut() {
+                live.open_settings();
+            } else {
+                self.controller.open_settings();
+            }
+        }
+
+        for act in incoming_batch {
+            if act.quit {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+                return;
+            }
+            if act.show {
+                self.started_hidden_to_tray = false;
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            if let Some(live) = self.live_host.as_mut() {
+                live.handle_incoming_activation(act, ctx);
+            } else {
+                self.controller.handle_incoming_activation(act, ctx);
+            }
+        }
+
+        let update_action = if let Some(live) = self.live_host.as_mut() {
+            live.take_update_action()
+        } else {
+            self.controller.take_update_action()
+        };
+        if let Some(action) = update_action {
+            match action {
+                UpdateUiAction::CheckNow => {
+                    if let Some(startup) = self.startup.as_ref() {
+                        startup.update_controller.request_check_now();
+                    }
+                }
+                UpdateUiAction::RestartToUpdate => {
+                    let launch_res = if let Some(startup) = self.startup.as_ref() {
+                        startup.log_manager.close_main();
+                        startup.crash_manager.finish();
+                        match startup.update_controller.launch_updater_for_restart() {
+                            Ok(_) => Ok(()),
+                            Err(err) => {
+                                let _ = startup.crash_manager.restart();
+                                Err(err)
+                            }
+                        }
+                    } else {
+                        Err("updater is not initialized".to_owned())
+                    };
+                    match launch_res {
+                        Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                        Err(err) => {
+                            let msg = format!("Could not launch updater: {err}");
+                            if let Some(live) = self.live_host.as_mut() {
+                                live.show_toast(msg);
+                            } else {
+                                self.controller.show_toast(msg);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // While hidden to tray on startup, wake periodically so tray icon clicks are polled promptly.
+        if self.started_hidden_to_tray {
+            let visible = ctx.input(|i| i.viewport().minimized != Some(true));
+            if !visible {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+impl eframe::App for TgforkApp {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let hwnd = extract_eframe_hwnd(frame);
+        let has_crash_recovery = self
+            .startup
+            .as_ref()
+            .is_some_and(|s| s.crash_recovery.is_some());
+        self.sync_theme(&ctx);
+
+        // If the previous launch exited uncleanly (`tdata/working`), show the crash recovery
+        // screen before entering the main workspace (`LastCrashedWindow`).
+        if let Some(startup) = self.startup.as_mut()
+            && let Some(recovery) = startup.crash_recovery.as_mut()
+        {
+            self.platform_shell.sync_window_frame(
+                Some(&ctx),
+                hwnd,
+                self.controller.theme_mode() == crate::stand_in::theme::ThemeMode::Night,
+                true,
+                true,
+                false,
+            );
+            let palette = self.controller.palette();
+            let decision = CentralPanel::default()
+                .frame(Frame::NONE)
+                .show(ui, |ui| recovery.show(ui, &palette))
+                .inner;
+            if let Some(action) = decision {
+                match action {
+                    CrashRecoveryAction::Continue => {
+                        let _ = startup.crash_manager.restart();
+                        startup.crash_recovery = None;
+                        let pos = self.controller.settings().window_position.clamped();
+                        ctx.send_viewport_cmd(ViewportCommand::Title("Rustgram".to_owned()));
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+                            pos.width, pos.height,
+                        )));
+                        if pos.maximized {
+                            ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
+                        }
+                        ctx.request_repaint();
+                    }
+                    CrashRecoveryAction::Quit => {
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+            }
+            return;
+        }
+
+        if self.live_host.is_some() {
+            self.process_startup_hooks(&ctx);
+            if let Some(live) = self.live_host.as_mut() {
+                if hwnd != 0 {
+                    live.set_window_hwnd(hwnd as usize);
+                }
+                let native_frame = live.native_window_frame();
+                let dark_mode = live.is_dark_theme();
+                let passcode_locked = live.is_passcode_locked();
+                let palette = live.current_palette();
+                self.platform_shell.sync_window_frame(
+                    Some(&ctx),
+                    hwnd,
+                    dark_mode,
+                    native_frame,
+                    has_crash_recovery,
+                    passcode_locked,
+                );
+                self.platform_shell.show_frameless_title_bar(
+                    ui,
+                    "Rustgram",
+                    &palette,
+                    native_frame,
+                    has_crash_recovery,
+                );
+                let vp = ctx.input(|i| i.viewport().clone());
+                if let Some(inner) = vp.inner_rect {
+                    live.note_window_position(WindowPosition {
+                        x: vp.outer_rect.map(|r| r.min.x),
+                        y: vp.outer_rect.map(|r| r.min.y),
+                        width: inner.width(),
+                        height: inner.height(),
+                        maximized: vp.maximized.unwrap_or(false),
+                    });
+                }
+                live.set_native_hwnd(hwnd);
+                live.show(&ctx, ui);
+                if let Some(audio_bar) = live.active_audio_player_bar_mut() {
+                    let _ = self
+                        .platform_shell
+                        .poll_and_dispatch_taskbar_clicks(audio_bar);
+                    let dark_taskbar =
+                        tg_platform::system_info::is_dark_taskbar().unwrap_or(dark_mode);
+                    self.platform_shell
+                        .sync_taskbar_from_audio_bar(hwnd, audio_bar, dark_taskbar);
+                }
+            }
+            return;
+        }
+
+        self.controller.set_window_hwnd(hwnd);
+        self.controller.set_native_hwnd(hwnd);
+        let native_frame = self.controller.sync_native_window_frame_setting();
+        let dark_mode = self.controller.theme_mode() == crate::stand_in::theme::ThemeMode::Night;
+        let passcode_locked = self.controller.root_screen() == RootScreen::PasscodeLock;
+        self.platform_shell.sync_window_frame(
+            Some(&ctx),
+            hwnd,
+            dark_mode,
+            native_frame,
+            has_crash_recovery,
+            passcode_locked,
+        );
+        let title_palette = self.controller.palette();
+        self.platform_shell.show_frameless_title_bar(
+            ui,
+            "Rustgram",
+            &title_palette,
+            native_frame,
+            has_crash_recovery,
+        );
+
+        self.track_window_geometry(&ctx);
+        self.process_startup_hooks(&ctx);
+
+        self.calls_host.update_and_render(ui);
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            self.controller
+                .show_with_stories(ui, Some(&mut self.stories));
+        });
+        let dark_taskbar = tg_platform::system_info::is_dark_taskbar().unwrap_or(dark_mode);
+        let audio_bar = self.controller.main_widget_mut().audio_player_bar_mut();
+        let _ = self
+            .platform_shell
+            .poll_and_dispatch_taskbar_clicks(audio_bar);
+        self.platform_shell
+            .sync_taskbar_from_audio_bar(hwnd, audio_bar, dark_taskbar);
+        if self.controller.take_open_recent_calls_request() {
+            self.calls_host.open_recent_calls();
+        }
+        self.controller.dispatch_demo_overlay_requests(&ctx);
+
+        self.dispatch_webview_requests();
+
+        self.notify_tray
+            .set_active_peer(self.controller.active_focused_peer());
+        self.notify_tray.update_and_render(
+            &ctx,
+            &self.controller.palette(),
+            self.controller.root_screen() == RootScreen::PasscodeLock,
+        );
+        self.controller.poll_notification_opens(Some(&ctx));
+
+        self.webview_host
+            .update_and_render(&ctx, self.controller.theme_mode());
+        for ev in self.webview_host.take_events() {
+            self.controller.handle_webview_event(ev, &ctx);
+        }
+        crate::statistics::AppStatisticsHost::update_and_render(
+            &ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::export::AppExportHost::update_and_render(
+            &ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::payments::AppPaymentsHost::update_and_render(
+            &ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::wallet::AppWalletHost::update_and_render(
+            &ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::business::AppBusinessHost::update_and_render(
+            &ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::bots::AppBotsHost::update_and_render(
+            &ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::themes::AppThemesHost::update_and_render(
+            &ctx,
+            self.controller.palette().layer_backdrop,
+            self.controller.palette().divider,
+        );
+        self.stories
+            .update_and_render(&ctx, &self.controller.palette());
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(live) = self.live_host.as_mut() {
+            live.on_exit();
+        } else {
+            self.calls_host.on_exit();
+            self.webview_host.on_exit();
+            self.notify_tray.on_exit();
+            self.controller.flush_settings();
+        }
+
+        if let Some(mut startup) = self.startup.take() {
+            startup.update_controller.shutdown();
+            // Only remove `tdata/working` if we actually passed crash recovery into normal execution.
+            if startup.crash_recovery.is_none() {
+                startup.crash_manager.finish();
+            }
+            startup.log_manager.finish();
+            drop(startup.single_instance_guard);
+        }
+    }
+}
+
+fn build_notify_settings_store() -> NotifySettingsStore {
+    let mut store = NotifySettingsStore::default();
+    store.register_peer_kind(session_peers::SELF, PeerKind::User);
+    store.register_peer_kind(session_peers::USER_MIRA, PeerKind::User);
+    store.register_peer_kind(session_peers::USER_THEO, PeerKind::User);
+    store.register_peer_kind(session_peers::USER_SAM, PeerKind::User);
+    store.register_peer_kind(session_peers::USER_RILEY, PeerKind::User);
+    store.register_peer_kind(session_peers::BOT_CATALOG, PeerKind::User);
+    store.register_peer_kind(session_peers::GROUP_CORE, PeerKind::Group);
+    store.register_peer_kind(session_peers::GROUP_UI_LAB, PeerKind::Group);
+    store.register_peer_kind(session_peers::CHANNEL_DEV_LOG, PeerKind::Channel);
+    store.register_peer_kind(session_peers::CHANNEL_RELEASES, PeerKind::Channel);
+    store.register_peer_kind(session_peers::CHANNEL_ARCHIVE, PeerKind::Channel);
+    store.update_peer(
+        session_peers::CHANNEL_RELEASES,
+        MuteValue::forever(),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
+    store.update_peer(
+        session_peers::CHANNEL_ARCHIVE,
+        MuteValue::forever(),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
+    store
+}
+
+/// Launches the native Windows desktop window titled `"Rustgram"`.
+pub fn run_app(mut config: AppConfig) -> anyhow::Result<()> {
+    let startup = config.startup.take();
+    let settings_path = config
+        .settings_path
+        .unwrap_or_else(ShellSettings::default_path);
+    let mut settings = ShellSettings::load_from(&settings_path);
+    if let Some(override_frame) = config.native_window_frame {
+        settings.native_window_frame = override_frame;
+    }
+    let pos = settings.window_position.clamped();
+
+    let has_crash_recovery = startup.as_ref().is_some_and(|s| s.crash_recovery.is_some());
+    let start_in_tray = !has_crash_recovery
+        && startup
+            .as_ref()
+            .is_some_and(|s| s.plan.start_minimized_to_tray);
+
+    let initial_native_frame = config
+        .native_window_frame
+        .unwrap_or(settings.native_window_frame);
+    let mut viewport = apply_initial_viewport_frame(
+        ViewportBuilder::default()
+            .with_icon(load_window_icon())
+            .with_min_inner_size(Vec2::new(WINDOW_MIN_WIDTH as f32, WINDOW_MIN_HEIGHT as f32)),
+        initial_native_frame,
+        has_crash_recovery,
+    );
+
+    if has_crash_recovery {
+        viewport = viewport
+            .with_title("Rustgram — Crash Recovery")
+            .with_inner_size(Vec2::new(CRASH_WINDOW_WIDTH, CRASH_WINDOW_HEIGHT))
+            .with_maximized(false);
+    } else {
+        viewport = viewport
+            .with_title("Rustgram")
+            .with_inner_size(Vec2::new(pos.width, pos.height))
+            .with_maximized(pos.maximized);
+        if let (Some(x), Some(y)) = (pos.x, pos.y) {
+            viewport = viewport.with_position(egui::Pos2::new(x, y));
+        }
+        if start_in_tray {
+            viewport = viewport.with_visible(false);
+        }
+    }
+
+    let native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+
+    let start_signed_in = config.start_signed_in;
+    let live_mode = config.live_mode;
+    eframe::run_native(
+        "Rustgram",
+        native_options,
+        Box::new(move |cc| {
+            let mut app = if live_mode {
+                let (working_dir, data_name) = startup
+                    .as_ref()
+                    .map(|s| {
+                        let key = if s.plan.parsed_args.key.is_empty() {
+                            "data".to_owned()
+                        } else {
+                            s.plan.parsed_args.key.clone()
+                        };
+                        (s.plan.resolved_working_dir.path.clone(), key)
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                            "data".to_owned(),
+                        )
+                    });
+                TgforkApp::new_live(cc, settings, settings_path, working_dir, data_name)
+            } else {
+                let mock_session = MockSession::new(start_signed_in);
+                TgforkApp::with_session(cc, mock_session, settings, settings_path)
+            };
+            if let Some(startup_ctx) = startup {
+                app = app.with_startup(&cc.egui_ctx, startup_ctx, start_in_tray);
+            }
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|err| anyhow::anyhow!("eframe failed to launch Rustgram window: {err}"))
+}

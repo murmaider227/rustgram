@@ -1,0 +1,33 @@
+[package]
+name = "tg-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+parking_lot = "0.12.5"
+tg-api = { path = "../tg-api" }
+tg-core = { path = "../tg-core" }
+tg-crypto = { path = "../tg-crypto" }
+tg-data = { path = "../tg-data" }
+tg-lang = { path = "../tg-lang" }
+tg-mtproto = { path = "../tg-mtproto" }
+tg-platform = { path = "../tg-platform" }
+tg-storage = { path = "../tg-storage" }
+tg-tl = { path = "../tg-tl" }
+tg-transport = { path = "../tg-transport" }
+thiserror = "2.0"
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+rpassword = "7.3"
+serde_json = "1.0.154"
+tempfile = "3.14"
+tg-calls = { path = "../tg-calls" }
+tg-media = { path = "../tg-media" }
+tg-text = { path = "../tg-text" }
+tokio = { version = "1.44.2", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

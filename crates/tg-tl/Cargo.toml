@@ -1,0 +1,12 @@
+[package]
+name = "tg-tl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flate2 = "1.1"
+thiserror = "2.0"
+
+[build-dependencies]
+tg-tl-gen = { path = "../tg-tl-gen" }

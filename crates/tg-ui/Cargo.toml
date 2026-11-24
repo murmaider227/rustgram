@@ -1,0 +1,17 @@
+[package]
+name = "tg-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui = { workspace = true }
+eframe = { workspace = true }
+tg-lottie = { path = "../tg-lottie" }
+tg-style = { path = "../tg-style" }
+tg-text = { path = "../tg-text" }
+tg-theme = { path = "../tg-theme" }
+tg-video = { path = "../tg-video" }
+
+[dev-dependencies]
+image = { version = "0.25.9", default-features = false, features = ["png"] }

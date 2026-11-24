@@ -1,0 +1,36 @@
+[package]
+name = "tg-tgw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+crc32fast = "1.5"
+flate2 = "1.0.35"
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tg-theme = { path = "../tg-theme" }
+tg-webview = { path = "../tg-webview" }
+thiserror = "2.0.21"
+tiny-skia = "0.11.4"
+tracing = "0.1.44"
+url = "2.5.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3.14.0"

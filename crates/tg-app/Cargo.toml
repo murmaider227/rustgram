@@ -1,0 +1,78 @@
+[package]
+name = "tg-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { workspace = true }
+egui = { workspace = true }
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+resvg = "0.45.1"
+tg-api = { path = "../tg-api" }
+tg-app-core = { path = "../tg-app-core" }
+tg-app-history = { path = "../tg-app-history" }
+tg-app-info = { path = "../tg-app-info" }
+tg-app-live = { path = "../tg-app-live" }
+tg-app-media = { path = "../tg-app-media" }
+tg-app-settings = { path = "../tg-app-settings" }
+tg-app-window = { path = "../tg-app-window" }
+tg-core = { path = "../tg-core" }
+tg-data = { path = "../tg-data" }
+tg-export = { path = "../tg-export" }
+tg-lang = { path = "../tg-lang" }
+tg-platform = { path = "../tg-platform" }
+tg-session = { path = "../tg-session" }
+tg-stories = { path = "../tg-stories" }
+tg-tl = { path = "../tg-tl" }
+tg-ui = { path = "../tg-ui" }
+tg-updater = { path = "../tg-updater" }
+tg-video = { path = "../tg-video" }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.build-dependencies]
+ico = "0.4.0"
+resvg = "0.45.1"
+tiny-skia = "0.11.4"
+winresource = "0.1.34"
+
+[dev-dependencies]
+ed25519-dalek = "2.1.1"
+egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+num-bigint = "0.4"
+png = "0.18.1"
+qrcode = { version = "0.14", default-features = false }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tg-audio = { path = "../tg-audio" }
+tg-bots = { path = "../tg-bots" }
+tg-calls = { path = "../tg-calls" }
+tg-chat = { path = "../tg-chat" }
+tg-crypto = { path = "../tg-crypto" }
+tg-history = { path = "../tg-history" }
+tg-iv = { path = "../tg-iv" }
+tg-lottie = { path = "../tg-lottie" }
+tg-media = { path = "../tg-media" }
+tg-mtproto = { path = "../tg-mtproto" }
+tg-passport = { path = "../tg-passport" }
+tg-payments = { path = "../tg-payments" }
+tg-stats = { path = "../tg-stats" }
+tg-text = { path = "../tg-text" }
+tg-tgw = { path = "../tg-tgw" }
+tg-theme = { path = "../tg-theme" }
+tg-transport = { path = "../tg-transport" }
+tg-voip = { path = "../tg-voip" }
+tg-wallet = { path = "../tg-wallet" }
+tg-webview = { path = "../tg-webview" }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "rustgram"
+path = "src/main.rs"

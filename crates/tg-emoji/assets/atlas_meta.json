@@ -1,0 +1,13 @@
+{
+  "source": "googlefonts/noto-emoji",
+  "tag": "v2.042",
+  "license": "Apache-2.0",
+  "cell_size": 64,
+  "cols": 32,
+  "rows": 16,
+  "sheet_count": 8,
+  "total_entries": 3900,
+  "present_entries": 3499,
+  "exact_entries": 3484,
+  "missing_entries": 401
+}

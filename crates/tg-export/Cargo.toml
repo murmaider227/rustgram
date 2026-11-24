@@ -1,0 +1,23 @@
+[package]
+name = "tg-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitflags = "2.13"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tg-data = { path = "../tg-data" }
+tg-history = { path = "../tg-history" }
+tg-lang = { path = "../tg-lang" }
+tg-text = { path = "../tg-text" }
+tg-tl = { path = "../tg-tl" }
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["sync", "rt", "macros"] }
+unicode-general-category = "1.1"
+
+[dev-dependencies]
+tg-crypto = { path = "../tg-crypto" }
+tg-mtproto = { path = "../tg-mtproto" }

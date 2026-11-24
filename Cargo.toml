@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later WITH openvpn-openssl-exception"
+
+[workspace.dependencies]
+eframe = { version = "0.37.0", features = ["glow"] }
+egui = "0.37.0"
+
+[profile.dev]
+opt-level = 1
+# Full debug info (PDBs) made each agent's target dir many GB and filled drive D.
+debug = "line-tables-only"
+
+# The tg-app* crates compile ~40% faster unoptimized with lower peak rustc RAM.
+# Unoptimized frames are bigger: test threads get RUST_MIN_STACK=16 MB (cargo config) and rustgram.exe a 16 MB
+# main-thread stack (build.rs).
+[profile.dev.package.tg-app]
+opt-level = 0
+
+[profile.dev.package.tg-app-core]
+opt-level = 0
+
+[profile.dev.package.tg-app-media]
+opt-level = 0
+
+[profile.dev.package.tg-app-settings]
+opt-level = 0
+
+[profile.dev.package.tg-app-info]
+opt-level = 0
+
+[profile.dev.package.tg-app-history]
+opt-level = 0
+
+[profile.dev.package.tg-app-live]
+opt-level = 0
+
+[profile.dev.package.tg-app-window]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

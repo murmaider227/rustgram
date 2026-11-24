@@ -1,0 +1,9 @@
+[package]
+name = "tg-history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tg-data = { path = "../tg-data" }
+tg-style = { path = "../tg-style" }

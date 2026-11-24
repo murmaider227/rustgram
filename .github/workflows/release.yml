@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without leading 'v' (e.g. 0.1.0 or 0.2.0-beta.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  release-windows:
+    name: Build & Publish Windows Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $isccDir = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          if (-not (Test-Path (Join-Path $isccDir "ISCC.exe"))) {
+            $isccDir = "$env:ProgramFiles\Inno Setup 6"
+          }
+          if (-not (Test-Path (Join-Path $isccDir "ISCC.exe"))) {
+            throw "ISCC.exe not found after installing Inno Setup"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $isccDir
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+            $tag = "v$version"
+          } else {
+            $tag = $env:GITHUB_REF_NAME
+            $version = $tag -replace '^v', ''
+          }
+          $isPrerelease = if ($version -match '-') { "true" } else { "false" }
+          $channel = if ($isPrerelease -eq "true") { "beta" } else { "stable" }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "prerelease=$isPrerelease"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "channel=$channel"
+
+      - name: Build distribution artifacts (portable zip, installer, update package)
+        shell: pwsh
+        env:
+          RUSTGRAM_API_ID: ${{ secrets.RUSTGRAM_API_ID }}
+          RUSTGRAM_API_HASH: ${{ secrets.RUSTGRAM_API_HASH }}
+          RUSTGRAM_UPDATER_SIGNING_KEY: ${{ secrets.RUSTGRAM_UPDATER_SIGNING_KEY }}
+        run: |
+          cargo run --release -p tg-xtask -- dist `
+            --version "${{ steps.meta.outputs.version }}" `
+            --channel "${{ steps.meta.outputs.channel }}" `
+            --out-dir dist `
+            --require-iscc
+
+      - name: Verify expected release artifacts exist
+        shell: pwsh
+        run: |
+          $v = "${{ steps.meta.outputs.version }}"
+          $required = @(
+            "dist/Rustgram-Setup-$v-win-x64.exe",
+            "dist/rustgram-$v-win-x64-portable.zip",
+            "dist/SHA256SUMS.txt"
+          )
+          foreach ($f in $required) {
+            if (-not (Test-Path $f)) {
+              throw "Expected release artifact missing: $f"
+            }
+          }
+          Get-ChildItem dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Rustgram ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            dist/Rustgram-Setup-*-win-x64.exe
+            dist/rustgram-*-win-x64-portable.zip
+            dist/rustgram-*-win-x64.tupdate
+            dist/SHA256SUMS.txt

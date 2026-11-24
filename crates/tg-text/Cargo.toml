@@ -1,0 +1,11 @@
+[package]
+name = "tg-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitflags = "2.9"
+regex = "1.11"
+unicode-general-category = "1.0"
+unicode-script = "0.5"

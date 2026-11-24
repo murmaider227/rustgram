@@ -1,0 +1,59 @@
+[package]
+name = "tg-app-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+arboard = "3.7.0"
+egui = { workspace = true }
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+num-bigint = "0.4"
+raw-window-handle = "0.6.2"
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tg-api = { path = "../tg-api" }
+tg-app-core = { path = "../tg-app-core" }
+tg-audio = { path = "../tg-audio" }
+tg-bots = { path = "../tg-bots" }
+tg-calls = { path = "../tg-calls" }
+tg-chat = { path = "../tg-chat" }
+tg-core = { path = "../tg-core" }
+tg-crypto = { path = "../tg-crypto" }
+tg-data = { path = "../tg-data" }
+tg-export = { path = "../tg-export" }
+tg-history = { path = "../tg-history" }
+tg-iv = { path = "../tg-iv" }
+tg-lang = { path = "../tg-lang" }
+tg-lottie = { path = "../tg-lottie" }
+tg-media = { path = "../tg-media" }
+tg-passport = { path = "../tg-passport" }
+tg-payments = { path = "../tg-payments" }
+tg-platform = { path = "../tg-platform" }
+tg-session = { path = "../tg-session" }
+tg-stats = { path = "../tg-stats" }
+tg-storage = { path = "../tg-storage" }
+tg-stories = { path = "../tg-stories" }
+tg-text = { path = "../tg-text" }
+tg-tgw = { path = "../tg-tgw" }
+tg-theme = { path = "../tg-theme" }
+tg-tl = { path = "../tg-tl" }
+tg-transport = { path = "../tg-transport" }
+tg-video = { path = "../tg-video" }
+tg-voip = { path = "../tg-voip" }
+tg-wallet = { path = "../tg-wallet" }
+tg-webview = { path = "../tg-webview" }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.44"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+ed25519-dalek = "2.1.1"
+png = "0.18.1"
+tempfile = "3.27.0"
+tg-mtproto = { path = "../tg-mtproto" }

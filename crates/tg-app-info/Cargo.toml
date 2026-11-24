@@ -1,0 +1,40 @@
+[package]
+name = "tg-app-info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+egui = { workspace = true }
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+qrcode = { version = "0.14", default-features = false }
+rfd = "0.15"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tg-app-core = { path = "../tg-app-core" }
+tg-bots = { path = "../tg-bots" }
+tg-core = { path = "../tg-core" }
+tg-crypto = { path = "../tg-crypto" }
+tg-data = { path = "../tg-data" }
+tg-editor = { path = "../tg-editor" }
+tg-history = { path = "../tg-history" }
+tg-lang = { path = "../tg-lang" }
+tg-passport = { path = "../tg-passport" }
+tg-payments = { path = "../tg-payments" }
+tg-stats = { path = "../tg-stats" }
+tg-text = { path = "../tg-text" }
+tg-theme = { path = "../tg-theme" }
+tg-tl = { path = "../tg-tl" }
+tg-transport = { path = "../tg-transport" }
+tg-ui = { path = "../tg-ui" }
+tg-wallet = { path = "../tg-wallet" }
+tracing = "0.1.44"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+eframe = { workspace = true }
+egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
+png = "0.18.1"
+tempfile = "3.27.0"
+winit = "0.30.13"

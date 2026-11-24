@@ -1,0 +1,23 @@
+[package]
+name = "tg-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Video decoding, streaming player, clip/sticker reader, and thumbnail extraction ported from Telegram Desktop"
+
+[features]
+default = ["encode"]
+encode = []
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+tg-media = { path = "../tg-media" }
+tg-storage = { path = "../tg-storage" }
+thiserror = "2"
+tracing = "0.1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tempfile = "3"

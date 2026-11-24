@@ -1,0 +1,45 @@
+[package]
+name = "tg-app-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { workspace = true }
+egui = { workspace = true }
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+raw-window-handle = "0.6.2"
+rfd = "0.15"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tg-app-core = { path = "../tg-app-core" }
+tg-audio = { path = "../tg-audio" }
+tg-calls = { path = "../tg-calls" }
+tg-core = { path = "../tg-core" }
+tg-data = { path = "../tg-data" }
+tg-emoji = { path = "../tg-emoji" }
+tg-iv = { path = "../tg-iv" }
+tg-lang = { path = "../tg-lang" }
+tg-media = { path = "../tg-media" }
+tg-platform = { path = "../tg-platform" }
+tg-stories = { path = "../tg-stories" }
+tg-text = { path = "../tg-text" }
+tg-tgw = { path = "../tg-tgw" }
+tg-theme = { path = "../tg-theme" }
+tg-tl = { path = "../tg-tl" }
+tg-ui = { path = "../tg-ui" }
+tg-video = { path = "../tg-video" }
+tg-voip = { path = "../tg-voip" }
+tg-webview = { path = "../tg-webview" }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.44"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
+png = "0.18.1"
+tempfile = "3.27.0"
+winit = "0.30.13"

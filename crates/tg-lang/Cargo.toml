@@ -1,0 +1,11 @@
+[package]
+name = "tg-lang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tg-storage = { path = "../tg-storage" }
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["sync"] }
+tracing = "0.1"

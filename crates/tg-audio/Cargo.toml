@@ -1,0 +1,15 @@
+[package]
+name = "tg-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Audio playback, mixing, Opus voice recording, waveform computation, playlists, and device management ported from Telegram Desktop."
+
+[dependencies]
+cpal = "0.18.2"
+opus-pure = "0.2.3"
+rand = "0.8.5"
+symphonia = { version = "0.6.1", features = ["all"] }
+tg-data = { path = "../tg-data" }
+thiserror = "2.0.12"
+tracing = "0.1.41"

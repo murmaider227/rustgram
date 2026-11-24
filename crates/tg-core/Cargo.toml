@@ -1,0 +1,29 @@
+[package]
+name = "tg-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+md-5 = "0.10"
+rand = "0.8"
+tg-storage = { path = "../tg-storage" }
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52.0", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3.14"
+tg-crypto = { path = "../tg-crypto" }
+tg-lang = { path = "../tg-lang" }
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "test-util"] }

@@ -1,0 +1,15 @@
+[package]
+name = "tg-passport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22"
+serde_json = "1.0"
+tg-crypto = { path = "../tg-crypto" }
+tg-data = { path = "../tg-data" }
+tg-tl = { path = "../tg-tl" }
+thiserror = "2.0"
+url = "2.5"
+zeroize = { version = "1", features = ["derive"] }

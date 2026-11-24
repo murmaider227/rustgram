@@ -1,0 +1,301 @@
+//! Delete Messages and Delete/Leave Chat confirmation box with "Delete for everyone" option.
+//!
+//! Port origin: `Telegram/SourceFiles/boxes/delete_messages_box.h`
+//! and `Telegram/SourceFiles/boxes/delete_messages_box.cpp`.
+
+use egui::{Align2, CornerRadius, FontId, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2};
+use tg_app_core::core_types::dto::engagement::FutureChatCreatorInfo;
+use tg_lang::tr;
+use tg_ui::fonts::{family_regular, family_semibold};
+use tg_ui::layers::{BoxButton, BoxModal};
+use tg_ui::stand_in::{CheckStyle, CheckboxStyle, Colors, FlatLabelStyle};
+use tg_ui::tg_style::st;
+use tg_ui::userpic::EmptyUserpic;
+use tg_ui::widgets::checkbox::Checkbox;
+use tg_ui::widgets::labels::FlatLabel;
+
+use crate::boxes::strings;
+use crate::info::backend::{InfoBackend, InfoPeerKind, PeerProfile};
+use tg_app_core::stand_in::types::PeerId;
+
+/// Mode of [`DeleteMessagesBoxState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// Delete specific selected message IDs.
+    Messages(Vec<i32>),
+    /// Clear chat history without leaving.
+    ClearHistory,
+    /// Delete chat / leave group or channel.
+    DeleteAndLeave,
+}
+
+/// Stateful Delete Messages / Leave Chat modal (`DeleteMessagesBox`).
+#[derive(Debug, Clone)]
+pub struct DeleteMessagesBoxState {
+    /// Target peer id.
+    pub peer_id: PeerId,
+    /// Target peer title.
+    pub peer_title: String,
+    /// Target peer category.
+    pub peer_kind: InfoPeerKind,
+    /// Delete operation mode.
+    pub mode: DeleteMode,
+    /// Whether "Delete for everyone / Also delete for <peer>" is allowed.
+    pub can_revoke_for_everyone: bool,
+    /// Default value for `revoke_for_everyone` (used to decide when to show "Remember my choice").
+    pub default_revoke: bool,
+    /// Current state of the "Delete for everyone" checkbox.
+    pub revoke_for_everyone: bool,
+    /// Optional "Remember my choice" checkbox revealed when user diverges from default.
+    pub remember_choice: bool,
+    /// Optional future chat/channel creator who will inherit ownership if the current owner leaves
+    /// (`messages.getFutureChatCreatorAfterLeave`, `window_peer_menu.cpp:4367-4389`).
+    pub future_creator: Option<FutureChatCreatorInfo>,
+}
+
+impl DeleteMessagesBoxState {
+    /// Creates a box for deleting specific messages in `peer`.
+    #[must_use]
+    pub fn for_messages(peer: &PeerProfile, message_ids: Vec<i32>) -> Self {
+        let can_revoke = peer.kind != InfoPeerKind::SavedMessages && peer.kind != InfoPeerKind::Bot;
+        Self {
+            peer_id: peer.id,
+            peer_title: peer.title.clone(),
+            peer_kind: peer.kind,
+            mode: DeleteMode::Messages(message_ids),
+            can_revoke_for_everyone: can_revoke,
+            default_revoke: can_revoke,
+            revoke_for_everyone: can_revoke,
+            remember_choice: false,
+            future_creator: None,
+        }
+    }
+
+    /// Creates a box for deleting chat history or leaving a group/channel.
+    #[must_use]
+    pub fn for_delete_or_leave(peer: &PeerProfile, just_clear: bool) -> Self {
+        let can_revoke = peer.kind == InfoPeerKind::User || (peer.can_edit && peer.kind.is_group());
+        Self {
+            peer_id: peer.id,
+            peer_title: peer.title.clone(),
+            peer_kind: peer.kind,
+            mode: if just_clear {
+                DeleteMode::ClearHistory
+            } else {
+                DeleteMode::DeleteAndLeave
+            },
+            can_revoke_for_everyone: can_revoke,
+            default_revoke: false,
+            revoke_for_everyone: false,
+            remember_choice: false,
+            future_creator: None,
+        }
+    }
+
+    /// Attaches the future owner candidate returned by `messages.getFutureChatCreatorAfterLeave`.
+    #[must_use]
+    pub fn with_future_creator(mut self, creator: Option<FutureChatCreatorInfo>) -> Self {
+        self.future_creator = creator;
+        self
+    }
+
+    /// Computes the primary action button label (`"Delete"` vs `"Leave"`).
+    #[must_use]
+    pub fn confirm_label(&self) -> String {
+        match self.mode {
+            DeleteMode::DeleteAndLeave
+                if (self.peer_kind.is_group() || self.peer_kind.is_channel())
+                    && !self.revoke_for_everyone =>
+            {
+                tr::lng_box_leave()
+            }
+            _ => tr::lng_box_delete(),
+        }
+    }
+
+    /// Computes the body prompt text matching `DeleteMessagesBox::prepare`.
+    #[must_use]
+    pub fn prompt_text(&self) -> String {
+        match &self.mode {
+            DeleteMode::Messages(ids) => {
+                if ids.len() <= 1 {
+                    tr::lng_selected_delete_sure_this()
+                } else {
+                    format!(
+                        "{} {} {}",
+                        strings::DELETE_SELECTED_PREFIX,
+                        ids.len(),
+                        strings::DELETE_SELECTED_SUFFIX
+                    )
+                }
+            }
+            DeleteMode::ClearHistory => tr::lng_sure_delete_group_history(&self.peer_title),
+            DeleteMode::DeleteAndLeave => match self.peer_kind {
+                InfoPeerKind::SavedMessages => tr::lng_sure_delete_saved_messages(),
+                InfoPeerKind::User | InfoPeerKind::Bot => {
+                    tr::lng_sure_delete_history(&self.peer_title)
+                }
+                InfoPeerKind::Group | InfoPeerKind::Supergroup => tr::lng_sure_leave_group(),
+                InfoPeerKind::Channel => tr::lng_sure_leave_channel(),
+            },
+        }
+    }
+
+    /// Computes the checkbox label for `revoke_for_everyone`.
+    #[must_use]
+    pub fn revoke_checkbox_label(&self) -> String {
+        match self.peer_kind {
+            InfoPeerKind::User => tr::lng_delete_for_other_check(&self.peer_title),
+            InfoPeerKind::Group | InfoPeerKind::Supergroup => {
+                if matches!(self.mode, DeleteMode::DeleteAndLeave) {
+                    strings::DELETE_GROUP_ALL_MEMBERS.to_owned()
+                } else {
+                    tr::lng_delete_for_everyone_check()
+                }
+            }
+            _ => tr::lng_delete_for_everyone_check(),
+        }
+    }
+
+    /// Executes the deletion against `backend`.
+    pub fn submit(&self, backend: &mut dyn InfoBackend) -> Result<usize, String> {
+        let ids = match &self.mode {
+            DeleteMode::Messages(ids) => ids.clone(),
+            DeleteMode::ClearHistory | DeleteMode::DeleteAndLeave => Vec::new(),
+        };
+        backend.delete_messages(self.peer_id, &ids, self.revoke_for_everyone)
+    }
+
+    /// Builds the `tg-ui` [`BoxModal`] descriptor.
+    #[must_use]
+    pub fn to_modal(&self, id: &str) -> BoxModal {
+        let title = match self.mode {
+            DeleteMode::Messages(ref ids) if ids.len() > 1 => {
+                strings::DELETE_MESSAGES_TITLE.to_owned()
+            }
+            DeleteMode::Messages(_) => strings::DELETE_MESSAGE_TITLE.to_owned(),
+            DeleteMode::ClearHistory => tr::lng_profile_clear_history(),
+            DeleteMode::DeleteAndLeave => {
+                if self.future_creator.is_some() {
+                    if self.peer_kind.is_group() {
+                        tr::lng_leave_next_owner_box_title_group()
+                    } else if self.peer_kind.is_channel() {
+                        tr::lng_leave_next_owner_box_title()
+                    } else {
+                        tr::lng_profile_delete_conversation()
+                    }
+                } else if self.peer_kind.is_group() {
+                    tr::lng_profile_leave_group()
+                } else if self.peer_kind.is_channel() {
+                    tr::lng_profile_leave_channel()
+                } else {
+                    tr::lng_profile_delete_conversation()
+                }
+            }
+        };
+        BoxModal::new(id, title)
+            .width(st::box_width.0 as f32 + 28.0)
+            .add_button(BoxButton::default_btn("cancel", tr::lng_cancel()))
+            .add_button(BoxButton::attention("delete", self.confirm_label()))
+    }
+
+    /// Renders the confirmation copy, optional future-owner transfer callout, and delete-for-everyone
+    /// checkboxes.
+    pub fn show_body(&mut self, ui: &mut Ui, colors: &dyn Colors) {
+        let prompt = self.prompt_text();
+        FlatLabel::plain(&prompt, FlatLabelStyle::box_label(colors))
+            .id_salt("delete_prompt")
+            .show(ui);
+
+        // `messages.getFutureChatCreatorAfterLeave` ownership transfer callout
+        // (`select_future_owner_box.cpp:278-314`).
+        if matches!(self.mode, DeleteMode::DeleteAndLeave)
+            && !self.revoke_for_everyone
+            && let Some(ref creator) = self.future_creator
+        {
+            ui.add_space(12.0);
+            let avail_w = ui.available_width().max(180.0);
+            let notice = if self.peer_kind == InfoPeerKind::Group {
+                tr::lng_leave_next_owner_box_about_legacy(&creator.name, &self.peer_title)
+            } else {
+                tr::lng_leave_next_owner_box_about(&creator.name, &self.peer_title)
+            }
+            .replace("**", "");
+            let notice_galley = ui.painter().layout(
+                notice.clone(),
+                FontId::new(12.5, family_regular()),
+                colors.color("windowFg"),
+                (avail_w - 64.0).max(110.0),
+            );
+            let card_h = (notice_galley.size().y + 38.0).max(66.0);
+            let (card_rect, card_resp) =
+                ui.allocate_exact_size(Vec2::new(avail_w, card_h), egui::Sense::hover());
+            let a11y_label = format!("{}: {notice}", creator.name);
+            card_resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::accesskit::Role::Label, true, a11y_label.clone())
+            });
+            ui.painter().rect_filled(
+                card_rect,
+                CornerRadius::same(10),
+                colors.color("windowBgOver"),
+            );
+            ui.painter().rect_stroke(
+                card_rect,
+                CornerRadius::same(10),
+                Stroke::new(1.0, colors.color("shadowFg")),
+                StrokeKind::Inside,
+            );
+
+            let av_rect = Rect::from_center_size(
+                Pos2::new(card_rect.left() + 28.0, card_rect.center().y),
+                Vec2::splat(36.0),
+            );
+            let color_idx = (creator.user_id.bare() % 8) as u8;
+            EmptyUserpic::for_color_index(color_idx, &creator.name, colors)
+                .paint_circle(ui.painter(), av_rect);
+
+            let text_left = av_rect.right() + 12.0;
+            let header_text = match creator.username.as_deref() {
+                Some(u) if !u.is_empty() => format!("{} (@{u})", creator.name),
+                _ => creator.name.clone(),
+            };
+            ui.painter().text(
+                Pos2::new(text_left, card_rect.top() + 10.0),
+                Align2::LEFT_TOP,
+                header_text,
+                FontId::new(13.0, family_semibold()),
+                colors.color("windowBoldFg"),
+            );
+            ui.painter().galley(
+                Pos2::new(text_left, card_rect.top() + 28.0),
+                notice_galley,
+                colors.color("windowFg"),
+            );
+        }
+
+        if self.can_revoke_for_everyone {
+            ui.add_space(12.0);
+            let revoke_label = self.revoke_checkbox_label();
+            Checkbox::new(
+                &mut self.revoke_for_everyone,
+                &revoke_label,
+                CheckboxStyle::box_checkbox(colors),
+                CheckStyle::default_check(colors),
+            )
+            .show(ui);
+
+            // Reveal "Remember my choice" when toggled away from default (`delete_messages_box.cpp:208-213`).
+            if matches!(self.mode, DeleteMode::Messages(_))
+                && self.revoke_for_everyone != self.default_revoke
+            {
+                Checkbox::new(
+                    &mut self.remember_choice,
+                    strings::REMEMBER_MY_CHOICE,
+                    CheckboxStyle::box_checkbox(colors),
+                    CheckStyle::default_check(colors),
+                )
+                .show(ui);
+            }
+        }
+    }
+}

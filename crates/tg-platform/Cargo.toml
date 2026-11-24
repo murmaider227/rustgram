@@ -1,0 +1,77 @@
+[package]
+name = "tg-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustgram-widget-helper"
+path = "src/bin/tgfork_widget_helper.rs"
+
+[dependencies]
+aes = "0.8.4"
+aes-gcm = "0.10.3"
+base64 = "0.22.1"
+getrandom = "0.2.17"
+hmac = "0.12.1"
+p256 = { version = "0.14.0", features = ["ecdh", "getrandom"] }
+png = "0.18.1"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.16.0"
+serde_json = "1.0.154"
+sha1 = "0.10.7"
+sha2 = "0.10.9"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+webpki-roots = "1.0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = [
+    "ApplicationModel",
+    "Data_Xml_Dom",
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Advertisement",
+    "Devices_Geolocation",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media",
+    "Media_Ocr",
+    "Security_Credentials_UI",
+    "Storage_Streams",
+    "System",
+    "UI_Notifications",
+    "Win32_Devices_Bluetooth",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Notifications",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }

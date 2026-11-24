@@ -1,0 +1,723 @@
+//! Emoji database, sequence finder, categories, skin-tone variants, and autocomplete suggestions.
+//!
+//! Port of `Telegram/codegen/codegen/emoji/*`, `Telegram/lib_ui/ui/emoji_config.cpp/.h`,
+//! and `Telegram/lib_ui/emoji_suggestions/emoji_suggestions.cpp/.h`.
+
+use std::borrow::Cow;
+
+/// Variation Selector-16 (`U+FE0F`) emoji presentation postfix (`Ui::Emoji::kPostfix`).
+pub const K_POSTFIX: char = '\u{FE0F}';
+/// UTF-16 code unit for `U+FE0F`.
+pub const K_POSTFIX_U16: u16 = 0xFE0F;
+/// Zero Width Joiner (`U+200D`).
+pub const K_JOINER: char = '\u{200D}';
+
+/// Emoji picker categories (`Ui::Emoji::Section`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Section {
+    /// Recently used emojis (populated by the application, not a static table).
+    Recent,
+    /// Smileys & People.
+    People,
+    /// Animals & Nature.
+    Nature,
+    /// Food & Drink.
+    Food,
+    /// Activities.
+    Activity,
+    /// Travel & Places.
+    Travel,
+    /// Objects.
+    Objects,
+    /// Symbols & Flags.
+    Symbols,
+}
+
+/// Static metadata for a single emoji in the generated table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EmojiEntry {
+    /// Canonical emoji sequence (without trailing `U+FE0F` when `has_postfix` is `true`).
+    pub id: &'static str,
+    /// 1-based index of the uncolored base emoji if this is a skin-tone variant, else `0`.
+    pub original: u16,
+    /// 0-based index in `EMOJI_ITEMS`.
+    pub index: u16,
+    /// Whether `text()` appends `U+FE0F` to `id`.
+    pub has_postfix: bool,
+    /// Whether this base emoji has 5 immediately following skin-tone variants.
+    pub colorizable: bool,
+}
+
+/// Reference handle to a static emoji entry (analog of `EmojiPtr` = `const Ui::Emoji::One*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EmojiRef(&'static EmojiEntry);
+
+impl EmojiRef {
+    /// Canonical emoji identifier (without trailing `U+FE0F` if `has_postfix()` is true).
+    #[inline]
+    pub fn id(self) -> &'static str {
+        self.0.id
+    }
+
+    /// Full text representation of the emoji (appends `U+FE0F` if `has_postfix()` is true).
+    #[inline]
+    pub fn text(self) -> Cow<'static, str> {
+        if self.0.has_postfix {
+            let mut s = String::with_capacity(self.0.id.len() + K_POSTFIX.len_utf8());
+            s.push_str(self.0.id);
+            s.push(K_POSTFIX);
+            Cow::Owned(s)
+        } else {
+            Cow::Borrowed(self.0.id)
+        }
+    }
+
+    /// Whether this emoji is a skin-tone variant of a base emoji.
+    #[inline]
+    pub fn colored(self) -> bool {
+        self.0.original != 0
+    }
+
+    /// Returns the uncolored original emoji (or `self` if already uncolored).
+    #[inline]
+    pub fn original(self) -> EmojiRef {
+        if self.0.original != 0 {
+            EmojiRef(&EMOJI_ITEMS[(self.0.original - 1) as usize])
+        } else {
+            self
+        }
+    }
+
+    /// Returns the `id()` of the uncolored base emoji.
+    #[inline]
+    pub fn non_colored_id(self) -> &'static str {
+        self.original().id()
+    }
+
+    /// Whether `text()` appends `U+FE0F`.
+    #[inline]
+    pub fn has_postfix(self) -> bool {
+        self.0.has_postfix
+    }
+
+    /// Whether this emoji supports skin-tone variants.
+    #[inline]
+    pub fn has_variants(self) -> bool {
+        self.0.colorizable || self.colored()
+    }
+
+    /// Number of skin-tone variants (5 if `has_variants()`, else 0).
+    #[inline]
+    pub fn variants_count(self) -> usize {
+        if self.has_variants() { 5 } else { 0 }
+    }
+
+    /// Returns the variant index (`0` for original, `1..=5` for skin tones) of `variant`.
+    #[inline]
+    pub fn variant_index(self, variant: EmojiRef) -> usize {
+        variant.index().saturating_sub(self.original().index())
+    }
+
+    /// Returns the variant at `index` (`0` = uncolored, `1..=5` = skin tones), or `self` if out of range.
+    #[inline]
+    pub fn variant(self, index: usize) -> EmojiRef {
+        if index <= self.variants_count() {
+            let target = self.original().index() + index;
+            if let Some(entry) = EMOJI_ITEMS.get(target) {
+                return EmojiRef(entry);
+            }
+        }
+        self
+    }
+
+    /// 0-based index in the emoji table.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0.index as usize
+    }
+
+    /// Sprite sheet index (tdesktop layout: 512 emojis per sprite).
+    #[inline]
+    pub fn sprite(self) -> usize {
+        self.index() >> 9
+    }
+
+    /// Row within sprite sheet (0..16).
+    #[inline]
+    pub fn row(self) -> usize {
+        (self.index() >> 5) & 0x0F
+    }
+
+    /// Column within sprite sheet (0..32).
+    #[inline]
+    pub fn column(self) -> usize {
+        self.index() & 0x1F
+    }
+
+    /// Internal URL representation (`"emoji://e.<index>"`).
+    #[inline]
+    pub fn to_url(self) -> String {
+        format!("emoji://e.{}", self.index())
+    }
+}
+
+/// Static flat trie node generated by `build.rs`.
+pub(crate) struct TrieNode {
+    unit: u16,
+    children_start: u32,
+    children_len: u16,
+    emoji_index: u16,
+    postfix_required: bool,
+}
+
+/// Static suggestion entry generated by `build.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuggestionEntry {
+    /// Emoji sequence string (UTF-8).
+    pub emoji: &'static str,
+    /// Shortcode replacement string (e.g. `":smile:"`).
+    pub replacement: &'static str,
+    /// Sorted searchable keywords extracted from `replacement`.
+    pub words: &'static [&'static str],
+}
+
+/// Resolved emoji autocomplete suggestion (`Ui::Emoji::Suggestion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Suggestion {
+    /// Emoji sequence string.
+    pub emoji: &'static str,
+    /// Display label (same as `replacement` in tdesktop).
+    pub label: &'static str,
+    /// Shortcode replacement (e.g. `":thumbsup:"`).
+    pub replacement: &'static str,
+}
+
+include!(concat!(env!("OUT_DIR"), "/emoji_data.rs"));
+
+/// Total number of emojis in the database (`Ui::Emoji::internal::FullCount`).
+#[inline]
+pub fn full_count() -> usize {
+    EMOJI_ITEMS.len()
+}
+
+/// Looks up an emoji by 0-based table index (`Ui::Emoji::internal::ByIndex`).
+#[inline]
+pub fn by_index(index: usize) -> Option<EmojiRef> {
+    EMOJI_ITEMS.get(index).map(EmojiRef)
+}
+
+/// Parses an `"emoji://e.<index>"` URL back to an `EmojiRef` (`Ui::Emoji::FromUrl`).
+pub fn from_url(url: &str) -> Option<EmojiRef> {
+    let rest = url.strip_prefix("emoji://e.")?;
+    let idx: usize = rest.parse().ok()?;
+    by_index(idx)
+}
+
+/// Returns the number of emojis in a picker section (`Ui::Emoji::GetSectionCount`).
+pub fn section_count(section: Section) -> usize {
+    match section_index(section) {
+        Some(idx) => SECTIONS[idx].len(),
+        None => 0,
+    }
+}
+
+/// Returns all emojis in a picker section (`Ui::Emoji::GetSection`).
+pub fn section(section: Section) -> Vec<EmojiRef> {
+    match section_index(section) {
+        Some(idx) => SECTIONS[idx]
+            .iter()
+            .map(|&i| EmojiRef(&EMOJI_ITEMS[i as usize]))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn section_index(section: Section) -> Option<usize> {
+    match section {
+        Section::Recent => None,
+        Section::People => Some(0),
+        Section::Nature => Some(1),
+        Section::Food => Some(2),
+        Section::Activity => Some(3),
+        Section::Travel => Some(4),
+        Section::Objects => Some(5),
+        Section::Symbols => Some(6),
+    }
+}
+
+fn find_in_trie_utf16(
+    trie: &[TrieNode],
+    units: &[u16],
+    from: usize,
+    skip_postfixes: bool,
+) -> Option<(EmojiRef, usize)> {
+    let end = units.len();
+    let mut pos = from;
+    let mut node_idx = 0usize;
+    let mut best: Option<(u16, usize)> = None;
+
+    while pos < end {
+        let unit = units[pos];
+        let node = &trie[node_idx];
+        let start = node.children_start as usize;
+        let len = node.children_len as usize;
+        let children = &trie[start..start + len];
+        let Ok(rel) = children.binary_search_by_key(&unit, |c| c.unit) else {
+            break;
+        };
+        node_idx = start + rel;
+        pos += 1;
+        if skip_postfixes && pos < end && units[pos] == K_POSTFIX_U16 {
+            pos += 1;
+        }
+        let next = &trie[node_idx];
+        if next.emoji_index != 0
+            && (!next.postfix_required || (pos > from && units[pos - 1] == K_POSTFIX_U16))
+        {
+            best = Some((next.emoji_index - 1, pos - from));
+        }
+    }
+
+    best.map(|(idx, len)| (EmojiRef(&EMOJI_ITEMS[idx as usize]), len))
+}
+
+/// Finds the longest emoji sequence starting at UTF-16 offset `from` in `units`
+/// (`Ui::Emoji::Find(const QChar*, const QChar*, int*)`).
+///
+/// Returns `(emoji, matched_utf16_len)`.
+pub fn find_emoji_utf16(units: &[u16], from: usize) -> Option<(EmojiRef, usize)> {
+    find_in_trie_utf16(EMOJI_TRIE, units, from, true)
+}
+
+/// Finds the longest emoji sequence starting at UTF-8 byte offset `from` in `text`.
+///
+/// Matches C++ `Ui::Emoji::Find` behavior (including optional `U+FE0F` variation selectors
+/// and mandatory `U+FE0F` on `™️`, `©️`, `®️`). Returns `(emoji, matched_utf8_bytes)`.
+pub fn find_emoji(text: &str, from: usize) -> Option<(EmojiRef, usize)> {
+    if from >= text.len() || !text.is_char_boundary(from) {
+        return None;
+    }
+    let slice = &text[from..];
+    // Longest possible Unicode emoji sequence is well under 64 UTF-16 code units.
+    // Encode incrementally on the stack to avoid heap allocation in hot loops.
+    let mut units = [0u16; 64];
+    let mut byte_ends = [0usize; 64];
+    let mut u_len = 0usize;
+    for (byte_idx, ch) in slice.char_indices() {
+        let mut buf = [0u16; 2];
+        let encoded = ch.encode_utf16(&mut buf);
+        if u_len + encoded.len() > units.len() {
+            break;
+        }
+        let end_byte = byte_idx + ch.len_utf8();
+        for &u in encoded.iter() {
+            units[u_len] = u;
+            byte_ends[u_len] = end_byte;
+            u_len += 1;
+        }
+    }
+    let (emoji, matched_u16) = find_in_trie_utf16(EMOJI_TRIE, &units[..u_len], 0, true)?;
+    let matched_bytes = if matched_u16 == 0 {
+        0
+    } else {
+        byte_ends[matched_u16 - 1]
+    };
+    Some((emoji, matched_bytes))
+}
+
+/// Finds an ASCII emoticon replacement (e.g. `":-)"`, `"<3"`) starting at UTF-8 byte
+/// offset `from` in `text` (`Ui::Emoji::internal::FindReplace`).
+///
+/// Returns `(emoji, matched_utf8_bytes)`.
+pub fn find_replace(text: &str, from: usize) -> Option<(EmojiRef, usize)> {
+    if from >= text.len() || !text.is_char_boundary(from) {
+        return None;
+    }
+    let slice = &text[from..];
+    let mut units = [0u16; 16];
+    let mut byte_ends = [0usize; 16];
+    let mut u_len = 0usize;
+    for (byte_idx, ch) in slice.char_indices() {
+        let mut buf = [0u16; 2];
+        let encoded = ch.encode_utf16(&mut buf);
+        if u_len + encoded.len() > units.len() {
+            break;
+        }
+        let end_byte = byte_idx + ch.len_utf8();
+        for &u in encoded.iter() {
+            units[u_len] = u;
+            byte_ends[u_len] = end_byte;
+            u_len += 1;
+        }
+    }
+    let (emoji, matched_u16) = find_in_trie_utf16(REPLACE_TRIE, &units[..u_len], 0, false)?;
+    let matched_bytes = if matched_u16 == 0 {
+        0
+    } else {
+        byte_ends[matched_u16 - 1]
+    };
+    Some((emoji, matched_bytes))
+}
+
+/// Returns all `(emoticon, emoji_index)` replacement pairs (`Ui::Emoji::internal::GetReplacementPairs`).
+#[inline]
+pub fn replacement_pairs() -> &'static [(&'static str, u16)] {
+    REPLACEMENT_PAIRS
+}
+
+/// Decodes a legacy 64-bit tdesktop emoji key to its Unicode string (`Ui::Emoji::IdFromOldKey`).
+pub fn id_from_old_key(old_key: u64) -> String {
+    let mut code = (old_key >> 32) as u32;
+    let mut code2 = (old_key & 0xFFFF_FFFF) as u32;
+    if code == 0 && code2 != 0 {
+        code = code2;
+        code2 = 0;
+    }
+    if (code & 0xFFFF_0000) != 0xFFFF_0000 {
+        let mut units = Vec::with_capacity(4);
+        let push_code = |units: &mut Vec<u16>, c: u32| {
+            let high = (c >> 16) as u16;
+            if high != 0 {
+                units.push(high);
+            }
+            units.push((c & 0xFFFF) as u16);
+        };
+        push_code(&mut units, code);
+        if code2 != 0 {
+            push_code(&mut units, code2);
+        }
+        return String::from_utf16_lossy(&units);
+    }
+
+    match (code & 0xFFFF) as usize {
+        0 => "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".to_string(),
+        1 => "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}".to_string(),
+        2 => "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}\u{200D}\u{1F466}".to_string(),
+        3 => "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F467}".to_string(),
+        4 => "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F466}".to_string(),
+        5 => "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}".to_string(),
+        6 => "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}".to_string(),
+        7 => "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F466}\u{200D}\u{1F466}".to_string(),
+        8 => "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F467}".to_string(),
+        9 => "\u{1F468}\u{200D}\u{1F468}\u{200D}\u{1F466}".to_string(),
+        10 => "\u{1F468}\u{200D}\u{1F468}\u{200D}\u{1F467}".to_string(),
+        11 => "\u{1F468}\u{200D}\u{1F468}\u{200D}\u{1F467}\u{200D}\u{1F466}".to_string(),
+        12 => "\u{1F468}\u{200D}\u{1F468}\u{200D}\u{1F466}\u{200D}\u{1F466}".to_string(),
+        13 => "\u{1F468}\u{200D}\u{1F468}\u{200D}\u{1F467}\u{200D}\u{1F467}".to_string(),
+        14 => "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F469}".to_string(),
+        15 => "\u{1F468}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F468}".to_string(),
+        16 => "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F469}".to_string(),
+        17 => "\u{1F468}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F468}".to_string(),
+        18 => "\u{1F441}\u{200D}\u{1F5E8}".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Looks up an emoji from a legacy 64-bit tdesktop emoji key (`Ui::Emoji::FromOldKey`).
+pub fn from_old_key(old_key: u64) -> Option<EmojiRef> {
+    let id = id_from_old_key(old_key);
+    find_emoji(&id, 0).map(|(e, _)| e)
+}
+
+/// Converts a UTF-16 packed Fitzpatrick skin-tone modifier code to `1..=5`, or `0` (`Ui::Emoji::ColorIndexFromCode`).
+#[inline]
+pub fn color_index_from_code(code: u32) -> usize {
+    match code {
+        0xD83C_DFFB => 1,
+        0xD83C_DFFC => 2,
+        0xD83C_DFFD => 3,
+        0xD83C_DFFE => 4,
+        0xD83C_DFFF => 5,
+        _ => 0,
+    }
+}
+
+/// Extracts skin-tone index (`0..=5`) from a legacy 64-bit emoji key (`Ui::Emoji::ColorIndexFromOldKey`).
+#[inline]
+pub fn color_index_from_old_key(old_key: u64) -> usize {
+    color_index_from_code((old_key & 0xFFFF_FFFF) as u32)
+}
+
+/// Returns tdesktop's default recent emojis list (`Ui::Emoji::GetDefaultRecent`).
+pub fn default_recent() -> Vec<EmojiRef> {
+    const KEYS: &[u64] = &[
+        0xD83D_DE02,
+        0xD83D_DE18,
+        0x2764,
+        0xD83D_DE0D,
+        0xD83D_DE0A,
+        0xD83D_DE01,
+        0xD83D_DC4D,
+        0x263A,
+        0xD83D_DE14,
+        0xD83D_DE04,
+        0xD83D_DE2D,
+        0xD83D_DC8B,
+        0xD83D_DE12,
+        0xD83D_DE33,
+        0xD83D_DE1C,
+        0xD83D_DE48,
+        0xD83D_DE09,
+        0xD83D_DE03,
+        0xD83D_DE22,
+        0xD83D_DE1D,
+        0xD83D_DE31,
+        0xD83D_DE21,
+        0xD83D_DE0F,
+        0xD83D_DE1E,
+        0xD83D_DE05,
+        0xD83D_DE1A,
+        0xD83D_DE4A,
+        0xD83D_DE0C,
+        0xD83D_DE00,
+        0xD83D_DE0B,
+        0xD83D_DE06,
+        0xD83D_DC4C,
+        0xD83D_DE10,
+        0xD83D_DE15,
+    ];
+    KEYS.iter().filter_map(|&k| from_old_key(k)).collect()
+}
+
+// --- Emoji text-replacement suggestions (port of lib_ui/emoji_suggestions/emoji_suggestions.cpp) ---
+
+/// Returns the maximum shortcode replacement length in UTF-16 units (`Ui::Emoji::GetSuggestionMaxLength`).
+#[inline]
+pub fn suggestion_max_length() -> usize {
+    SUGGESTION_MAX_LENGTH
+}
+
+/// Returns all generated emoji shortcode suggestions (`Ui::Emoji::internal::GetAllReplacements`).
+#[inline]
+pub fn all_suggestions() -> &'static [SuggestionEntry] {
+    SUGGESTIONS
+}
+
+/// Looks up the exact emoji for a full shortcode replacement like `":smile:"`
+/// (`Ui::Emoji::GetSuggestionEmoji`).
+pub fn get_suggestion_emoji(replacement: &str) -> Option<&'static str> {
+    let idx = SUGGESTION_BY_REPLACEMENT
+        .binary_search_by_key(&replacement, |&(rep, _)| rep)
+        .ok()?;
+    Some(SUGGESTIONS[SUGGESTION_BY_REPLACEMENT[idx].1 as usize].emoji)
+}
+
+fn normalize_suggestion_query(query: &str) -> Vec<char> {
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = Vec::with_capacity(chars.len());
+    for i in 0..chars.len() {
+        let ch = chars[i];
+        if ch.is_ascii_lowercase()
+            || ch.is_ascii_digit()
+            || ((ch == '-' || ch == '+') && (i + 1 == chars.len() || chars[i + 1].is_ascii_digit()))
+        {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+struct CompleterResult {
+    entry: &'static SuggestionEntry,
+    words_used: usize,
+}
+
+struct Completer<'a> {
+    initial_query: &'a str,
+    query: Vec<char>,
+    results: Vec<CompleterResult>,
+    used_words: Vec<bool>,
+    words_used_count: usize,
+}
+
+impl<'a> Completer<'a> {
+    fn new(initial_query: &'a str) -> Self {
+        let query = normalize_suggestion_query(initial_query);
+        Self {
+            initial_query,
+            query,
+            results: Vec::new(),
+            used_words: Vec::new(),
+            words_used_count: 0,
+        }
+    }
+
+    fn resolve(mut self) -> Vec<Suggestion> {
+        if self.query.is_empty() {
+            return Vec::new();
+        }
+        let first = self.query[0];
+        let Ok(idx) = SUGGESTION_BY_FIRST.binary_search_by_key(&first, |&(c, _)| c) else {
+            return Vec::new();
+        };
+        let initial_list = SUGGESTION_BY_FIRST[idx].1;
+        self.results.reserve(initial_list.len());
+
+        if self.query.len() > 1 {
+            let max_words = initial_list
+                .iter()
+                .map(|&i| SUGGESTIONS[i as usize].words.len())
+                .max()
+                .unwrap_or(0);
+            self.used_words = vec![false; max_words];
+            for &entry_idx in initial_list {
+                let entry = &SUGGESTIONS[entry_idx as usize];
+                self.words_used_count = 1;
+                if self.match_query(entry.words) {
+                    self.add_result(entry);
+                }
+                self.words_used_count = 0;
+            }
+        } else {
+            self.words_used_count = 1;
+            for &entry_idx in initial_list {
+                self.add_result(&SUGGESTIONS[entry_idx as usize]);
+            }
+        }
+
+        self.prepare_result()
+    }
+
+    fn add_result(&mut self, item: &'static SuggestionEntry) {
+        let is_dup = self
+            .results
+            .last()
+            .is_some_and(|last| last.entry.emoji == item.emoji);
+        if !is_dup {
+            self.results.push(CompleterResult {
+                entry: item,
+                words_used: self.words_used_count,
+            });
+        } else if let Some(last) = self.results.last_mut() {
+            let better = if self.words_used_count < last.words_used {
+                true
+            } else {
+                let first_q = self.query[0];
+                let last_first = last.entry.replacement.chars().nth(1);
+                let cur_first = item.replacement.chars().nth(1);
+                last_first != Some(first_q) && cur_first == Some(first_q)
+            };
+            if better {
+                *last = CompleterResult {
+                    entry: item,
+                    words_used: self.words_used_count,
+                };
+            }
+        }
+    }
+
+    fn match_query(&mut self, words: &[&'static str]) -> bool {
+        if words.is_empty() {
+            return false;
+        }
+        if words.len() < 2 {
+            let w: Vec<char> = words[0].chars().collect();
+            return w.len() >= self.query.len() && w[..self.query.len()] == self.query[..];
+        }
+        self.match_tail(words, 0)
+    }
+
+    fn match_tail(&mut self, words: &[&'static str], position: usize) -> bool {
+        if position == self.query.len() {
+            return true;
+        }
+        let first_ch = self.query[position];
+        // `words` are sorted lexicographically, so binary search the range starting with `first_ch`.
+        let start = words.partition_point(|w| w.chars().next().is_some_and(|c| c < first_ch));
+        let end = words.partition_point(|w| w.chars().next().is_some_and(|c| c <= first_ch));
+
+        for word_idx in start..end {
+            if self.used_words[word_idx] {
+                continue;
+            }
+            self.used_words[word_idx] = true;
+            self.words_used_count += 1;
+
+            let word_chars: Vec<char> = words[word_idx].chars().collect();
+            let possible = (self.query.len() - position).min(word_chars.len());
+            let mut equal_count = 1;
+            while equal_count < possible
+                && word_chars[equal_count] == self.query[position + equal_count]
+            {
+                equal_count += 1;
+            }
+
+            let mut matched = false;
+            for check in (1..=equal_count).rev() {
+                if self.match_tail(words, position + check) {
+                    matched = true;
+                    break;
+                }
+            }
+
+            self.used_words[word_idx] = false;
+            if matched {
+                return true;
+            }
+            self.words_used_count -= 1;
+        }
+        false
+    }
+
+    fn prepare_result(mut self) -> Vec<Suggestion> {
+        let first_q = self.query[0];
+        let initial_query = self.initial_query;
+        stable_partition(&mut self.results, |r| {
+            r.entry.replacement.chars().nth(1) == Some(first_q)
+        });
+        stable_partition(&mut self.results, |r| r.words_used < 2);
+        stable_partition(&mut self.results, |r| r.words_used < 3);
+        stable_partition(&mut self.results, |r| {
+            r.entry.replacement.len() == initial_query.len() + 1
+                && r.entry.replacement.starts_with(initial_query)
+        });
+
+        self.results
+            .into_iter()
+            .map(|r| Suggestion {
+                emoji: r.entry.emoji,
+                label: r.entry.replacement,
+                replacement: r.entry.replacement,
+            })
+            .collect()
+    }
+}
+
+fn stable_partition<T, F: Fn(&T) -> bool>(slice: &mut [T], pred: F) {
+    let mut trues = Vec::new();
+    let mut falses = Vec::new();
+    // Temporarily move via swap-less index order using a simple allocation.
+    let mut order: Vec<usize> = Vec::with_capacity(slice.len());
+    for (i, item) in slice.iter().enumerate() {
+        if pred(item) {
+            trues.push(i);
+        } else {
+            falses.push(i);
+        }
+    }
+    order.extend(trues);
+    order.extend(falses);
+    // Apply permutation in place.
+    let mut visited = vec![false; slice.len()];
+    for start in 0..slice.len() {
+        if visited[start] || order[start] == start {
+            visited[start] = true;
+            continue;
+        }
+        let mut cur = start;
+        while !visited[cur] {
+            visited[cur] = true;
+            let next = order[cur];
+            if !visited[next] {
+                slice.swap(cur, next);
+            }
+            cur = next;
+        }
+    }
+}
+
+/// Resolves emoji shortcode autocomplete suggestions for `query` (e.g. `":sm"`, `":th_up"`)
+/// (`Ui::Emoji::GetSuggestions`).
+pub fn get_suggestions(query: &str) -> Vec<Suggestion> {
+    Completer::new(query).resolve()
+}

@@ -1,0 +1,46 @@
+[package]
+name = "tg-app-settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { workspace = true }
+egui = { workspace = true }
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+num-bigint = "0.4"
+qrcode = { version = "0.14", default-features = false }
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+resvg = "0.45.1"
+rfd = "0.15"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tg-api = { path = "../tg-api" }
+tg-app-core = { path = "../tg-app-core" }
+tg-audio = { path = "../tg-audio" }
+tg-chat = { path = "../tg-chat" }
+tg-core = { path = "../tg-core" }
+tg-crypto = { path = "../tg-crypto" }
+tg-data = { path = "../tg-data" }
+tg-emoji = { path = "../tg-emoji" }
+tg-export = { path = "../tg-export" }
+tg-lang = { path = "../tg-lang" }
+tg-lottie = { path = "../tg-lottie" }
+tg-platform = { path = "../tg-platform" }
+tg-text = { path = "../tg-text" }
+tg-theme = { path = "../tg-theme" }
+tg-tl = { path = "../tg-tl" }
+tg-transport = { path = "../tg-transport" }
+tg-ui = { path = "../tg-ui" }
+tg-updater = { path = "../tg-updater" }
+tg-wallet = { path = "../tg-wallet" }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.44"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
+png = "0.18.1"
+tempfile = "3.27.0"
+winit = "0.30.13"
