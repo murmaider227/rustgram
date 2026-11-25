@@ -854,8 +854,9 @@ fn restricted_origin_csp_navigation_policy_dialogs_and_helpers() {
     assert!(guard.try_begin(now + Duration::from_secs(1) + POPUPS_QUICKLY_DELAY, false));
 
     // Storage dir & scrollbar CSS helpers
-    let dir = resolve_user_data_dir(Path::new(r"C:\rustgram-data"), "account/1:main");
-    assert_eq!(dir, Path::new(r"C:\rustgram-data\webview\account_1_main"));
+    let workdir = Path::new("rustgram-data");
+    let dir = resolve_user_data_dir(workdir, "account/1:main");
+    assert_eq!(dir, workdir.join("webview").join("account_1_main"));
     assert_eq!(generate_storage_token().len(), 16);
 
     let (init_css, eval_css) = scrollbar_theme_scripts(

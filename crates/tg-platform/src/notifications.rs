@@ -572,12 +572,12 @@ impl ToastManager {
         }
         #[cfg(not(windows))]
         {
-            if let Ok(mut map) = self.active.lock() {
-                if let Some(inner) = map.get_mut(&context) {
-                    inner.remove(&msg_id);
-                    if inner.is_empty() {
-                        map.remove(&context);
-                    }
+            if let Ok(mut map) = self.active.lock()
+                && let Some(inner) = map.get_mut(&context)
+            {
+                inner.remove(&msg_id);
+                if inner.is_empty() {
+                    map.remove(&context);
                 }
             }
         }

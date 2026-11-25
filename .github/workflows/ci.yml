@@ -18,6 +18,11 @@ jobs:
   windows:
     name: Windows (x86_64-pc-windows-msvc)
     runs-on: windows-latest
+    env:
+      # The tg-app* crates build at opt-level 0 in dev; their test threads overflow the default 2 MB stack.
+      RUST_MIN_STACK: "16777216"
+      # Runners have no audio device; tests must not open real audio output.
+      RUSTGRAM_HEADLESS_AUDIO: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,6 +34,12 @@ jobs:
 
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          # Keep compiled dependencies even when clippy or tests fail, so the next run starts warm.
+          cache-on-failure: true
+
+      - name: Setup FFmpeg shared development build
+        uses: ./.github/actions/setup-ffmpeg
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -55,9 +66,17 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Lints and tests the crates that need neither the Windows desktop app (tg-app*, tg-platform) nor native
+  # media libraries (FFmpeg: tg-video, tg-ui, tg-editor; ALSA: tg-audio, tg-voip). The Windows job covers those.
   ubuntu-core:
     name: Ubuntu (platform-independent crates)
     runs-on: ubuntu-latest
+    env:
+      EXCLUDE_CRATES: >-
+        --exclude tg-app --exclude tg-app-core --exclude tg-app-history --exclude tg-app-info
+        --exclude tg-app-live --exclude tg-app-media --exclude tg-app-settings --exclude tg-app-window
+        --exclude tg-platform --exclude tg-audio --exclude tg-voip --exclude tg-video --exclude tg-editor
+        --exclude tg-ui
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -69,12 +88,15 @@ jobs:
 
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          # Keep compiled dependencies even when clippy or tests fail, so the next run starts warm.
+          cache-on-failure: true
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run Clippy (platform-independent crates)
-        run: cargo clippy --workspace --exclude tg-app --exclude tg-platform --all-targets -- -D warnings
+        run: cargo clippy --workspace $EXCLUDE_CRATES --all-targets -- -D warnings
 
       - name: Run tests (platform-independent crates)
-        run: cargo test --workspace --exclude tg-app --exclude tg-platform
+        run: cargo test --workspace $EXCLUDE_CRATES

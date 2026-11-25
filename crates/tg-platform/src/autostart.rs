@@ -558,7 +558,9 @@ impl AutostartProvider for WinRtStartupTaskProvider {
 /// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` registry key.
 #[derive(Debug, Clone)]
 pub struct WindowsRunKeyAutostartProvider {
+    #[cfg(windows)]
     root: RegistryRoot,
+    #[cfg(windows)]
     run_subkey: String,
     entry: AutostartEntry,
 }
@@ -567,22 +569,25 @@ impl WindowsRunKeyAutostartProvider {
     /// Creates a provider targeting the real `HKEY_CURRENT_USER` `Run` key for `entry`.
     #[must_use]
     pub fn hkcu(entry: AutostartEntry) -> Self {
-        Self {
-            root: RegistryRoot::hkcu(),
-            run_subkey: WINDOWS_RUN_KEY_PATH.to_owned(),
-            entry,
-        }
+        Self::with_root(RegistryRoot::hkcu(), WINDOWS_RUN_KEY_PATH, entry)
     }
 
     /// Creates a provider targeting an explicit [`RegistryRoot`] and subkey path.
+    ///
+    /// The registry location is only kept on Windows; elsewhere every operation returns
+    /// [`PlatformError::Unsupported`].
     #[must_use]
     pub fn with_root(
         root: RegistryRoot,
         run_subkey: impl Into<String>,
         entry: AutostartEntry,
     ) -> Self {
+        #[cfg(not(windows))]
+        let _ = (root, run_subkey);
         Self {
+            #[cfg(windows)]
             root,
+            #[cfg(windows)]
             run_subkey: run_subkey.into(),
             entry,
         }

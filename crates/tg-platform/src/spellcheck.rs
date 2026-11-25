@@ -37,6 +37,7 @@ pub fn sanitize_for_spellcheck(text: &str) -> String {
 /// non-alphanumeric boundaries within `max_word_size` characters of the chunk edge.
 ///
 /// Mirrors `WindowsSpellChecker::chunkedCheckSpellingText` in `spellcheck_win.cpp`.
+#[cfg(any(windows, test))]
 pub(crate) fn split_text_chunks(
     text: &str,
     max_utf16: usize,
@@ -86,6 +87,7 @@ pub(crate) fn split_text_chunks(
 
 /// Convert a `(utf16_start, utf16_len)` range within `text` into a [`MisspelledRange`]
 /// with accurate UTF-8 byte offsets.
+#[cfg(any(windows, test))]
 pub(crate) fn utf16_range_to_misspelled(
     text: &str,
     utf16_start: usize,

@@ -521,13 +521,57 @@ end;
     )
 }
 
+/// `/D` defines handed to `ISCC.exe` for the installer script.
+#[derive(Debug, Clone)]
+pub struct InnoSetupDefines<'a> {
+    /// `MyAppVersion` (semver string).
+    pub version: &'a str,
+    /// `MyAppNumericVersion` (Windows `a.b.c.d` quad).
+    pub numeric_version: &'a str,
+    /// `DistDir`: staged portable folder.
+    pub dist_dir: &'a Path,
+    /// `ReleasePath`: cargo release output folder.
+    pub release_dir: &'a Path,
+    /// `PrivacyFile`: staged privacy notice.
+    pub privacy_file: &'a Path,
+    /// `SetupIcon`: installer icon.
+    pub setup_icon: &'a Path,
+    /// `OutputDir`: where ISCC writes the installer.
+    pub output_dir: &'a Path,
+    /// `MyOutputBaseFilename`: installer file name without `.exe`.
+    pub output_base_filename: &'a str,
+}
+
+impl InnoSetupDefines<'_> {
+    /// Builds the `/D...` arguments. ISCC resolves relative paths against the `.iss` file's folder
+    /// (`installer/`), not the working directory, so every path is made absolute first.
+    pub fn to_args(&self) -> Result<Vec<String>, XtaskError> {
+        let abs = |path: &Path| -> Result<String, XtaskError> {
+            Ok(std::path::absolute(path)?.display().to_string())
+        };
+        Ok(vec![
+            format!("/DMyAppVersion={}", self.version),
+            format!("/DMyAppNumericVersion={}", self.numeric_version),
+            format!("/DDistDir={}", abs(self.dist_dir)?),
+            format!("/DReleasePath={}", abs(self.release_dir)?),
+            format!("/DPrivacyFile={}", abs(self.privacy_file)?),
+            format!("/DSetupIcon={}", abs(self.setup_icon)?),
+            format!("/DOutputDir={}", abs(self.output_dir)?),
+            format!("/DMyOutputBaseFilename={}", self.output_base_filename),
+        ])
+    }
+}
+
 /// Executes the full distribution workflow.
 pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
-    fs::create_dir_all(&opts.out_dir)?;
+    // Absolute from here on: child processes (cargo for the icon path, ISCC) resolve relative paths
+    // against their own working directories, not ours.
+    let out_dir = std::path::absolute(&opts.out_dir)?;
+    fs::create_dir_all(&out_dir)?;
 
     // 1. Render assets/icon.svg -> multi-size rustgram.ico
     let svg_path = opts.workspace_root.join("assets").join("icon.svg");
-    let icon_path = opts.out_dir.join("rustgram.ico");
+    let icon_path = out_dir.join("rustgram.ico");
     println!(
         "tg-xtask: rendering {} -> {}",
         svg_path.display(),
@@ -536,10 +580,11 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     render_svg_to_ico(&svg_path, &icon_path)?;
 
     let target_dir = resolve_target_dir(&opts.workspace_root);
-    let release_dir = opts
-        .release_dir
-        .clone()
-        .unwrap_or_else(|| target_dir.join("release"));
+    let release_dir = std::path::absolute(
+        opts.release_dir
+            .clone()
+            .unwrap_or_else(|| target_dir.join("release")),
+    )?;
 
     // 2. Build release binaries unless --skip-build
     if !opts.skip_build {
@@ -613,7 +658,7 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     }
 
     // 3. Stage ready portable folder `<out_dir>/Rustgram/`
-    let portable_dir = opts.out_dir.join(PORTABLE_DIR_NAME);
+    let portable_dir = out_dir.join(PORTABLE_DIR_NAME);
     if portable_dir.exists() {
         fs::remove_dir_all(&portable_dir)?;
     }
@@ -667,9 +712,7 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     let version_str = opts.version.to_string();
 
     // 4. Create portable ZIP archive from the staged portable folder contents
-    let portable_zip = opts
-        .out_dir
-        .join(format!("rustgram-{version_str}-{suffix}-portable.zip"));
+    let portable_zip = out_dir.join(format!("rustgram-{version_str}-{suffix}-portable.zip"));
     println!("tg-xtask: creating portable zip {}", portable_zip.display());
     let zip_entries: Vec<(&str, &Path)> = staged_files
         .iter()
@@ -683,9 +726,7 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     let update_package = if let Some(signing_key) =
         load_signing_key(opts.signing_key_path.as_deref())?
     {
-        let update_path = opts
-            .out_dir
-            .join(format!("rustgram-{version_str}-{suffix}.tupdate"));
+        let update_path = out_dir.join(format!("rustgram-{version_str}-{suffix}.tupdate"));
         println!("tg-xtask: packing signed update {}", update_path.display());
         let app_bytes = fs::read(&app_exe)?;
         let updater_bytes = fs::read(&updater_exe)?;
@@ -736,18 +777,19 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
                 iscc.display(),
                 iss_script.display()
             );
+            let numeric_version = opts.version.to_windows_quad();
+            let defines = InnoSetupDefines {
+                version: &version_str,
+                numeric_version: &numeric_version,
+                dist_dir: &portable_dir,
+                release_dir: &release_dir,
+                privacy_file: &staged_privacy,
+                setup_icon: &icon_path,
+                output_dir: &out_dir,
+                output_base_filename: &base_name,
+            };
             let status = Command::new(&iscc)
-                .arg(format!("/DMyAppVersion={version_str}"))
-                .arg(format!(
-                    "/DMyAppNumericVersion={}",
-                    opts.version.to_windows_quad()
-                ))
-                .arg(format!("/DDistDir={}", portable_dir.display()))
-                .arg(format!("/DReleasePath={}", release_dir.display()))
-                .arg(format!("/DPrivacyFile={}", staged_privacy.display()))
-                .arg(format!("/DSetupIcon={}", icon_path.display()))
-                .arg(format!("/DOutputDir={}", opts.out_dir.display()))
-                .arg(format!("/DMyOutputBaseFilename={base_name}"))
+                .args(defines.to_args()?)
                 .arg(&iss_script)
                 .status()?;
             if !status.success() {
@@ -756,7 +798,7 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
                     status: status.to_string(),
                 });
             }
-            let exe_path = opts.out_dir.join(format!("{base_name}.exe"));
+            let exe_path = out_dir.join(format!("{base_name}.exe"));
             artifacts_to_hash.push(exe_path.clone());
             Some(exe_path)
         }
@@ -768,7 +810,7 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     };
 
     // 7. Write SHA256SUMS.txt
-    let checksums_path = opts.out_dir.join("SHA256SUMS.txt");
+    let checksums_path = out_dir.join("SHA256SUMS.txt");
     write_sha256_sums(&checksums_path, &artifacts_to_hash)?;
     println!("tg-xtask: wrote checksums to {}", checksums_path.display());
 

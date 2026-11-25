@@ -1,0 +1,36 @@
+name: Setup FFmpeg shared development build
+description: >
+  Downloads the pinned BtbN FFmpeg win64 GPL shared build, verifies its SHA-256 against the
+  release's checksums.sha256, and exports FFMPEG_DIR and the DLL directory on PATH for tg-video.
+
+runs:
+  using: composite
+  steps:
+    - name: Download, verify and extract FFmpeg
+      shell: pwsh
+      run: |
+        $ffmpegArchive = "ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+        $baseUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+        $workDir = Join-Path $env:RUNNER_TEMP "ffmpeg-download"
+        New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+        $zipPath = Join-Path $workDir $ffmpegArchive
+        $sumsPath = Join-Path $workDir "checksums.sha256"
+        Invoke-WebRequest -Uri "$baseUrl/checksums.sha256" -OutFile $sumsPath
+        Invoke-WebRequest -Uri "$baseUrl/$ffmpegArchive" -OutFile $zipPath
+        $expectedLine = Get-Content $sumsPath | Where-Object { $_ -match ([regex]::Escape($ffmpegArchive) + '$') } | Select-Object -First 1
+        if (-not $expectedLine) {
+          throw "Could not find $ffmpegArchive in BtbN checksums.sha256"
+        }
+        $expectedHash = ($expectedLine -split '\s+')[0].ToLowerInvariant()
+        $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $expectedHash) {
+          throw "FFmpeg SHA-256 mismatch: expected $expectedHash, got $actualHash"
+        }
+        $extractRoot = Join-Path $env:RUNNER_TEMP "ffmpeg-extract"
+        Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+        $ffmpegDir = (Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1).FullName
+        if (-not (Test-Path (Join-Path $ffmpegDir "include\libavcodec\avcodec.h"))) {
+          throw "Extracted FFmpeg directory is missing headers: $ffmpegDir"
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value "FFMPEG_DIR=$ffmpegDir"
+        Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $ffmpegDir "bin")

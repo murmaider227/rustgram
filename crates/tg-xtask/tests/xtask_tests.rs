@@ -6,9 +6,11 @@
 //!   `tg-updater`), and `SHA256SUMS.txt` while gracefully skipping missing `ISCC.exe`.
 //! - Validating `installer/tgfork.iss` (no Telegram branding, product name "Rustgram",
 //!   optional `tg://` registration, FFmpeg DLLs & license files).
+//! - Checking that every path handed to `ISCC.exe` is absolute when `--out-dir` is relative.
 
 use std::fs::{self, File};
 use std::io::Read;
+use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -19,7 +21,7 @@ use tg_updater::package::verify_package;
 use tg_updater::version::{Target, UpdateChannel, Version};
 use tg_updater::{DEFAULT_EXE_NAME, UPDATER_EXE_NAME};
 use tg_xtask::dist::{
-    DIST_EXE_NAMES, DistOptions, PORTABLE_DIR_NAME, PRIVACY_NOTICE_NAME,
+    DIST_EXE_NAMES, DistOptions, InnoSetupDefines, PORTABLE_DIR_NAME, PRIVACY_NOTICE_NAME,
     REQUIRED_FFMPEG_DLL_PREFIXES, THIRD_PARTY_NOTICES_NAME, WIDGET_HELPER_EXE_NAME,
     find_workspace_root, generate_inno_setup_script, read_workspace_version, run_dist,
 };
@@ -40,8 +42,8 @@ fn renders_repo_icon_svg_to_multisize_ico() {
     let rendered_sizes: Vec<u32> = icon_dir.entries().iter().map(|e| e.width()).collect();
     assert_eq!(rendered_sizes, ICON_SIZES);
 
-    // Check 64x64 entry has both teal background pixels (#0891b2) and non-teal pixels
-    // (transparent rounded corners and white "T" glyph where a sans-serif font is available).
+    // Check 64x64 entry has violet circle pixels (gradient #8A6CFF -> #4B2FC2), the white
+    // paper plane, and transparent corners outside the circle.
     let entry_64 = icon_dir
         .entries()
         .iter()
@@ -52,15 +54,18 @@ fn renders_repo_icon_svg_to_multisize_ico() {
     assert_eq!(img.height(), 64);
 
     let (pixel_chunks, _) = img.rgba_data().as_chunks::<4>();
-    let has_teal = pixel_chunks
-        .iter()
-        .any(|p| p[0] < 30 && p[1] > 120 && p[2] > 150 && p[3] == 255);
+    let has_violet = pixel_chunks.iter().any(|p| {
+        (60..=150).contains(&p[0]) && p[1] < 120 && p[2] > 180 && p[2] > p[0] && p[3] == 255
+    });
     let has_white = pixel_chunks
         .iter()
         .any(|p| p[0] > 230 && p[1] > 230 && p[2] > 230 && p[3] == 255);
     let has_transparent_corner = pixel_chunks[0][3] == 0;
-    assert!(has_teal, "expected teal icon fill (#0891b2)");
-    assert!(has_white, "expected white 'T' glyph rendered from icon.svg");
+    assert!(has_violet, "expected violet icon fill (#8A6CFF -> #4B2FC2)");
+    assert!(
+        has_white,
+        "expected white paper plane rendered from icon.svg"
+    );
     assert!(
         has_transparent_corner,
         "expected transparent rounded corner"
@@ -622,4 +627,49 @@ fn release_workflow_builds_prerelease_draft_with_pubkey_guard_and_all_artifacts(
             "release.yml missing artifact reference '{artifact}'"
         );
     }
+}
+
+#[test]
+fn inno_setup_paths_are_absolute_for_relative_out_dir() {
+    // `tg-xtask dist --out-dir dist`: ISCC resolves relative /D paths against `installer/`, which
+    // made the release workflow look for `installer\dist\Rustgram\PRIVACY.txt`.
+    let out_dir = Path::new("dist");
+    let dist_dir = out_dir.join(PORTABLE_DIR_NAME);
+    let privacy_file = dist_dir.join(PRIVACY_NOTICE_NAME);
+    let setup_icon = out_dir.join("rustgram.ico");
+    let release_dir = Path::new("target").join("release");
+    let defines = InnoSetupDefines {
+        version: "0.1.0-alpha.1",
+        numeric_version: "0.1.0.1",
+        dist_dir: &dist_dir,
+        release_dir: &release_dir,
+        privacy_file: &privacy_file,
+        setup_icon: &setup_icon,
+        output_dir: out_dir,
+        output_base_filename: "Rustgram-Setup-0.1.0-alpha.1-win-x64",
+    };
+    let args = defines.to_args().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+
+    for (key, relative) in [
+        ("DistDir", dist_dir.as_path()),
+        ("ReleasePath", release_dir.as_path()),
+        ("PrivacyFile", privacy_file.as_path()),
+        ("SetupIcon", setup_icon.as_path()),
+        ("OutputDir", out_dir),
+    ] {
+        let prefix = format!("/D{key}=");
+        let value = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("missing /D{key} in {args:?}"));
+        let path = Path::new(value);
+        assert!(path.is_absolute(), "/D{key} must be absolute, got {value}");
+        assert_eq!(path, cwd.join(relative), "/D{key}");
+    }
+    assert!(args.contains(&"/DMyAppVersion=0.1.0-alpha.1".to_owned()));
+    assert!(args.contains(&"/DMyAppNumericVersion=0.1.0.1".to_owned()));
+    assert!(
+        args.contains(&"/DMyOutputBaseFilename=Rustgram-Setup-0.1.0-alpha.1-win-x64".to_owned())
+    );
 }
