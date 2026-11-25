@@ -205,7 +205,7 @@ pub(crate) fn channel_management_state(
             boosts_unrestrict,
             boosts_applied,
             stars_per_message: i64::from(ch.stars_per_message.max(0)),
-            broadcast_messages_allowed: !ch.flags.contains(ChannelFlags::MONOFORUM_DISABLED),
+            broadcast_messages_allowed: ch.broadcast_messages_allowed,
             autotranslation: ch.flags.contains(ChannelFlags::AUTO_TRANSLATION),
             can_set_stickers: ch.flags.contains(ChannelFlags::CAN_SET_STICKERS),
             sticker_set: None,
@@ -629,10 +629,7 @@ pub(crate) fn update_channel_paid_messages_price(
         if let Some(Peer::Channel(ch)) = s.peer_mut(DataPeerId::from_channel(cid)) {
             ch.flags.insert(ChannelFlags::STARS_PER_MESSAGE_KNOWN);
             if is_broadcast {
-                ch.flags.set(
-                    ChannelFlags::MONOFORUM_DISABLED,
-                    !effective_broadcast_allowed,
-                );
+                ch.broadcast_messages_allowed = effective_broadcast_allowed;
                 let effective_stars = if effective_broadcast_allowed {
                     stars_i32
                 } else {

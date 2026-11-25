@@ -17,6 +17,7 @@ pub mod compose_extras;
 pub mod contacts_extras;
 pub mod convert;
 pub mod deep_links;
+pub mod dialogs_actions;
 pub mod dice_pack;
 pub mod emoji_pack;
 pub mod engagement;
@@ -30,11 +31,13 @@ pub mod live_extras;
 pub mod media;
 pub mod media_cache;
 pub mod music_send;
+mod open_chat_prefetch;
 pub mod paid_messages;
 pub mod passkeys;
 pub mod passport_upload;
 pub mod payments;
 pub mod polls_stats;
+pub mod preview_text;
 pub mod profile_extras;
 pub mod profile_info_extras;
 pub mod proxy;
@@ -82,6 +85,8 @@ mod tests_contacts_extras;
 #[cfg(test)]
 mod tests_engagement;
 #[cfg(test)]
+mod tests_fu7a_pts_pagination;
+#[cfg(test)]
 mod tests_history_sections;
 #[cfg(test)]
 mod tests_layer233_extras;
@@ -112,6 +117,8 @@ mod tests_search_and_info;
 #[cfg(test)]
 mod tests_search_topics_conformance;
 #[cfg(test)]
+mod tests_seca;
+#[cfg(test)]
 mod tests_settings_extra;
 #[cfg(test)]
 mod tests_sticker_owner;
@@ -124,6 +131,8 @@ mod tests_stories_channels_conformance;
 #[cfg(test)]
 mod tests_transcribe;
 #[cfg(test)]
+mod tests_uip_f;
+#[cfg(test)]
 mod tests_unified_pts;
 #[cfg(test)]
 mod tests_upload;
@@ -131,6 +140,12 @@ mod tests_upload;
 mod tests_wallet_mtproto;
 #[cfg(test)]
 mod tests_wp52_ux_extras;
+#[cfg(test)]
+mod tests_wp71_live_wiring;
+#[cfg(test)]
+mod tests_wp74_async_and_models;
+#[cfg(test)]
+mod tests_wp77_data_live;
 
 pub use bridge::{LiveBridgeState, LiveRuntimeBridge, RuntimeBridgedRpc};
 pub use calls::TelegramBroadcastChunkLoader;

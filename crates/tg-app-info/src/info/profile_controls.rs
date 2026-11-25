@@ -17,9 +17,13 @@ use tg_ui::theme::{ColorsResolver, resolve_color_ref};
 use tg_ui::userpic::EmptyUserpic;
 
 use crate::info::backend::{
-    InfoPeerKind, PeerProfile, PersonalChannelOption, ProfileMainTab, ReportReason, SharedMediaTab,
+    InfoPeerKind, PeerProfile, PersonalChannelOption, ProfileMainTab, ProfilePhotoRef,
+    ReportReason, SharedMediaTab,
 };
 use crate::info::values::{Birthday, MAX_REPORT_COMMENT_LENGTH, format_subscribers_status};
+use tg_app_core::core_types::dto::contacts_extras::{
+    ContactProfilePhotoMode, ContactProfilePhotoUpload,
+};
 use tg_app_core::stand_in::types::PeerId;
 
 /// Returns whether `peer` allows setting `tab` as its Main Profile Tab, matching
@@ -696,6 +700,13 @@ pub fn show_suggest_birthday_card(
     outcome
 }
 
+/// Returns `true` when `photo` carries a real server `id` and `access_hash`
+/// (rejecting placeholder `id == 0` or `access_hash == 0` refs before any RPC).
+#[must_use]
+pub const fn is_valid_profile_photo_ref(photo: &ProfilePhotoRef) -> bool {
+    photo.id != 0 && photo.access_hash != 0
+}
+
 /// Inline form state for reporting a peer's profile photo (`account.reportProfilePhoto`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportProfilePhotoDraft {
@@ -703,6 +714,8 @@ pub struct ReportProfilePhotoDraft {
     pub peer_id: PeerId,
     /// Target peer title.
     pub peer_title: String,
+    /// Real server profile photo reference (`id`, `access_hash`, `file_reference`).
+    pub photo: ProfilePhotoRef,
     /// Selected abuse reason.
     pub reason: ReportReason,
     /// Optional report comment.
@@ -712,12 +725,13 @@ pub struct ReportProfilePhotoDraft {
 }
 
 impl ReportProfilePhotoDraft {
-    /// Creates a new profile-photo report draft.
+    /// Creates a new profile-photo report draft bound to a real [`ProfilePhotoRef`].
     #[must_use]
-    pub fn new(peer_id: PeerId, peer_title: impl Into<String>) -> Self {
+    pub fn new(peer_id: PeerId, peer_title: impl Into<String>, photo: ProfilePhotoRef) -> Self {
         Self {
             peer_id,
             peer_title: peer_title.into(),
+            photo,
             reason: ReportReason::Spam,
             comment: String::new(),
             error: None,
@@ -836,6 +850,463 @@ pub fn show_report_profile_photo_card(
                             });
                         }
                     }
+                });
+        });
+    outcome
+}
+
+/// Maximum private contact note length (`contact_note_length_limit`, `edit_contact_box.cpp`).
+pub const MAX_CONTACT_NOTE_LENGTH: usize = 128;
+
+/// Inline form state for editing a private Contact Note (`contacts.updateContactNote`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactNoteDraft {
+    /// Target contact peer ID.
+    pub peer_id: PeerId,
+    /// Target contact display title.
+    pub peer_title: String,
+    /// Draft private note text.
+    pub text: String,
+    /// Whether an existing note was loaded (enables Delete Note button).
+    pub had_existing: bool,
+    /// Inline error message.
+    pub error: Option<String>,
+}
+
+impl ContactNoteDraft {
+    /// Creates a new Contact Note editor draft initialized with `existing_note`.
+    #[must_use]
+    pub fn new(
+        peer_id: PeerId,
+        peer_title: impl Into<String>,
+        existing_note: Option<&str>,
+    ) -> Self {
+        let initial = existing_note.unwrap_or_default().to_owned();
+        let had_existing = !initial.trim().is_empty();
+        Self {
+            peer_id,
+            peer_title: peer_title.into(),
+            text: initial,
+            had_existing,
+            error: None,
+        }
+    }
+}
+
+/// Outcome emitted by [`show_contact_note_card`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContactNoteOutcome {
+    /// Save updated private contact note (`contacts.updateContactNote`).
+    Save(String),
+    /// Clear/delete the private contact note (`contacts.updateContactNote` with empty text).
+    Delete,
+    /// Cancel editing.
+    Cancel,
+}
+
+/// Renders the inline Contact Note editor card (`info_profile_actions.cpp:789-900`,
+/// `edit_contact_box.cpp:963`).
+pub fn show_contact_note_card(
+    ui: &mut Ui,
+    draft: &mut ContactNoteDraft,
+    colors: &dyn Colors,
+) -> Option<ContactNoteOutcome> {
+    let mut outcome = None;
+    let width = ui.available_width().max(200.0);
+    Frame::NONE
+        .inner_margin(Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            Frame::NONE
+                .fill(colors.color("windowBgOver"))
+                .stroke(Stroke::new(1.0, colors.color("windowBgActive")))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_min_width((width - 48.0).max(160.0));
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Contact Note")
+                                .font(font_id_from_style(st::semibold_font))
+                                .color(colors.color("windowBoldFg")),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button(tr::lng_cancel()).clicked() {
+                                outcome = Some(ContactNoteOutcome::Cancel);
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}/{MAX_CONTACT_NOTE_LENGTH}",
+                                    draft.text.chars().count()
+                                ))
+                                .font(FontId::new(11.0, family_regular()))
+                                .color(colors.color("windowSubTextFg")),
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Private note for {} (only visible to you).",
+                            draft.peer_title
+                        ))
+                        .font(FontId::new(11.5, family_regular()))
+                        .color(colors.color("windowSubTextFg")),
+                    );
+                    ui.add_space(6.0);
+                    ui.add(
+                        TextEdit::multiline(&mut draft.text)
+                            .desired_width(ui.available_width())
+                            .desired_rows(2)
+                            .hint_text("Add a private note..."),
+                    );
+                    let char_count = draft.text.chars().count();
+                    if char_count > MAX_CONTACT_NOTE_LENGTH {
+                        let excess = (char_count - MAX_CONTACT_NOTE_LENGTH) as i64;
+                        draft.error = Some(tr::lng_contact_notes_limit_reached(excess));
+                    } else {
+                        draft.error = None;
+                    }
+                    if let Some(ref err) = draft.error {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(err)
+                                .font(FontId::new(11.5, family_regular()))
+                                .color(colors.color("boxTextFgError")),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let can_save = draft.text.chars().count() <= MAX_CONTACT_NOTE_LENGTH;
+                        if ui
+                            .add_enabled(can_save, egui::Button::new("Save Note"))
+                            .clicked()
+                        {
+                            outcome = Some(ContactNoteOutcome::Save(draft.text.trim().to_owned()));
+                        }
+                        if draft.had_existing {
+                            let del_btn = egui::Button::new(
+                                egui::RichText::new("Delete Note")
+                                    .color(colors.color("attentionButtonFg")),
+                            );
+                            if ui.add(del_btn).clicked() {
+                                outcome = Some(ContactNoteOutcome::Delete);
+                            }
+                        }
+                    });
+                });
+        });
+    outcome
+}
+
+/// Inline confirmation state for deleting a contact (`contacts.deleteContacts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteContactDraft {
+    /// Target contact peer ID.
+    pub peer_id: PeerId,
+    /// Target contact display title.
+    pub peer_title: String,
+    /// Inline error message, if RPC fails.
+    pub error: Option<String>,
+}
+
+/// Outcome emitted by [`show_delete_contact_card`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteContactOutcome {
+    /// User confirmed deleting the contact.
+    Confirm,
+    /// User cancelled.
+    Cancel,
+}
+
+/// Renders the inline Delete Contact confirmation card (`info_profile_actions.cpp:2983`).
+pub fn show_delete_contact_card(
+    ui: &mut Ui,
+    draft: &DeleteContactDraft,
+    colors: &dyn Colors,
+) -> Option<DeleteContactOutcome> {
+    let mut outcome = None;
+    let width = ui.available_width().max(200.0);
+    Frame::NONE
+        .inner_margin(Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            Frame::NONE
+                .fill(colors.color("windowBgOver"))
+                .stroke(Stroke::new(1.0, colors.color("attentionButtonFg")))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_min_width((width - 48.0).max(160.0));
+                    ui.label(
+                        egui::RichText::new(tr::lng_info_delete_contact())
+                            .font(font_id_from_style(st::semibold_font))
+                            .color(colors.color("windowBoldFg")),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(tr::lng_sure_delete_contact(&draft.peer_title))
+                            .font(FontId::new(12.0, family_regular()))
+                            .color(colors.color("windowFg")),
+                    );
+                    if let Some(ref err) = draft.error {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(err)
+                                .font(FontId::new(11.5, family_regular()))
+                                .color(colors.color("boxTextFgError")),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let confirm_btn = egui::Button::new(
+                            egui::RichText::new("Confirm Delete Contact")
+                                .color(colors.color("attentionButtonFg")),
+                        );
+                        if ui.add(confirm_btn).clicked() {
+                            outcome = Some(DeleteContactOutcome::Confirm);
+                        }
+                        if ui.button(tr::lng_cancel()).clicked() {
+                            outcome = Some(DeleteContactOutcome::Cancel);
+                        }
+                    });
+                });
+        });
+    outcome
+}
+
+/// Inline confirmation state for deleting the current account's own profile photo
+/// (`photos.deletePhotos`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteOwnPhotoDraft {
+    /// Real server profile photo reference (`id`, `access_hash`, `file_reference`).
+    pub photo: ProfilePhotoRef,
+    /// Inline error message, if RPC fails.
+    pub error: Option<String>,
+}
+
+/// Outcome emitted by [`show_delete_own_photo_card`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOwnPhotoOutcome {
+    /// Confirm deleting the photo via `photos.deletePhotos`.
+    Confirm,
+    /// Cancel.
+    Cancel,
+}
+
+/// Renders the inline Delete Own Profile Photo confirmation card (`photos.deletePhotos`).
+pub fn show_delete_own_photo_card(
+    ui: &mut Ui,
+    draft: &DeleteOwnPhotoDraft,
+    colors: &dyn Colors,
+) -> Option<DeleteOwnPhotoOutcome> {
+    let mut outcome = None;
+    let width = ui.available_width().max(200.0);
+    Frame::NONE
+        .inner_margin(Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            Frame::NONE
+                .fill(colors.color("windowBgOver"))
+                .stroke(Stroke::new(1.0, colors.color("attentionButtonFg")))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_min_width((width - 48.0).max(160.0));
+                    ui.label(
+                        egui::RichText::new("Delete Profile Photo")
+                            .font(font_id_from_style(st::semibold_font))
+                            .color(colors.color("windowBoldFg")),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(tr::lng_delete_photo_sure())
+                            .font(FontId::new(12.0, family_regular()))
+                            .color(colors.color("windowFg")),
+                    );
+                    if let Some(ref err) = draft.error {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(err)
+                                .font(FontId::new(11.5, family_regular()))
+                                .color(colors.color("boxTextFgError")),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let del_btn = egui::Button::new(
+                            egui::RichText::new("Confirm Delete Photo")
+                                .color(colors.color("attentionButtonFg")),
+                        );
+                        if ui.add(del_btn).clicked() {
+                            outcome = Some(DeleteOwnPhotoOutcome::Confirm);
+                        }
+                        if ui.button(tr::lng_cancel()).clicked() {
+                            outcome = Some(DeleteOwnPhotoOutcome::Cancel);
+                        }
+                    });
+                });
+        });
+    outcome
+}
+
+/// Inline form state for suggesting or setting a personal profile photo for a contact
+/// (`photos.uploadContactProfilePhoto`, `edit_contact_box.cpp:870-920`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactPhotoDraft {
+    /// Target contact peer ID.
+    pub peer_id: PeerId,
+    /// Target contact display name.
+    pub peer_title: String,
+    /// Selected upload mode (`Suggest` vs personal `Save`).
+    pub mode: ContactProfilePhotoMode,
+    /// Inline error message.
+    pub error: Option<String>,
+}
+
+impl ContactPhotoDraft {
+    /// Creates a new Contact Photo draft defaulting to `Suggest`.
+    #[must_use]
+    pub fn new(
+        peer_id: PeerId,
+        peer_title: impl Into<String>,
+        mode: ContactProfilePhotoMode,
+    ) -> Self {
+        Self {
+            peer_id,
+            peer_title: peer_title.into(),
+            mode,
+            error: None,
+        }
+    }
+
+    /// Builds a deterministic synthetic JPEG/PNG avatar payload for offline / fake-RPC submission.
+    #[must_use]
+    pub fn build_upload_request(&self) -> ContactProfilePhotoUpload {
+        let filename = match self.mode {
+            ContactProfilePhotoMode::Suggest => {
+                format!("suggest_photo_{}.jpg", self.peer_id.bare())
+            }
+            ContactProfilePhotoMode::Save => {
+                format!("personal_photo_{}.jpg", self.peer_id.bare())
+            }
+        };
+        // Minimal valid JPEG SOI/EOI marker bytes for deterministic offline/fake tests.
+        let bytes = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0xFF, 0xD9,
+        ];
+        ContactProfilePhotoUpload::static_photo(self.mode, filename, bytes)
+    }
+}
+
+/// Outcome emitted by [`show_contact_photo_card`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContactPhotoOutcome {
+    /// Upload a suggested or personal photo (`photos.uploadContactProfilePhoto`).
+    Upload(ContactProfilePhotoUpload),
+    /// Clear the personal contact photo (`PeerPhoto::clearPersonal`).
+    ClearPersonal,
+    /// Cancel.
+    Cancel,
+}
+
+/// Renders the inline Suggest / Set Personal Contact Photo card (`photos.uploadContactProfilePhoto`).
+pub fn show_contact_photo_card(
+    ui: &mut Ui,
+    draft: &mut ContactPhotoDraft,
+    colors: &dyn Colors,
+) -> Option<ContactPhotoOutcome> {
+    let mut outcome = None;
+    let width = ui.available_width().max(200.0);
+    Frame::NONE
+        .inner_margin(Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            Frame::NONE
+                .fill(colors.color("windowBgOver"))
+                .stroke(Stroke::new(1.0, colors.color("windowBgActive")))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_min_width((width - 48.0).max(160.0));
+                    ui.horizontal(|ui| {
+                        let heading = match draft.mode {
+                            ContactProfilePhotoMode::Suggest => {
+                                tr::lng_suggest_photo_for(&draft.peer_title)
+                            }
+                            ContactProfilePhotoMode::Save => {
+                                tr::lng_set_photo_for_user(&draft.peer_title)
+                            }
+                        };
+                        ui.label(
+                            egui::RichText::new(heading)
+                                .font(font_id_from_style(st::semibold_font))
+                                .color(colors.color("windowBoldFg")),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button(tr::lng_cancel()).clicked() {
+                                outcome = Some(ContactPhotoOutcome::Cancel);
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .selectable_label(
+                                draft.mode == ContactProfilePhotoMode::Suggest,
+                                tr::lng_profile_suggest_photo(),
+                            )
+                            .clicked()
+                        {
+                            draft.mode = ContactProfilePhotoMode::Suggest;
+                        }
+                        if ui
+                            .selectable_label(
+                                draft.mode == ContactProfilePhotoMode::Save,
+                                tr::lng_profile_set_photo_for(),
+                            )
+                            .clicked()
+                        {
+                            draft.mode = ContactProfilePhotoMode::Save;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(match draft.mode {
+                            ContactProfilePhotoMode::Suggest => format!(
+                                "{} will receive this photo as a profile photo suggestion.",
+                                draft.peer_title
+                            ),
+                            ContactProfilePhotoMode::Save => format!(
+                                "Only you will see this custom photo for {}.",
+                                draft.peer_title
+                            ),
+                        })
+                        .font(FontId::new(11.5, family_regular()))
+                        .color(colors.color("windowSubTextFg")),
+                    );
+                    if let Some(ref err) = draft.error {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(err)
+                                .font(FontId::new(11.5, family_regular()))
+                                .color(colors.color("boxTextFgError")),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let primary_lbl = match draft.mode {
+                            ContactProfilePhotoMode::Suggest => "Send Photo Suggestion",
+                            ContactProfilePhotoMode::Save => "Set Personal Photo",
+                        };
+                        if ui.button(primary_lbl).clicked() {
+                            outcome =
+                                Some(ContactPhotoOutcome::Upload(draft.build_upload_request()));
+                        }
+                        let clear_btn = egui::Button::new(
+                            egui::RichText::new("Reset Personal Photo")
+                                .color(colors.color("attentionButtonFg")),
+                        );
+                        if ui.add(clear_btn).clicked() {
+                            outcome = Some(ContactPhotoOutcome::ClearPersonal);
+                        }
+                    });
                 });
         });
     outcome

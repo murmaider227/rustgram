@@ -182,6 +182,9 @@ pub fn activation_to_incoming(activation: InstanceActivation) -> IncomingActivat
             send_paths.push(PathBuf::from(entry));
         }
     }
+    // Only absolute local paths: `..\secret.txt` or `\\host\share\x` never reach the ShareBox
+    // (the controller also requires the file to exist before showing it).
+    send_paths.retain(|p| tg_platform::url_policy::is_local_absolute_path(p));
 
     let show =
         activation.show || (!activation.quit && (!urls.is_empty() || !send_paths.is_empty()));
@@ -266,5 +269,34 @@ pub fn stop_running_instance(instance_name: &str) -> tg_platform::Result<bool> {
             }
             Ok(true)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_sec2a {
+    use super::*;
+
+    #[test]
+    fn l11_relative_unc_and_device_send_paths_are_dropped() {
+        // Only file entries (a mixed URL + file activation drops the files anyway).
+        let activation = InstanceActivation {
+            show: false,
+            quit: false,
+            urls: vec![
+                r"..\secret.txt".to_owned(),
+                "secret.txt".to_owned(),
+                r"\\attacker\share\x.txt".to_owned(),
+                "file://attacker/share/y.txt".to_owned(),
+                r"\\?\C:\Windows\win.ini".to_owned(),
+                "file:///C:/Users/test/photo.png".to_owned(),
+            ],
+            args: vec![],
+        };
+        let decoded = activation_to_incoming(activation);
+        assert!(decoded.urls.is_empty());
+        assert_eq!(
+            decoded.send_paths,
+            vec![PathBuf::from("C:/Users/test/photo.png")]
+        );
     }
 }

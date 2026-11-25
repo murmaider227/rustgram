@@ -27,6 +27,104 @@ use crate::calls::theme::{
     paint_phone_icon, paint_pin_icon, paint_screen_share_icon, paint_sidebar_icon, with_alpha,
 };
 
+/// Resolved bounding boxes for the group-call header bar (used for painting and 390 px tests).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroupCallHeaderLayout {
+    /// Clipped left region containing the call title, participant count, and optional REC badge.
+    pub title_clip_rect: Rect,
+    /// `"Display As"` identity-switcher pill rect.
+    pub join_as_rect: Rect,
+    /// Optional wide-mode sidebar column toggle button rect.
+    pub sidebar_rect: Option<Rect>,
+    /// Pin-on-top button rect.
+    pub pin_rect: Rect,
+    /// Minimize button rect.
+    pub min_rect: Rect,
+    /// Close button rect.
+    pub close_rect: Rect,
+    /// Whether the header uses compact narrow-viewport spacing (`< 440px`).
+    pub compact: bool,
+}
+
+/// Computes non-overlapping bounding boxes for the group-call header bar at any viewport width.
+#[must_use]
+pub fn compute_group_call_header_layout(rect: Rect, wide_mode: bool) -> GroupCallHeaderLayout {
+    let compact = rect.width() < 440.0;
+    let cy = rect.center().y;
+    let close_rect = Rect::from_center_size(Pos2::new(rect.right() - 22.0, cy), Vec2::splat(26.0));
+    let min_rect = Rect::from_center_size(Pos2::new(rect.right() - 52.0, cy), Vec2::splat(26.0));
+    let pin_rect = Rect::from_center_size(Pos2::new(rect.right() - 82.0, cy), Vec2::splat(26.0));
+
+    let mut right_edge = pin_rect.left() - if compact { 6.0 } else { 8.0 };
+    let sidebar_rect = if wide_mode {
+        let col_r = Rect::from_center_size(Pos2::new(right_edge - 13.0, cy), Vec2::splat(26.0));
+        right_edge = col_r.left() - 8.0;
+        Some(col_r)
+    } else {
+        None
+    };
+
+    let join_as_w = if compact { 82.0 } else { 96.0 };
+    let join_as_rect = Rect::from_center_size(
+        Pos2::new(right_edge - join_as_w * 0.5, cy),
+        Vec2::new(join_as_w, 26.0),
+    );
+
+    let left = rect.left() + if compact { 14.0 } else { 18.0 };
+    let title_right = (join_as_rect.left() - 10.0).max(left + 20.0);
+    let title_clip_rect = Rect::from_min_max(
+        Pos2::new(left, rect.top() + 4.0),
+        Pos2::new(title_right, rect.bottom() - 4.0),
+    );
+
+    GroupCallHeaderLayout {
+        title_clip_rect,
+        join_as_rect,
+        sidebar_rect,
+        pin_rect,
+        min_rect,
+        close_rect,
+        compact,
+    }
+}
+
+fn ellipsize_header_text(
+    painter: &Painter,
+    text: &str,
+    font: &FontId,
+    max_width: f32,
+) -> (String, bool) {
+    if max_width <= 4.0 || text.is_empty() {
+        return (String::new(), !text.is_empty());
+    }
+    let full = painter.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE);
+    if full.size().x <= max_width {
+        return (text.to_owned(), false);
+    }
+    let ellipsis = "…";
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let mut candidate: String = chars[..mid].iter().collect();
+        candidate.push_str(ellipsis);
+        let w = painter
+            .layout_no_wrap(candidate, font.clone(), Color32::WHITE)
+            .size()
+            .x;
+        if w <= max_width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut out: String = chars[..lo].iter().collect();
+    out = out.trim_end().to_owned();
+    out.push_str(ellipsis);
+    (out, true)
+}
+
 /// Persistent UI state for the Group Call window (`Calls::Group::Panel`).
 #[derive(Debug)]
 pub struct GroupCallPanelState {
@@ -533,57 +631,96 @@ impl GroupCallPanelState {
         palette: &CallPalette,
         now_ms: u64,
     ) {
-        // Left: Title + participant count + optional REC indicator.
-        let left = rect.left() + 18.0;
-        painter.text(
+        let layout = compute_group_call_header_layout(rect, wide_mode);
+        let title_clip = layout.title_clip_rect;
+        let left = title_clip.left();
+        let max_text_w = title_clip.width();
+
+        // Left: Ellipsized & strictly clipped title + participant count + optional REC indicator.
+        let title_font = FontId::proportional(if layout.compact { 15.0 } else { 16.0 });
+        let full_title = snapshot.display_title();
+        let (title_display, title_truncated) =
+            ellipsize_header_text(painter, full_title, &title_font, max_text_w);
+        let clipped = painter.with_clip_rect(title_clip);
+        clipped.text(
             Pos2::new(left, rect.top() + 20.0),
             Align2::LEFT_CENTER,
-            snapshot.display_title(),
-            FontId::proportional(16.0),
+            title_display,
+            title_font,
             palette.group_members_fg,
         );
+        if title_truncated {
+            let _ = ui
+                .interact(
+                    title_clip,
+                    ui.scope_id().with("tg_group_call_title_tip"),
+                    Sense::hover(),
+                )
+                .on_hover_text(full_title);
+        }
 
         let sub = match snapshot.state {
             GroupCallState::Joining | GroupCallState::Connecting => tr::lng_group_call_connecting(),
             _ => tr::lng_group_call_members(snapshot.joined_count() as i64),
         };
-        painter.text(
+        let sub_font = FontId::proportional(12.0);
+        let rec_reserved = if snapshot.recording { 42.0 } else { 0.0 };
+        let (sub_display, _) = ellipsize_header_text(
+            painter,
+            &sub,
+            &sub_font,
+            (max_text_w - rec_reserved).max(32.0),
+        );
+        let sub_w = painter
+            .layout_no_wrap(
+                sub_display.clone(),
+                sub_font.clone(),
+                palette.group_member_sub_fg,
+            )
+            .size()
+            .x;
+        clipped.text(
             Pos2::new(left, rect.top() + 39.0),
             Align2::LEFT_CENTER,
-            sub,
-            FontId::proportional(12.0),
+            sub_display,
+            sub_font,
             palette.group_member_sub_fg,
         );
 
         if snapshot.recording {
             let pulse = 0.55 + 0.45 * ((now_ms as f32 * 0.005).sin());
-            let rec_pos = Pos2::new(left + 120.0, rect.top() + 39.0);
-            painter.circle_filled(
-                rec_pos,
-                4.5,
-                with_alpha(palette.group_member_muted_icon, pulse),
-            );
-            painter.text(
-                Pos2::new(rec_pos.x + 10.0, rec_pos.y),
-                Align2::LEFT_CENTER,
-                strings::REC_BADGE,
-                FontId::proportional(11.0),
-                palette.group_member_muted_icon,
-            );
+            let rec_x = left + sub_w + 12.0;
+            if rec_x + 36.0 <= title_clip.right() {
+                let rec_pos = Pos2::new(rec_x, rect.top() + 39.0);
+                clipped.circle_filled(
+                    rec_pos,
+                    4.5,
+                    with_alpha(palette.group_member_muted_icon, pulse),
+                );
+                clipped.text(
+                    Pos2::new(rec_pos.x + 9.0, rec_pos.y),
+                    Align2::LEFT_CENTER,
+                    strings::REC_BADGE,
+                    FontId::proportional(11.0),
+                    palette.group_member_muted_icon,
+                );
+            }
         }
 
         // Right header controls: Join-As badge · Sidebar toggle · Pin · Minimize · Close.
-        let cy = rect.center().y;
-        let close_r = Rect::from_center_size(Pos2::new(rect.right() - 22.0, cy), Vec2::splat(26.0));
-        let min_r = Rect::from_center_size(Pos2::new(rect.right() - 52.0, cy), Vec2::splat(26.0));
-        let pin_r = Rect::from_center_size(Pos2::new(rect.right() - 82.0, cy), Vec2::splat(26.0));
-
-        if paint_header_btn(ui, painter, close_r, false, palette, |p, c, fg| {
-            paint_close_icon(p, c, 14.0, fg);
-        }) {
+        if paint_header_btn(
+            ui,
+            painter,
+            layout.close_rect,
+            false,
+            palette,
+            |p, c, fg| {
+                paint_close_icon(p, c, 14.0, fg);
+            },
+        ) {
             self.visible = false;
         }
-        if paint_header_btn(ui, painter, min_r, false, palette, |p, c, fg| {
+        if paint_header_btn(ui, painter, layout.min_rect, false, palette, |p, c, fg| {
             paint_minimize_icon(p, c, 14.0, fg);
         }) {
             self.visible = false;
@@ -591,7 +728,7 @@ impl GroupCallPanelState {
         if paint_header_btn(
             ui,
             painter,
-            pin_r,
+            layout.pin_rect,
             self.pinned_on_top,
             palette,
             |p, c, fg| {
@@ -601,10 +738,8 @@ impl GroupCallPanelState {
             self.pinned_on_top = !self.pinned_on_top;
         }
 
-        let mut next_x = rect.right() - 114.0;
-        if wide_mode {
-            let col_r = Rect::from_center_size(Pos2::new(next_x, cy), Vec2::splat(26.0));
-            if paint_header_btn(
+        if let Some(col_r) = layout.sidebar_rect
+            && paint_header_btn(
                 ui,
                 painter,
                 col_r,
@@ -613,15 +748,23 @@ impl GroupCallPanelState {
                 |p, c, fg| {
                     paint_sidebar_icon(p, c, 16.0, fg);
                 },
-            ) {
-                self.show_members_column = !self.show_members_column;
-            }
-            next_x -= 36.0;
+            )
+        {
+            self.show_members_column = !self.show_members_column;
         }
 
-        let join_as_rect =
-            Rect::from_center_size(Pos2::new(next_x - 38.0, cy), Vec2::new(96.0, 26.0));
-        let join_as_resp = ui.allocate_rect(join_as_rect, Sense::click());
+        let join_as_rect = layout.join_as_rect;
+        let join_as_resp = ui.interact(
+            join_as_rect,
+            ui.scope_id().with("tg_group_call_display_as"),
+            Sense::click(),
+        );
+        join_as_resp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Button, true, strings::DISPLAY_AS_PILL)
+        });
+        if join_as_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
         painter.rect_filled(
             join_as_rect,
             CornerRadius::same(13),
@@ -631,20 +774,34 @@ impl GroupCallPanelState {
                 palette.group_members_bg
             },
         );
+        if join_as_resp.has_focus() {
+            painter.rect_stroke(
+                join_as_rect,
+                CornerRadius::same(13),
+                Stroke::new(1.5, palette.group_active_fg),
+                egui::StrokeKind::Inside,
+            );
+        }
         painter.text(
             Pos2::new(join_as_rect.center().x - 6.0, join_as_rect.center().y),
             Align2::CENTER_CENTER,
             strings::DISPLAY_AS_PILL,
-            FontId::proportional(11.5),
+            FontId::proportional(if layout.compact { 10.5 } else { 11.5 }),
             palette.group_active_fg,
         );
         paint_chevron_down_icon(
             painter,
-            Pos2::new(join_as_rect.right() - 14.0, join_as_rect.center().y),
-            10.0,
+            Pos2::new(
+                join_as_rect.right() - if layout.compact { 11.0 } else { 14.0 },
+                join_as_rect.center().y,
+            ),
+            if layout.compact { 9.0 } else { 10.0 },
             palette.group_active_fg,
         );
-        if join_as_resp.clicked() {
+        if join_as_resp
+            .on_hover_text(tr::lng_group_call_display_as_header())
+            .clicked()
+        {
             self.request_switch_join_as = true;
         }
     }

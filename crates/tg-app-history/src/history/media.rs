@@ -199,6 +199,7 @@ pub struct MediaAssetCache {
     stripped_textures: HashMap<u64, Option<TextureHandle>>,
     lottie_comps: HashMap<u64, Option<Composition>>,
     lottie_frames: HashMap<(u64, u32), TextureHandle>,
+    emoji: tg_emoji::egui_ext::EmojiTextureCache,
 }
 
 impl fmt::Debug for MediaAssetCache {
@@ -218,7 +219,13 @@ impl MediaAssetCache {
         Self::default()
     }
 
-    /// Decodes (once) and returns a GPU texture for Telegram stripped thumbnail bytes via `tg-media`.
+    /// Emoji sprite-sheet textures (reaction buttons, reaction strip).
+    pub fn emoji(&mut self) -> &mut tg_emoji::egui_ext::EmojiTextureCache {
+        &mut self.emoji
+    }
+
+    /// Decodes (once) and returns a GPU texture for Telegram stripped thumbnail bytes via `tg-media`,
+    /// blurred like `Images::Prepare(..., Images::Option::Blur)`.
     pub fn get_stripped_texture(
         &mut self,
         ctx: &egui::Context,
@@ -229,6 +236,7 @@ impl MediaAssetCache {
             return cached.clone();
         }
         let decoded = from_inline_bytes(bytes).ok().map(|rgba| {
+            let rgba = blur_small_rgba(&rgba);
             let (w, h) = rgba.dimensions();
             let raw = rgba.into_raw();
             let img = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
@@ -523,23 +531,25 @@ fn paint_photo_surface(
         Color32::from_rgba_unmultiplied(bot.r(), bot.g(), bot.b(), 195),
     );
 
-    // Overlay decoded Telegram stripped thumbnail if available via `tg-media`.
+    // Decoded Telegram stripped thumbnail, drawn opaque and blurred
+    // (`Photo::paintUserpicFrame` / `validateImageCache` with `Images::Option::Blur`).
     if let Some(bytes) = stripped_thumb
         && let Some(tex) = assets.get_stripped_texture(ctx, cache_key, bytes)
     {
-        painter.image(
-            tex.id(),
-            rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::from_rgba_unmultiplied(255, 255, 255, 110),
+        painter.add(
+            egui::epaint::RectShape::filled(rect, cr, Color32::WHITE).with_texture(
+                tex.id(),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            ),
         );
+        return;
     }
 
-    // Subtle crisp mountain/sun vector illustration emblem on procedural photos.
+    // Demo-only placeholder when no thumbnail bytes exist: a crisp mountain/sun emblem.
     let c = rect.center();
     let s = rect.width().min(rect.height());
     let sun_pos = Pos2::new(
-        rect.left() + rect.width() * 0.28,
+        rect.left() + rect.width() * 0.72,
         rect.top() + rect.height() * 0.30,
     );
     painter.circle_filled(
@@ -570,6 +580,37 @@ fn paint_photo_surface(
         Color32::from_rgba_unmultiplied(255, 255, 255, 64),
         Stroke::NONE,
     ));
+}
+
+/// Two passes of a 3x3 box blur over a small decoded thumbnail (stripped sizes are ~40px).
+fn blur_small_rgba(src: &image::RgbaImage) -> image::RgbaImage {
+    let (w, h) = src.dimensions();
+    if w < 3 || h < 3 {
+        return src.clone();
+    }
+    let mut cur = src.clone();
+    for _ in 0..2 {
+        let prev = cur.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0u32; 4];
+                let mut n = 0u32;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as u32;
+                        let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as u32;
+                        let p = prev.get_pixel(sx, sy).0;
+                        for k in 0..4 {
+                            acc[k] += u32::from(p[k]);
+                        }
+                        n += 1;
+                    }
+                }
+                cur.put_pixel(x, y, image::Rgba(acc.map(|v| (v / n) as u8)));
+            }
+        }
+    }
+    cur
 }
 
 fn paint_photo(
@@ -928,10 +969,10 @@ fn paint_document(
     let text_left = thumb_rect.right() + st.thumb_skip as f32;
     let max_text_w = (rect.right() - text_left - st.padding.right as f32).max(40.0);
 
-    // Filename
+    // Filename (`st::semiboldTextStyle`, history_view_document.cpp)
     let name_galley = ui.painter().layout(
         doc.file_name.clone(),
-        FontId::proportional(13.5),
+        FontId::new(13.0, tg_ui::fonts::family_semibold()),
         colors.bold_fg,
         max_text_w,
     );

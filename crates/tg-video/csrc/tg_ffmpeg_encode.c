@@ -19,7 +19,9 @@
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
+#include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +29,60 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* Mirror decoder shim limits (`tg_ffmpeg_shim.c` / `MAX_FRAME_AREA` = 4K). */
+#define TG_ENCODE_MAX_DIM 16384
+#define TG_ENCODE_MAX_AREA ((int64_t)3840 * 2160)
+#define TG_MAX_PIXELS_PADDING_RATIO 32
+#define TG_MAX_PIXELS_FIXED_PADDING (64 * 1024)
+
+static int64_t max_pixels_for_area_limit(int64_t area) {
+    return area + area / TG_MAX_PIXELS_PADDING_RATIO + TG_MAX_PIXELS_FIXED_PADDING;
+}
+
+static int valid_video_dims(int w, int h) {
+    if (w <= 0 || h <= 0 || w > TG_ENCODE_MAX_DIM || h > TG_ENCODE_MAX_DIM) {
+        return 0;
+    }
+    int64_t area = (int64_t)w * (int64_t)h;
+    if (area <= 0 || area > TG_ENCODE_MAX_AREA) {
+        return 0;
+    }
+    if (w > INT_MAX / 4) {
+        return 0;
+    }
+    if ((uint64_t)area > SIZE_MAX / 4) {
+        return 0;
+    }
+    return 1;
+}
+
+static int validate_frame_planes(const AVFrame *frame, enum AVPixelFormat pix_fmt) {
+    if (!frame || frame->width <= 0 || frame->height <= 0 || !frame->data[0]) {
+        return 0;
+    }
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
+    if (!desc) return 0;
+    int visible_bytes[4] = {0, 0, 0, 0};
+    if (av_image_fill_linesizes(visible_bytes, pix_fmt, frame->width) < 0) {
+        return 0;
+    }
+    int is_pal = (desc->flags & AV_PIX_FMT_FLAG_PAL) != 0;
+    for (int plane = 0; plane < 4; ++plane) {
+        const uint8_t *data = frame->data[plane];
+        if (is_pal && plane == 1) {
+            if (!data) return 0;
+            continue;
+        }
+        int visible = visible_bytes[plane];
+        if (visible <= 0) continue;
+        int stride = frame->linesize[plane];
+        if (!data || stride == 0 || stride == INT_MIN) return 0;
+        int mag = stride < 0 ? -stride : stride;
+        if (mag < visible) return 0;
+    }
+    return 1;
+}
 
 static void set_err(char *buf, size_t size, const char *ctx, int errnum) {
     if (!buf || size == 0) return;
@@ -104,8 +160,14 @@ static uint8_t *transform_rgba(
     int *out_w,
     int *out_h) {
     /* 1. Apply file display rotation so pixels are in display orientation. */
+    if (!src || !out_w || !out_h || !valid_video_dims(src_w, src_h)) {
+        return NULL;
+    }
     int disp_w = (file_rot == 90 || file_rot == 270) ? src_h : src_w;
     int disp_h = (file_rot == 90 || file_rot == 270) ? src_w : src_h;
+    if (!valid_video_dims(disp_w, disp_h)) {
+        return NULL;
+    }
     size_t disp_bytes = (size_t)disp_w * (size_t)disp_h * 4;
     uint8_t *disp = (uint8_t *)malloc(disp_bytes);
     if (!disp) return NULL;
@@ -129,15 +191,15 @@ static uint8_t *transform_rgba(
         }
     }
 
-    /* 2. Clamp crop rectangle inside display dimensions. */
+    /* 2. Clamp crop rectangle inside display dimensions (overflow-safe). */
     int cx = 0, cy = 0, cw = disp_w, ch = disp_h;
     if (crop_w > 0 && crop_h > 0) {
         cx = crop_x < 0 ? 0 : (crop_x >= disp_w ? disp_w - 1 : crop_x);
         cy = crop_y < 0 ? 0 : (crop_y >= disp_h ? disp_h - 1 : crop_y);
         cw = crop_w;
         ch = crop_h;
-        if (cx + cw > disp_w) cw = disp_w - cx;
-        if (cy + ch > disp_h) ch = disp_h - cy;
+        if (cw > disp_w - cx) cw = disp_w - cx;
+        if (ch > disp_h - cy) ch = disp_h - cy;
         if (cw < 1) cw = 1;
         if (ch < 1) ch = 1;
     }
@@ -145,6 +207,10 @@ static uint8_t *transform_rgba(
     /* 3. Apply crop + optional horizontal flip + user rotation. */
     int final_w = (user_rot == 90 || user_rot == 270) ? ch : cw;
     int final_h = (user_rot == 90 || user_rot == 270) ? cw : ch;
+    if (!valid_video_dims(final_w, final_h)) {
+        free(disp);
+        return NULL;
+    }
     uint8_t *out = (uint8_t *)malloc((size_t)final_w * (size_t)final_h * 4);
     if (!out) {
         free(disp);
@@ -248,8 +314,33 @@ int tg_video_transcode_file(
     uint8_t *rgba_buf = NULL;
     int ret = 0;
 
-    ret = avformat_open_input(&in_fmt, input_path, NULL, NULL);
+    /* Restrict input I/O strictly to local files and Telegram's whitelisted containers/codecs. */
+    in_fmt = avformat_alloc_context();
+    if (!in_fmt) {
+        ret = AVERROR(ENOMEM);
+        set_err(err_buf, err_buf_size, "avformat_alloc_context", ret);
+        goto cleanup;
+    }
+    ret = av_opt_set(in_fmt, "protocol_whitelist", "file", 0);
+    if (ret >= 0) {
+        ret = av_opt_set(in_fmt, "format_whitelist", TG_FORMAT_WHITELIST, 0);
+    }
+    if (ret >= 0) {
+        ret = av_opt_set(in_fmt, "codec_whitelist", TG_CODEC_WHITELIST, 0);
+    }
     if (ret < 0) {
+        set_err(err_buf, err_buf_size, "av_opt_set(whitelists)", ret);
+        goto cleanup;
+    }
+    AVDictionary *in_opts = NULL;
+    av_dict_set(&in_opts, "protocol_whitelist", "file", 0);
+    av_dict_set(&in_opts, "format_whitelist", TG_FORMAT_WHITELIST, 0);
+    av_dict_set(&in_opts, "codec_whitelist", TG_CODEC_WHITELIST, 0);
+    ret = avformat_open_input(&in_fmt, input_path, NULL, &in_opts);
+    av_dict_free(&in_opts);
+    if (ret < 0) {
+        /* avformat_open_input frees in_fmt on failure. */
+        in_fmt = NULL;
         set_err(err_buf, err_buf_size, "avformat_open_input", ret);
         goto cleanup;
     }
@@ -283,6 +374,17 @@ int tg_video_transcode_file(
         set_err(err_buf, err_buf_size, "avcodec_parameters_to_context(vdec)", ret);
         goto cleanup;
     }
+    if ((vdec->width != 0 || vdec->height != 0) && !valid_video_dims(vdec->width, vdec->height)) {
+        ret = AVERROR_INVALIDDATA;
+        set_err(err_buf, err_buf_size, "invalid or oversized codecpar video dimensions", ret);
+        goto cleanup;
+    }
+    vdec->max_pixels = max_pixels_for_area_limit(TG_ENCODE_MAX_AREA);
+    ret = av_opt_set(vdec, "codec_whitelist", TG_CODEC_WHITELIST, 0);
+    if (ret < 0) {
+        set_err(err_buf, err_buf_size, "av_opt_set(vdec codec_whitelist)", ret);
+        goto cleanup;
+    }
     ret = avcodec_open2(vdec, vdec_codec, NULL);
     if (ret < 0) {
         set_err(err_buf, err_buf_size, "avcodec_open2(vdec)", ret);
@@ -295,6 +397,11 @@ int tg_video_transcode_file(
 
     int coded_w = vdec->width;
     int coded_h = vdec->height;
+    if (!valid_video_dims(coded_w, coded_h)) {
+        ret = AVERROR_INVALIDDATA;
+        set_err(err_buf, err_buf_size, "invalid or oversized input video dimensions", ret);
+        goto cleanup;
+    }
     int disp_w = (file_rot == 90 || file_rot == 270) ? coded_h : coded_w;
     int disp_h = (file_rot == 90 || file_rot == 270) ? coded_w : coded_h;
 
@@ -312,6 +419,11 @@ int tg_video_transcode_file(
 
     int out_w = (config->target_width > 0) ? even_down_min2(config->target_width) : even_down_min2(eff_w);
     int out_h = (config->target_height > 0) ? even_down_min2(config->target_height) : even_down_min2(eff_h);
+    if (!valid_video_dims(out_w, out_h)) {
+        ret = AVERROR(EINVAL);
+        set_err(err_buf, err_buf_size, "invalid or oversized output video dimensions", ret);
+        goto cleanup;
+    }
 
     AVRational guessed_fps = av_guess_frame_rate(in_fmt, in_vstream, NULL);
     double src_fps = (guessed_fps.num > 0 && guessed_fps.den > 0) ? av_q2d(guessed_fps) : 30.0;
@@ -330,6 +442,7 @@ int tg_video_transcode_file(
             adec = avcodec_alloc_context3(adec_codec);
             if (adec &&
                 avcodec_parameters_to_context(adec, in_astream->codecpar) >= 0 &&
+                av_opt_set(adec, "codec_whitelist", TG_CODEC_WHITELIST, 0) >= 0 &&
                 avcodec_open2(adec, adec_codec, NULL) >= 0) {
                 /* audio decoder opened */
             } else {
@@ -457,9 +570,12 @@ int tg_video_transcode_file(
     }
 
     if (!(out_fmt->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&out_fmt->pb, output_path, AVIO_FLAG_WRITE);
+        AVDictionary *out_io_opts = NULL;
+        av_dict_set(&out_io_opts, "protocol_whitelist", "file", 0);
+        ret = avio_open2(&out_fmt->pb, output_path, AVIO_FLAG_WRITE, NULL, &out_io_opts);
+        av_dict_free(&out_io_opts);
         if (ret < 0) {
-            set_err(err_buf, err_buf_size, "avio_open(output)", ret);
+            set_err(err_buf, err_buf_size, "avio_open2(output)", ret);
             goto cleanup;
         }
     }
@@ -503,6 +619,11 @@ int tg_video_transcode_file(
         (file_rot != 0) || (user_rot != 0) || (flip_h != 0) ||
         (config->crop_w > 0 && config->crop_h > 0);
     if (need_rgba_transform) {
+        if (!valid_video_dims(coded_w, coded_h)) {
+            ret = AVERROR_INVALIDDATA;
+            set_err(err_buf, err_buf_size, "invalid rgba_buf dimensions", ret);
+            goto cleanup;
+        }
         rgba_buf = (uint8_t *)malloc((size_t)coded_w * (size_t)coded_h * 4);
         if (!rgba_buf) {
             ret = AVERROR(ENOMEM);
@@ -589,6 +710,18 @@ int tg_video_transcode_file(
                 goto cleanup;
             }
 
+            /* Validate decoded source frame dimensions, pixel format, and plane strides before sws_scale. */
+            if (!valid_video_dims(dec_frame->width, dec_frame->height) ||
+                dec_frame->format <= AV_PIX_FMT_NONE ||
+                dec_frame->format >= AV_PIX_FMT_NB ||
+                !validate_frame_planes(dec_frame, (enum AVPixelFormat)dec_frame->format) ||
+                !validate_frame_planes(enc_vframe, AV_PIX_FMT_YUV420P)) {
+                av_frame_unref(dec_frame);
+                ret = AVERROR_INVALIDDATA;
+                set_err(err_buf, err_buf_size, "invalid decoded video frame geometry or stride", ret);
+                goto cleanup;
+            }
+
             if (need_rgba_transform) {
                 sws_to_rgba = sws_getCachedContext(
                     sws_to_rgba,
@@ -608,7 +741,7 @@ int tg_video_transcode_file(
                 }
                 uint8_t *rgba_planes[4] = { rgba_buf, NULL, NULL, NULL };
                 int rgba_linesize[4] = { coded_w * 4, 0, 0, 0 };
-                sws_scale(
+                int rgba_scaled = sws_scale(
                     sws_to_rgba,
                     (const uint8_t *const *)dec_frame->data,
                     dec_frame->linesize,
@@ -616,6 +749,12 @@ int tg_video_transcode_file(
                     dec_frame->height,
                     rgba_planes,
                     rgba_linesize);
+                if (rgba_scaled != coded_h) {
+                    av_frame_unref(dec_frame);
+                    ret = AVERROR_EXTERNAL;
+                    set_err(err_buf, err_buf_size, "sws_scale(rgba)", ret);
+                    goto cleanup;
+                }
 
                 int tw = 0, th = 0;
                 uint8_t *transformed = transform_rgba(
@@ -631,7 +770,8 @@ int tg_video_transcode_file(
                     user_rot,
                     &tw,
                     &th);
-                if (!transformed) {
+                if (!transformed || !valid_video_dims(tw, th)) {
+                    free(transformed);
                     av_frame_unref(dec_frame);
                     ret = AVERROR(ENOMEM);
                     set_err(err_buf, err_buf_size, "transform_rgba", ret);
@@ -657,7 +797,7 @@ int tg_video_transcode_file(
                 }
                 const uint8_t *src_planes[4] = { transformed, NULL, NULL, NULL };
                 int src_linesize[4] = { tw * 4, 0, 0, 0 };
-                sws_scale(
+                int yuv_scaled = sws_scale(
                     sws_to_yuv,
                     src_planes,
                     src_linesize,
@@ -666,6 +806,12 @@ int tg_video_transcode_file(
                     enc_vframe->data,
                     enc_vframe->linesize);
                 free(transformed);
+                if (yuv_scaled != out_h) {
+                    av_frame_unref(dec_frame);
+                    ret = AVERROR_EXTERNAL;
+                    set_err(err_buf, err_buf_size, "sws_scale(yuv)", ret);
+                    goto cleanup;
+                }
             } else {
                 sws_to_yuv = sws_getCachedContext(
                     sws_to_yuv,
@@ -683,7 +829,7 @@ int tg_video_transcode_file(
                     set_err(err_buf, err_buf_size, "sws_getCachedContext(direct)", ret);
                     goto cleanup;
                 }
-                sws_scale(
+                int direct_scaled = sws_scale(
                     sws_to_yuv,
                     (const uint8_t *const *)dec_frame->data,
                     dec_frame->linesize,
@@ -691,6 +837,12 @@ int tg_video_transcode_file(
                     dec_frame->height,
                     enc_vframe->data,
                     enc_vframe->linesize);
+                if (direct_scaled != out_h) {
+                    av_frame_unref(dec_frame);
+                    ret = AVERROR_EXTERNAL;
+                    set_err(err_buf, err_buf_size, "sws_scale(direct)", ret);
+                    goto cleanup;
+                }
             }
 
             enc_vframe->pts = out_pts_us;
@@ -884,6 +1036,10 @@ int tg_video_generate_test_clip(
     }
     int w = even_down_min2(width);
     int h = even_down_min2(height);
+    if (!valid_video_dims(w, h)) {
+        set_err(err_buf, err_buf_size, "oversized synthetic clip dimensions", AVERROR(EINVAL));
+        return AVERROR(EINVAL);
+    }
     int total_frames = (int)(((int64_t)duration_ms * fps + 999) / 1000);
     if (total_frames < 2) total_frames = 2;
 
@@ -970,9 +1126,12 @@ int tg_video_generate_test_clip(
     }
 
     if (!(out_fmt->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&out_fmt->pb, output_path, AVIO_FLAG_WRITE);
+        AVDictionary *out_io_opts = NULL;
+        av_dict_set(&out_io_opts, "protocol_whitelist", "file", 0);
+        ret = avio_open2(&out_fmt->pb, output_path, AVIO_FLAG_WRITE, NULL, &out_io_opts);
+        av_dict_free(&out_io_opts);
         if (ret < 0) {
-            set_err(err_buf, err_buf_size, "avio_open(test clip)", ret);
+            set_err(err_buf, err_buf_size, "avio_open2(test clip)", ret);
             goto cleanup;
         }
     }

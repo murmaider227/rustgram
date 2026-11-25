@@ -216,7 +216,9 @@ impl<F: WindowFrameBackend, T: TaskbarButtonsBackend> PlatformWindowShell<F, T> 
             return false;
         }
         tg_ui::fonts::ensure_tdesktop_fonts(ui.ctx());
+        // tdesktop's frameless title bar (`main_window_win.cpp`) has no divider stroke below it.
         Panel::top("tg_frameless_title_bar")
+            .show_separator_line(false)
             .frame(
                 Frame::NONE
                     .fill(palette.window_bg)

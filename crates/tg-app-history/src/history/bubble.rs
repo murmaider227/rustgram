@@ -22,7 +22,7 @@ use tg_ui::text::{
     RichTextOptions, SyntaxHighlightPalette, build_layout_job, render_rich_text,
     render_text_with_entities,
 };
-use tg_ui::userpic::peer_name_color;
+use tg_ui::userpic::{EmptyUserpic, peer_name_color};
 
 use crate::bots::inline_keyboard::{
     InlineKeyboardActivation, InlineKeyboardParams, InlineKeyboardState, show_inline_keyboard,
@@ -50,6 +50,9 @@ pub enum MessagePaintEvent {
     JumpToMessage(MsgId),
     /// Clicked a hyperlink / mention / hashtag inside rich text.
     OpenLink(String),
+    /// Clicked a hidden hyperlink (`messageEntityTextUrl` / `EntityType::CustomUrl`) that
+    /// requires scheme validation and confirmation before opening externally.
+    OpenHiddenLink(String),
     /// Clicked a reaction pill to toggle it.
     ToggleReaction {
         /// Message id.
@@ -253,6 +256,41 @@ pub fn paint_message_bubble_shell(
     }
 }
 
+/// `st::msgServiceFont` (13px semibold), used for service pills and date badges.
+#[must_use]
+pub fn service_font() -> FontId {
+    FontId::new(13.0, tg_ui::fonts::family_semibold())
+}
+
+/// Service message text as tdesktop renders it (`HistoryService::setServiceText`):
+/// `lng_action_created_channel` for broadcast channels, `lng_action_created_chat` with «»
+/// quotes for groups.
+#[must_use]
+pub fn service_text(msg: &HistoryMessage, svc: &crate::history::backend::ServiceAction) -> String {
+    use crate::history::backend::ServiceAction;
+    match svc {
+        ServiceAction::NoForwardsToggle { new_value, .. } => {
+            crate::history::no_forwards_request::format_no_forwards_toggle_text(
+                &msg.sender_name,
+                msg.outgoing,
+                *new_value,
+            )
+        }
+        ServiceAction::ChatCreated { title } => {
+            let broadcast = matches!(
+                msg.peer_id.kind(),
+                tg_app_core::stand_in::types::PeerKind::Channel
+            ) && (msg.is_post || msg.from_id == msg.peer_id);
+            if broadcast {
+                tg_lang::tr::lng_action_created_channel()
+            } else {
+                tg_lang::tr::lng_action_created_chat(&msg.sender_name, title)
+            }
+        }
+        _ => svc.display_text(&msg.sender_name),
+    }
+}
+
 /// Paints a centered date separator pill (`DateBadge`, `history_view_service_message.cpp`).
 pub fn paint_date_separator(
     painter: &Painter,
@@ -266,7 +304,7 @@ pub fn paint_date_separator(
         date_rect.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(12.5),
+        service_font(),
         colors.service_fg,
     );
 }
@@ -428,22 +466,13 @@ pub fn paint_service_message(
     let Some(ref svc) = msg.service else {
         return;
     };
-    let text = match svc {
-        crate::history::backend::ServiceAction::NoForwardsToggle { new_value, .. } => {
-            crate::history::no_forwards_request::format_no_forwards_toggle_text(
-                &msg.sender_name,
-                msg.outgoing,
-                *new_value,
-            )
-        }
-        _ => svc.display_text(&msg.sender_name),
-    };
+    let text = service_text(msg, svc);
     let bubble_rect = hist_rect_to_egui(layout.text_bubble_rect, origin.x, origin.y);
     if bubble_rect.is_positive() {
         let r = (bubble_rect.height() * 0.5).min(13.0).round() as u8;
         painter.rect_filled(bubble_rect, CornerRadius::same(r), colors.service_bg);
         let max_w = (bubble_rect.width() - MSG_SERVICE_PADDING.horizontal() as f32).max(20.0);
-        let galley = painter.layout(text, FontId::proportional(12.5), colors.service_fg, max_w);
+        let galley = painter.layout(text, service_font(), colors.service_fg, max_w);
         let text_pos = Pos2::new(
             bubble_rect.center().x - galley.size().x * 0.5,
             bubble_rect.center().y - galley.size().y * 0.5,
@@ -482,6 +511,7 @@ pub fn paint_message_element(
         None,
         None,
         false,
+        None,
     )
 }
 
@@ -517,6 +547,7 @@ pub fn paint_message_element_with_runtime(
         None,
         None,
         false,
+        None,
     )
 }
 
@@ -553,6 +584,7 @@ pub fn paint_message_element_with_bots(
         inline_kb,
         None,
         false,
+        None,
     )
 }
 
@@ -575,6 +607,7 @@ pub fn paint_message_element_full(
     inline_kb: Option<InlineKeyboardRenderCtx<'_>>,
     summary: Option<&MessageSummaryEntry>,
     paused_chat_effects: bool,
+    reaction_userpics: Option<&ReactionUserpics>,
 ) -> Vec<MessagePaintEvent> {
     paint_message_element_internal(
         ui,
@@ -592,6 +625,7 @@ pub fn paint_message_element_full(
         inline_kb,
         summary,
         paused_chat_effects,
+        reaction_userpics,
     )
 }
 
@@ -612,6 +646,7 @@ fn paint_message_element_internal(
     inline_kb: Option<InlineKeyboardRenderCtx<'_>>,
     summary: Option<&MessageSummaryEntry>,
     paused_chat_effects: bool,
+    reaction_userpics: Option<&ReactionUserpics>,
 ) -> Vec<MessagePaintEvent> {
     let mut events = Vec::new();
     let is_selected = selection.is_full();
@@ -661,7 +696,7 @@ fn paint_message_element_internal(
             Pos2::new(inner_left, header_y),
             Align2::LEFT_TOP,
             &msg.sender_name,
-            FontId::proportional(13.0),
+            FontId::new(13.0, tg_ui::fonts::family_semibold()),
             name_fg,
         );
         header_y += layout.header_heights.from_name_or_via as f32;
@@ -732,36 +767,37 @@ fn paint_message_element_internal(
                 &ui_colors,
             )
         };
-        ui.painter().text(
-            Pos2::new(text_x, reply_rect.top() + 2.0),
-            Align2::LEFT_TOP,
+        // history_view_reply.cpp: name in `msgNameStyle` (semibold 13px), one elided line of
+        // `defaultTextStyle` (13px) in the bubble's text colour below it.
+        let text_max_w =
+            (reply_rect.right() - text_x - HISTORY_REPLY_PADDING.right as f32).max(40.0);
+        let name_top = reply_rect.top() + HISTORY_REPLY_PADDING.top as f32;
+        let name = elided_line(
+            ui,
             &reply.author_name,
-            FontId::proportional(12.0),
+            FontId::new(13.0, tg_ui::fonts::family_semibold()),
             name_col,
+            text_max_w,
         );
+        let name_h = name.size().y.max(18.0);
+        ui.painter()
+            .galley(Pos2::new(text_x, name_top), name, name_col);
         let snippet_text = if let Some(ref quote) = reply.quote_text {
             format!("“{quote}”")
         } else {
             reply.preview_text.clone()
         };
-        let snippet_max_w = (reply_rect.right() - text_x - 6.0).max(40.0);
-        let snippet = ui.painter().layout_no_wrap(
-            snippet_text,
-            FontId::proportional(12.0),
-            if reply.quote_text.is_some() {
-                colors.text_fg
-            } else {
-                colors.sub_text_fg
-            },
+        let snippet = elided_line(
+            ui,
+            &snippet_text,
+            FontId::proportional(13.0),
+            colors.text_fg,
+            text_max_w,
         );
-        let clipped_painter = ui.painter().with_clip_rect(Rect::from_min_size(
-            Pos2::new(text_x, reply_rect.top() + 17.0),
-            Vec2::new(snippet_max_w, 18.0),
-        ));
-        clipped_painter.galley(
-            Pos2::new(text_x, reply_rect.top() + 17.0),
+        ui.painter().galley(
+            Pos2::new(text_x, name_top + name_h),
             snippet,
-            colors.sub_text_fg,
+            colors.text_fg,
         );
 
         let reply_resp = ui.interact(
@@ -1047,7 +1083,7 @@ fn paint_message_element_internal(
             } else {
                 SyntaxHighlightPalette::day()
             });
-            let mut clicked_link = None;
+            let mut clicked_link: Option<(String, bool)> = None;
             ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
                 let resp = render_text_with_entities(
                     ui,
@@ -1058,11 +1094,16 @@ fn paint_message_element_internal(
                     &opts,
                 );
                 if let Some(link) = resp.clicked_link {
-                    clicked_link = Some(link.target);
+                    let is_hidden = link.kind == tg_text::EntityType::CustomUrl;
+                    clicked_link = Some((link.target, is_hidden));
                 }
             });
-            if let Some(url) = clicked_link {
-                events.push(MessagePaintEvent::OpenLink(url));
+            if let Some((url, is_hidden)) = clicked_link {
+                if is_hidden {
+                    events.push(MessagePaintEvent::OpenHiddenLink(url));
+                } else {
+                    events.push(MessagePaintEvent::OpenLink(url));
+                }
             }
         } else {
             let rich = entities_to_rich_text(active_text);
@@ -1105,7 +1146,15 @@ fn paint_message_element_internal(
                 clicked_link = resp.clicked_link;
             });
             if let Some(url) = clicked_link {
-                events.push(MessagePaintEvent::OpenLink(url));
+                let is_hidden = active_text
+                    .entities
+                    .iter()
+                    .any(|e| e.entity_type() == tg_text::EntityType::CustomUrl && e.data() == url);
+                if is_hidden {
+                    events.push(MessagePaintEvent::OpenHiddenLink(url));
+                } else {
+                    events.push(MessagePaintEvent::OpenLink(url));
+                }
             }
 
             // Drag-select text sensing over the text rect.
@@ -1175,30 +1224,24 @@ fn paint_message_element_internal(
         }
     }
 
-    // 5. Reactions row (interactive emoji counter pills + `+` full picker button).
+    // 5. Reactions row (`Reactions::InlineList`: emoji + count, or reactor userpics in
+    // private chats). The full picker opens from the context menu reaction strip.
     if !msg.reactions.is_empty() && !layout.reactions_rect.is_empty() {
         let react_rect = hist_rect_to_egui(layout.reactions_rect, origin.x, origin.y);
-        match paint_reactions_row(
+        if let Some(ReactionRowAction::Toggle(emoji)) = paint_reactions_row(
             ui,
             msg.id,
             &msg.reactions,
             react_rect,
             layout.has_out_layout,
             colors,
+            reaction_userpics,
+            assets,
         ) {
-            Some(ReactionRowAction::Toggle(emoji)) => {
-                events.push(MessagePaintEvent::ToggleReaction {
-                    msg_id: msg.id,
-                    emoji,
-                });
-            }
-            Some(ReactionRowAction::OpenPicker(pos)) => {
-                events.push(MessagePaintEvent::OpenReactionsPicker {
-                    msg_id: msg.id,
-                    pos,
-                });
-            }
-            None => {}
+            events.push(MessagePaintEvent::ToggleReaction {
+                msg_id: msg.id,
+                emoji,
+            });
         }
     }
 
@@ -1565,9 +1608,76 @@ fn paint_link_preview_card(
 
 enum ReactionRowAction {
     Toggle(String),
-    OpenPicker(Pos2),
 }
 
+/// Private-chat reactors shown as userpics inside reaction buttons
+/// (`Reactions::InlineList`, "always show userpics" for users).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionUserpics {
+    /// The other side of the private chat (`peer`, display name).
+    pub peer: (PeerId, String),
+    /// The current account (`peer`, display name).
+    pub me: (PeerId, String),
+}
+
+/// `st::reactionInlinePadding`.
+const REACTION_PAD_LEFT: f32 = 5.0;
+const REACTION_PAD_RIGHT: f32 = 7.0;
+const REACTION_PAD_V: f32 = 2.0;
+/// `st::reactionInlineSize`.
+const REACTION_SIZE: f32 = 18.0;
+/// `st::reactionInlineSkip`.
+const REACTION_SKIP: f32 = 3.0;
+/// `st::reactionInlineBetween`.
+const REACTION_BETWEEN: f32 = 4.0;
+/// `st::reactionInlineUserpics.size` / `.shift`.
+const REACTION_USERPIC: f32 = 20.0;
+const REACTION_USERPIC_SHIFT: f32 = 7.0;
+/// `st::reactionInlineUserpicsPadding` (left + right).
+const REACTION_USERPICS_PAD: f32 = 2.0;
+
+/// Number of userpics a private-chat reaction button shows (`InlineListDataFromMessage`).
+/// One line of `text` elided with "…" to `max_w` (`Ui::Text::String` `elisionLines = 1`).
+fn elided_line(
+    ui: &Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.replace('\n', " "),
+        egui::TextFormat::simple(font, color),
+    );
+    job.wrap.max_width = max_w.max(1.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    ui.painter().layout_job(job)
+}
+
+fn reaction_userpic_count(r: &ReactionCounter) -> usize {
+    usize::from(!r.chosen || r.count > 1) + usize::from(r.chosen)
+}
+
+fn reaction_count_text(r: &ReactionCounter) -> String {
+    r.count.to_string()
+}
+
+fn reaction_button_width(r: &ReactionCounter, private_chat: bool, count_w: f32) -> f32 {
+    if private_chat {
+        let n = reaction_userpic_count(r) as f32;
+        REACTION_PAD_LEFT
+            + REACTION_SIZE
+            + REACTION_USERPICS_PAD
+            + REACTION_USERPIC
+            + (n - 1.0).max(0.0) * (REACTION_USERPIC - REACTION_USERPIC_SHIFT)
+    } else {
+        REACTION_PAD_LEFT + REACTION_SIZE + REACTION_SKIP + REACTION_PAD_RIGHT + count_w
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_reactions_row(
     ui: &mut Ui,
     msg_id: MsgId,
@@ -1575,14 +1685,16 @@ fn paint_reactions_row(
     rect: Rect,
     outgoing: bool,
     colors: &HistoryColors,
+    userpics: Option<&ReactionUserpics>,
+    assets: &mut MediaAssetCache,
 ) -> Option<ReactionRowAction> {
     let mut toggled = None;
     let mut x = rect.left();
     let y = rect.top();
-    let pill_h = 24.0;
+    let pill_h = REACTION_PAD_V * 2.0 + REACTION_SIZE;
+    let ui_colors = colors.ui_colors();
 
     for (idx, r) in reactions.iter().enumerate() {
-        let label = format!("{} {}", r.emoji, r.count);
         let fg = if r.chosen {
             colors.reaction_chosen_fg
         } else if outgoing {
@@ -1597,11 +1709,12 @@ fn paint_reactions_row(
         } else {
             colors.reaction_in_bg
         };
-
-        let galley = ui
-            .painter()
-            .layout_no_wrap(label, FontId::proportional(12.0), fg);
-        let pill_w = (galley.size().x + 16.0).max(40.0);
+        let count_galley = ui.painter().layout_no_wrap(
+            reaction_count_text(r),
+            FontId::new(12.0, tg_ui::fonts::family_semibold()),
+            fg,
+        );
+        let pill_w = reaction_button_width(r, userpics.is_some(), count_galley.size().x);
         let pill_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(pill_w, pill_h));
 
         let resp = ui.interact(
@@ -1609,49 +1722,67 @@ fn paint_reactions_row(
             Id::unique(("tg_reaction", msg_id.0, idx)),
             Sense::click(),
         );
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::Role::Button,
+                true,
+                r.chosen,
+                format!("{} {}", r.emoji, r.count),
+            )
+        });
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         ui.painter()
-            .rect_filled(pill_rect, CornerRadius::same(12), bg);
-        ui.painter().galley(
-            Pos2::new(
-                pill_rect.center().x - galley.size().x * 0.5,
-                pill_rect.center().y - galley.size().y * 0.5,
-            ),
-            galley,
-            fg,
+            .rect_filled(pill_rect, CornerRadius::same((pill_h * 0.5) as u8), bg);
+        let emoji_rect = Rect::from_min_size(
+            Pos2::new(x + REACTION_PAD_LEFT, y + REACTION_PAD_V),
+            Vec2::splat(REACTION_SIZE),
         );
+        let ctx = ui.ctx().clone();
+        let _ = assets.emoji().paint_emoji_str(
+            ui.painter(),
+            &ctx,
+            &r.emoji,
+            emoji_rect,
+            Color32::WHITE,
+        );
+        if let Some(pics) = userpics {
+            let mut list: Vec<&(PeerId, String)> = Vec::with_capacity(2);
+            if !r.chosen || r.count > 1 {
+                list.push(&pics.peer);
+            }
+            if r.chosen {
+                list.push(&pics.me);
+            }
+            let mut px = emoji_rect.right() + REACTION_USERPICS_PAD * 0.5;
+            for (peer, name) in list {
+                let pic = Rect::from_min_size(
+                    Pos2::new(px, pill_rect.center().y - REACTION_USERPIC * 0.5),
+                    Vec2::splat(REACTION_USERPIC),
+                );
+                ui.painter()
+                    .circle_filled(pic.center(), REACTION_USERPIC * 0.5 + 1.0, bg);
+                EmptyUserpic::for_peer(peer.bare(), name, &ui_colors)
+                    .paint_circle(ui.painter(), pic);
+                px += REACTION_USERPIC - REACTION_USERPIC_SHIFT;
+            }
+        } else {
+            ui.painter().galley(
+                Pos2::new(
+                    emoji_rect.right() + REACTION_SKIP,
+                    pill_rect.center().y - count_galley.size().y * 0.5,
+                ),
+                count_galley,
+                fg,
+            );
+        }
 
         if resp.clicked() {
             toggled = Some(ReactionRowAction::Toggle(r.emoji.clone()));
         }
-        x += pill_w + 5.0;
+        x += pill_w + REACTION_BETWEEN;
     }
-
-    // Small `+` button to open the full emoji reactions picker.
-    let add_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(24.0, pill_h));
-    let add_resp = ui.interact(
-        add_rect,
-        Id::unique(("tg_reaction_add", msg_id.0)),
-        Sense::click(),
-    );
-    if add_resp.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        ui.painter()
-            .circle_filled(add_rect.center(), 11.0, colors.bar_bg_over);
-    }
-    ui.painter().text(
-        add_rect.center(),
-        Align2::CENTER_CENTER,
-        "+",
-        FontId::proportional(13.0),
-        colors.sub_text_fg,
-    );
-    if add_resp.on_hover_text("More reactions").clicked() {
-        toggled = Some(ReactionRowAction::OpenPicker(add_rect.right_top()));
-    }
-
     toggled
 }
 
@@ -1690,7 +1821,7 @@ fn paint_bottom_info(
     if msg.edited {
         parts.push("edited".to_owned());
     }
-    parts.push(msg.formatted_time());
+    parts.push(crate::history::inner::message_time_text(msg));
     let text = parts.join("  ");
 
     let reserve_ticks = if outgoing { 16.0 } else { 0.0 };
@@ -1799,20 +1930,26 @@ pub fn format_compact_views(views: u32) -> String {
     }
 }
 
-/// Computes the exact width of a message's reactions row for `MessageInput::reactions_size`.
+/// Computes the exact size of a message's reactions row for `MessageInput::reactions_size`
+/// (`InlineList::countOptimalSize`; private chats show userpics instead of counts).
 #[must_use]
-pub fn measure_reactions_size(reactions: &[ReactionCounter]) -> tg_history::Size {
+pub fn measure_reactions_size(
+    reactions: &[ReactionCounter],
+    private_chat: bool,
+) -> tg_history::Size {
     if reactions.is_empty() {
         return tg_history::Size::ZERO;
     }
-    let mut w = 0i32;
+    let mut w = 0.0f32;
     for (i, r) in reactions.iter().enumerate() {
-        let digits = r.count.to_string().len() as i32;
-        let pill_w = (36 + digits * 7).max(42);
-        w += pill_w;
+        let digits = reaction_count_text(r).len() as f32;
+        w += reaction_button_width(r, private_chat, digits * 7.0);
         if i + 1 < reactions.len() {
-            w += 5;
+            w += REACTION_BETWEEN;
         }
     }
-    tg_history::Size::new(w + 29, 24)
+    tg_history::Size::new(
+        w.ceil() as i32,
+        (REACTION_PAD_V * 2.0 + REACTION_SIZE) as i32,
+    )
 }

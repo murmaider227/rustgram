@@ -875,6 +875,7 @@ fn wp39_fragment_get_collectible_info_fake_rpc_and_modal() {
         bot_reads_all_messages: false,
         has_mini_app: false,
         media_counts: Default::default(),
+        group_call: Default::default(),
     };
 
     let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));

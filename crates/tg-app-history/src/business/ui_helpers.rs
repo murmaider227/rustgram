@@ -237,7 +237,8 @@ pub fn toggle_switch(ui: &mut Ui, checked: &mut bool, palette: &Palette) -> bool
     changed
 }
 
-/// Draws a full-width toggle settings row (`SettingsButton::toggleOn`).
+/// Draws a full-width toggle settings row (`SettingsButton::toggleOn`), wrapping label and
+/// optional subtitle strictly left of the toggle switch so text never overlaps on narrow widths.
 pub fn settings_toggle_row(
     ui: &mut Ui,
     label: &str,
@@ -245,59 +246,113 @@ pub fn settings_toggle_row(
     checked: &mut bool,
     palette: &Palette,
 ) -> bool {
-    let h = if subtitle.is_some() { 50.0 } else { 42.0 };
     let width = ui.available_width().max(160.0);
+    let text_offset_x = 6.0_f32;
+    let switch_w = 38.0_f32;
+    let right_pad = 6.0_f32;
+    let text_gap = 12.0_f32;
+    let text_max_w = (width - right_pad - switch_w - text_gap - text_offset_x).max(48.0);
+
+    let title_galley = ui.painter().layout(
+        label.to_owned(),
+        FontId::proportional(13.5),
+        palette.window_fg,
+        text_max_w,
+    );
+    let sub_galley = subtitle.filter(|s| !s.is_empty()).map(|sub| {
+        ui.painter().layout(
+            sub.to_owned(),
+            FontId::proportional(11.5),
+            palette.window_sub_text_fg,
+            text_max_w,
+        )
+    });
+
+    let pad_v = 8.0_f32;
+    let sub_gap = 3.0_f32;
+    let h = if let Some(ref sg) = sub_galley {
+        (pad_v + title_galley.size().y + sub_gap + sg.size().y + pad_v).max(50.0)
+    } else {
+        (pad_v + title_galley.size().y + pad_v).max(42.0)
+    };
+
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, h), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         ui.painter()
             .rect_filled(rect, CornerRadius::same(6), palette.window_bg_over);
     }
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            CornerRadius::same(6),
+            Stroke::new(1.5, palette.window_bg_active),
+            egui::StrokeKind::Inside,
+        );
+    }
     let mut changed = false;
     if resp.clicked() {
         *checked = !*checked;
         changed = true;
     }
-    if let Some(sub) = subtitle {
-        ui.painter().text(
-            Pos2::new(rect.left() + 6.0, rect.top() + 16.0),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(13.5),
-            palette.window_fg,
-        );
-        ui.painter().text(
-            Pos2::new(rect.left() + 6.0, rect.top() + 34.0),
-            Align2::LEFT_CENTER,
-            sub,
-            FontId::proportional(11.5),
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, *checked, label));
+
+    let switch_left = rect.right() - right_pad - switch_w;
+    let text_x = rect.left() + text_offset_x;
+    let text_clip = Rect::from_min_max(
+        Pos2::new(text_x, rect.top()),
+        Pos2::new(
+            (text_x + text_max_w).min(switch_left - text_gap * 0.5),
+            rect.bottom(),
+        ),
+    );
+    let text_painter = ui.painter().with_clip_rect(text_clip);
+
+    if let Some(sg) = sub_galley {
+        let content_h = title_galley.size().y + sub_gap + sg.size().y;
+        let top_y = (rect.center().y - content_h * 0.5).max(rect.top() + pad_v * 0.75);
+        text_painter.galley(Pos2::new(text_x, top_y), title_galley, palette.window_fg);
+        text_painter.galley(
+            Pos2::new(text_x, top_y + content_h - sg.size().y),
+            sg,
             palette.window_sub_text_fg,
         );
     } else {
-        ui.painter().text(
-            Pos2::new(rect.left() + 6.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(13.5),
-            palette.window_fg,
-        );
+        let top_y = rect.center().y - title_galley.size().y * 0.5;
+        text_painter.galley(Pos2::new(text_x, top_y), title_galley, palette.window_fg);
     }
+
     let switch_rect = Rect::from_min_size(
-        Pos2::new(rect.right() - 44.0, rect.center().y - 10.5),
-        Vec2::new(38.0, 21.0),
+        Pos2::new(switch_left, rect.center().y - 10.5),
+        Vec2::new(switch_w, 21.0),
     );
-    let track_col = if *checked {
-        palette.window_bg_active
+    let anim_secs = if ui.style().animation_time <= 0.0 {
+        0.0
     } else {
-        with_alpha(palette.window_sub_text_fg, 0.35)
+        0.16
     };
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, *checked, anim_secs);
+    let off_col = with_alpha(palette.window_sub_text_fg, 0.35);
+    let track_col = Color32::from_rgba_unmultiplied(
+        (f32::from(off_col.r())
+            + (f32::from(palette.window_bg_active.r()) - f32::from(off_col.r())) * t)
+            .round() as u8,
+        (f32::from(off_col.g())
+            + (f32::from(palette.window_bg_active.g()) - f32::from(off_col.g())) * t)
+            .round() as u8,
+        (f32::from(off_col.b())
+            + (f32::from(palette.window_bg_active.b()) - f32::from(off_col.b())) * t)
+            .round() as u8,
+        (f32::from(off_col.a())
+            + (f32::from(palette.window_bg_active.a()) - f32::from(off_col.a())) * t)
+            .round() as u8,
+    );
     ui.painter()
         .rect_filled(switch_rect, CornerRadius::same(11), track_col);
-    let knob_x = if *checked {
-        switch_rect.right() - 10.5
-    } else {
-        switch_rect.left() + 10.5
-    };
+    let knob_x = (switch_rect.left() + 10.5)
+        + ((switch_rect.right() - 10.5) - (switch_rect.left() + 10.5)) * t;
     ui.painter().circle_filled(
         Pos2::new(knob_x, switch_rect.center().y),
         8.0,

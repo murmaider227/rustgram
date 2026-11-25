@@ -428,6 +428,24 @@ impl MediaBackend for CompositeMetadataBackend<'_> {
         }
     }
 
+    // The trait default would call `open_in_external_app` again, re-running the launch
+    // warning check the user just confirmed, so the confirmed launch must reach the base.
+    fn open_in_external_app_confirmed(&self, id: MediaItemId) -> anyhow::Result<PathBuf> {
+        if let Some(base) = self.base {
+            base.open_in_external_app_confirmed(id)
+        } else {
+            Ok(PathBuf::new())
+        }
+    }
+
+    fn forward_item_to(&self, id: MediaItemId, to_peer: i64) -> anyhow::Result<()> {
+        if let Some(base) = self.base {
+            base.forward_item_to(id, to_peer)
+        } else {
+            Ok(())
+        }
+    }
+
     fn audio_track_metadata(&self, id: AudioMsgId) -> Option<AudioTrackMetadata> {
         self.overlay
             .audio_track_metadata(id)
@@ -1388,14 +1406,10 @@ impl HistoryMediaRuntime {
             }
             PhotoLoadState::Ready { bytes } => {
                 if !self.full_photos.contains_key(&msg_id)
-                    && let Ok(img) = image::load_from_memory(&bytes)
+                    && let Some((w, h, raw)) = decode_inline_photo_rgba(&bytes)
                 {
-                    let rgba = img.to_rgba8();
-                    let (w, h) = rgba.dimensions();
-                    let color_img = ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        &rgba.into_raw(),
-                    );
+                    let color_img =
+                        ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
                     let tex = ctx.load_texture(
                         format!("tg_full_photo_{}", msg_id.0),
                         color_img,
@@ -2060,6 +2074,21 @@ pub fn paint_round_video_inline(
     let _ = colors;
 }
 
+/// Decodes inline photo bytes into `(width, height, rgba)` via [`tg_media::image::read_image`],
+/// enforcing tdesktop's input byte limit and pixel-area cap before pixel allocation.
+pub fn decode_inline_photo_rgba(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let decoded = tg_media::image::read_image(tg_media::image::ReadArgs {
+        content: bytes.to_vec(),
+        ..Default::default()
+    })
+    .ok()?;
+    let (w, h) = decoded.image.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h, decoded.image.into_raw()))
+}
+
 /// Synthesizes a clean deterministic WAV tone buffer (48kHz mono PCM16) for mock voice/music
 /// items that don't carry raw encoded audio bytes on disk.
 #[must_use]
@@ -2079,4 +2108,82 @@ pub fn synthesize_tone_wav(base_hz: f32, duration_secs: f32) -> Vec<u8> {
         pcm.push(sample);
     }
     encode_wav_pcm_s16le(&pcm, sample_rate, 1)
+}
+
+#[cfg(test)]
+mod tests_sec2a {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingBase {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl MediaBackend for RecordingBase {
+        fn get_item(&self, _id: MediaItemId) -> Option<MediaItem> {
+            None
+        }
+        fn siblings_in_chat(&self, _peer_id: i64, _item_id: MediaItemId) -> Vec<MediaItem> {
+            Vec::new()
+        }
+        fn load_bytes(&self, _id: MediaItemId) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unused")
+        }
+        fn open_range_loader(
+            &self,
+            _id: MediaItemId,
+        ) -> anyhow::Result<Arc<dyn tg_video::RangeLoader>> {
+            anyhow::bail!("unused")
+        }
+        fn save_to_disk(
+            &self,
+            _id: MediaItemId,
+            _destination: &std::path::Path,
+        ) -> anyhow::Result<PathBuf> {
+            anyhow::bail!("unused")
+        }
+        fn copy_item(&self, _id: MediaItemId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn forward_item(&self, _id: MediaItemId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete_item(&self, _id: MediaItemId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn show_in_chat(&self, _peer_id: i64, _msg_id: i32) {}
+        fn open_in_external_app(&self, _id: MediaItemId) -> anyhow::Result<PathBuf> {
+            self.calls.lock().expect("calls").push("open");
+            Ok(PathBuf::from("warned"))
+        }
+        fn open_in_external_app_confirmed(&self, _id: MediaItemId) -> anyhow::Result<PathBuf> {
+            self.calls.lock().expect("calls").push("confirmed");
+            Ok(PathBuf::from("launched"))
+        }
+        fn audio_track_metadata(&self, _id: AudioMsgId) -> Option<AudioTrackMetadata> {
+            None
+        }
+        fn audio_data_source(&self) -> Arc<dyn AudioDataSource> {
+            Arc::new(MemoryAudioSource::new())
+        }
+        fn playlist_provider(&self) -> Arc<dyn PlaylistProvider> {
+            Arc::new(InMemoryPlaylistProvider::new())
+        }
+    }
+
+    #[test]
+    fn l8_confirmed_external_launch_reaches_the_base_backend() {
+        let base = RecordingBase::default();
+        let overlay = SharedAudioBackend::new();
+        let composite = CompositeMetadataBackend {
+            overlay: &overlay,
+            base: Some(&base),
+        };
+        let id = MediaItemId::default();
+        let launched = composite
+            .open_in_external_app_confirmed(id)
+            .expect("launch");
+        assert_eq!(launched, PathBuf::from("launched"));
+        assert_eq!(*base.calls.lock().expect("calls"), vec!["confirmed"]);
+    }
 }

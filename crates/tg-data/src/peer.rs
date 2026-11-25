@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use bitflags::bitflags;
 
 use crate::id::{
-    COLOR_INDEX_COUNT, ChannelId, ChatId, CollectibleId, DocumentId, MsgId, PeerId, PhotoId,
-    TimeId, UNKNOWN_PHOTO_ID, UserId, decide_color_index,
+    COLOR_INDEX_COUNT, CallId, ChannelId, ChatId, CollectibleId, DocumentId, MsgId, PeerId,
+    PhotoId, TimeId, UNKNOWN_PHOTO_ID, UserId, decide_color_index,
 };
 use crate::lastseen::{
     LastseenStatus, OnlineStatusText, SET_ONLINE_AFTER_ACTIVITY, sort_by_online_status,
@@ -1278,6 +1278,9 @@ pub struct Chat {
     pub bot_status: BotStatus,
     /// Target megagroup `ChannelId` if this basic group was migrated.
     pub migrated_to: Option<ChannelId>,
+    /// Active group call `(call_id, access_hash)` when loaded from `chatFull.call` or
+    /// `updateGroupCall` (`PeerData::groupCall`).
+    pub group_call: Option<(CallId, u64)>,
 }
 
 impl Chat {
@@ -1301,6 +1304,7 @@ impl Chat {
             member_ranks: BTreeMap::new(),
             bot_status: BotStatus::Unknown,
             migrated_to: None,
+            group_call: None,
         }
     }
 
@@ -1505,6 +1509,8 @@ pub struct Channel {
     pub discussion_link_known: bool,
     /// Linked monoforum / broadcast channel pair.
     pub monoforum_link: Option<ChannelId>,
+    /// Whether direct messages are enabled for this broadcast channel (`channel.broadcast_messages_allowed`).
+    pub broadcast_messages_allowed: bool,
     /// Linked community channel ID.
     pub linked_community_id: Option<ChannelId>,
     /// Allowed reactions configuration.
@@ -1513,6 +1519,9 @@ pub struct Channel {
     pub bot_verify_details: Option<BotVerifyDetails>,
     /// Megagroup-specific details (populated when `ChannelFlags::MEGAGROUP` is set).
     pub mg_info: Option<MegagroupInfo>,
+    /// Active group call / live stream `(call_id, access_hash)` when loaded from
+    /// `channelFull.call` or `updateGroupCall` (`PeerData::groupCall`).
+    pub group_call: Option<(CallId, u64)>,
 }
 
 impl Channel {
@@ -1542,10 +1551,12 @@ impl Channel {
             discussion_link: None,
             discussion_link_known: false,
             monoforum_link: None,
+            broadcast_messages_allowed: false,
             linked_community_id: None,
             allowed_reactions: AllowedReactions::default(),
             bot_verify_details: None,
             mg_info: None,
+            group_call: None,
         }
     }
 
@@ -2332,6 +2343,36 @@ impl Peer {
     pub fn slowmode_seconds_left(&self, now: TimeId) -> i32 {
         self.as_channel()
             .map_or(0, |ch| ch.slowmode_seconds_left(now))
+    }
+
+    /// Returns the active group call `(call_id, access_hash)` if loaded (`PeerData::groupCall`).
+    pub const fn group_call(&self) -> Option<(CallId, u64)> {
+        match self {
+            Self::User(_) => None,
+            Self::Chat(c) => c.group_call,
+            Self::Channel(ch) => ch.group_call,
+        }
+    }
+
+    /// Returns `true` if a group call or live stream is currently active (`CALL_ACTIVE` or
+    /// loaded `group_call`).
+    pub const fn has_active_group_call(&self) -> bool {
+        match self {
+            Self::User(_) => false,
+            Self::Chat(c) => c.flags.contains(ChatFlags::CALL_ACTIVE) || c.group_call.is_some(),
+            Self::Channel(ch) => {
+                ch.flags.contains(ChannelFlags::CALL_ACTIVE) || ch.group_call.is_some()
+            }
+        }
+    }
+
+    /// Returns `true` if the active group call currently has participants (`CALL_NOT_EMPTY`).
+    pub const fn has_non_empty_group_call(&self) -> bool {
+        match self {
+            Self::User(_) => false,
+            Self::Chat(c) => c.flags.contains(ChatFlags::CALL_NOT_EMPTY),
+            Self::Channel(ch) => ch.flags.contains(ChannelFlags::CALL_NOT_EMPTY),
+        }
     }
 
     /// Returns `true` if the current account can manage group calls (`PeerData::canManageGroupCall`).

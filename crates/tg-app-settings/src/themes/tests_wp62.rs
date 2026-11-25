@@ -578,7 +578,7 @@ fn chat_background_rasterizes_tgv_and_svg_for_positive_and_negative_intensity() 
         &wp_pos.background_colors,
         wp_pos.rotation,
         wp_pos.intensity,
-        Some((192, 192)),
+        Some((93, 192)), // pattern scaled to the area height at 1440:2960 (`CacheBackgroundByRequest`)
         PatternTileMode::Centered,
     )
     .expect("direct tg-theme render +40");
@@ -601,7 +601,7 @@ fn chat_background_rasterizes_tgv_and_svg_for_positive_and_negative_intensity() 
         &wp_neg.background_colors,
         wp_neg.rotation,
         wp_neg.intensity,
-        Some((192, 192)),
+        Some((93, 192)), // pattern scaled to the area height at 1440:2960 (`CacheBackgroundByRequest`)
         PatternTileMode::Centered,
     )
     .expect("direct tg-theme render -50");

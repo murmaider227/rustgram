@@ -19,11 +19,12 @@ use tg_updater::package::verify_package;
 use tg_updater::version::{Target, UpdateChannel, Version};
 use tg_updater::{DEFAULT_EXE_NAME, UPDATER_EXE_NAME};
 use tg_xtask::dist::{
-    DIST_EXE_NAMES, DistOptions, PORTABLE_DIR_NAME, REQUIRED_FFMPEG_DLL_PREFIXES,
-    THIRD_PARTY_NOTICES_NAME, WIDGET_HELPER_EXE_NAME, find_workspace_root,
-    generate_inno_setup_script, run_dist,
+    DIST_EXE_NAMES, DistOptions, PORTABLE_DIR_NAME, PRIVACY_NOTICE_NAME,
+    REQUIRED_FFMPEG_DLL_PREFIXES, THIRD_PARTY_NOTICES_NAME, WIDGET_HELPER_EXE_NAME,
+    find_workspace_root, generate_inno_setup_script, read_workspace_version, run_dist,
 };
 use tg_xtask::icon::{ICON_SIZES, render_svg_to_ico};
+use tg_xtask::winrc::{COMPANY_NAME, DIST_BINARY_RESOURCES, PRODUCT_NAME, generate_version_rc};
 
 #[test]
 fn renders_repo_icon_svg_to_multisize_ico() {
@@ -166,6 +167,11 @@ fn dist_stages_portable_folder_with_ffmpeg_and_licenses_zip_update_and_checksums
     let notices = fs::read_to_string(output.portable_dir.join(THIRD_PARTY_NOTICES_NAME)).unwrap();
     assert!(notices.contains("GPL-3.0"));
     assert!(notices.contains("FFmpeg"));
+    let privacy = fs::read_to_string(output.portable_dir.join(PRIVACY_NOTICE_NAME)).unwrap();
+    assert!(privacy.contains("# Privacy policy"));
+    assert!(
+        privacy.contains("Update automatically") || privacy.contains("Update\r\nautomatically")
+    );
 
     // Inspect portable ZIP contents
     let zip_file = File::open(&output.portable_zip).unwrap();
@@ -186,6 +192,7 @@ fn dist_stages_portable_folder_with_ffmpeg_and_licenses_zip_update_and_checksums
     assert!(names.contains(&"LICENSE".to_string()));
     assert!(names.contains(&"LEGAL".to_string()));
     assert!(names.contains(&THIRD_PARTY_NOTICES_NAME.to_string()));
+    assert!(names.contains(&PRIVACY_NOTICE_NAME.to_string()));
     for dll in mock_dlls {
         assert!(
             names.contains(&dll.to_string()),
@@ -263,6 +270,34 @@ fn inno_setup_script_is_valid_unbranded_and_has_optional_tg_protocol() {
     assert!(norm_disk.contains("LICENSE"));
     assert!(norm_disk.contains("LEGAL"));
     assert!(norm_disk.contains(THIRD_PARTY_NOTICES_NAME));
+    assert!(norm_disk.contains(PRIVACY_NOTICE_NAME));
+    assert!(norm_disk.contains("InfoBeforeFile={#DistDir}\\PRIVACY.txt"));
+
+    // Must declare default-checked `autoupdate` task writing StartupPrefs.auto_update.
+    let autoupdate_line = norm_disk
+        .lines()
+        .find(|l| l.contains("Name: \"autoupdate\""))
+        .expect("installer/tgfork.iss missing autoupdate task");
+    assert!(
+        autoupdate_line.contains("Check for updates automatically"),
+        "autoupdate task must carry user-facing description"
+    );
+    assert!(
+        !autoupdate_line.contains("unchecked"),
+        "autoupdate task must be checked by default"
+    );
+    assert!(norm_disk.contains("startup_prefs.json"));
+    assert!(norm_disk.contains("\"auto_update\""));
+
+    // Must preserve user tdata on uninstall, matching docs/PRIVACY.md.
+    assert!(
+        !norm_disk.contains("Name: \"{app}\\tdata\""),
+        "uninstaller must keep tdata per docs/PRIVACY.md"
+    );
+    assert!(
+        !norm_disk.contains("Name: \"{userappdata}\\{#MyAppName}\\tdata\""),
+        "uninstaller must keep userappdata tdata per docs/PRIVACY.md"
+    );
 
     // Must declare optional `registertg` task and gate EVERY [Registry] line with `Tasks: registertg`.
     assert!(norm_disk.contains("Name: \"registertg\""));
@@ -398,6 +433,193 @@ fn dist_file_list_and_installers_include_all_three_executables() {
         assert!(
             iss.contains("{#MyWidgetHelperExeName}"),
             "{rel} [Files] must install {{#MyWidgetHelperExeName}}"
+        );
+    }
+}
+
+#[test]
+fn generated_windows_version_resource_scripts_cover_all_exes_and_release_version() {
+    let root = find_workspace_root().unwrap();
+    let workspace_version = read_workspace_version(&root).unwrap();
+    let prerelease_version = Version::parse("0.1.0-alpha.1").unwrap();
+
+    assert_eq!(DIST_BINARY_RESOURCES.len(), DIST_EXE_NAMES.len());
+    for (spec, &expected_exe) in DIST_BINARY_RESOURCES.iter().zip(DIST_EXE_NAMES.iter()) {
+        assert_eq!(spec.exe_name, expected_exe);
+    }
+
+    for version in [&prerelease_version, &workspace_version] {
+        let ver_str = version.to_string();
+        let expected_quad = format!("{},{},{},0", version.major, version.minor, version.patch);
+
+        for spec in DIST_BINARY_RESOURCES {
+            let icon = spec.has_icon.then_some("rustgram.ico");
+            let rc = generate_version_rc(spec, version, icon);
+
+            assert!(
+                rc.contains("1 VERSIONINFO"),
+                "{}: missing VERSIONINFO block",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!("FILEVERSION {expected_quad}")),
+                "{}: missing FILEVERSION {expected_quad}",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!("PRODUCTVERSION {expected_quad}")),
+                "{}: missing PRODUCTVERSION {expected_quad}",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!("VALUE \"ProductName\", \"{PRODUCT_NAME}\"")),
+                "{}: ProductName must be {PRODUCT_NAME}",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!("VALUE \"CompanyName\", \"{COMPANY_NAME}\"")),
+                "{}: CompanyName must be {COMPANY_NAME}",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!(
+                    "VALUE \"FileDescription\", \"{}\"",
+                    spec.file_description
+                )),
+                "{}: missing FileDescription",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!("VALUE \"FileVersion\", \"{ver_str}\"")),
+                "{}: FileVersion must equal release version {ver_str}",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!("VALUE \"ProductVersion\", \"{ver_str}\"")),
+                "{}: ProductVersion must equal release version {ver_str}",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!(
+                    "VALUE \"OriginalFilename\", \"{}\"",
+                    spec.exe_name
+                )),
+                "{}: missing OriginalFilename",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains(&format!(
+                    "VALUE \"InternalName\", \"{}\"",
+                    spec.internal_name
+                )),
+                "{}: missing InternalName",
+                spec.exe_name
+            );
+            assert!(
+                rc.contains("VALUE \"Translation\", 0x0409, 1200"),
+                "{}: missing VarFileInfo Translation",
+                spec.exe_name
+            );
+            if spec.has_icon {
+                assert!(
+                    rc.contains("1 ICON \"rustgram.ico\""),
+                    "{}: expected icon directive",
+                    spec.exe_name
+                );
+            } else {
+                assert!(
+                    !rc.contains("1 ICON"),
+                    "{}: helper exe should not require icon directive",
+                    spec.exe_name
+                );
+            }
+        }
+    }
+
+    // Verify each crate's build.rs embeds matching metadata and reads RUSTGRAM_VERSION.
+    for spec in DIST_BINARY_RESOURCES {
+        let build_rs = fs::read_to_string(root.join(spec.build_script_rel_path))
+            .unwrap_or_else(|e| panic!("read {}: {e}", spec.build_script_rel_path));
+        assert!(
+            build_rs.contains(&format!("const PRODUCT_NAME: &str = \"{PRODUCT_NAME}\";")),
+            "{} must set PRODUCT_NAME = \"{PRODUCT_NAME}\"",
+            spec.build_script_rel_path
+        );
+        assert!(
+            build_rs.contains(&format!("const COMPANY_NAME: &str = \"{COMPANY_NAME}\";")),
+            "{} must set COMPANY_NAME = \"{COMPANY_NAME}\"",
+            spec.build_script_rel_path
+        );
+        assert!(
+            build_rs.contains(&format!(
+                "const FILE_DESCRIPTION: &str = \"{}\";",
+                spec.file_description
+            )),
+            "{} must set FILE_DESCRIPTION = \"{}\"",
+            spec.build_script_rel_path,
+            spec.file_description
+        );
+        assert!(
+            build_rs.contains("RUSTGRAM_VERSION") && build_rs.contains("CARGO_PKG_VERSION"),
+            "{} must read RUSTGRAM_VERSION with CARGO_PKG_VERSION fallback",
+            spec.build_script_rel_path
+        );
+        assert!(
+            build_rs.contains("(\"FileVersion\", version_str)")
+                && build_rs.contains("(\"ProductVersion\", version_str)"),
+            "{} must set both FileVersion and ProductVersion to version_str",
+            spec.build_script_rel_path
+        );
+    }
+
+    // Verify both Inno Setup scripts carry full installer VersionInfo metadata, privacy policy, and autoupdate task.
+    for rel in ["installer/tgfork.iss", "packaging/windows/tgfork.iss"] {
+        let iss = fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        assert!(
+            iss.contains(&format!("#define MyAppPublisher \"{COMPANY_NAME}\"")),
+            "{rel} must set MyAppPublisher to \"{COMPANY_NAME}\""
+        );
+        for required in [
+            "VersionInfoVersion={#MyAppNumericVersion}",
+            "VersionInfoTextVersion={#MyAppVersion}",
+            "VersionInfoProductName={#MyAppName}",
+            "VersionInfoProductVersion={#MyAppNumericVersion}",
+            "VersionInfoProductTextVersion={#MyAppVersion}",
+            "VersionInfoCompany={#MyAppPublisher}",
+            "VersionInfoDescription={#MyAppName} Setup",
+            "InfoBeforeFile=",
+            "PRIVACY.txt",
+            "Name: \"autoupdate\"",
+            "Check for updates automatically",
+            "startup_prefs.json",
+        ] {
+            assert!(iss.contains(required), "{rel} missing '{required}'");
+        }
+    }
+}
+
+#[test]
+fn release_workflow_builds_prerelease_draft_with_pubkey_guard_and_all_artifacts() {
+    let root = find_workspace_root().unwrap();
+    let yml = fs::read_to_string(root.join(".github").join("workflows").join("release.yml"))
+        .expect("read .github/workflows/release.yml");
+
+    assert!(yml.contains("\"v*\""));
+    assert!(yml.contains("vars.RUSTGRAM_UPDATE_PUBKEY"));
+    assert!(yml.contains("draft: true"));
+    assert!(yml.contains("prerelease: ${{ steps.meta.outputs.prerelease }}"));
+    assert!(
+        yml.contains("$channel = if ($isPrerelease -eq \"true\") { \"beta\" } else { \"stable\" }")
+    );
+    for artifact in [
+        "Rustgram-Setup-",
+        "-win-x64-portable.zip",
+        "-win-x64.tupdate",
+        "SHA256SUMS.txt",
+    ] {
+        assert!(
+            yml.contains(artifact),
+            "release.yml missing artifact reference '{artifact}'"
         );
     }
 }

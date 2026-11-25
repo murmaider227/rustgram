@@ -102,6 +102,8 @@ pub struct MockStoriesBackend {
     pub shared_records: Vec<SharedStoryRecord>,
     /// Log of report actions performed.
     pub reported_records: Vec<ReportedStoryRecord>,
+    /// Log of bulk stories blocklist updates (`contacts.setBlocked(my_stories_from=true)`).
+    pub saved_stories_blocklists: Vec<Vec<PeerId>>,
     /// Count of actions executed (useful for tests).
     pub executed_actions_count: usize,
 }
@@ -131,6 +133,7 @@ impl MockStoriesBackend {
             sent_replies: Vec::new(),
             shared_records: Vec::new(),
             reported_records: Vec::new(),
+            saved_stories_blocklists: Vec::new(),
             executed_actions_count: 0,
         };
         backend.seed_sample_data();
@@ -1522,6 +1525,12 @@ impl StoriesBackend for MockStoriesBackend {
 
     fn is_viewer_stories_blocked(&self, peer_id: PeerId) -> bool {
         self.blocked_viewers.contains(&peer_id)
+    }
+
+    fn save_stories_blocklist(&mut self, peers: &[PeerId]) -> Result<bool, String> {
+        self.blocked_viewers = peers.iter().copied().collect();
+        self.saved_stories_blocklists.push(peers.to_vec());
+        Ok(true)
     }
 
     fn pending_uploads(&self) -> Vec<StoryUploadStatus> {

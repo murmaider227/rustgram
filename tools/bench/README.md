@@ -1,0 +1,75 @@
+# Rustgram vs Telegram Desktop Benchmark Scripts
+
+Reproducible Windows benchmark harness comparing official Telegram Desktop against Rustgram.
+No machine-specific or local paths are hardcoded in these scripts; supply all executable,
+working-directory, and output paths via CLI flags or environment variables.
+
+## Scripts
+
+- `build_dist.py` — Generates an ephemeral Ed25519 keypair in memory (never printed or committed)
+  and runs `cargo run -p tg-xtask -- dist` to build release binaries and stage the portable
+  `Rustgram/` distribution folder with FFmpeg DLLs.
+- `win_metrics.py` — Shared Win32 measurement library (`GetSystemTimes`, `GetProcessTimes`,
+  `GetProcessMemoryInfo`, `EnumWindows`, `PrintWindow`, `BitBlt`, `SendInput`).
+- `bench_part1.py` — Part 1 (no account): binary/folder size, cold start (first window visible
+  and 500 ms stable login screen via `PrintWindow`), and idle memory & CPU at 30 s and 5 min.
+- `bench_part2.py` — Part 2 (test account): `probe` (layout discovery), `cold-start` (start to
+  chat list loaded), `interactive` (open chat latency, 10 s wheel scroll CPU & frame pacing,
+  memory after opening chats), and `delivery` (A → B message delivery latency).
+- `report.py` — Merges Part 1 and Part 2 JSON outputs into `results.json` and `BENCHMARKS.md`.
+- `bench_startup_fair.py` — Startup and open-chat comparison that measures both clients the same
+  way (test account): start → first window visible, start → chat list drawn and stable, open a
+  chat → history stable. See "Interactive desktop" below.
+
+## Interactive desktop (needed for Telegram Desktop captures)
+
+`PrintWindow` returns a white rectangle for Telegram Desktop's Direct3D 11 window unless the
+client runs on the desktop that receives user input (`WinSta0\Default` in the logged-on user's
+console session). `bench_startup_fair.py` checks this first and exits with code 3 elsewhere.
+
+- A shell that already runs on that desktop (the process's thread desktop equals
+  `OpenInputDesktop`) can start the script directly.
+- From a shell on another desktop or session, start it through a Task Scheduler task with the
+  "run only when the user is logged on" option, which runs in the user's interactive session:
+  `schtasks /Create /TN <name> /TR "<python> -I <script> <args>" /SC ONCE /ST 23:59 /IT /F`,
+  then `schtasks /Run /TN <name>`, wait for its output file, and `schtasks /Delete /TN <name> /F`.
+
+The clients' windows appear on the user's screen during the runs. Clicks are posted to the
+window (`PostMessageW`), so the user's mouse is not moved.
+
+`chat_list_ready_ms` keeps every capture that differs from the previous one, records until the
+window has not changed for `--settle-s` seconds, and reports the first capture from which the
+window matches its settled state. A loading state that stays still for a while is therefore not
+counted as ready. Run it only on an idle PC: the script checks CPU (< 15 %) and the idle time of
+every disk (`--disk-idle-min`, default 80 %), because disk-bound background work such as Windows
+servicing slows the start of both clients by seconds.
+
+## Requirements
+
+- Windows 10/11 (x64)
+- Python 3.11+ with `numpy` and `Pillow` (`python -I` compatible)
+- For Rustgram live mode (`--rustgram-live` / Part 2): `RUSTGRAM_API_ID` and `RUSTGRAM_API_HASH`
+  in the environment (or `--api-creds-doc` pointing to tdesktop's `docs/api_credentials.md`).
+
+## Memory diagnosis (where private bytes go)
+
+- `mem_walk.py` — read-only VMMap-style walk of a running process (`VirtualQueryEx`, TEB stacks, PEB heap
+  list, `QueryWorkingSetEx`). Splits committed memory into thread stacks, NT heaps, writable image pages,
+  mapped views and other private `VirtualAlloc` regions, with the resident part of each.
+  `python -I mem_walk.py --pid <pid> --out-json walk.json`. Heaps that are not in the PEB list (segment
+  heaps created by system or driver DLLs) are counted under "other VirtualAlloc".
+- `memdiag/` — a small standalone `cdylib` (own `[workspace]`, build it with
+  `cargo build --release --manifest-path tools/bench/memdiag/Cargo.toml`). Loaded into a measurement build, it
+  hooks `NtAllocateVirtualMemory(/Ex)`, `NtFreeVirtualMemory` and the single-argument `D3DKMT*` syscalls in
+  `win32u.dll`, records each call with its call stack, and measures the private-bytes delta of every D3DKMT
+  call (GPU drivers commit memory from the kernel side, which no user-mode allocation hook sees). It costs
+  about 100 MiB of commit for its own tables; `mem_attribution.py` subtracts them.
+  To load it, a throwaway build calls `LoadLibraryW(<dll>)` and the exported `memdiag_start()` as the first
+  statement of `main`, with `RG_MEMDIAG_OUT=<folder>` in the environment. Creating `<folder>/va.trigger`
+  makes it write `events.bin`, `stacks.tsv`, `frames.tsv`, `heaps.txt` (a `HeapWalk` summary) and `va.done`.
+  Build the app with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` and keep the `.pdb` next to the exe so
+  frames resolve to `file:line`. Never ship a build that loads it.
+- `mem_attribution.py` — joins `walk.json` (taken just before the trigger) with the `memdiag` dump:
+  `python -I mem_attribution.py --dir <folder>` prints MiB per memory type, owner module and phase.
+- Heap allocation sites: use `dhat` as the global allocator in the same throwaway build and sort its
+  `dhat-heap.json` by bytes live at the end.

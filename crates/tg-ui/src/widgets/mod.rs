@@ -4,6 +4,7 @@ pub mod buttons;
 pub mod checkbox;
 pub mod input_field;
 pub mod labels;
+pub mod media_marker;
 pub mod menu;
 pub mod rich_input;
 pub mod scroll_area;

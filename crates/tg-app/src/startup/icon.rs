@@ -23,10 +23,31 @@ pub const DEFAULT_WINDOW_ICON_SIZE: u32 = 64;
 /// Falls back to a solid Rustgram-teal square if SVG rasterization unexpectedly fails.
 #[must_use]
 pub fn load_window_icon() -> Arc<IconData> {
+    if let Some(icon) = prerendered_window_icon() {
+        return Arc::new(icon);
+    }
     Arc::new(
         render_svg_to_icon_data(APP_ICON_SVG, DEFAULT_WINDOW_ICON_SIZE)
             .unwrap_or_else(|_| fallback_icon_data(DEFAULT_WINDOW_ICON_SIZE)),
     )
+}
+
+/// The window icon rendered by `build.rs` from the same SVG with the same `resvg` pipeline, which
+/// spares loading the system font database at startup.
+fn prerendered_window_icon() -> Option<IconData> {
+    #[cfg(rustgram_window_icon_rgba)]
+    {
+        const RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/window_icon_64.rgba"));
+        let size = DEFAULT_WINDOW_ICON_SIZE;
+        if RGBA.len() == (size * size * 4) as usize {
+            return Some(IconData {
+                rgba: RGBA.to_vec(),
+                width: size,
+                height: size,
+            });
+        }
+    }
+    None
 }
 
 /// Renders raw SVG XML bytes into a square `size x size` straight-alpha RGBA [`IconData`].

@@ -10,9 +10,10 @@ use std::time::Duration;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align2, Area, Color32, ColorImage, CornerRadius, CursorIcon, FontFamily, FontId, Id, Key,
-    Order, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
+    Order, Pos2, Rect, Role, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2, WidgetInfo,
 };
 use image::DynamicImage;
+use tg_app_core::chat_helpers::backend::AttachedStickersMedia;
 use tg_text::{EntityType, TextWithEntities, utf16_range_to_utf8};
 use tg_ui::fonts::{ensure_tdesktop_fonts, font_id_from_style};
 use tg_ui::tg_style::st;
@@ -23,7 +24,7 @@ use tg_video::{
 
 use crate::media::backend::{MediaBackend, MediaItem, MediaItemId, MediaItemKind};
 use crate::media::controls::{PlaybackControlsAction, PlaybackControlsState, TimestampChapter};
-use crate::media::group_thumbs::GroupThumbsStrip;
+use crate::media::group_thumbs::{GroupThumbsStrip, album_strip_range};
 use crate::media::ocr_selection::{
     OcrOverlayState, OcrSelection, image_rect_to_screen, recognized_text_in_reading_order,
 };
@@ -32,11 +33,13 @@ use crate::media::strings;
 use crate::media::style::{
     MEDIAVIEW_BG, MEDIAVIEW_CAPTION_BG, MEDIAVIEW_CAPTION_FG, MEDIAVIEW_CAPTION_MARGIN,
     MEDIAVIEW_CAPTION_PAD_X, MEDIAVIEW_CAPTION_PAD_Y, MEDIAVIEW_CAPTION_RADIUS,
-    MEDIAVIEW_CONTROL_BG, MEDIAVIEW_CONTROL_BG_OVER, MEDIAVIEW_CONTROL_FG, MEDIAVIEW_MENU_BG,
-    MEDIAVIEW_MENU_BG_OVER, MEDIAVIEW_MENU_DANGER_FG, MEDIAVIEW_MENU_FG, MEDIAVIEW_SAVE_MSG_BG,
-    MEDIAVIEW_SAVE_MSG_FG, MEDIAVIEW_SAVE_MSG_SHOWN_MS, MEDIAVIEW_SUB_FG, MEDIAVIEW_TEXT_LINK_FG,
-    MEDIAVIEW_VIDEO_BG, MediaColors, paint_centered_style_icon, paint_centered_style_icon_alpha,
-    paint_transparent_checkerboard, with_opacity,
+    MEDIAVIEW_CONTROL_BG, MEDIAVIEW_CONTROL_BG_OVER, MEDIAVIEW_CONTROL_FG,
+    MEDIAVIEW_HIDE_DURATION_MS, MEDIAVIEW_MENU_BG, MEDIAVIEW_MENU_BG_OVER,
+    MEDIAVIEW_MENU_DANGER_FG, MEDIAVIEW_MENU_FG, MEDIAVIEW_SAVE_MSG_BG, MEDIAVIEW_SAVE_MSG_FG,
+    MEDIAVIEW_SAVE_MSG_SHOWN_MS, MEDIAVIEW_SHOW_DURATION_MS, MEDIAVIEW_SUB_FG,
+    MEDIAVIEW_TEXT_LINK_FG, MEDIAVIEW_VIDEO_BG, MEDIAVIEW_WAIT_HIDE_MS, MediaColors,
+    paint_centered_style_icon, paint_centered_style_icon_alpha, paint_transparent_checkerboard,
+    with_opacity,
 };
 use crate::media::video_stream::{
     PlaybackSponsoredEvent, PlaybackSponsoredOverlay, SponsoredForVideo, ThemeFilePreview,
@@ -172,6 +175,105 @@ impl GalleryNavigator {
     }
 }
 
+/// `Storage::SharedMediaType` the viewer navigates for an item (`OverlayWidget::sharedMediaType`):
+/// photos and videos share one list, GIFs, round videos, live streams and files each have their
+/// own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedMediaKind {
+    PhotoVideo,
+    Gif,
+    RoundVoice,
+    Stream,
+    File,
+}
+
+const fn shared_media_kind(kind: MediaItemKind) -> SharedMediaKind {
+    match kind {
+        MediaItemKind::Photo | MediaItemKind::Video => SharedMediaKind::PhotoVideo,
+        MediaItemKind::Gif => SharedMediaKind::Gif,
+        MediaItemKind::RoundVideo => SharedMediaKind::RoundVoice,
+        MediaItemKind::VideoStream => SharedMediaKind::Stream,
+        MediaItemKind::Theme | MediaItemKind::Document => SharedMediaKind::File,
+    }
+}
+
+/// Keeps only the siblings in the same shared-media list as `target_id` (a `.txt` file is never
+/// part of a photo's "Photo N of M"). Unknown targets keep the list as given.
+#[must_use]
+pub fn filter_gallery_siblings(items: Vec<MediaItem>, target_id: MediaItemId) -> Vec<MediaItem> {
+    let Some(kind) = items
+        .iter()
+        .find(|item| item.id == target_id)
+        .map(|item| shared_media_kind(item.kind))
+    else {
+        return items;
+    };
+    items
+        .into_iter()
+        .filter(|item| shared_media_kind(item.kind) == kind)
+        .collect()
+}
+
+/// Opacity of the viewer's over-controls (header, arrows, caption, thumbnails, bottom bar):
+/// tdesktop's `_controlsOpacity`, shown on activity and hidden `mediaviewWaitHide` ms later over
+/// `mediaviewHideDuration` (`OverlayWidget::activateControls` / `hideControls`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ControlsFade {
+    last_activity_ms: i64,
+    opacity: f32,
+    last_step_ms: i64,
+}
+
+impl Default for ControlsFade {
+    fn default() -> Self {
+        Self {
+            last_activity_ms: 0,
+            opacity: 1.0,
+            last_step_ms: 0,
+        }
+    }
+}
+
+impl ControlsFade {
+    /// Shows the controls and restarts the hide timer (`activateControls`).
+    pub const fn activate(&mut self, now_ms: i64) {
+        self.last_activity_ms = now_ms;
+    }
+
+    /// Advances the fade to `now_ms`; `hold` keeps the controls shown (menu open, mouse pressed).
+    pub fn step(&mut self, now_ms: i64, hold: bool) -> f32 {
+        let dt = (now_ms - self.last_step_ms).max(0) as f32;
+        self.last_step_ms = now_ms;
+        if hold {
+            self.last_activity_ms = now_ms;
+        }
+        let idle_ms = (now_ms - self.last_activity_ms).max(0) as u64;
+        if idle_ms <= MEDIAVIEW_WAIT_HIDE_MS {
+            let step = dt / MEDIAVIEW_SHOW_DURATION_MS.max(1) as f32;
+            self.opacity = (self.opacity + step).min(1.0);
+        } else {
+            let fade_elapsed = (idle_ms - MEDIAVIEW_WAIT_HIDE_MS) as f32;
+            let target = 1.0 - (fade_elapsed / MEDIAVIEW_HIDE_DURATION_MS.max(1) as f32);
+            self.opacity = self.opacity.min(target.clamp(0.0, 1.0));
+        }
+        self.opacity
+    }
+
+    /// Current opacity in `[0, 1]`.
+    #[must_use]
+    pub const fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    /// Returns `true` while the fade still changes and needs repaints.
+    #[must_use]
+    pub fn is_animating(&self, now_ms: i64) -> bool {
+        let idle_ms = (now_ms - self.last_activity_ms).max(0) as u64;
+        (self.opacity > 0.0 && idle_ms <= MEDIAVIEW_WAIT_HIDE_MS + MEDIAVIEW_HIDE_DURATION_MS)
+            || (idle_ms <= MEDIAVIEW_WAIT_HIDE_MS && self.opacity < 1.0)
+    }
+}
+
 /// Action events emitted by [`MediaOverlayWidget::show`] to the host window.
 #[derive(Debug)]
 pub enum OverlayEvent {
@@ -194,6 +296,14 @@ pub enum OverlayEvent {
     Copied(MediaItemId),
     /// User requested opening media in external application.
     OpenExternal(PathBuf),
+    /// Opening an executable, unknown-extension, extensionless, or IP-revealing item requires
+    /// explicit user confirmation (`Data::LaunchWithWarning`).
+    ConfirmOpenExternal {
+        /// Target media item ID.
+        item_id: MediaItemId,
+        /// Sanitized display filename.
+        file_name: String,
+    },
     /// User switched the active video into Picture-in-Picture mode.
     EnterPip(Box<PipWindow>),
     /// Event emitted by the live RTMP/HLS video stream viewer (`media_view_video_stream`).
@@ -208,6 +318,14 @@ pub enum OverlayEvent {
         theme_name: String,
         /// Original raw theme file bytes.
         raw_bytes: Vec<u8>,
+    },
+    /// User clicked "Attached Stickers" (`tr::lng_context_attached_stickers`) for a photo/video
+    /// that carries attached stickers or masks (`OverlayWidget::showAttachedStickers`).
+    AttachedStickers {
+        /// Real photo or document reference to pass to `messages.getAttachedStickers`.
+        media: AttachedStickersMedia,
+        /// Display label describing the inspected media.
+        media_label: String,
     },
 }
 
@@ -260,12 +378,29 @@ pub struct MediaOverlayWidget {
     screenshot_protection: ScreenshotProtectionManager,
     protection_reason: Option<ReasonId>,
     playback_sponsored: PlaybackSponsoredOverlay,
+    controls_fade: ControlsFade,
 }
 
 impl Default for MediaOverlayWidget {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Default folder for "Save as" from the media viewer: the user's Downloads folder
+/// (`<USERPROFILE>\Downloads\Rustgram` on Windows, `<HOME>/Downloads/Rustgram` elsewhere), like
+/// tdesktop's `Core::App().downloadPath()` default. Falls back to a temp folder only when neither
+/// home variable is set.
+#[must_use]
+pub fn default_save_directory() -> PathBuf {
+    ["USERPROFILE", "HOME"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .find(|v| !v.is_empty())
+        .map_or_else(
+            || std::env::temp_dir().join("RustgramDownloads"),
+            |home| PathBuf::from(home).join("Downloads").join("Rustgram"),
+        )
 }
 
 impl MediaOverlayWidget {
@@ -284,7 +419,7 @@ impl MediaOverlayWidget {
             toast: None,
             last_viewport_size: Vec2::new(1280.0, 800.0),
             last_world_ms: 0,
-            save_directory: std::env::temp_dir().join("rustgram_downloads"),
+            save_directory: default_save_directory(),
             volume: 1.0,
             speed: 1.0,
             ocr: OcrOverlayState::default(),
@@ -292,7 +427,14 @@ impl MediaOverlayWidget {
             screenshot_protection: ScreenshotProtectionManager::new(),
             protection_reason: None,
             playback_sponsored: PlaybackSponsoredOverlay::new(),
+            controls_fade: ControlsFade::default(),
         }
+    }
+
+    /// Opacity of the header, arrows, caption, thumbnails and bottom bar (`_controlsOpacity`).
+    #[must_use]
+    pub const fn controls_opacity(&self) -> f32 {
+        self.controls_fade.opacity()
     }
 
     /// Returns `true` when the currently displayed media item forbids saving/forwarding
@@ -387,6 +529,12 @@ impl MediaOverlayWidget {
         self.save_directory = dir;
     }
 
+    /// Directory used by quick Save As actions.
+    #[must_use]
+    pub fn save_directory(&self) -> &std::path::Path {
+        &self.save_directory
+    }
+
     /// Returns `true` when the fullscreen overlay is currently visible.
     #[must_use]
     pub const fn is_open(&self) -> bool {
@@ -461,6 +609,8 @@ impl MediaOverlayWidget {
             allows_delete: false,
             allows_save: false,
             local_path: None,
+            grouped_id: None,
+            attached_stickers_media: None,
         };
         self.gallery = GalleryNavigator::new(vec![item], MediaItemId(descriptor.call_id as u64));
         self.open = true;
@@ -504,6 +654,8 @@ impl MediaOverlayWidget {
             allows_delete: false,
             allows_save: true,
             local_path: None,
+            grouped_id: None,
+            attached_stickers_media: None,
         };
         self.gallery = GalleryNavigator::new(vec![item], item_id);
         self.open = true;
@@ -579,7 +731,8 @@ impl MediaOverlayWidget {
         item_id: MediaItemId,
         world_now_ms: i64,
     ) -> anyhow::Result<()> {
-        let mut siblings = backend.siblings_in_chat(peer_id, item_id);
+        let mut siblings =
+            filter_gallery_siblings(backend.siblings_in_chat(peer_id, item_id), item_id);
         if siblings.is_empty()
             && let Some(item) = backend.get_item(item_id)
         {
@@ -588,6 +741,8 @@ impl MediaOverlayWidget {
         self.gallery = GalleryNavigator::new(siblings, item_id);
         self.open = !self.gallery.is_empty();
         self.last_world_ms = world_now_ms;
+        self.controls_fade = ControlsFade::default();
+        self.controls_fade.activate(world_now_ms);
         self.load_current_item(backend, world_now_ms, 0, false)
     }
 
@@ -601,13 +756,16 @@ impl MediaOverlayWidget {
     ) -> anyhow::Result<()> {
         self.volume = resume.volume.clamp(0.0, 1.0);
         self.speed = resume.speed.clamp(tg_video::SPEED_MIN, tg_video::SPEED_MAX);
-        let mut siblings = backend.siblings_in_chat(item.peer_id, item.id);
+        let mut siblings =
+            filter_gallery_siblings(backend.siblings_in_chat(item.peer_id, item.id), item.id);
         if siblings.is_empty() {
             siblings.push(item.clone());
         }
         self.gallery = GalleryNavigator::new(siblings, item.id);
         self.open = !self.gallery.is_empty();
         self.last_world_ms = world_now_ms;
+        self.controls_fade = ControlsFade::default();
+        self.controls_fade.activate(world_now_ms);
         self.load_current_item(backend, world_now_ms, resume.position_ms, resume.paused)
     }
 
@@ -693,8 +851,12 @@ impl MediaOverlayWidget {
 
         match item.kind {
             MediaItemKind::Photo => match backend.load_bytes(item.id) {
-                Ok(bytes) => match image::load_from_memory(&bytes) {
-                    Ok(img) => {
+                Ok(bytes) => match tg_media::image::read_image(tg_media::image::ReadArgs {
+                    content: bytes,
+                    ..tg_media::image::ReadArgs::default()
+                }) {
+                    Ok(read) => {
+                        let img = DynamicImage::ImageRgba8(read.image);
                         let w = f64::from(img.width().max(1));
                         let h = f64::from(img.height().max(1));
                         self.zoom.set_content(w, h, item.rotation_degrees);
@@ -1150,11 +1312,26 @@ impl MediaOverlayWidget {
                 }
 
                 // Track pointer activity for controls fade.
-                if ctx.input(|i| i.pointer.delta().length_sq() > 0.5) {
+                let (pointer_moved, pointer_down) = ctx.input(|i| {
+                    (
+                        i.pointer.delta().length_sq() > 0.5,
+                        i.pointer.any_down() || i.pointer.any_pressed(),
+                    )
+                });
+                if pointer_moved {
                     self.controls.note_activity(world_now_ms);
+                    self.controls_fade.activate(world_now_ms);
                 }
                 self.controls
                     .step_fade(world_now_ms, !self.zoom.full_screen_video);
+                let chrome_opacity = self
+                    .controls_fade
+                    .step(world_now_ms, self.more_menu_open || pointer_down);
+                if self.controls_fade.is_animating(world_now_ms) {
+                    ctx.request_repaint();
+                }
+                let mut chrome_painter = painter.clone();
+                chrome_painter.multiply_opacity(chrome_opacity);
 
                 // ── Left / Right gallery navigation chevrons (`st::mediaviewLeft` / `Right`) ──
                 if !self.zoom.full_screen_video {
@@ -1165,7 +1342,7 @@ impl MediaOverlayWidget {
                             Vec2::splat(ctrl_size),
                         );
                         let resp = ui.interact(left_btn, Id::unique("mv_nav_prev"), Sense::click());
-                        painter.circle_filled(
+                        chrome_painter.circle_filled(
                             left_btn.center(),
                             ctrl_size * 0.42,
                             if resp.hovered() {
@@ -1176,7 +1353,7 @@ impl MediaOverlayWidget {
                         );
                         paint_centered_style_icon(
                             ctx,
-                            &painter,
+                            &chrome_painter,
                             &st::mediaview_left,
                             left_btn,
                             &colors,
@@ -1192,7 +1369,7 @@ impl MediaOverlayWidget {
                         );
                         let resp =
                             ui.interact(right_btn, Id::unique("mv_nav_next"), Sense::click());
-                        painter.circle_filled(
+                        chrome_painter.circle_filled(
                             right_btn.center(),
                             ctrl_size * 0.42,
                             if resp.hovered() {
@@ -1203,7 +1380,7 @@ impl MediaOverlayWidget {
                         );
                         paint_centered_style_icon(
                             ctx,
-                            &painter,
+                            &chrome_painter,
                             &st::mediaview_right,
                             right_btn,
                             &colors,
@@ -1216,7 +1393,10 @@ impl MediaOverlayWidget {
 
                 // ── Top header bar (sender name, date, counter, zoom badge, close button) ──
                 if !self.zoom.full_screen_video {
-                    self.paint_header(ui, viewport_rect, &item, &colors, &mut events);
+                    ui.scope(|ui| {
+                        ui.multiply_opacity(chrome_opacity);
+                        self.paint_header(ui, viewport_rect, &item, &colors, &mut events);
+                    });
                 }
 
                 // ── Video PlaybackControls pill (for videos) + Sponsored video overlay ──
@@ -1249,8 +1429,12 @@ impl MediaOverlayWidget {
                     }
                 }
 
-                // ── Album / Gallery Group Thumbnails Strip (`media_view_group_thumbs`) ──
-                if !self.zoom.full_screen_video && self.gallery.len() > 1 {
+                // ── Album Group Thumbnails Strip (`media_view_group_thumbs`): only the
+                // items of the current message's album (`ComputeContext` = `groupId`). ──
+                let album = album_strip_range(self.gallery.items(), self.gallery.current_index());
+                if !self.zoom.full_screen_video
+                    && let Some(album) = album
+                {
                     let strip_h = GroupThumbsStrip::height();
                     let strip_rect = Rect::from_min_size(
                         Pos2::new(
@@ -1259,42 +1443,57 @@ impl MediaOverlayWidget {
                         ),
                         Vec2::new((viewport_rect.width() - 240.0).max(60.0), strip_h),
                     );
-                    if let Some(target_idx) = self.group_thumbs.show(
-                        ui,
-                        strip_rect,
-                        self.gallery.items(),
-                        self.gallery.current_index(),
-                    ) {
+                    let picked = ui
+                        .scope(|ui| {
+                            ui.multiply_opacity(chrome_opacity);
+                            self.group_thumbs.show(
+                                ui,
+                                strip_rect,
+                                &self.gallery.items()[album.clone()],
+                                self.gallery.current_index() - album.start,
+                            )
+                        })
+                        .inner
+                        .map(|i| i + album.start);
+                    if let Some(target_idx) = picked {
                         let delta = target_idx as i32 - self.gallery.current_index() as i32;
                         if delta != 0 {
                             self.navigate(backend, delta, world_now_ms);
                         }
                     }
                     caption_bottom_offset += strip_h + 6.0;
+                } else {
+                    self.group_thumbs.clear();
                 }
 
                 // ── Caption with rich entities ──
                 if !self.zoom.full_screen_video && !item.caption.text.is_empty() {
-                    self.paint_caption(
-                        ui,
-                        viewport_rect,
-                        &item.caption,
-                        caption_bottom_offset,
-                        &colors,
-                    );
+                    ui.scope(|ui| {
+                        ui.multiply_opacity(chrome_opacity);
+                        self.paint_caption(
+                            ui,
+                            viewport_rect,
+                            &item.caption,
+                            caption_bottom_offset,
+                            &colors,
+                        );
+                    });
                 }
 
                 // ── Bottom-left sender/file info + Bottom-right action toolbar ──
                 if !self.zoom.full_screen_video && !is_stream_mode && !is_theme_preview {
-                    self.paint_bottom_actions(
-                        ui,
-                        viewport_rect,
-                        &item,
-                        backend,
-                        &colors,
-                        world_now_ms,
-                        &mut events,
-                    );
+                    ui.scope(|ui| {
+                        ui.multiply_opacity(chrome_opacity);
+                        self.paint_bottom_actions(
+                            ui,
+                            viewport_rect,
+                            &item,
+                            backend,
+                            &colors,
+                            world_now_ms,
+                            &mut events,
+                        );
+                    });
                 }
 
                 // ── Save/Copy toast banner (`st::mediaviewSaveMsgCheck` + `mediaviewSaveMsgStyle`) ──
@@ -1921,32 +2120,16 @@ impl MediaOverlayWidget {
             Pos2::new(viewport_rect.min.x, viewport_rect.max.y - footer_h),
             Vec2::new(viewport_rect.width(), footer_h),
         );
-        painter.rect_filled(
-            footer_rect,
-            CornerRadius::ZERO,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 96),
-        );
-
-        // Bottom-left metadata: file name + dimensions / rotation.
-        let rot_suffix = if self.zoom.rotation != 0 {
-            format!(" · {}°", self.zoom.rotation)
-        } else {
-            String::new()
-        };
-        let info_line = format!(
-            "{}  ·  {}×{}{}",
-            item.file_name, item.width, item.height, rot_suffix
-        );
-        painter.text(
-            Pos2::new(
-                footer_rect.min.x + st::mediaview_text_left.0 as f32,
-                footer_rect.center().y,
-            ),
-            Align2::LEFT_CENTER,
-            info_line,
-            font_id_from_style(st::mediaview_font),
-            MEDIAVIEW_SUB_FG,
-        );
+        // `OverlayWidget::paint`: photos and videos get no file-name line and no bar behind the
+        // bottom-right buttons; only a document shows its name and size.
+        let shows_file_line = item.kind == MediaItemKind::Document;
+        if shows_file_line {
+            painter.rect_filled(
+                footer_rect,
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(0, 0, 0, 96),
+            );
+        }
 
         // Bottom-right icon buttons (`st::mediaviewRotate`, `Share`, `Save`, `More`).
         let btn_sz = Vec2::splat(38.0);
@@ -1961,16 +2144,60 @@ impl MediaOverlayWidget {
         x -= btn_sz.x + 6.0;
         let rotate_rect = Rect::from_min_size(Pos2::new(x, y), btn_sz);
 
-        let more_resp = ui.interact(more_rect, Id::unique("mv_act_more"), Sense::click());
+        // Bottom-left metadata: file name + dimensions / rotation (clipped clear of buttons).
+        let rot_suffix = if self.zoom.rotation != 0 {
+            format!(" · {}°", self.zoom.rotation)
+        } else {
+            String::new()
+        };
+        let info_line = format!(
+            "{}  ·  {}×{}{}",
+            item.file_name, item.width, item.height, rot_suffix
+        );
+        let info_left = footer_rect.min.x + st::mediaview_text_left.0 as f32;
+        let info_max_w = (rotate_rect.min.x - 12.0 - info_left).max(40.0);
+        let info_font = font_id_from_style(st::mediaview_font);
+        let info_clip = Rect::from_min_max(
+            Pos2::new(info_left, footer_rect.min.y),
+            Pos2::new(info_left + info_max_w, footer_rect.max.y),
+        );
+        if shows_file_line {
+            let fitted_info = ellipsize_single_line(ui, &info_line, &info_font, info_max_w);
+            painter.with_clip_rect(info_clip).text(
+                Pos2::new(info_left, footer_rect.center().y),
+                Align2::LEFT_CENTER,
+                fitted_info,
+                info_font,
+                MEDIAVIEW_SUB_FG,
+            );
+        }
+
+        let more_resp = ui
+            .interact(more_rect, ui.scope_id().with("mv_act_more"), Sense::click())
+            .on_hover_text("More");
+        more_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "More"));
+        let save_label = tg_lang::tr::lng_mediaview_save_as();
         let save_resp = ui
-            .interact(save_rect, Id::unique("mv_act_save"), Sense::click())
-            .on_hover_text(tg_lang::tr::lng_mediaview_save_as());
+            .interact(save_rect, ui.scope_id().with("mv_act_save"), Sense::click())
+            .on_hover_text(&save_label);
+        save_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &save_label));
+        let fwd_label = tg_lang::tr::lng_mediaview_forward();
         let fwd_resp = ui
-            .interact(forward_rect, Id::unique("mv_act_forward"), Sense::click())
-            .on_hover_text(tg_lang::tr::lng_mediaview_forward());
+            .interact(
+                forward_rect,
+                ui.scope_id().with("mv_act_forward"),
+                Sense::click(),
+            )
+            .on_hover_text(&fwd_label);
+        fwd_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &fwd_label));
         let rot_resp = ui
-            .interact(rotate_rect, Id::unique("mv_act_rotate"), Sense::click())
+            .interact(
+                rotate_rect,
+                ui.scope_id().with("mv_act_rotate"),
+                Sense::click(),
+            )
             .on_hover_text(strings::ROTATE_CW_90);
+        rot_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, strings::ROTATE_CW_90));
 
         for (r, hovered) in [
             (more_rect, more_resp.hovered() || self.more_menu_open),
@@ -2042,6 +2269,20 @@ impl MediaOverlayWidget {
             entries.push(("copy", copy_label, false));
             entries.push(("open_external", tg_lang::tr::lng_media_open_with(), false));
         }
+        if matches!(
+            item.kind,
+            MediaItemKind::Photo
+                | MediaItemKind::Video
+                | MediaItemKind::Gif
+                | MediaItemKind::RoundVideo
+        ) && item.attached_stickers_media.is_some()
+        {
+            entries.push((
+                "attached_stickers",
+                tg_lang::tr::lng_context_attached_stickers(),
+                false,
+            ));
+        }
         if item.allows_forward {
             entries.push(("forward", tg_lang::tr::lng_mediaview_forward(), false));
         }
@@ -2077,10 +2318,12 @@ impl MediaOverlayWidget {
             );
             let resp = ui.interact(
                 row,
-                Id::unique(("mv_menu_item", *action_id)),
+                ui.scope_id().with(("mv_menu_item", *action_id)),
                 Sense::click(),
             );
+            resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
             if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 painter.rect_filled(row, CornerRadius::same(5), menu_bg_over);
             }
             painter.text(
@@ -2123,9 +2366,19 @@ impl MediaOverlayWidget {
                     self.trigger_copy(item, backend, world_now_ms, events);
                 }
                 "open_external" => {
-                    if let Ok(path) = backend.open_in_external_app(item.id) {
-                        self.show_toast(strings::OPENED_IN_EXTERNAL_APP, world_now_ms);
-                        events.push(OverlayEvent::OpenExternal(path));
+                    self.trigger_open_external(item, backend, world_now_ms, events);
+                }
+                "attached_stickers" => {
+                    if let Some(media) = item.attached_stickers_media.clone() {
+                        let media_label = if !item.file_name.is_empty() {
+                            item.file_name.clone()
+                        } else if item.kind.is_video_like() {
+                            "Video".to_owned()
+                        } else {
+                            "Photo".to_owned()
+                        };
+                        events.push(OverlayEvent::AttachedStickers { media, media_label });
+                        self.close();
                     }
                 }
                 "forward" => {
@@ -2146,6 +2399,74 @@ impl MediaOverlayWidget {
         }
     }
 
+    /// Returns the active decode/load error message when the viewer is in its error state.
+    #[must_use]
+    pub fn error_message(&self) -> Option<&str> {
+        match &self.content {
+            ActiveContent::Error(msg) => Some(msg.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Triggers saving the currently displayed gallery item into `save_directory` using a
+    /// sanitized, unique filename that cannot escape `save_directory` or overwrite existing files.
+    pub fn save_current_item(
+        &mut self,
+        backend: &dyn MediaBackend,
+        world_now_ms: i64,
+        events: &mut Vec<OverlayEvent>,
+    ) {
+        if let Some(item) = self.gallery.current().cloned() {
+            self.trigger_save(&item, backend, world_now_ms, events);
+        }
+    }
+
+    /// Triggers "Open in External App" on the currently displayed gallery item, emitting
+    /// [`OverlayEvent::ConfirmOpenExternal`] when the file type requires a launch warning.
+    pub fn request_open_external_current(
+        &mut self,
+        backend: &dyn MediaBackend,
+        world_now_ms: i64,
+        events: &mut Vec<OverlayEvent>,
+    ) {
+        if let Some(item) = self.gallery.current().cloned() {
+            self.trigger_open_external(&item, backend, world_now_ms, events);
+        }
+    }
+
+    fn trigger_open_external(
+        &mut self,
+        item: &MediaItem,
+        backend: &dyn MediaBackend,
+        world_now_ms: i64,
+        events: &mut Vec<OverlayEvent>,
+    ) {
+        let safe_name = tg_platform::file_safety::sanitize_filename(&item.file_name);
+        let ext = tg_media::document::file_extension(&safe_name);
+        let needs_warning = ext.is_empty()
+            || tg_media::document::is_ip_revealing_filename(&safe_name)
+            || matches!(
+                tg_media::document::detect_name_type(&safe_name),
+                tg_media::document::NameType::Executable | tg_media::document::NameType::Unknown
+            );
+        if needs_warning {
+            events.push(OverlayEvent::ConfirmOpenExternal {
+                item_id: item.id,
+                file_name: safe_name,
+            });
+            return;
+        }
+        match backend.open_in_external_app(item.id) {
+            Ok(path) => {
+                self.show_toast(strings::OPENED_IN_EXTERNAL_APP, world_now_ms);
+                events.push(OverlayEvent::OpenExternal(path));
+            }
+            Err(err) => {
+                self.show_toast(format!("Failed to open file: {err}"), world_now_ms);
+            }
+        }
+    }
+
     fn trigger_save(
         &mut self,
         item: &MediaItem,
@@ -2153,7 +2474,19 @@ impl MediaOverlayWidget {
         world_now_ms: i64,
         events: &mut Vec<OverlayEvent>,
     ) {
-        let dest = self.save_directory.join(&item.file_name);
+        let dest = match tg_platform::file_safety::resolve_safe_path_in_dir(
+            &self.save_directory,
+            &item.file_name,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                self.show_toast(
+                    format!("{}: {err}", strings::SAVE_FAILED_PREFIX),
+                    world_now_ms,
+                );
+                return;
+            }
+        };
         match backend.save_to_disk(item.id, &dest) {
             Ok(saved) => {
                 let downloads = tg_lang::tr::lng_mediaview_downloads();
@@ -2488,3 +2821,42 @@ pub fn build_caption_layout_job(
     }
     job
 }
+
+fn ellipsize_single_line(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> String {
+    let full = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE);
+    if full.size().x <= max_width {
+        return text.to_owned();
+    }
+    let ellipsis = "\u{2026}";
+    let mut best = String::new();
+    for (idx, _) in text.char_indices() {
+        let candidate = format!("{}{}", &text[..idx], ellipsis);
+        let w = ui
+            .painter()
+            .layout_no_wrap(candidate.clone(), font.clone(), Color32::WHITE)
+            .size()
+            .x;
+        if w <= max_width {
+            best = candidate;
+        } else {
+            break;
+        }
+    }
+    if best.is_empty() {
+        ellipsis.to_owned()
+    } else {
+        best
+    }
+}
+
+#[cfg(test)]
+#[path = "tests_uip_f.rs"]
+#[cfg(test)]
+mod tests_uip_f;
+
+#[cfg(test)]
+#[path = "tests_wp74i_album_strip.rs"]
+#[cfg(test)]
+mod tests_wp74i_album_strip;

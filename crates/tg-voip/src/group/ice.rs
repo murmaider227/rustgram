@@ -365,7 +365,9 @@ pub fn build_ice_binding_response(
     finish_ice_stun(STUN_BINDING_RESPONSE, tx_id, attrs, integrity_key)
 }
 
-/// Verify STUN `FINGERPRINT` and (when both present and key non-empty) `MESSAGE-INTEGRITY`.
+/// Verify STUN `FINGERPRINT` and, when `integrity_key` is `Some`, require and verify
+/// `MESSAGE-INTEGRITY` using that key (failing closed if the attribute is missing or the key is
+/// empty).
 pub fn verify_stun_integrity_and_fingerprint(
     packet: &[u8],
     integrity_key: Option<&[u8]>,
@@ -373,12 +375,18 @@ pub fn verify_stun_integrity_and_fingerprint(
     if !is_stun_packet(packet) {
         return Err(VoipError::Ice("invalid STUN header".into()));
     }
+    if let Some(key) = integrity_key
+        && key.is_empty()
+    {
+        return Err(VoipError::Ice("empty STUN MESSAGE-INTEGRITY key".into()));
+    }
     let msg_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
     let end = 20 + msg_len;
     if end > packet.len() {
         return Err(VoipError::Ice("truncated STUN body".into()));
     }
 
+    let mut saw_integrity = false;
     let mut cursor = 20usize;
     while cursor + 4 <= end {
         let attr_type = u16::from_be_bytes([packet[cursor], packet[cursor + 1]]);
@@ -395,9 +403,7 @@ pub fn verify_stun_integrity_and_fingerprint(
                 if val.len() != 20 {
                     return Err(VoipError::Ice("invalid MESSAGE-INTEGRITY length".into()));
                 }
-                if let Some(key) = integrity_key
-                    && !key.is_empty()
-                {
+                if let Some(key) = integrity_key {
                     let mut prefix = packet[..cursor].to_vec();
                     // Length field in HMAC covers up to and including MESSAGE-INTEGRITY (+24 bytes).
                     let len_mi = (cursor - 20 + 24) as u16;
@@ -409,6 +415,7 @@ pub fn verify_stun_integrity_and_fingerprint(
                         return Err(VoipError::Ice("STUN MESSAGE-INTEGRITY mismatch".into()));
                     }
                 }
+                saw_integrity = true;
             }
             stun_attr::FINGERPRINT => {
                 if val.len() != 4 {
@@ -425,6 +432,12 @@ pub fn verify_stun_integrity_and_fingerprint(
 
         let padded = (attr_len + 3) & !3;
         cursor = val_start + padded;
+    }
+
+    if integrity_key.is_some() && !saw_integrity {
+        return Err(VoipError::Ice(
+            "missing STUN MESSAGE-INTEGRITY attribute".into(),
+        ));
     }
     Ok(())
 }
@@ -581,5 +594,76 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let parsed = parse_join_response(&json).unwrap();
         assert!(matches!(parsed, tg_calls::ParsedJoinResponse::Rtc { .. }));
+    }
+
+    #[test]
+    fn sec2c_w5_ice_requires_stun_message_integrity() {
+        let sfu_addr: SocketAddr = "127.0.0.1:45678".parse().unwrap();
+        let response = RtcJoinResponse {
+            transport: JoinResponseTransport {
+                ufrag: "sfu_uf".into(),
+                pwd: "sfu_password_123456789012".into(),
+                fingerprints: Vec::new(),
+                candidates: vec![IceCandidateParam {
+                    port: "45678".into(),
+                    protocol: "udp".into(),
+                    network: "0".into(),
+                    generation: "0".into(),
+                    id: "1".into(),
+                    component: "1".into(),
+                    foundation: "1".into(),
+                    priority: "2130706431".into(),
+                    ip: "127.0.0.1".into(),
+                    kind: "host".into(),
+                }],
+                rtcp_mux: true,
+            },
+            ..RtcJoinResponse::default()
+        };
+
+        let creds = LocalIceCredentials::generate();
+        let mut client = IceLiteClient::from_join_response(creds, &response).unwrap();
+        let checks = client.poll_outgoing_checks(0);
+        let mut tx_id = [0u8; 12];
+        tx_id.copy_from_slice(&checks[0].1[8..20]);
+
+        // Unauthenticated STUN Binding Response (valid FINGERPRINT, matching tx_id/src, no
+        // MESSAGE-INTEGRITY) must be rejected instead of nominating the candidate.
+        let unauth_resp =
+            build_ice_binding_response(tx_id, "127.0.0.1:50000".parse().unwrap(), None);
+        let err =
+            verify_stun_integrity_and_fingerprint(&unauth_resp, Some(b"sfu_password_123456789012"))
+                .expect_err("authenticated verification must require MESSAGE-INTEGRITY");
+        assert!(
+            err.to_string().contains("MESSAGE-INTEGRITY"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            client.handle_stun(&unauth_resp, sfu_addr, 25).is_err(),
+            "handle_stun must reject STUN Binding Response without MESSAGE-INTEGRITY"
+        );
+        assert_eq!(
+            client.nominated_addr(),
+            None,
+            "unauthenticated STUN response must not nominate any candidate"
+        );
+
+        // Unauthenticated STUN Binding Request must also be rejected.
+        let unauth_req = build_ice_binding_request(tx_id, "user", b"", 100, 1, false);
+        assert!(
+            client.handle_stun(&unauth_req, sfu_addr, 30).is_err(),
+            "handle_stun must reject STUN Binding Request without MESSAGE-INTEGRITY"
+        );
+
+        // Authenticated STUN Binding Response still succeeds.
+        let auth_resp = build_ice_binding_response(
+            tx_id,
+            "127.0.0.1:50000".parse().unwrap(),
+            Some(b"sfu_password_123456789012"),
+        );
+        assert_eq!(
+            client.handle_stun(&auth_resp, sfu_addr, 35).unwrap(),
+            IceStunOutcome::NewlyNominated(sfu_addr)
+        );
     }
 }

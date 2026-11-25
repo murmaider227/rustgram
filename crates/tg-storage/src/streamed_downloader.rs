@@ -14,12 +14,22 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use tg_crypto::{const_time_eq, random_u64, sha256_bytes};
+use tg_crypto::{
+    AES_BLOCK_SIZE, STORAGE_CTR_SALT_SIZE, Sha256Hasher, StorageCtrState, StorageEncryptionKey,
+    const_time_eq, random_bytes, random_u64, sha256, sha256_bytes,
+};
 use tokio::sync::{oneshot, watch};
 
 use crate::cache::binlog::CacheKey;
+use crate::cache::media_cache::lookup_cache_key_for_path;
 use crate::cloud_blob::{sha256_file, sha256_hex};
 use crate::error::StorageError;
+
+/// Binary magic header for encrypted streamed `.part` / finalized cache files (`TGSE`).
+pub const STREAMED_ENC_MAGIC: [u8; 4] = *b"TGSE";
+
+/// Byte length of the encrypted streamed file header (`4` magic + `64` salt + `32` header MAC).
+pub const STREAMED_ENC_HEADER_LEN: u64 = 4 + STORAGE_CTR_SALT_SIZE as u64 + 32;
 
 /// Default streaming part size (128 KiB, matching `Media::Streaming::Loader::kPartSize`).
 pub const STREAMED_PART_SIZE: usize = 128 * 1024;
@@ -524,7 +534,7 @@ pub trait ChunkProvider: Send + Sync + 'static {
 }
 
 /// Configuration for [`StreamedFileDownloader`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StreamedDownloaderConfig {
     /// Logical object identifier (`StreamedFileDownloader::objId`).
     pub object_id: u64,
@@ -544,6 +554,28 @@ pub struct StreamedDownloaderConfig {
     pub part_path: Option<PathBuf>,
     /// Optional explicit path for the partial metadata file (defaults to `<target_path>.part.meta`).
     pub meta_path: Option<PathBuf>,
+    /// Optional encryption key for encrypting `.part` and finalized cache files on disk with
+    /// seekable AES-256-CTR (`StorageEncryptionKey`). When `None`, `StreamedFileDownloader::open`
+    /// also checks whether `target_path` lies under an encrypted [`crate::cache::media_cache`]
+    /// directory and automatically inherits its key.
+    pub encryption_key: Option<StorageEncryptionKey>,
+}
+
+impl std::fmt::Debug for StreamedDownloaderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamedDownloaderConfig")
+            .field("object_id", &self.object_id)
+            .field("cache_key", &self.cache_key)
+            .field("total_size", &self.total_size)
+            .field("part_size", &self.part_size)
+            .field("max_in_flight", &self.max_in_flight)
+            .field("expected_sha256", &self.expected_sha256)
+            .field("target_path", &self.target_path)
+            .field("part_path", &self.part_path)
+            .field("meta_path", &self.meta_path)
+            .field("has_encryption_key", &self.encryption_key.is_some())
+            .finish()
+    }
 }
 
 impl StreamedDownloaderConfig {
@@ -560,7 +592,15 @@ impl StreamedDownloaderConfig {
             target_path: target_path.into(),
             part_path: None,
             meta_path: None,
+            encryption_key: None,
         }
+    }
+
+    /// Enables seekable AES-256-CTR encryption for `.part` and finalized cache files on disk.
+    #[must_use]
+    pub fn with_encryption_key(mut self, key: StorageEncryptionKey) -> Self {
+        self.encryption_key = Some(key);
+        self
     }
 
     /// Resolve the sparse `.part` file path.
@@ -668,11 +708,103 @@ impl MutableState {
     }
 }
 
+struct StreamedCipher {
+    state: StorageCtrState,
+}
+
+impl StreamedCipher {
+    fn new(key: &StorageEncryptionKey, salt: &[u8; STORAGE_CTR_SALT_SIZE]) -> Self {
+        Self {
+            state: key.prepare_ctr_state(salt),
+        }
+    }
+
+    fn header_mac(key: &StorageEncryptionKey, salt: &[u8; STORAGE_CTR_SALT_SIZE]) -> [u8; 32] {
+        sha256(&[key.as_bytes(), salt, &STREAMED_ENC_MAGIC])
+    }
+
+    fn write_header(file: &mut File, key: &StorageEncryptionKey) -> StreamedDownloadResult<Self> {
+        let mut salt = [0u8; STORAGE_CTR_SALT_SIZE];
+        random_bytes(&mut salt);
+        let mac = Self::header_mac(key, &salt);
+        let mut header = [0u8; STREAMED_ENC_HEADER_LEN as usize];
+        header[0..4].copy_from_slice(&STREAMED_ENC_MAGIC);
+        header[4..4 + STORAGE_CTR_SALT_SIZE].copy_from_slice(&salt);
+        header[4 + STORAGE_CTR_SALT_SIZE..].copy_from_slice(&mac);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header)?;
+        Ok(Self::new(key, &salt))
+    }
+
+    fn read_header(file: &mut File, key: &StorageEncryptionKey) -> Option<Self> {
+        file.seek(SeekFrom::Start(0)).ok()?;
+        let mut header = [0u8; STREAMED_ENC_HEADER_LEN as usize];
+        file.read_exact(&mut header).ok()?;
+        if header[0..4] != STREAMED_ENC_MAGIC {
+            return None;
+        }
+        let mut salt = [0u8; STORAGE_CTR_SALT_SIZE];
+        salt.copy_from_slice(&header[4..4 + STORAGE_CTR_SALT_SIZE]);
+        let expected_mac = Self::header_mac(key, &salt);
+        if !const_time_eq(&header[4 + STORAGE_CTR_SALT_SIZE..], &expected_mac) {
+            return None;
+        }
+        Some(Self::new(key, &salt))
+    }
+
+    fn apply_xor(&self, logical_offset: u64, data: &mut [u8]) -> StreamedDownloadResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let block = AES_BLOCK_SIZE as u64;
+        let aligned_start = logical_offset - (logical_offset % block);
+        let end = logical_offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| StreamedDownloadError::InvalidRange("CTR offset overflow".into()))?;
+        let aligned_end = end.div_ceil(block) * block;
+        let ks_len = usize::try_from(aligned_end - aligned_start)
+            .map_err(|_| StreamedDownloadError::InvalidRange("CTR keystream too large".into()))?;
+        let mut keystream = vec![0u8; ks_len];
+        self.state
+            .encrypt(&mut keystream, aligned_start)
+            .map_err(|e| StreamedDownloadError::Io(std::io::Error::other(e.to_string())))?;
+        let skip = (logical_offset - aligned_start) as usize;
+        let data_len = data.len();
+        for (b, k) in data.iter_mut().zip(&keystream[skip..skip + data_len]) {
+            *b ^= *k;
+        }
+        Ok(())
+    }
+
+    fn sha256_decrypted_file(
+        &self,
+        path: &Path,
+        total_size: u64,
+    ) -> StreamedDownloadResult<[u8; 32]> {
+        let mut f = File::open(path)?;
+        f.seek(SeekFrom::Start(STREAMED_ENC_HEADER_LEN))?;
+        let mut hasher = Sha256Hasher::new();
+        let mut remaining = total_size;
+        let mut offset = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len() as u64) as usize;
+            f.read_exact(&mut buf[..to_read])?;
+            self.apply_xor(offset, &mut buf[..to_read])?;
+            hasher.update(&buf[..to_read]);
+            offset += to_read as u64;
+            remaining -= to_read as u64;
+        }
+        Ok(hasher.finalize())
+    }
+}
+
 struct DownloaderInner<P: ChunkProvider> {
     config: StreamedDownloaderConfig,
     part_path: PathBuf,
     meta_path: PathBuf,
     provider: Arc<P>,
+    cipher: Option<StreamedCipher>,
     file: Mutex<Option<File>>,
     state: Mutex<MutableState>,
     progress_tx: watch::Sender<DownloadProgress>,
@@ -743,37 +875,102 @@ impl<P: ChunkProvider> StreamedFileDownloader<P> {
             config.expected_sha256,
         )?;
 
-        let meta = if meta_path.is_file() && part_path.is_file() {
-            match PartialFileMetadata::load(&meta_path) {
-                Ok(loaded)
-                    if loaded.object_id == fresh_meta.object_id
-                        && loaded.total_size == fresh_meta.total_size
-                        && loaded.part_size == fresh_meta.part_size
-                        && loaded.expected_sha256 == fresh_meta.expected_sha256 =>
+        let effective_key = config
+            .encryption_key
+            .clone()
+            .or_else(|| lookup_cache_key_for_path(&config.target_path));
+
+        let (meta, file_opt, cipher, already_finished) = if let Some(ref key) = effective_key {
+            let expected_enc_len = STREAMED_ENC_HEADER_LEN + config.total_size;
+            // Fast-path: reuse an already-finalized valid encrypted target file.
+            let mut reused_final = None;
+            if config.target_path.is_file() {
+                if let Ok(mut existing_target) = File::open(&config.target_path)
+                    && existing_target
+                        .metadata()
+                        .is_ok_and(|m| m.len() == expected_enc_len)
+                    && let Some(c) = StreamedCipher::read_header(&mut existing_target, key)
                 {
-                    let part_len = fs::metadata(&part_path)?.len();
-                    if part_len == config.total_size {
-                        loaded
-                    } else {
-                        fresh_meta
+                    let mut complete_meta = fresh_meta.clone();
+                    for idx in 0..complete_meta.parts_count as usize {
+                        complete_meta.mark_part_saved(idx);
                     }
+                    reused_final = Some((complete_meta, None, Some(c), true));
+                } else {
+                    // Legacy plaintext target under an encrypted cache dir: purge it.
+                    let _ = fs::remove_file(&config.target_path);
                 }
-                _ => fresh_meta,
+            }
+
+            if let Some(reused) = reused_final {
+                reused
+            } else {
+                let mut resumed = None;
+                if meta_path.is_file()
+                    && part_path.is_file()
+                    && let Ok(loaded) = PartialFileMetadata::load(&meta_path)
+                    && loaded.object_id == fresh_meta.object_id
+                    && loaded.total_size == fresh_meta.total_size
+                    && loaded.part_size == fresh_meta.part_size
+                    && loaded.expected_sha256 == fresh_meta.expected_sha256
+                    && let Ok(mut f) = File::options().read(true).write(true).open(&part_path)
+                    && f.metadata().is_ok_and(|m| m.len() == expected_enc_len)
+                    && let Some(c) = StreamedCipher::read_header(&mut f, key)
+                {
+                    resumed = Some((loaded, Some(f), Some(c), false));
+                }
+
+                if let Some(res) = resumed {
+                    res.0.save_atomic(&meta_path)?;
+                    res
+                } else {
+                    let mut f = File::options()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&part_path)?;
+                    let c = StreamedCipher::write_header(&mut f, key)?;
+                    f.set_len(expected_enc_len)?;
+                    f.flush()?;
+                    fresh_meta.save_atomic(&meta_path)?;
+                    (fresh_meta, Some(f), Some(c), false)
+                }
             }
         } else {
-            fresh_meta
-        };
+            let meta = if meta_path.is_file() && part_path.is_file() {
+                match PartialFileMetadata::load(&meta_path) {
+                    Ok(loaded)
+                        if loaded.object_id == fresh_meta.object_id
+                            && loaded.total_size == fresh_meta.total_size
+                            && loaded.part_size == fresh_meta.part_size
+                            && loaded.expected_sha256 == fresh_meta.expected_sha256 =>
+                    {
+                        let part_len = fs::metadata(&part_path)?.len();
+                        if part_len == config.total_size {
+                            loaded
+                        } else {
+                            fresh_meta
+                        }
+                    }
+                    _ => fresh_meta,
+                }
+            } else {
+                fresh_meta
+            };
 
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&part_path)?;
-        if file.metadata()?.len() != config.total_size {
-            file.set_len(config.total_size)?;
-        }
-        meta.save_atomic(&meta_path)?;
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&part_path)?;
+            if file.metadata()?.len() != config.total_size {
+                file.set_len(config.total_size)?;
+            }
+            meta.save_atomic(&meta_path)?;
+            (meta, Some(file), None, false)
+        };
 
         let mutable = MutableState {
             meta,
@@ -781,7 +978,7 @@ impl<P: ChunkProvider> StreamedFileDownloader<P> {
             in_flight: HashMap::new(),
             next_request_id: 1,
             next_sequential_index: 0,
-            finished: false,
+            finished: already_finished,
             cancelled: false,
             last_error: None,
         };
@@ -795,7 +992,8 @@ impl<P: ChunkProvider> StreamedFileDownloader<P> {
                 part_path,
                 meta_path,
                 provider,
-                file: Mutex::new(Some(file)),
+                cipher,
+                file: Mutex::new(file_opt),
                 state: Mutex::new(mutable),
                 progress_tx,
                 progress_rx,
@@ -1475,11 +1673,26 @@ impl<P: ChunkProvider> DownloaderInner<P> {
         }
     }
 
+    fn disk_offset(&self, logical_offset: u64) -> u64 {
+        if self.cipher.is_some() {
+            STREAMED_ENC_HEADER_LEN + logical_offset
+        } else {
+            logical_offset
+        }
+    }
+
     fn write_part_to_disk(&self, offset: u64, bytes: &[u8]) -> StreamedDownloadResult<()> {
+        let disk_pos = self.disk_offset(offset);
         let mut guard = self.file.lock().unwrap();
         let file = guard.as_mut().ok_or(StreamedDownloadError::Cancelled)?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(bytes)?;
+        file.seek(SeekFrom::Start(disk_pos))?;
+        if let Some(ref cipher) = self.cipher {
+            let mut encrypted = bytes.to_vec();
+            cipher.apply_xor(offset, &mut encrypted)?;
+            file.write_all(&encrypted)?;
+        } else {
+            file.write_all(bytes)?;
+        }
         file.flush()?;
         Ok(())
     }
@@ -1490,25 +1703,28 @@ impl<P: ChunkProvider> DownloaderInner<P> {
         len: usize,
         is_finished: bool,
     ) -> StreamedDownloadResult<Vec<u8>> {
+        let disk_pos = self.disk_offset(offset);
         let mut buf = vec![0u8; len];
         if is_finished {
             let mut f = File::open(&self.config.target_path)?;
-            f.seek(SeekFrom::Start(offset))?;
+            f.seek(SeekFrom::Start(disk_pos))?;
             f.read_exact(&mut buf)?;
-            return Ok(buf);
-        }
-        let mut guard = self.file.lock().unwrap();
-        if let Some(file) = guard.as_mut() {
-            file.seek(SeekFrom::Start(offset))?;
-            file.read_exact(&mut buf)?;
-            Ok(buf)
         } else {
-            drop(guard);
-            let mut f = File::open(&self.config.target_path)?;
-            f.seek(SeekFrom::Start(offset))?;
-            f.read_exact(&mut buf)?;
-            Ok(buf)
+            let mut guard = self.file.lock().unwrap();
+            if let Some(file) = guard.as_mut() {
+                file.seek(SeekFrom::Start(disk_pos))?;
+                file.read_exact(&mut buf)?;
+            } else {
+                drop(guard);
+                let mut f = File::open(&self.config.target_path)?;
+                f.seek(SeekFrom::Start(disk_pos))?;
+                f.read_exact(&mut buf)?;
+            }
         }
+        if let Some(ref cipher) = self.cipher {
+            cipher.apply_xor(offset, &mut buf)?;
+        }
+        Ok(buf)
     }
 
     fn finalize_file(&self) -> StreamedDownloadResult<PathBuf> {
@@ -1521,8 +1737,13 @@ impl<P: ChunkProvider> DownloaderInner<P> {
         }
 
         if let Some(expected) = &self.config.expected_sha256 {
-            let actual = sha256_file(&self.part_path)
-                .map_err(|err| StreamedDownloadError::Io(std::io::Error::other(err.to_string())))?;
+            let actual = if let Some(ref cipher) = self.cipher {
+                cipher.sha256_decrypted_file(&self.part_path, self.config.total_size)?
+            } else {
+                sha256_file(&self.part_path).map_err(|err| {
+                    StreamedDownloadError::Io(std::io::Error::other(err.to_string()))
+                })?
+            };
             if !const_time_eq(&actual, expected) {
                 // Re-open the `.part` file handle so state stays inspectable, leave target untouched.
                 if let Ok(reopened) = File::options().read(true).write(true).open(&self.part_path) {
@@ -1535,6 +1756,9 @@ impl<P: ChunkProvider> DownloaderInner<P> {
             }
         }
 
+        if self.config.target_path.exists() {
+            let _ = fs::remove_file(&self.config.target_path);
+        }
         fs::rename(&self.part_path, &self.config.target_path)?;
         let _ = fs::remove_file(&self.meta_path);
 
@@ -1543,5 +1767,97 @@ impl<P: ChunkProvider> DownloaderInner<P> {
         self.notify_state_change(&state);
 
         Ok(self.config.target_path.clone())
+    }
+}
+
+#[cfg(test)]
+mod encrypted_tests {
+    use super::*;
+    use crate::cache::media_cache::{MediaCacheIndex, derive_media_cache_key};
+    use tempfile::TempDir;
+    use tg_crypto::AuthKey;
+
+    struct SliceProvider(Vec<u8>);
+
+    impl ChunkProvider for SliceProvider {
+        fn fetch_chunk(&self, offset: u64, length: usize) -> ChunkFuture<'_> {
+            let start = offset as usize;
+            let end = (start + length).min(self.0.len());
+            let slice = self.0[start..end].to_vec();
+            Box::pin(async move { Ok(slice) })
+        }
+    }
+
+    #[tokio::test]
+    async fn d1_streamed_downloader_encrypts_part_and_final_on_disk() {
+        let dir = TempDir::new().expect("tempdir");
+        let local_key = AuthKey::new([0x55u8; 256]);
+        let key = derive_media_cache_key(&local_key, "data");
+
+        let mut payload = Vec::new();
+        for i in 0..300 {
+            payload.extend_from_slice(format!("SECRET_VIDEO_FRAME_{i:04}_DATA!").as_bytes());
+        }
+        let expected_sha = sha256_bytes(&payload);
+        let target = dir.path().join("stream_001.bin");
+
+        let mut cfg = StreamedDownloaderConfig::new(77, payload.len() as u64, &target)
+            .with_encryption_key(key.clone());
+        cfg.part_size = 1024;
+        cfg.max_in_flight = 2;
+        cfg.expected_sha256 = Some(expected_sha);
+
+        let provider = Arc::new(SliceProvider(payload.clone()));
+        let dl = StreamedFileDownloader::open(cfg.clone(), Arc::clone(&provider)).expect("open");
+
+        // Read an unaligned mid-file range and verify plaintext is NOT present in `.part`.
+        let range = dl.read_range(1500, 777).await.expect("read_range");
+        assert_eq!(range, payload[1500..2277]);
+        let raw_part = fs::read(dl.part_path()).expect("read raw .part");
+        assert!(raw_part.starts_with(&STREAMED_ENC_MAGIC));
+        assert!(
+            !raw_part
+                .windows(b"SECRET_VIDEO_FRAME_".len())
+                .any(|w| w == b"SECRET_VIDEO_FRAME_"),
+            ".part file on disk must not contain plaintext media bytes"
+        );
+
+        // Finalize download and verify finalized file is STILL encrypted on disk while SHA-256 matched plaintext.
+        let finalized = dl.download_all().await.expect("download_all");
+        assert_eq!(finalized, target);
+        let raw_final = fs::read(&target).expect("read raw finalized");
+        assert!(raw_final.starts_with(&STREAMED_ENC_MAGIC));
+        assert!(
+            !raw_final
+                .windows(b"SECRET_VIDEO_FRAME_".len())
+                .any(|w| w == b"SECRET_VIDEO_FRAME_"),
+            "finalized streamed cache file must not contain plaintext media bytes"
+        );
+
+        // Reopening against the finalized encrypted file decrypts cleanly without re-fetching.
+        let dl2 = StreamedFileDownloader::open(cfg, provider).expect("reopen finalized");
+        assert!(dl2.progress().finished);
+        assert_eq!(
+            dl2.read_range(0, payload.len()).await.expect("read full"),
+            payload
+        );
+
+        // Also verify automatic key inheritance when target lies inside an encrypted MediaCacheIndex dir.
+        let cache_dir = dir.path().join("mc");
+        let _idx = MediaCacheIndex::open_with_key(&cache_dir, key).expect("open cache");
+        let auto_target = cache_dir.join("streamed").join("auto.bin");
+        let mut auto_cfg = StreamedDownloaderConfig::new(88, payload.len() as u64, &auto_target);
+        auto_cfg.part_size = 1024;
+        let auto_dl =
+            StreamedFileDownloader::open(auto_cfg, Arc::new(SliceProvider(payload.clone())))
+                .expect("open auto-inherited");
+        auto_dl.download_all().await.expect("auto download_all");
+        let raw_auto = fs::read(&auto_target).expect("read auto");
+        assert!(raw_auto.starts_with(&STREAMED_ENC_MAGIC));
+        assert!(
+            !raw_auto
+                .windows(b"SECRET_VIDEO_FRAME_".len())
+                .any(|w| w == b"SECRET_VIDEO_FRAME_")
+        );
     }
 }

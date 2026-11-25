@@ -980,6 +980,35 @@ impl IvController {
         NavigationDecision::Cancel(Some(target))
     }
 
+    /// Returns `true` when `source_url` matches this controller's configured Instant View origin
+    /// (`self.custom_origin`), rejecting empty URLs, foreign origins, userinfo spoofing, and
+    /// prefix-confused hosts (e.g. `rustgram-internal://iv.evil`).
+    #[must_use]
+    pub fn is_authorized_bridge_sender(&self, source_url: &str) -> bool {
+        let Some(expected) = extract_origin(&self.custom_origin) else {
+            return false;
+        };
+        let Some(actual) = extract_origin(source_url) else {
+            return false;
+        };
+        actual == expected
+    }
+
+    /// Processes a raw JSON message sent by `assets/page.js` via the WebView bridge, authorizing
+    /// the WebView sender `source_url` against this controller's expected Instant View origin.
+    pub fn handle_bridge_json_from_source(
+        &mut self,
+        raw_json: &str,
+        source_url: &str,
+    ) -> Result<Vec<ControllerAction>, IvError> {
+        if !self.is_authorized_bridge_sender(source_url) {
+            return Err(IvError::InvalidBridgeMessage(format!(
+                "unauthorized Instant View bridge sender: '{source_url}'"
+            )));
+        }
+        self.handle_bridge_json(raw_json)
+    }
+
     /// Processes a raw JSON message sent by `assets/page.js` via the WebView bridge.
     pub fn handle_bridge_json(&mut self, raw_json: &str) -> Result<Vec<ControllerAction>, IvError> {
         let msg = BridgeMessage::parse_json(raw_json)?;
@@ -1125,4 +1154,28 @@ impl IvController {
             },
         }
     }
+}
+
+/// Extracts a normalized lowercase `scheme://authority` origin from `url`, rejecting empty inputs,
+/// missing/invalid schemes, whitespace, or userinfo (`@`).
+fn extract_origin(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let (scheme, rest) = trimmed.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    ))
 }

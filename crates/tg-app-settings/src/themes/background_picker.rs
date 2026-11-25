@@ -18,6 +18,21 @@ use tg_ui::theme::{Colors, theme_color_to_egui};
 use crate::themes::backend::{CloudWallPaperRecord, ThemesBackend};
 use crate::themes::chat_background::{BackgroundConfig, ChatBackground, PatternKind};
 use crate::themes::color_editor::{ColorEditorMode, ColorEditorState};
+use tg_app_core::chat_helpers::backend::{ChatHelpersBackend, DefaultEmojiCatalogKind};
+
+/// Curated fallback emoji symbols when a server `DocumentId` from
+/// `account.getDefaultBackgroundEmojis` does not yet have a local `alt_emoji` cached.
+const DEFAULT_BACKGROUND_EMOJI_GLYPHS: &[&str] =
+    &["✨", "🌸", "🌿", "⭐", "🌙", "💎", "🌊", "🔥", "🍀", "🎵"];
+
+/// One default background emoji suggestion loaded from `account.getDefaultBackgroundEmojis`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundEmojiOption {
+    /// Custom emoji document ID returned by `account.getDefaultBackgroundEmojis`.
+    pub document_id: tg_chat::DocumentId,
+    /// Representative emoji glyph rendered on the picker chip.
+    pub emoji: String,
+}
 
 /// Target scope when applying a background from [`BackgroundPreviewState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -545,6 +560,12 @@ pub struct BackgroundPickerState {
     pub custom_file_path: String,
     /// Embedded live preview panel state.
     pub preview: BackgroundPreviewState,
+    /// Default background emojis loaded via `account.getDefaultBackgroundEmojis`.
+    default_emojis: Vec<BackgroundEmojiOption>,
+    /// Currently selected default background emoji ID, if any.
+    selected_emoji_id: Option<tg_chat::DocumentId>,
+    /// Whether `default_emoji_catalog(Background)` has been queried at least once.
+    default_emojis_loaded: bool,
 }
 
 impl BackgroundPickerState {
@@ -563,7 +584,82 @@ impl BackgroundPickerState {
             selected_id,
             custom_file_path: String::new(),
             preview: BackgroundPreviewState::new(first, dark_mode, target_peer),
+            default_emojis: Vec::new(),
+            selected_emoji_id: None,
+            default_emojis_loaded: false,
         }
+    }
+
+    /// Returns default background emojis loaded from `account.getDefaultBackgroundEmojis`.
+    #[must_use]
+    pub fn default_emojis(&self) -> &[BackgroundEmojiOption] {
+        &self.default_emojis
+    }
+
+    /// Returns the currently selected default background emoji document ID, if any.
+    #[must_use]
+    pub const fn selected_emoji_id(&self) -> Option<tg_chat::DocumentId> {
+        self.selected_emoji_id
+    }
+
+    /// Queries `ChatHelpersBackend::default_emoji_catalog(DefaultEmojiCatalogKind::Background, force)`
+    /// (`account.getDefaultBackgroundEmojis`) and caches the resulting pattern emoji chips.
+    pub fn load_default_emojis(
+        &mut self,
+        chat_helpers: &dyn ChatHelpersBackend,
+        force: bool,
+    ) -> Result<usize, String> {
+        let catalog =
+            chat_helpers.default_emoji_catalog(DefaultEmojiCatalogKind::Background, force)?;
+        self.default_emojis_loaded = true;
+        if !catalog.not_modified || self.default_emojis.is_empty() {
+            let mut used_emojis = std::collections::HashSet::new();
+            self.default_emojis = catalog
+                .document_ids
+                .into_iter()
+                .enumerate()
+                .map(|(idx, document_id)| {
+                    let from_doc = chat_helpers
+                        .sticker_document(document_id)
+                        .map(|doc| doc.alt_emoji.clone())
+                        .filter(|e| !e.trim().is_empty() && !used_emojis.contains(e.as_str()));
+                    let emoji = from_doc.unwrap_or_else(|| {
+                        DEFAULT_BACKGROUND_EMOJI_GLYPHS
+                            .iter()
+                            .cycle()
+                            .skip(idx)
+                            .take(DEFAULT_BACKGROUND_EMOJI_GLYPHS.len())
+                            .find(|&&g| !used_emojis.contains(g))
+                            .copied()
+                            .unwrap_or(
+                                DEFAULT_BACKGROUND_EMOJI_GLYPHS
+                                    [idx % DEFAULT_BACKGROUND_EMOJI_GLYPHS.len()],
+                            )
+                            .to_owned()
+                    });
+                    used_emojis.insert(emoji.clone());
+                    BackgroundEmojiOption { document_id, emoji }
+                })
+                .collect();
+        }
+        Ok(self.default_emojis.len())
+    }
+
+    /// Renders the Chat Background Picker, automatically hydrating default background emojis
+    /// from `chat_helpers` (`account.getDefaultBackgroundEmojis`) on first render.
+    pub fn show_with_chat_helpers(
+        &mut self,
+        ui: &mut Ui,
+        chat_bg: &mut ChatBackground,
+        chat_helpers: Option<&dyn ChatHelpersBackend>,
+        colors: &dyn Colors,
+    ) -> BackgroundPickerOutput {
+        if let Some(ch) = chat_helpers
+            && !self.default_emojis_loaded
+        {
+            let _ = self.load_default_emojis(ch, false);
+        }
+        self.show(ui, chat_bg, colors)
     }
 
     /// Returns all gallery items.
@@ -900,6 +996,108 @@ impl BackgroundPickerState {
                 }
             }
         });
+
+        // Server-suggested default background emojis (`account.getDefaultBackgroundEmojis`).
+        if !self.default_emojis.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Pattern Emojis")
+                    .size(12.0)
+                    .strong()
+                    .color(sub_fg),
+            );
+            ui.add_space(4.0);
+            let mut toggled_emoji: Option<(usize, tg_chat::DocumentId, String)> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                for (idx, opt) in self.default_emojis.iter().enumerate() {
+                    let is_sel = self.selected_emoji_id == Some(opt.document_id);
+                    let (chip_rect, chip_resp) =
+                        ui.allocate_exact_size(Vec2::new(34.0, 30.0), Sense::click());
+                    let aria_label = format!("Background emoji {}", opt.emoji);
+                    chip_resp.widget_info(|| {
+                        WidgetInfo::selected(Role::Button, true, is_sel, aria_label.clone())
+                    });
+                    if chip_resp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    let fill = if is_sel {
+                        Color32::from_rgba_unmultiplied(
+                            active_bg.r(),
+                            active_bg.g(),
+                            active_bg.b(),
+                            44,
+                        )
+                    } else if chip_resp.hovered() {
+                        bg_over
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    let stroke = if is_sel || chip_resp.has_focus() {
+                        Stroke::new(1.8, active_bg)
+                    } else {
+                        Stroke::new(1.0, divider)
+                    };
+                    ui.painter()
+                        .rect_filled(chip_rect, CornerRadius::same(8), fill);
+                    ui.painter().rect_stroke(
+                        chip_rect,
+                        CornerRadius::same(8),
+                        stroke,
+                        StrokeKind::Inside,
+                    );
+                    let emoji_rect = Rect::from_center_size(chip_rect.center(), Vec2::splat(18.0));
+                    let emoji_cache = ui.ctx().data_mut(|d| {
+                        d.get_temp_mut_or_insert_with(
+                            egui::Id::unique("tg_bg_picker_emoji_cache"),
+                            || {
+                                std::sync::Arc::new(std::sync::Mutex::new(
+                                    tg_emoji::EmojiTextureCache::new(),
+                                ))
+                            },
+                        )
+                        .clone()
+                    });
+                    if let Ok(mut cache) = emoji_cache.lock() {
+                        let _ = cache.paint_emoji_str(
+                            ui.painter(),
+                            ui.ctx(),
+                            &opt.emoji,
+                            emoji_rect,
+                            Color32::WHITE,
+                        );
+                    }
+                    let activated = chip_resp.clicked()
+                        || (chip_resp.has_focus()
+                            && ui.input(|i| {
+                                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
+                            }));
+                    if activated {
+                        toggled_emoji = Some((idx, opt.document_id, opt.emoji.clone()));
+                    }
+                }
+            });
+            if let Some((idx, doc_id, emoji)) = toggled_emoji {
+                if self.selected_emoji_id == Some(doc_id) {
+                    self.selected_emoji_id = None;
+                } else {
+                    self.selected_emoji_id = Some(doc_id);
+                    let pattern_kinds = [
+                        PatternKind::Doodles,
+                        PatternKind::Waves,
+                        PatternKind::Hexagons,
+                        PatternKind::Botanical,
+                        PatternKind::Constellation,
+                    ];
+                    let chosen_kind = pattern_kinds[idx % pattern_kinds.len()];
+                    self.preview.set_pattern_kind(chosen_kind);
+                    if self.preview.config.wallpaper.intensity == 0 {
+                        self.preview.set_pattern_intensity(42);
+                    }
+                    out.toast = Some(format!("Selected background pattern emoji {emoji}"));
+                }
+            }
+        }
 
         ui.add_space(8.0);
 

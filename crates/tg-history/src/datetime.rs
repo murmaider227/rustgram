@@ -4,6 +4,48 @@
 //! `Telegram/SourceFiles/history/view/history_view_element.cpp` and
 //! `Telegram/SourceFiles/ui/text/format_values.cpp`.
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use chrono::{Local, Offset, TimeZone};
+
+/// Sentinel stored in [`UTC_OFFSET_OVERRIDE`] when no override is active.
+const NO_OVERRIDE: i64 = i64::MIN;
+
+/// Process-wide fixed UTC offset used instead of the system time zone (deterministic tests).
+static UTC_OFFSET_OVERRIDE: AtomicI64 = AtomicI64::new(NO_OVERRIDE);
+
+/// Forces every local-time conversion to use `offset_secs` (`None` restores the system zone).
+///
+/// Headless tests and screenshot captures call this so rendered times do not depend on the
+/// machine's time zone.
+pub fn set_utc_offset_override(offset_secs: Option<i32>) {
+    UTC_OFFSET_OVERRIDE.store(
+        offset_secs.map_or(NO_OVERRIDE, i64::from),
+        Ordering::Relaxed,
+    );
+}
+
+/// UTC offset (seconds east of UTC) of the system local time zone at `unix_secs`, including
+/// daylight saving time, or the value set by [`set_utc_offset_override`].
+#[must_use]
+pub fn local_utc_offset_secs(unix_secs: i64) -> i32 {
+    let forced = UTC_OFFSET_OVERRIDE.load(Ordering::Relaxed);
+    if forced != NO_OVERRIDE {
+        return i32::try_from(forced).unwrap_or(0);
+    }
+    Local
+        .timestamp_opt(unix_secs, 0)
+        .single()
+        .map_or(0, |dt| dt.offset().fix().local_minus_utc())
+}
+
+/// Formats a message time like tdesktop's `QLocale::toString(time, QLocale::ShortFormat)` with a
+/// 24-hour system locale (`"H:mm"`, e.g. `"0:02"`, `"23:47"`).
+#[must_use]
+pub fn format_time_short(dt: LocalDateTime) -> String {
+    format!("{}:{:02}", dt.hour, dt.minute)
+}
+
 /// Day of week (Monday = 1 .. Sunday = 7, matching Qt `QDate::dayOfWeek()`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Weekday {
@@ -155,6 +197,13 @@ impl LocalDateTime {
         }
     }
 
+    /// Converts a Unix timestamp into the system local time zone (`base::unixtime::parse`,
+    /// which tdesktop renders through `QDateTime::fromSecsSinceEpoch` in local time).
+    #[must_use]
+    pub fn from_unix_local(unix_secs: i64) -> Self {
+        Self::from_unix_with_offset(unix_secs, local_utc_offset_secs(unix_secs))
+    }
+
     /// Converts a UTC Unix timestamp (`utc_offset_secs = 0`) into `LocalDateTime`.
     #[must_use]
     pub const fn from_unix_utc(unix_secs: i64) -> Self {
@@ -174,5 +223,24 @@ impl LocalDateTime {
     #[must_use]
     pub const fn secs_to(self, other: Self) -> i64 {
         other.to_local_epoch_secs() - self.to_local_epoch_secs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_conversion_uses_offset_override_and_short_time_format() {
+        set_utc_offset_override(Some(2 * 3600));
+        // 2026-11-24 22:02:00 UTC -> 2026-11-25 00:02 at UTC+2.
+        let dt = LocalDateTime::from_unix_local(1_795_557_720);
+        set_utc_offset_override(None);
+        assert_eq!(dt.date, CivilDate::new(2026, 11, 25));
+        assert_eq!(format_time_short(dt), "0:02");
+        assert_eq!(
+            format_time_short(LocalDateTime::new(2026, 11, 24, 23, 47, 0)),
+            "23:47"
+        );
     }
 }

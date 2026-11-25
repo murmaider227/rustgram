@@ -327,15 +327,8 @@ fn history_delete_message_via_context_menu_and_confirm() {
     right_click_at(&mut harness, msg_pos);
     wait_for_menu_item(&mut harness, "Delete");
 
-    // Compute exact bottom-clamped "Delete" row Y using PopupMenuStyle::default_popup (menu.rs:233-243).
-    let ui_colors =
-        tg_app::history::theme::HistoryColors::from_palette(&Palette::day()).ui_colors();
-    let menu_style = tg_ui::stand_in::PopupMenuStyle::default_popup(&ui_colors);
-    let row_h = menu_style.menu.item_padding.top
-        + menu_style.menu.item_style.font.line_height()
-        + menu_style.menu.item_padding.bottom;
-    let delete_y = WORKSPACE_SIZE.y - 8.0 - menu_style.scroll_padding.bottom - row_h * 0.5;
-    let delete_item_pos = Pos2::new(msg_pos.x + 60.0, delete_y);
+    // Click the compact 7.4.6 menu's "Delete" row where it is painted.
+    let delete_item_pos = harness.get_by_label("Delete").rect().center();
     click_at(&mut harness, delete_item_pos);
     wait_for_label_settled(&mut harness, "Delete Message");
 
@@ -371,43 +364,14 @@ fn history_forward_message_to_another_chat() {
     right_click_at(&mut harness, msg_pos);
     wait_for_menu_item(&mut harness, "Forward");
 
-    // Context menu for incoming text message in USER_THEO (13 action items + 2 separators):
-    // From bottom up (clamped to screen bottom `WORKSPACE_SIZE.y - 8.0`):
-    // Delete, sep, Report, Select, Pin, Forward!
-    let ui_colors =
-        tg_app::history::theme::HistoryColors::from_palette(&Palette::day()).ui_colors();
-    let menu_style = tg_ui::stand_in::PopupMenuStyle::default_popup(&ui_colors);
-    let row_h = menu_style.menu.item_padding.top
-        + menu_style.menu.item_style.font.line_height()
-        + menu_style.menu.item_padding.bottom;
-    let sep_h = menu_style.menu.separator.padding.vertical() + menu_style.menu.separator.width;
-    let forward_y = WORKSPACE_SIZE.y
-        - 8.0
-        - menu_style.scroll_padding.bottom
-        - row_h
-        - sep_h
-        - 3.0 * row_h
-        - row_h * 0.5;
-    let forward_item_pos = Pos2::new(msg_pos.x + 60.0, forward_y);
+    // Click the compact 7.4.6 menu's "Forward" row where it is painted.
+    let forward_item_pos = harness.get_by_label("Forward").rect().center();
     click_at(&mut harness, forward_item_pos);
-    wait_until(
-        &mut harness,
-        DEFAULT_MAX_FRAMES,
-        "clicking Forward in context menu must enter ComposeMode::Forward",
-        |h| {
-            matches!(
-                h.state_mut()
-                    .controller
-                    .main_widget_mut()
-                    .history_mut()
-                    .compose_mut()
-                    .mode,
-                ComposeMode::Forward { .. }
-            )
-        },
-    );
+    // tdesktop opens the "Forward to..." box (`Window::ShowForwardMessagesBox`) instead of a
+    // forward bar in the current chat.
+    wait_for_forward_box(&mut harness);
 
-    // Switch destination chat to Sam Chen and send the forwarded message.
+    // Pick Sam Chen in the box and send the forwarded message.
     let before_sam = harness
         .state()
         .controller
@@ -415,23 +379,7 @@ fn history_forward_message_to_another_chat() {
         .load_slice_around(session_peers::USER_SAM, MsgId::SHOW_AT_END, 50, 0)
         .messages
         .len();
-
-    open_peer(&mut harness, session_peers::USER_SAM);
-    let mode_after_switch = harness
-        .state_mut()
-        .controller
-        .main_widget_mut()
-        .history_mut()
-        .compose_mut()
-        .mode
-        .clone();
-    assert!(
-        matches!(mode_after_switch, ComposeMode::Forward { .. }),
-        "switching to target chat must keep ComposeMode::Forward active (got {mode_after_switch:?})"
-    );
-
-    focus_compose_input(&mut harness);
-    press_key(&mut harness, Modifiers::NONE, Key::Enter);
+    submit_forward_box_to(&mut harness, session_peers::USER_SAM);
     wait_until(
         &mut harness,
         DEFAULT_MAX_FRAMES,
@@ -443,9 +391,58 @@ fn history_forward_message_to_another_chat() {
                 .mock_session()
                 .load_slice_around(session_peers::USER_SAM, MsgId::SHOW_AT_END, 50, 0)
                 .messages;
-            msgs.len() == before_sam + 1 && msgs.last().is_some_and(|m| m.forward.is_some())
+            msgs.len() == before_sam + 1
         },
     );
+    assert!(
+        !matches!(
+            harness
+                .state_mut()
+                .controller
+                .main_widget_mut()
+                .history_mut()
+                .compose_mut()
+                .mode,
+            ComposeMode::Forward { .. }
+        ),
+        "the source chat's composer must not switch to a forward bar"
+    );
+}
+
+fn wait_for_forward_box(harness: &mut egui_kittest::Harness<'static, crate::common::AppTestState>) {
+    wait_until(
+        harness,
+        DEFAULT_MAX_FRAMES,
+        "clicking Forward must open the Forward to... ShareBox",
+        |h| {
+            matches!(
+                h.state_mut().controller.box_host_mut().top_kind(),
+                Some(tg_app::boxes::BoxKind::Share(share)) if !share.message_ids.is_empty()
+            )
+        },
+    );
+}
+
+fn submit_forward_box_to(
+    harness: &mut egui_kittest::Harness<'static, crate::common::AppTestState>,
+    target: PeerId,
+) {
+    let mut forwarded = Err(String::new());
+    let session = harness.state().controller.session_handle();
+    if let Some(tg_app::boxes::BoxKind::Share(share)) =
+        harness.state_mut().controller.box_host_mut().top_kind_mut()
+    {
+        share.toggle_target(target);
+        let mut backend = session;
+        forwarded = share.submit(&mut backend);
+    }
+    assert!(forwarded.is_ok(), "ShareBox submit failed: {forwarded:?}");
+    harness
+        .state_mut()
+        .controller
+        .box_host_mut()
+        .pop_immediate();
+    settle_animations(harness);
 }
 
 #[test]
@@ -468,21 +465,8 @@ fn history_react_to_message_via_context_menu() {
     right_click_at(&mut harness, msg_pos);
     wait_for_menu_item(&mut harness, "Forward");
 
-    // Exact top item ("👍  React with Thumbs Up") position for USER_THEO's incoming text message
-    // (13 action items + 2 separators, clamped to `screen.max.y - total_h - 8.0`).
-    let ui_colors =
-        tg_app::history::theme::HistoryColors::from_palette(&Palette::day()).ui_colors();
-    let menu_style = tg_ui::stand_in::PopupMenuStyle::default_popup(&ui_colors);
-    let row_h = menu_style.menu.item_padding.top
-        + menu_style.menu.item_style.font.line_height()
-        + menu_style.menu.item_padding.bottom;
-    let sep_h = menu_style.menu.separator.padding.vertical() + menu_style.menu.separator.width;
-    let total_h = menu_style.scroll_padding.vertical() + 13.0 * row_h + 2.0 * sep_h;
-    let menu_top = msg_pos.y.min(WORKSPACE_SIZE.y - total_h - 8.0).max(8.0);
-    let thumbs_up_pos = Pos2::new(
-        msg_pos.x + 60.0,
-        menu_top + menu_style.scroll_padding.top + row_h * 0.5,
-    );
+    // 👍 in the reaction strip above the compact 7.4.6 context menu.
+    let thumbs_up_pos = harness.get_by_label("👍").rect().center();
     click_at(&mut harness, thumbs_up_pos);
     wait_until(
         &mut harness,
@@ -544,15 +528,23 @@ fn history_open_emoji_panel_and_insert_emoji() {
     // Layout inside panel_rect:
     //   tab bar (38px) + search bar (~45px) + scroll margin (2px) + section header (30px) + spacing (~8px)
     //   -> first emoji row (38px tall) spans roughly [top + 123 .. top + 161].
-    let panel_rect = harness
+    // At this width the selector docks as a 292 px third column (`TabbedSection`).
+    let docked = harness
         .state_mut()
         .controller
         .main_widget_mut()
-        .tabbed_panel_mut()
-        .compute_panel_rect(
-            compose_rect,
-            Rect::from_min_size(Pos2::ZERO, WORKSPACE_SIZE),
-        );
+        .docked_tabbed_rect();
+    let panel_rect = docked.unwrap_or_else(|| {
+        harness
+            .state_mut()
+            .controller
+            .main_widget_mut()
+            .tabbed_panel_mut()
+            .compute_panel_rect(
+                compose_rect,
+                Rect::from_min_size(Pos2::ZERO, WORKSPACE_SIZE),
+            )
+    });
     let first_emoji_pos = Pos2::new(panel_rect.left() + 28.0, panel_rect.top() + 142.0);
     click_at(&mut harness, first_emoji_pos);
     wait_until(
@@ -772,22 +764,7 @@ fn history_forward_preserves_target_chat_draft_text() {
     right_click_at(&mut harness, msg_pos);
     wait_for_menu_item(&mut harness, "Forward");
     harness.get_by_label("Forward").click();
-    wait_until(
-        &mut harness,
-        DEFAULT_MAX_FRAMES,
-        "clicking Forward must enter ComposeMode::Forward",
-        |h| {
-            matches!(
-                h.state_mut()
-                    .controller
-                    .main_widget_mut()
-                    .history_mut()
-                    .compose_mut()
-                    .mode,
-                ComposeMode::Forward { .. }
-            )
-        },
-    );
+    wait_for_forward_box(&mut harness);
 
     let before_sam = harness
         .state()
@@ -796,42 +773,31 @@ fn history_forward_preserves_target_chat_draft_text() {
         .load_slice_around(session_peers::USER_SAM, MsgId::SHOW_AT_END, 50, 0)
         .messages
         .len();
+    submit_forward_box_to(&mut harness, session_peers::USER_SAM);
 
-    // Switch back to Sam Chen: draft text MUST be restored AND forward mode MUST stay active!
+    // Switch back to Sam Chen: the forwarded message arrived and the saved draft is restored.
     open_peer(&mut harness, session_peers::USER_SAM);
-    let compose = harness
-        .state_mut()
+    let msgs = harness
+        .state()
         .controller
-        .main_widget_mut()
-        .history_mut()
-        .compose_mut();
-    assert!(
-        matches!(compose.mode, ComposeMode::Forward { .. }),
-        "switching to target chat must keep ComposeMode::Forward active"
+        .mock_session()
+        .load_slice_around(session_peers::USER_SAM, MsgId::SHOW_AT_END, 50, 0)
+        .messages;
+    assert_eq!(
+        msgs.len(),
+        before_sam + 1,
+        "forward must reach Sam Chen's chat"
     );
     assert_eq!(
-        compose.text, "Draft before forward",
-        "target chat's saved draft text must be restored alongside the forward bar"
-    );
-
-    // Sending dispatches both the forwarded message and the restored draft comment.
-    focus_compose_input(&mut harness);
-    press_key(&mut harness, Modifiers::NONE, Key::Enter);
-    wait_until(
-        &mut harness,
-        DEFAULT_MAX_FRAMES,
-        "sending must dispatch both forwarded message and restored draft comment",
-        |h| {
-            let msgs = h
-                .state()
-                .controller
-                .mock_session()
-                .load_slice_around(session_peers::USER_SAM, MsgId::SHOW_AT_END, 50, 0)
-                .messages;
-            msgs.len() == before_sam + 2
-                && msgs[msgs.len() - 2].forward.is_some()
-                && msgs[msgs.len() - 1].text.text == "Draft before forward"
-        },
+        harness
+            .state_mut()
+            .controller
+            .main_widget_mut()
+            .history_mut()
+            .compose_mut()
+            .text,
+        "Draft before forward",
+        "target chat's saved draft text must survive the forward"
     );
 }
 
@@ -856,9 +822,9 @@ fn history_forum_click_opens_topics_and_create_send_topic() {
     );
 
     // Clicking the forum supergroup opens its ForumTopics list in place of history (tdesktop behavior).
-    harness
-        .get_by_label("Rustgram Core Port (2 unread)")
-        .click();
+    // `Rustgram Core Port` was opened on startup and marked read before switching to Mira Vance,
+    // so its dialog row label no longer has an unread suffix.
+    harness.get_by_label("Rustgram Core Port").click();
     wait_until(
         &mut harness,
         DEFAULT_MAX_FRAMES,

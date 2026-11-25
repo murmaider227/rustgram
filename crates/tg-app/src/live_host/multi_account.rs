@@ -327,18 +327,152 @@ pub struct MultiAccountWorkspaceHost {
     settings: ShellSettings,
     settings_path: PathBuf,
     tdata_dir: Option<PathBuf>,
+    data_name: String,
+    downloads_dir: PathBuf,
     native_hwnd: isize,
     update_snapshot: UpdateSnapshot,
     widget_helper_path: Option<PathBuf>,
     window_hwnd: usize,
 }
 
-/// Computes the per-account persistent media cache directory inside `tdata`.
+/// Resolves the OS Downloads directory for Rustgram (`<USERPROFILE>/Downloads/Rustgram` on
+/// Windows, `<HOME>/Downloads/Rustgram` on Unix) so the media viewer saves files to the real
+/// user Downloads folder instead of `%TEMP%\rustgram_downloads`.
+#[must_use]
+pub fn resolve_default_downloads_dir() -> PathBuf {
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        return PathBuf::from(profile).join("Downloads").join("Rustgram");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home).join("Downloads").join("Rustgram");
+    }
+    std::env::temp_dir().join("RustgramDownloads")
+}
+
+/// Computes the per-account persistent media cache directory inside `tdata`, keyed by the
+/// account's tdesktop data-name hash (`ToFilePart(compute_data_name_key(compose_data_string(..)))`)
+/// rather than the raw slot index.
+#[must_use]
+pub fn account_media_cache_dir_for_data_name(
+    tdata_dir: &std::path::Path,
+    data_name: &str,
+    slot_index: i32,
+) -> PathBuf {
+    let key_part = tg_session::account::account_data_key_file_part(data_name, slot_index);
+    tdata_dir.join("media_cache").join(key_part)
+}
+
+/// Computes the per-account persistent media cache directory inside `tdata` for the default
+/// `"data"` profile, keyed by the account's data key rather than the slot index.
 #[must_use]
 pub fn account_media_cache_dir(tdata_dir: &std::path::Path, slot_index: i32) -> PathBuf {
-    tdata_dir
+    account_media_cache_dir_for_data_name(tdata_dir, "data", slot_index)
+}
+
+/// Computes the per-account temporary directory inside `tdata` (`tdata/temp_<acc_data_name>`),
+/// matching tdesktop's `Storage::Account::_tempPath`.
+#[must_use]
+pub fn account_temp_dir(tdata_dir: &std::path::Path, data_name: &str, slot_index: i32) -> PathBuf {
+    tdata_dir.join(tg_session::account::account_temp_dir_name(
+        data_name, slot_index,
+    ))
+}
+
+fn cleanup_unlocked_dir_files(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            cleanup_unlocked_dir_files(&p);
+            let _ = std::fs::remove_dir(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+fn configure_account_cache_and_temp(
+    tdata_dir: &std::path::Path,
+    data_name: &str,
+    slot_index: i32,
+    live: &LiveSession,
+) {
+    let cache_dir = account_media_cache_dir_for_data_name(tdata_dir, data_name, slot_index);
+    // Migrate/remove any legacy slot-indexed plaintext cache folder.
+    let legacy_slot_dir = tdata_dir
         .join("media_cache")
-        .join(format!("account_{slot_index}"))
+        .join(format!("account_{slot_index}"));
+    if legacy_slot_dir != cache_dir && legacy_slot_dir.exists() {
+        let _ = std::fs::remove_dir_all(&legacy_slot_dir);
+    }
+
+    if let Some(enc_key) =
+        tg_session::account::resolve_account_cache_key_for_tdata(tdata_dir, data_name, slot_index)
+    {
+        let _ = live.set_media_cache_dir_with_key(cache_dir, enc_key);
+    } else {
+        let _ = live.set_media_cache_dir(cache_dir);
+    }
+
+    let temp_dir = account_temp_dir(tdata_dir, data_name, slot_index);
+    cleanup_unlocked_dir_files(&temp_dir);
+    live.set_account_temp_dir(temp_dir);
+}
+
+fn sync_process_temp_dirs_for_account(temp_dir: Option<&std::path::Path>) {
+    match temp_dir {
+        Some(base) => {
+            crate::history::compose_extras::set_active_round_video_temp_dir(Some(
+                base.join("round_videos"),
+            ));
+            crate::history::video_editor::set_active_video_editor_temp_dir(Some(
+                base.join("video_edit"),
+            ));
+            crate::notifications::utilities::set_default_userpics_dir(Some(
+                base.join("notify_userpics"),
+            ));
+        }
+        None => {
+            crate::history::compose_extras::set_active_round_video_temp_dir(None);
+            crate::history::video_editor::set_active_video_editor_temp_dir(None);
+            crate::notifications::utilities::set_default_userpics_dir(None);
+        }
+    }
+}
+
+/// Starts the requests the main window needs from the network: the first chat-list page
+/// (`LiveSession::start_chats_list_request`), `messages.getDialogFilters` for the folder tabs and
+/// `account.getAutoDownloadSettings`. Nothing waits for them: like tdesktop (`firstShow` right
+/// after `startDomain`, `core/application.cpp:448-451`) the window shows at once, with the chat
+/// list's "Loading..." state, and each reply repaints it when it arrives.
+fn start_main_window_requests(live_session: &LiveSession, egui_ctx: Option<&egui::Context>) {
+    use tg_app_core::dialogs::backend::DialogsBackend;
+    use tg_app_core::settings::backend::SettingsBackend;
+    let repaint = move |ctx: Option<egui::Context>| {
+        if let Some(ctx) = ctx {
+            ctx.request_repaint();
+        }
+    };
+    let ctx = egui_ctx.cloned();
+    live_session.start_chats_list_request(move || repaint(ctx));
+    let session = live_session.clone();
+    let ctx = egui_ctx.cloned();
+    let _ = std::thread::Builder::new()
+        .name("first-frame-warm-up".to_owned())
+        .spawn(move || {
+            let filters = {
+                let session = session.clone();
+                std::thread::spawn(move || {
+                    let _ = DialogsBackend::chat_folders(&session);
+                })
+            };
+            let _ = SettingsBackend::auto_download(&session);
+            let _ = filters.join();
+            repaint(ctx);
+        });
 }
 
 impl MultiAccountWorkspaceHost {
@@ -361,6 +495,8 @@ impl MultiAccountWorkspaceHost {
             settings,
             settings_path,
             tdata_dir: None,
+            data_name: "data".to_owned(),
+            downloads_dir: resolve_default_downloads_dir(),
             native_hwnd: 0,
             update_snapshot: UpdateSnapshot::default(),
             widget_helper_path: None,
@@ -394,6 +530,8 @@ impl MultiAccountWorkspaceHost {
             settings,
             settings_path,
             tdata_dir: None,
+            data_name: "data".to_owned(),
+            downloads_dir: resolve_default_downloads_dir(),
             native_hwnd: 0,
             update_snapshot: UpdateSnapshot::default(),
             widget_helper_path: None,
@@ -402,20 +540,48 @@ impl MultiAccountWorkspaceHost {
     }
 
     /// Configures the `tdata` root directory for this host and binds per-account runtime storage
-    /// (`attach_proxy_tdata_path`, per-account `set_media_cache_dir`, `langpack().attach_tdata_dir`,
-    /// and `attach_shortcuts_tdata_dir`) on all running accounts and every account added subsequently.
+    /// (`attach_proxy_tdata_path`, per-account encrypted `set_media_cache_dir`, account temp dirs,
+    /// `langpack().attach_tdata_dir`, and `attach_shortcuts_tdata_dir`) on all running accounts
+    /// and every account added subsequently.
     pub fn set_tdata_dir(&mut self, tdata_dir: PathBuf) {
+        if let Some((unlocked_name, _)) =
+            tg_session::account::unlocked_domain_key_for_tdata(&tdata_dir)
+        {
+            self.data_name = unlocked_name;
+        }
         self.tdata_dir = Some(tdata_dir.clone());
+        let data_name = self.data_name.clone();
         for (&slot_index, entry) in &mut self.accounts {
             let live = entry.workspace.live_session();
             let _ = live.attach_proxy_tdata_path(tdata_dir.clone());
-            let _ = live.set_media_cache_dir(account_media_cache_dir(&tdata_dir, slot_index));
+            configure_account_cache_and_temp(&tdata_dir, &data_name, slot_index, live);
             let _ = live.langpack().attach_tdata_dir(tdata_dir.clone());
             entry
                 .workspace
                 .controller_mut()
                 .attach_shortcuts_tdata_dir(&tdata_dir);
         }
+        let active_temp = account_temp_dir(&tdata_dir, &self.data_name, self.active_slot);
+        sync_process_temp_dirs_for_account(Some(&active_temp));
+    }
+
+    /// Configures the Downloads directory wired into every account's [`crate::media::MediaOverlayWidget`]
+    /// (`set_save_directory`), replacing the default `%TEMP%\rustgram_downloads` fallback.
+    pub fn set_downloads_dir(&mut self, dir: PathBuf) {
+        self.downloads_dir = dir.clone();
+        for entry in self.accounts.values_mut() {
+            entry
+                .workspace
+                .controller_mut()
+                .media_overlay_mut()
+                .set_save_directory(dir.clone());
+        }
+    }
+
+    /// Returns the active Downloads directory configured for media viewer saves.
+    #[must_use]
+    pub fn downloads_dir(&self) -> &std::path::Path {
+        &self.downloads_dir
     }
 
     /// Returns the configured `tdata` root directory, if any.
@@ -461,9 +627,11 @@ impl MultiAccountWorkspaceHost {
             .set_window_hwnd(self.window_hwnd);
         if let Some(ref tdata_dir) = self.tdata_dir {
             let _ = live_session.attach_proxy_tdata_path(tdata_dir.clone());
-            let _ =
-                live_session.set_media_cache_dir(account_media_cache_dir(tdata_dir, slot_index));
+            configure_account_cache_and_temp(tdata_dir, &self.data_name, slot_index, &live_session);
             let _ = live_session.langpack().attach_tdata_dir(tdata_dir.clone());
+        }
+        if !self.headless {
+            start_main_window_requests(&live_session, egui_ctx);
         }
         let notify_session_handle = live_session.clone();
         let display_name = live_session
@@ -499,6 +667,10 @@ impl MultiAccountWorkspaceHost {
                 .controller_mut()
                 .attach_shortcuts_tdata_dir(tdata_dir);
         }
+        workspace
+            .controller_mut()
+            .media_overlay_mut()
+            .set_save_directory(self.downloads_dir.clone());
         workspace
             .controller_mut()
             .set_window_hwnd(self.window_hwnd as isize);
@@ -549,6 +721,10 @@ impl MultiAccountWorkspaceHost {
         }
         if was_empty || make_active {
             self.active_slot = slot_index;
+            if let Some(ref tdata_dir) = self.tdata_dir {
+                let active_temp = account_temp_dir(tdata_dir, &self.data_name, slot_index);
+                sync_process_temp_dirs_for_account(Some(&active_temp));
+            }
         }
         self.sync_tray_and_menus();
     }
@@ -563,12 +739,27 @@ impl MultiAccountWorkspaceHost {
         }
         if let Some(mut removed) = self.accounts.remove(&slot_index) {
             removed.workspace.controller_mut().set_native_hwnd(0);
+            // Release SQLite/blob file handles before AccountManager wipes the cache directory,
+            // and purge unlocked account temp files.
+            removed
+                .workspace
+                .live_session()
+                .media_cache()
+                .close_to_memory();
+            removed
+                .workspace
+                .live_session()
+                .cleanup_account_temp_files();
             removed.workspace.on_exit();
             let runtime = removed.runtime;
             drop(removed.workspace);
             if let Ok(rt) = Arc::try_unwrap(runtime) {
                 rt.shutdown();
             }
+        }
+        if let Some(ref tdata_dir) = self.tdata_dir {
+            let removed_temp = account_temp_dir(tdata_dir, &self.data_name, slot_index);
+            cleanup_unlocked_dir_files(&removed_temp);
         }
         if self.active_slot == slot_index
             && let Some(&next_slot) = self.accounts.keys().next()
@@ -582,6 +773,12 @@ impl MultiAccountWorkspaceHost {
             if let Ok(mut guard) = self.notify_state.lock() {
                 guard.active_slot = next_slot;
             }
+        }
+        if self.accounts.is_empty() {
+            sync_process_temp_dirs_for_account(None);
+        } else if let Some(ref tdata_dir) = self.tdata_dir {
+            let active_temp = account_temp_dir(tdata_dir, &self.data_name, self.active_slot);
+            sync_process_temp_dirs_for_account(Some(&active_temp));
         }
         self.sync_tray_and_menus();
         (!self.accounts.is_empty()).then_some(self.active_slot)
@@ -607,6 +804,10 @@ impl MultiAccountWorkspaceHost {
             }
             if let Ok(mut guard) = self.notify_state.lock() {
                 guard.active_slot = slot_index;
+            }
+            if let Some(ref tdata_dir) = self.tdata_dir {
+                let active_temp = account_temp_dir(tdata_dir, &self.data_name, slot_index);
+                sync_process_temp_dirs_for_account(Some(&active_temp));
             }
             self.sync_tray_and_menus();
         }
@@ -1097,14 +1298,20 @@ impl MultiAccountWorkspaceHost {
             guard.slots.clear();
         }
         let entries = std::mem::take(&mut self.accounts);
-        for mut entry in entries.into_values() {
+        for (slot_index, mut entry) in entries {
+            entry.workspace.live_session().cleanup_account_temp_files();
             entry.workspace.on_exit();
             let runtime = entry.runtime;
             drop(entry.workspace);
             if let Ok(rt) = Arc::try_unwrap(runtime) {
                 rt.shutdown();
             }
+            if let Some(ref tdata_dir) = self.tdata_dir {
+                let acc_temp = account_temp_dir(tdata_dir, &self.data_name, slot_index);
+                cleanup_unlocked_dir_files(&acc_temp);
+            }
         }
+        sync_process_temp_dirs_for_account(None);
     }
 
     /// Rebuilds the synchronized Main Menu account list, Tray accounts menu, and summed unread
@@ -1208,5 +1415,188 @@ fn compute_session_id(user_id: UserId, is_test_mode: bool) -> u64 {
         base | 0x0100_0000_0000_0000
     } else {
         base
+    }
+}
+
+#[cfg(test)]
+mod sec2b_host_tests {
+    use super::*;
+    use crate::media::backend::MediaItemId;
+    use crate::notifications::manager::NotificationSystem;
+    use crate::notifications::settings::{NotificationPreferences, NotifySettingsStore};
+    use crate::tray::MockTrayPlatform;
+    use tg_api::{DcId, InvocationError, RpcClient};
+    use tg_session::SessionRuntimeConfig;
+    use tg_tl::RemoteCall;
+
+    #[derive(Clone, Default)]
+    struct NoopRpcClient;
+
+    impl RpcClient for NoopRpcClient {
+        type Error = InvocationError;
+
+        async fn invoke<R: RemoteCall + Send + Sync>(
+            &self,
+            _req: &R,
+        ) -> Result<R::Return, Self::Error> {
+            Err(InvocationError::Dropped)
+        }
+
+        async fn invoke_in_dc<R: RemoteCall + Send + Sync>(
+            &self,
+            _dc_id: DcId,
+            _req: &R,
+        ) -> Result<R::Return, Self::Error> {
+            Err(InvocationError::Dropped)
+        }
+
+        fn main_dc_id(&self) -> DcId {
+            2
+        }
+
+        fn set_main_dc_id(&self, _dc_id: DcId) {}
+    }
+
+    #[test]
+    fn d2_account_media_cache_dir_keyed_by_data_key_not_slot() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let tdata = dir.path().join("tdata");
+        let slot0 = account_media_cache_dir(&tdata, 0);
+        let slot1 = account_media_cache_dir(&tdata, 1);
+        let alt_profile_slot0 = account_media_cache_dir_for_data_name(&tdata, "work", 0);
+
+        let name0 = slot0.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert_ne!(
+            name0, "account_0",
+            "media cache folder must be keyed by account data key, not slot index"
+        );
+        assert_eq!(
+            name0,
+            tg_session::account::account_data_key_file_part("data", 0)
+        );
+        assert_ne!(slot0, slot1);
+        assert_ne!(slot0, alt_profile_slot0);
+    }
+
+    #[test]
+    fn d4_host_wires_real_downloads_folder_to_media_overlay() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let system = NotificationSystem::headless(
+            NotificationPreferences::default(),
+            NotifySettingsStore::default(),
+            dir.path().join("userpics"),
+        );
+        let mut host = MultiAccountWorkspaceHost::new_headless_with_tray(
+            ShellSettings::default(),
+            dir.path().join("shell.json"),
+            system,
+            Box::new(MockTrayPlatform::default()),
+        );
+
+        let default_dl = host.downloads_dir().to_path_buf();
+        assert_ne!(
+            default_dl,
+            std::env::temp_dir().join("rustgram_downloads"),
+            "host must resolve real Downloads folder, never %TEMP%\\rustgram_downloads"
+        );
+
+        // Override downloads dir to an isolated TempDir and verify overlay receives it and saves there.
+        let custom_dl = dir.path().join("real_downloads");
+        std::fs::create_dir_all(&custom_dl).expect("mkdir downloads");
+        host.set_downloads_dir(custom_dl.clone());
+
+        let rt = Arc::new(
+            SessionRuntime::start(
+                UserId(42),
+                ErasedRpcClient::new(NoopRpcClient),
+                SessionRuntimeConfig {
+                    init_updates_state: false,
+                    run_get_difference_on_start: false,
+                    load_initial_dialogs: false,
+                    fetch_self_user_on_start: false,
+                    ..SessionRuntimeConfig::default()
+                },
+            )
+            .expect("start runtime"),
+        );
+        host.add_account(0, UserId(42), false, false, rt, None, true, false);
+
+        // Verify the media overlay saves into `custom_dl` (NOT %TEMP%\rustgram_downloads) with Zone.Identifier.
+        let entry = host.account_mut(0).expect("slot 0");
+        let live = entry.workspace.live_session().clone();
+        let photo_id = 99_001u64;
+        let photo = tg_data::PhotoData {
+            id: tg_data::PhotoId(photo_id),
+            access_hash: 1,
+            file_reference: vec![1, 2],
+            date: 1_700_000_000,
+            dc_id: 2,
+            sizes: vec![tg_data::PhotoSize {
+                kind: "y".to_owned(),
+                width: 32,
+                height: 32,
+                size: 14,
+            }],
+            ..tg_data::PhotoData::default()
+        };
+        let ckey = crate::live::media_cache::photo_cache_key(2, photo_id, "y");
+        live.media_cache()
+            .put_blob(
+                &ckey,
+                crate::live::media_cache::MediaCacheTag::Photo,
+                b"DOWNLOADED_IMG",
+            )
+            .expect("seed blob");
+        let peer = tg_data::PeerId::from_user(UserId(99));
+        let mut msg = tg_data::Message::new_text(
+            peer,
+            tg_data::MsgId(50),
+            Some(peer),
+            1_700_000_000,
+            tg_data::TextWithEntities::plain(String::new()),
+        );
+        msg.flags = tg_data::MessageFlags::empty();
+        msg.content = tg_data::MessageContent::Regular {
+            text: tg_data::TextWithEntities::plain(String::new()),
+            media: tg_data::MessageMedia::Photo(Box::new(photo)),
+        };
+        let sess = Arc::clone(live.runtime().session());
+        live.runtime().tokio_handle().block_on(async move {
+            sess.write().await.insert_message(msg);
+        });
+        let item_id = MediaItemId(photo_id);
+
+        let mut events = Vec::new();
+        let ctrl = entry.workspace.controller_mut();
+        ctrl.media_overlay_mut()
+            .open_item(&live, peer.0, item_id, 1_000)
+            .expect("open photo in media overlay");
+        ctrl.media_overlay_mut()
+            .save_current_item(&live, 1_000, &mut events);
+
+        let saved_path = events
+            .iter()
+            .find_map(|ev| match ev {
+                crate::media::OverlayEvent::Saved(path) => Some(path.clone()),
+                _ => None,
+            })
+            .expect("overlay save_current_item must emit OverlayEvent::Saved");
+        let canon_dl = std::fs::canonicalize(&custom_dl).expect("canon dl");
+        let canon_saved = std::fs::canonicalize(&saved_path).expect("canon saved");
+        assert!(
+            canon_saved.starts_with(&canon_dl),
+            "viewer must save into host-wired Downloads dir {}, got {}",
+            canon_dl.display(),
+            canon_saved.display()
+        );
+        #[cfg(windows)]
+        {
+            let mut ads = saved_path.as_os_str().to_os_string();
+            ads.push(":Zone.Identifier");
+            let zone = std::fs::read_to_string(PathBuf::from(ads)).expect("Zone.Identifier ADS");
+            assert!(zone.contains("ZoneId=3"));
+        }
+
+        host.on_exit();
     }
 }

@@ -87,16 +87,35 @@ pub fn serialize_bare_vec<T: Serializable>(items: &[T], buf: &mut Vec<u8>) {
 pub fn deserialize_bare_vec<T: Deserializable>(
     buf: &mut Cursor<'_>,
 ) -> Result<Vec<T>, DeserializeError> {
+    let mut depth = buf.enter_depth()?;
+    let buf = &mut *depth;
     let count = buf.read_i32()?;
     if count < 0 {
         return Err(DeserializeError::NegativeLength(count));
     }
     let count_usize = count as usize;
-    // Cap initial allocation to defend against truncated/malicious large lengths.
-    let prealloc = count_usize.min(buf.remaining() / 4).min(4096);
+    let elem_size = core::mem::size_of::<T>();
+    // Cap initial allocation to defend against truncated/malicious large lengths
+    // and avoid preallocating past the remaining cumulative byte budget.
+    let max_prealloc_by_budget = buf
+        .remaining_alloc_bytes()
+        .checked_div(elem_size)
+        .unwrap_or(4096);
+    let max_prealloc_cap = (64 * 1024usize)
+        .checked_div(elem_size)
+        .map_or(4096, |n| n.clamp(1, 4096));
+    let prealloc = count_usize
+        .min(buf.remaining() / 4)
+        .min(max_prealloc_by_budget)
+        .min(max_prealloc_cap);
     let mut out = Vec::with_capacity(prealloc);
     for _ in 0..count_usize {
-        out.push(T::deserialize(buf)?);
+        let item = T::deserialize(buf)?;
+        buf.charge_elements(1)?;
+        if elem_size > 0 {
+            buf.charge_alloc(elem_size)?;
+        }
+        out.push(item);
     }
     Ok(out)
 }
@@ -235,6 +254,7 @@ impl<T: Serializable> Serializable for Box<T> {
 
 impl<T: Deserializable> Deserializable for Box<T> {
     fn deserialize(buf: &mut Cursor<'_>) -> Result<Self, DeserializeError> {
+        buf.charge_alloc(core::mem::size_of::<T>())?;
         Ok(Box::new(T::deserialize(buf)?))
     }
 }
@@ -277,7 +297,9 @@ impl Serializable for RawObject {
 
 impl Deserializable for RawObject {
     fn deserialize(buf: &mut Cursor<'_>) -> Result<Self, DeserializeError> {
-        Ok(Self(buf.read_remaining().to_vec()))
+        let rem = buf.read_remaining();
+        buf.charge_alloc(rem.len())?;
+        Ok(Self(rem.to_vec()))
     }
 }
 

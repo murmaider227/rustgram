@@ -138,67 +138,33 @@ pub fn factorize(pq: u64) -> (u64, u64) {
     }
 }
 
-/// Factorize an arbitrary-size big-endian unsigned integer `pq` into `(p, q)` with `p <= q`
-/// (port of `FactorizePQ` / `FactorizeBigPQ` in `mtproto/details/mtproto_dc_key_creator.cpp`).
+/// Maximum accepted byte length of MTProto `resPQ.pq` before factorization (64-bit unsigned).
+pub const MAX_PQ_BYTES: usize = 8;
+
+/// Factorize a big-endian unsigned integer `pq` (at most [`MAX_PQ_BYTES`] = 8 bytes) into
+/// `(p, q)` with `p <= q` (port of `FactorizePQ` in `mtproto/details/mtproto_dc_key_creator.cpp`,
+/// rejecting oversized `pq` payloads before factorizing to prevent pre-auth CPU exhaustion).
 pub fn factorize_bytes(pq_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-    let pq = BigUint::from_bytes_be(pq_bytes);
-    if pq < BigUint::from(4u32) {
+    if pq_bytes.len() > MAX_PQ_BYTES {
+        return Err(CryptoError::InvalidLength("pq must be at most 8 bytes"));
+    }
+
+    let mut pq: u64 = 0;
+    for &b in pq_bytes {
+        pq = (pq << 8) | u64::from(b);
+    }
+    if pq < 4 {
         return Err(CryptoError::FactorizationFailed);
     }
 
-    if let Some(small) = pq.to_u64() {
-        let (p, q) = factorize(small);
-        if p <= 1 || p.checked_mul(q) != Some(small) {
-            return Err(CryptoError::FactorizationFailed);
-        }
-        return Ok((
-            BigUint::from(p).to_bytes_be(),
-            BigUint::from(q).to_bytes_be(),
-        ));
+    let (p, q) = factorize(pq);
+    if p <= 1 || p.checked_mul(q) != Some(pq) {
+        return Err(CryptoError::FactorizationFailed);
     }
-
-    // BigUint Brent-Pollard rho (for pq >= 2^64).
-    let two = BigUint::from(2u32);
-    if (&pq & BigUint::one()).is_zero() {
-        let q: BigUint = &pq >> 1usize;
-        return Ok((two.to_bytes_be(), q.to_bytes_be()));
-    }
-    for &sp in SMALL_PRIMES {
-        let d = BigUint::from(sp);
-        if (&pq % &d).is_zero() {
-            let q = &pq / &d;
-            return if d <= q {
-                Ok((d.to_bytes_be(), q.to_bytes_be()))
-            } else {
-                Ok((q.to_bytes_be(), d.to_bytes_be()))
-            };
-        }
-    }
-
-    for i in 0..16u32 {
-        let t = BigUint::from(17u32 + (random_u64() % 16) as u32);
-        let mut a = BigUint::from(random_u64());
-        let mut b = a.clone();
-        let lim = 1u32 << (i.min(4) + 20);
-        for j in 1..lim {
-            a = (&a * &a + &t) % &pq;
-            let diff = if a >= b { &a - &b } else { &b - &a };
-            let g = gcd_biguint(diff, pq.clone());
-            if g > BigUint::one() && g < pq {
-                let other = &pq / &g;
-                return if g <= other {
-                    Ok((g.to_bytes_be(), other.to_bytes_be()))
-                } else {
-                    Ok((other.to_bytes_be(), g.to_bytes_be()))
-                };
-            }
-            if (j & (j - 1)) == 0 {
-                b = a.clone();
-            }
-        }
-    }
-
-    Err(CryptoError::FactorizationFailed)
+    Ok((
+        BigUint::from(p).to_bytes_be(),
+        BigUint::from(q).to_bytes_be(),
+    ))
 }
 
 /// Validate that `prime_bytes` is a 2048-bit safe prime (`p` and `(p - 1) / 2` both prime)
@@ -389,15 +355,6 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
         b -= a;
     }
     a << shift
-}
-
-fn gcd_biguint(mut a: BigUint, mut b: BigUint) -> BigUint {
-    while !b.is_zero() {
-        let r = &a % &b;
-        a = b;
-        b = r;
-    }
-    a
 }
 
 /// Deterministic Miller-Rabin primality test for all 64-bit unsigned integers.

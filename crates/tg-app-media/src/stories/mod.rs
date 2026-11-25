@@ -222,6 +222,23 @@ impl AppStoriesHost {
         true
     }
 
+    /// Closes the story viewer, composer and drafts box when the app locks behind the local
+    /// passcode (`Application::closeAdditionalWindows`); nothing reopens until the host renders
+    /// the stories host again after unlock.
+    pub fn close_for_passcode_lock(&mut self) {
+        if self.viewer.is_open() {
+            self.viewer.close(&mut self.store, &mut self.media_cache);
+        }
+        self.composer = None;
+        self.drafts_box = None;
+    }
+
+    /// Returns `true` when the viewer, composer or drafts box is showing.
+    #[must_use]
+    pub fn has_open_window(&self) -> bool {
+        self.viewer.is_open() || self.composer.is_some() || self.drafts_box.is_some()
+    }
+
     /// Opens the [`StoryDraftsBox`] modal.
     pub fn open_drafts(&mut self, choosing_media: bool) {
         self.composer = None;
@@ -396,6 +413,11 @@ impl AppStoriesHost {
         self.viewer.take_premium_request()
     }
 
+    /// Consumes a pending request from an unsupported story card to check for app updates.
+    pub const fn take_update_app_request(&mut self) -> bool {
+        self.viewer.take_update_app_request()
+    }
+
     /// Drives store timers and renders the fullscreen [`StoryViewerOverlay`] when open.
     ///
     /// Also binds `Ctrl+Shift+S` to open the featured interactive story viewer for quick manual testing.
@@ -511,6 +533,24 @@ impl AppStoriesHost {
                     composer.error_message = Some(err);
                 } else {
                     self.show_toast("Close Friends updated", now_ms);
+                }
+                true
+            }
+            SendStoryOutcome::SaveStoriesBlocklist(peers) => {
+                match self.backend.save_stories_blocklist(&peers) {
+                    Ok(_) => {
+                        self.show_toast(
+                            if peers.is_empty() {
+                                "Stories blocklist cleared"
+                            } else {
+                                "Stories blocklist updated"
+                            },
+                            now_ms,
+                        );
+                    }
+                    Err(err) => {
+                        composer.error_message = Some(err);
+                    }
                 }
                 true
             }

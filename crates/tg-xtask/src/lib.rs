@@ -6,6 +6,7 @@
 
 pub mod dist;
 pub mod icon;
+pub mod winrc;
 
 use thiserror::Error;
 

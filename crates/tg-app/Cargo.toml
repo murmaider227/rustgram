@@ -56,6 +56,7 @@ tg-bots = { path = "../tg-bots" }
 tg-calls = { path = "../tg-calls" }
 tg-chat = { path = "../tg-chat" }
 tg-crypto = { path = "../tg-crypto" }
+tg-emoji = { path = "../tg-emoji" }
 tg-history = { path = "../tg-history" }
 tg-iv = { path = "../tg-iv" }
 tg-lottie = { path = "../tg-lottie" }

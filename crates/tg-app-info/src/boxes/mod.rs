@@ -7,6 +7,8 @@ pub mod about;
 pub mod about_cocoon;
 pub mod add_contact;
 pub mod add_proxy;
+pub mod attached_stickers;
+pub mod block_user;
 pub mod bot_info_extras;
 pub mod calendar;
 pub mod chat_import;
@@ -20,13 +22,16 @@ pub mod create_peer;
 pub mod delete_messages;
 pub use tg_app_core::core_types::dto::dictionaries;
 pub mod edit_peer;
+pub mod edit_peer_extras;
 pub mod emoji_userpic;
 pub mod invite_links;
 pub mod join_invite;
 pub mod join_requests;
 pub mod language;
 pub mod managed_bot;
+pub mod mini_app_confirm;
 pub mod moderate_messages;
+pub mod mute;
 pub mod ownership_transfer;
 pub mod peer_color;
 pub mod peer_list;
@@ -35,6 +40,7 @@ pub mod peer_reactions;
 pub mod peer_tags;
 pub mod photo_crop;
 pub mod report;
+pub mod security_confirm;
 pub mod self_destruct;
 pub mod share;
 pub mod sticker_creator;
@@ -62,6 +68,7 @@ use crate::boxes::about::AboutBoxState;
 use crate::boxes::about_cocoon::AboutCocoonBoxState;
 use crate::boxes::add_contact::AddContactBoxState;
 use crate::boxes::add_proxy::{AddProxyBoxState, route_proxy_link};
+use crate::boxes::attached_stickers::{AttachedStickersAction, AttachedStickersBoxState};
 use crate::boxes::bot_info_extras::{
     BotIntroPreviewBoxState, MusicAttachBoxState, TranslateBotInfoBoxState,
 };
@@ -90,12 +97,16 @@ use crate::boxes::edit_peer::{
     AdminsListAction, AdminsListBoxState, AutoDeleteTimerBoxState, EditAdminRightsBoxState,
     EditPeerInfoBoxState, EditPeerSubAction, EditPermissionsBoxState,
 };
+use crate::boxes::edit_peer_extras::{EditGroupStickersBoxState, EditHistoryVisibilityBoxState};
 use crate::boxes::emoji_userpic::EmojiUserpicBoxState;
 use crate::boxes::invite_links::{EditInviteLinksBoxState, InviteLinksBoxAction, InviteLinksView};
 use crate::boxes::join_invite::JoinInviteBoxState;
 use crate::boxes::join_requests::{JoinRequestsAction, JoinRequestsBoxState};
 use crate::boxes::language::LanguageBoxState;
 use crate::boxes::managed_bot::{CreateManagedBotBoxState, EditBotInfoBoxState};
+use crate::boxes::mini_app_confirm::{
+    BotStartConfirmBoxState, MiniAppConfirmBodyAction, MiniAppOpenConfirmBoxState,
+};
 use crate::boxes::moderate_messages::ModerateMessagesBoxState;
 use crate::boxes::ownership_transfer::{OwnershipTransferBoxState, OwnershipTransferStep};
 use crate::boxes::peer_color::EditPeerColorBoxState;
@@ -107,6 +118,7 @@ use crate::boxes::peer_reactions::EditPeerReactionsBoxState;
 use crate::boxes::peer_tags::EditPeerTagBoxState;
 use crate::boxes::photo_crop::PhotoCropBoxState;
 use crate::boxes::report::{ReportBoxState, ReportStep};
+use crate::boxes::security_confirm::{HiddenLinkConfirmBoxState, LaunchFileConfirmBoxState};
 use crate::boxes::share::ShareBoxState;
 use crate::boxes::sticker_set::{StickerSetBoxState, StickerSetOwnerAction};
 use crate::boxes::terms::TermsOfServiceBoxState;
@@ -122,6 +134,12 @@ use tg_app_core::stand_in::types::{MsgId, PeerId};
 pub enum BoxKind {
     /// Generic confirmation dialog (`Ui::ConfirmBox`).
     Confirm(ConfirmBoxState),
+    /// "Block {name}" confirmation (`Window::PeerMenuBlockUserBox`).
+    BlockUser(crate::boxes::block_user::BlockUserBoxState),
+    /// "Mute notifications for..." (`PickMuteBox`).
+    MuteFor(crate::boxes::mute::MuteForBoxState),
+    /// "Notification Sound" (`RingtonesBox`).
+    SelectTone(crate::boxes::mute::SelectToneBoxState),
     /// Phone confirmation verification code dialog (`Ui::ConfirmPhoneBox` / `tg://confirmphone`).
     ConfirmPhoneCode(ConfirmPhoneCodeBoxState),
     /// Add Contact dialog (`AddContactBox`).
@@ -227,6 +245,20 @@ pub enum BoxKind {
     TranslateBotInfo(TranslateBotInfoBoxState),
     /// Saved profile music attachment picker dialog (`boxes/music_attach_box.cpp`).
     MusicAttach(MusicAttachBoxState),
+    /// Chat History Visibility for New Members modal (`edit_peer_history_visibility_box.cpp`).
+    EditHistoryVisibility(EditHistoryVisibilityBoxState),
+    /// Group Stickers & Custom Emoji Pack selector (`channels.setStickers` / `setEmojiStickers`).
+    EditGroupStickers(EditGroupStickersBoxState),
+    /// Attached Sticker / Mask / Emoji sets chooser (`messages.getAttachedStickers`).
+    AttachedStickers(AttachedStickersBoxState),
+    /// Hidden external link confirmation dialog (`HiddenUrlClickHandler::Open`).
+    HiddenLinkConfirm(HiddenLinkConfirmBoxState),
+    /// Executable / unknown / extensionless / IP-revealing file launch warning (`Data::LaunchWithWarning`).
+    LaunchFileConfirm(LaunchFileConfirmBoxState),
+    /// First-open Mini App consent box (`WebViewInstance::confirmOpen`).
+    MiniAppOpenConfirm(MiniAppOpenConfirmBoxState),
+    /// START box for a bot `?start=` link (`HistoryWidget::_botStart`).
+    BotStartConfirm(BotStartConfirmBoxState),
 }
 
 impl BoxKind {
@@ -235,6 +267,9 @@ impl BoxKind {
     pub fn to_modal(&self, id: &str) -> BoxModal {
         match self {
             Self::Confirm(s) => s.to_modal(id),
+            Self::BlockUser(s) => s.to_modal(id),
+            Self::MuteFor(s) => s.to_modal(id),
+            Self::SelectTone(s) => s.to_modal(id),
             Self::ConfirmPhoneCode(s) => s.to_modal(id),
             Self::AddContact(s) => s.to_modal(id),
             Self::CreateGroup(s) => s.to_modal(id),
@@ -285,6 +320,13 @@ impl BoxKind {
             Self::BankCardAction(s) => s.to_modal(id),
             Self::CollectibleInfo(s) => s.to_modal(id),
             Self::EditPeerTag(s) => s.to_modal(id),
+            Self::EditHistoryVisibility(s) => s.to_modal(id),
+            Self::EditGroupStickers(s) => s.to_modal(id),
+            Self::AttachedStickers(s) => s.to_modal(id),
+            Self::HiddenLinkConfirm(s) => s.to_modal(id),
+            Self::LaunchFileConfirm(s) => s.to_modal(id),
+            Self::MiniAppOpenConfirm(s) => s.to_modal(id),
+            Self::BotStartConfirm(s) => s.to_modal(id),
         }
     }
 }
@@ -298,6 +340,22 @@ pub enum BoxEvent {
     PeerCreated(PeerId),
     /// A peer's profile or settings were updated.
     PeerUpdated(PeerId),
+    /// The user pressed "Block" in the block box: block, then report / delete as chosen.
+    BlockUserConfirmed(crate::boxes::block_user::BlockUserChoice),
+    /// "Mute" in "Mute notifications for...": mute `peer_id` for `seconds`.
+    MuteDialogFor {
+        /// The chat.
+        peer_id: PeerId,
+        /// Duration in seconds.
+        seconds: i32,
+    },
+    /// "Save" in "Notification Sound".
+    DialogToneChosen {
+        /// The chat.
+        peer_id: PeerId,
+        /// `true` for "No sound".
+        silent: bool,
+    },
     /// A photo crop completed with final pixel dimensions `(width, height)`.
     PhotoCropped {
         /// Optional target peer id.
@@ -428,6 +486,50 @@ pub enum BoxEvent {
         phone_code_hash: String,
         /// Digits-only verification code entered by the user.
         code: String,
+    },
+    /// User selected one attached sticker/mask/emoji pack inside [`BoxKind::AttachedStickers`].
+    OpenAttachedStickerSet {
+        /// Numeric sticker set ID.
+        set_id: u64,
+        /// Short name slug.
+        short_name: String,
+        /// Pack display title.
+        title: String,
+        /// `true` for custom-emoji sets.
+        is_emoji: bool,
+    },
+    /// Requests the host controller to hydrate the newly pushed [`BoxKind::EmojiUserpic`]
+    /// from [`tg_app_core::chat_helpers::backend::ChatHelpersBackend::default_emoji_catalog`].
+    LoadEmojiUserpicCatalog {
+        /// Target peer ID.
+        peer_id: PeerId,
+        /// Whether to load profile-photo or group-photo default emojis.
+        catalog_kind: tg_app_core::chat_helpers::backend::DefaultEmojiCatalogKind,
+    },
+    /// User confirmed launching a risky external file in [`BoxKind::LaunchFileConfirm`].
+    LaunchExternalFileConfirmed {
+        /// Target media item ID.
+        item_id: tg_app_core::media::backend::MediaItemId,
+        /// Optional extension to add to `no_warning_extensions` when the user checked "Remember".
+        remember_extension: Option<String>,
+        /// `true` if the user opted out of future IP-reveal warnings.
+        disable_ip_reveal_warning: bool,
+    },
+    /// User pressed Launch in [`BoxKind::MiniAppOpenConfirm`]; the bot becomes trusted.
+    MiniAppOpenConfirmed {
+        /// Bot that owns the Mini App.
+        bot_id: PeerId,
+        /// Optional explicit launch URL.
+        url: Option<String>,
+        /// Optional start parameter.
+        start_param: Option<String>,
+    },
+    /// User pressed START in [`BoxKind::BotStartConfirm`].
+    BotStartConfirmed {
+        /// Bot to start.
+        bot_id: PeerId,
+        /// Deep-link start token.
+        start_param: String,
     },
 }
 
@@ -762,6 +864,9 @@ impl BoxHost {
                                         | BoxKind::WelcomeMessages(_)
                                         | BoxKind::CollectibleInfo(_)
                                         | BoxKind::EditPeerTag(_)
+                                        | BoxKind::EditHistoryVisibility(_)
+                                        | BoxKind::EditGroupStickers(_)
+                                        | BoxKind::AttachedStickers(_)
                                 );
                                 ui.horizontal(|ui| {
                                     ui.add_space(style.content_padding.left);
@@ -994,9 +1099,35 @@ impl BoxHost {
             BoxKind::Confirm(s) if action_id == "confirm" => {
                 let tag = s.tag.clone();
                 let checked = s.checkbox_checked;
-                if matches!(tag, ConfirmTag::DeclineTerms) {
-                    events.push(BoxEvent::TermsResolved { accepted: false });
-                    events.push(BoxEvent::Toast(strings::TOAST_TOS_DECLINED.to_owned()));
+                match &tag {
+                    ConfirmTag::DeclineTerms => {
+                        events.push(BoxEvent::TermsResolved { accepted: false });
+                        events.push(BoxEvent::Toast(strings::TOAST_TOS_DECLINED.to_owned()));
+                    }
+                    ConfirmTag::ConvertToGigagroup(pid) => match backend.convert_to_gigagroup(*pid)
+                    {
+                        Ok(()) => {
+                            events.push(BoxEvent::PeerUpdated(*pid));
+                            events.push(BoxEvent::Toast(tr::lng_gigagroup_done()));
+                        }
+                        Err(err) => {
+                            events.push(BoxEvent::Toast(err));
+                        }
+                    },
+                    ConfirmTag::DeactivateAllUsernames(pid) => {
+                        match backend.deactivate_all_channel_usernames(*pid) {
+                            Ok(()) => {
+                                events.push(BoxEvent::PeerUpdated(*pid));
+                                events.push(BoxEvent::Toast(
+                                    "All collectible usernames deactivated".to_owned(),
+                                ));
+                            }
+                            Err(err) => {
+                                events.push(BoxEvent::Toast(err));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 events.push(BoxEvent::Confirmed(tag, checked));
                 should_pop = true;
@@ -1201,6 +1332,24 @@ impl BoxHost {
                         should_pop = true;
                     }
                 }
+            }
+            BoxKind::BlockUser(s) if action_id == "block" => {
+                events.push(BoxEvent::BlockUserConfirmed(s.confirmed()));
+                should_pop = true;
+            }
+            BoxKind::MuteFor(s) if action_id == "mute" => {
+                events.push(BoxEvent::MuteDialogFor {
+                    peer_id: s.peer_id,
+                    seconds: s.seconds(),
+                });
+                should_pop = true;
+            }
+            BoxKind::SelectTone(s) if action_id == "save" => {
+                events.push(BoxEvent::DialogToneChosen {
+                    peer_id: s.peer_id,
+                    silent: s.silent,
+                });
+                should_pop = true;
             }
             BoxKind::Report(s) => match (s.step, action_id) {
                 (ReportStep::SelectReason, "next") => {
@@ -1634,6 +1783,63 @@ impl BoxHost {
                 events.push(BoxEvent::Toast(format!("Card number copied: {}", s.number)));
                 should_pop = true;
             }
+            BoxKind::EditHistoryVisibility(s) if action_id == "save" => {
+                let pid = s.peer_id;
+                if s.submit(backend).is_ok() {
+                    events.push(BoxEvent::PeerUpdated(pid));
+                    events.push(BoxEvent::Toast(
+                        "Chat history visibility updated".to_owned(),
+                    ));
+                    should_pop = true;
+                }
+            }
+            BoxKind::EditGroupStickers(s) => {
+                let pid = s.peer_id;
+                if action_id == "save" && s.submit(backend).is_ok() {
+                    events.push(BoxEvent::PeerUpdated(pid));
+                    events.push(BoxEvent::Toast("Group sticker pack updated".to_owned()));
+                    should_pop = true;
+                } else if action_id == "clear_stickers" && s.clear_all(backend).is_ok() {
+                    events.push(BoxEvent::PeerUpdated(pid));
+                    events.push(BoxEvent::Toast("Group sticker packs removed".to_owned()));
+                    should_pop = true;
+                }
+            }
+            BoxKind::HiddenLinkConfirm(s) => match action_id {
+                "open" => {
+                    events.push(BoxEvent::OpenExternalUrl(s.url.clone()));
+                    should_pop = true;
+                }
+                "copy" => {
+                    ctx.copy_text(s.url.clone());
+                    s.copied = true;
+                    events.push(BoxEvent::Toast(tr::lng_username_copied()));
+                }
+                _ => {}
+            },
+            BoxKind::LaunchFileConfirm(s) if action_id == "launch" => {
+                events.push(BoxEvent::LaunchExternalFileConfirmed {
+                    item_id: s.item_id,
+                    remember_extension: s.remembered_extension().map(ToOwned::to_owned),
+                    disable_ip_reveal_warning: s.should_disable_ip_reveal_warning(),
+                });
+                should_pop = true;
+            }
+            BoxKind::MiniAppOpenConfirm(s) if action_id == "launch" => {
+                events.push(BoxEvent::MiniAppOpenConfirmed {
+                    bot_id: s.bot_id,
+                    url: s.url.clone(),
+                    start_param: s.start_param.clone(),
+                });
+                should_pop = true;
+            }
+            BoxKind::BotStartConfirm(s) if action_id == "start" => {
+                events.push(BoxEvent::BotStartConfirmed {
+                    bot_id: s.bot_id,
+                    start_param: s.start_param.clone(),
+                });
+                should_pop = true;
+            }
             _ => {}
         }
 
@@ -1672,6 +1878,9 @@ fn render_box_kind_body(
 ) {
     match kind {
         BoxKind::Confirm(s) => s.show_body(ui, colors),
+        BoxKind::BlockUser(s) => s.show_body(ui, colors),
+        BoxKind::MuteFor(s) => s.show_body(ui, colors),
+        BoxKind::SelectTone(s) => s.show_body(ui, colors),
         BoxKind::ConfirmPhoneCode(s) => {
             if let Some(act) = s.show_body(ui, colors) {
                 match act {
@@ -1770,9 +1979,23 @@ fn render_box_kind_body(
                             .as_ref()
                             .map(|p| p.title.clone())
                             .unwrap_or_else(|| s.title.clone());
-                        *deferred_push = Some(BoxKind::EmojiUserpic(EmojiUserpicBoxState::new(
-                            s.peer_id, title,
-                        )));
+                        let is_group_or_channel = peer_snap
+                            .as_ref()
+                            .map_or(s.kind.is_group() || s.kind.is_channel(), |p| {
+                                p.kind.is_group() || p.kind.is_channel()
+                            });
+                        let catalog_kind = if is_group_or_channel {
+                            tg_app_core::chat_helpers::backend::DefaultEmojiCatalogKind::GroupPhoto
+                        } else {
+                            tg_app_core::chat_helpers::backend::DefaultEmojiCatalogKind::ProfilePhoto
+                        };
+                        *deferred_push = Some(BoxKind::EmojiUserpic(
+                            EmojiUserpicBoxState::with_catalog_kind(s.peer_id, title, catalog_kind),
+                        ));
+                        body_events.push(BoxEvent::LoadEmojiUserpicCatalog {
+                            peer_id: s.peer_id,
+                            catalog_kind,
+                        });
                     }
                     EditPeerSubAction::OpenReactions => {
                         let title = peer_snap
@@ -1834,6 +2057,52 @@ fn render_box_kind_body(
                             ));
                         }
                     }
+                    EditPeerSubAction::OpenHistoryVisibility => {
+                        let is_legacy = s.kind == crate::info::backend::InfoPeerKind::Group;
+                        *deferred_push = Some(BoxKind::EditHistoryVisibility(
+                            EditHistoryVisibilityBoxState::new(
+                                s.peer_id,
+                                is_legacy,
+                                s.mgmt.pre_history_hidden,
+                            ),
+                        ));
+                    }
+                    EditPeerSubAction::OpenGroupStickers => {
+                        *deferred_push =
+                            Some(BoxKind::EditGroupStickers(EditGroupStickersBoxState::new(
+                                s.peer_id,
+                                s.mgmt.sticker_set.as_ref(),
+                                s.mgmt.emoji_set.as_ref(),
+                            )));
+                    }
+                    EditPeerSubAction::ConvertToGigagroup => {
+                        *deferred_push = Some(BoxKind::Confirm(
+                            ConfirmBoxState::new(
+                                tr::lng_gigagroup_warning_title(),
+                                format!(
+                                    "{}\n\n• {}\n• {}\n• {}",
+                                    tr::lng_gigagroup_warning().replace("**", ""),
+                                    tr::lng_gigagroup_convert_feature1(),
+                                    tr::lng_gigagroup_convert_feature2(),
+                                    tr::lng_gigagroup_convert_feature3(),
+                                ),
+                                tr::lng_gigagroup_convert_sure(),
+                                ConfirmTag::ConvertToGigagroup(s.peer_id),
+                            )
+                            .attention(true),
+                        ));
+                    }
+                    EditPeerSubAction::DeactivateAllUsernames => {
+                        *deferred_push = Some(BoxKind::Confirm(
+                            ConfirmBoxState::new(
+                                "Deactivate Collectible Usernames",
+                                "All active collectible usernames assigned to this channel or group will be hidden. You can re-enable them later.",
+                                "Deactivate All",
+                                ConfirmTag::DeactivateAllUsernames(s.peer_id),
+                            )
+                            .attention(true),
+                        ));
+                    }
                 }
             }
         }
@@ -1870,11 +2139,81 @@ fn render_box_kind_body(
         BoxKind::PeerList(s) => {
             let pool: Vec<_> = match s.purpose {
                 PeerListPurpose::AddMembers { .. } => contacts.to_vec(),
-                PeerListPurpose::LinkDiscussion { .. } => all_peers
-                    .iter()
-                    .filter(|p| p.kind.is_group())
-                    .cloned()
-                    .collect(),
+                PeerListPurpose::LinkDiscussion { .. } => {
+                    let from_rpc = backend.groups_for_discussion().unwrap_or_default();
+                    if !from_rpc.is_empty() {
+                        from_rpc
+                            .into_iter()
+                            .map(|cand| {
+                                if let Some(existing) = backend.peer_profile(cand.peer_id) {
+                                    existing
+                                } else {
+                                    let status = match cand.username.as_deref() {
+                                        Some(u) if !u.is_empty() => format!("@{u}"),
+                                        _ => tr::lng_manage_discussion_group_private_status(),
+                                    };
+                                    let mut usernames = Vec::new();
+                                    if let Some(u) = cand.username {
+                                        usernames.push(crate::info::backend::PeerUsername {
+                                            username: u,
+                                            is_editable: true,
+                                            is_active: true,
+                                        });
+                                    }
+                                    crate::info::backend::PeerProfile {
+                                        id: cand.peer_id,
+                                        kind: if cand.is_megagroup {
+                                            crate::info::backend::InfoPeerKind::Supergroup
+                                        } else {
+                                            crate::info::backend::InfoPeerKind::Group
+                                        },
+                                        title: cand.title,
+                                        status,
+                                        is_online: false,
+                                        verified: false,
+                                        premium: false,
+                                        color_index: (cand.peer_id.bare() % 7) as u8,
+                                        phone: None,
+                                        usernames,
+                                        bio: String::new(),
+                                        birthday: None,
+                                        invite_link: None,
+                                        muted: false,
+                                        is_contact: false,
+                                        is_blocked: false,
+                                        can_edit: true,
+                                        can_add_members: false,
+                                        can_manage_admins: false,
+                                        can_manage_permissions: false,
+                                        is_public: cand.is_public,
+                                        no_forwards: false,
+                                        is_forum: false,
+                                        members_count: cand.members_count,
+                                        online_count: 0,
+                                        admins_count: 0,
+                                        default_banned_rights:
+                                            tg_data::rights::ChatBannedRights::empty(),
+                                        slowmode_seconds: 0,
+                                        auto_delete_ttl_seconds: 0,
+                                        linked_discussion_peer: None,
+                                        bot_commands_count: 0,
+                                        bot_reads_all_messages: false,
+                                        has_mini_app: false,
+                                        media_counts:
+                                            crate::info::backend::SharedMediaCounts::default(),
+                                        group_call: Default::default(),
+                                    }
+                                }
+                            })
+                            .collect()
+                    } else {
+                        all_peers
+                            .iter()
+                            .filter(|p| p.kind.is_group())
+                            .cloned()
+                            .collect()
+                    }
+                }
                 PeerListPurpose::PickAdmin { peer_id } => {
                     let members = backend.peer_members(peer_id, "");
                     members
@@ -2014,6 +2353,35 @@ fn render_box_kind_body(
                             bytes.len()
                         )));
                     }
+                    PeerQrBodyAction::RefreshContactToken => match backend.export_contact_token() {
+                        Ok(info) => {
+                            s.apply_contact_token(&info);
+                            body_events.push(BoxEvent::Toast(
+                                "Temporary contact QR link refreshed".to_owned(),
+                            ));
+                        }
+                        Err(err) => {
+                            s.status_message =
+                                Some(format!("{} ({err})", tr::lng_peer_qr_link_unavailable()));
+                        }
+                    },
+                    PeerQrBodyAction::ExportNoPaidMessagesToken { revoke, temporary } => {
+                        match backend.export_no_paid_messages_token(revoke, temporary) {
+                            Ok(info) => {
+                                let toast =
+                                    s.apply_no_paid_messages_token(&info, revoke, temporary);
+                                body_events.push(BoxEvent::Toast(toast));
+                            }
+                            Err(err) => {
+                                s.status_message =
+                                    Some(format!("{} ({err})", tr::lng_peer_qr_link_unavailable()));
+                            }
+                        }
+                    }
+                    PeerQrBodyAction::RestoreMessageFee => {
+                        s.restore_plain_link();
+                        body_events.push(BoxEvent::Toast(tr::lng_no_paid_token_toast_restored()));
+                    }
                 }
             }
         }
@@ -2025,8 +2393,7 @@ fn render_box_kind_body(
                         body_events.push(BoxEvent::Toast(format!("Copied: {text}")));
                     }
                     CollectibleInfoBodyAction::OpenFragmentUrl(url) => {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
-                        body_events.push(BoxEvent::Toast(format!("Opening Fragment: {url}")));
+                        body_events.push(BoxEvent::OpenExternalUrl(url));
                     }
                 }
             }
@@ -2226,5 +2593,31 @@ fn render_box_kind_body(
                 }
             }
         }
+        BoxKind::EditHistoryVisibility(s) => s.show_body(ui, colors),
+        BoxKind::EditGroupStickers(s) => s.show_body(ui, colors),
+        BoxKind::AttachedStickers(s) => {
+            if let Some(AttachedStickersAction::OpenSet {
+                set_id,
+                short_name,
+                title,
+                is_emoji,
+            }) = s.show_body(ui, colors)
+            {
+                body_events.push(BoxEvent::OpenAttachedStickerSet {
+                    set_id,
+                    short_name,
+                    title,
+                    is_emoji,
+                });
+            }
+        }
+        BoxKind::HiddenLinkConfirm(s) => s.show_body(ui, colors),
+        BoxKind::LaunchFileConfirm(s) => s.show_body(ui, colors),
+        BoxKind::MiniAppOpenConfirm(s) => {
+            if let Some(MiniAppConfirmBodyAction::OpenTerms(url)) = s.show_body(ui, colors) {
+                body_events.push(BoxEvent::OpenExternalUrl(url));
+            }
+        }
+        BoxKind::BotStartConfirm(s) => s.show_body(ui, colors),
     }
 }

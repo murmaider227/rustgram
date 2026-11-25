@@ -55,8 +55,9 @@ pub use backend::{
 };
 
 pub use background_picker::{
-    BackgroundApplyScope, BackgroundCategory, BackgroundGalleryItem, BackgroundPickerOutput,
-    BackgroundPickerState, BackgroundPreviewOutput, BackgroundPreviewState, builtin_gallery_items,
+    BackgroundApplyScope, BackgroundCategory, BackgroundEmojiOption, BackgroundGalleryItem,
+    BackgroundPickerOutput, BackgroundPickerState, BackgroundPreviewOutput, BackgroundPreviewState,
+    builtin_gallery_items,
 };
 pub use chat_background::{
     BackgroundConfig, ChatBackground, PatternKind, active_chat_background, aspect_fill_uv,
@@ -143,6 +144,9 @@ pub struct ThemesStudio {
     pub preview_show_custom: bool,
     /// Cached rendered theme preview textures.
     pub preview_cache: ThemePreviewCache,
+    /// Whether `open_share_theme_for_peer` requested scrolling to the Shareable Theme Backdrop
+    /// picker on the next render frame.
+    pending_scroll_to_share_theme: bool,
     /// Optional live cloud themes/wallpapers RPC backend (`LiveSession`).
     backend: Option<Arc<dyn ThemesBackend>>,
     /// Cloud themes fetched via `account.getThemes`.
@@ -191,6 +195,7 @@ impl ThemesStudio {
             preview_embedded: EmbeddedType::Default,
             preview_show_custom: false,
             preview_cache: ThemePreviewCache::default(),
+            pending_scroll_to_share_theme: false,
             backend: None,
             cloud_themes: Vec::new(),
             saved_cloud_theme_ids: HashSet::new(),
@@ -547,6 +552,15 @@ impl ThemesStudio {
         }
     }
 
+    /// Hydrates default background pattern emojis in [`Self::bg_picker`] via
+    /// `ChatHelpersBackend::default_emoji_catalog(DefaultEmojiCatalogKind::Background, false)`.
+    pub fn hydrate_default_background_emojis(
+        &mut self,
+        chat_helpers: &dyn tg_app_core::chat_helpers::backend::ChatHelpersBackend,
+    ) -> Result<usize, String> {
+        self.bg_picker.load_default_emojis(chat_helpers, false)
+    }
+
     /// Renders the complete Theme Studio panel into `ui`. Returns `true` if Close was clicked.
     pub fn show(&mut self, ui: &mut Ui, show_close: bool) -> bool {
         let now_ms = self.elapsed_ms();
@@ -555,6 +569,23 @@ impl ThemesStudio {
 
     /// Deterministic timestamp variant of [`Self::show`] (used in unit tests & screenshots).
     pub fn show_at(&mut self, ui: &mut Ui, show_close: bool, now_ms: i64) -> bool {
+        self.show_at_with_chat_helpers(ui, show_close, now_ms, None)
+    }
+
+    /// Deterministic timestamp variant of [`Self::show`] that also supplies a
+    /// [`tg_app_core::chat_helpers::backend::ChatHelpersBackend`] for default background emojis.
+    pub fn show_at_with_chat_helpers(
+        &mut self,
+        ui: &mut Ui,
+        show_close: bool,
+        now_ms: i64,
+        chat_helpers: Option<&dyn tg_app_core::chat_helpers::backend::ChatHelpersBackend>,
+    ) -> bool {
+        if let Some(ch) = chat_helpers
+            && self.bg_picker.default_emojis().is_empty()
+        {
+            let _ = self.bg_picker.load_default_emojis(ch, false);
+        }
         if self.backend.is_some() && !self.cloud_loaded {
             let _ = self.refresh_cloud_catalogs();
         }
@@ -882,6 +913,10 @@ impl ThemesStudio {
                                 ui.add_space(16.0);
                                 ui.separator();
                                 ui.add_space(12.0);
+
+                                if std::mem::take(&mut self.pending_scroll_to_share_theme) {
+                                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                                }
 
                                 let gift_records = self.chat_theme_picker.gift_theme_records();
                                 let share_out = self.share_theme_picker.show(
@@ -1455,6 +1490,14 @@ impl AppThemesHost {
         host.lock().map(|guard| guard.open).unwrap_or(false)
     }
 
+    /// Closes the Theme Studio overlay (passcode lock: `Application::closeAdditionalWindows`).
+    pub fn close(ctx: &Context) {
+        let host = Self::get_or_init(ctx);
+        if let Ok(mut guard) = host.lock() {
+            guard.open = false;
+        }
+    }
+
     /// Returns the currently selected [`ThemesTab`] in the Theme Studio overlay.
     #[must_use]
     pub fn active_tab(ctx: &Context) -> ThemesTab {
@@ -1488,6 +1531,21 @@ impl AppThemesHost {
         if let Ok(mut guard) = host.lock() {
             guard.studio.clear_backend();
             guard.bound_session_key = None;
+        }
+    }
+
+    /// Hydrates default pattern background emojis (`account.getDefaultBackgroundEmojis`)
+    /// into the overlay's [`BackgroundPickerState`] once when the Backgrounds tab is open.
+    pub fn hydrate_default_background_emojis(
+        ctx: &Context,
+        chat_helpers: &dyn crate::chat_helpers::backend::ChatHelpersBackend,
+    ) {
+        let host = Self::get_or_init(ctx);
+        if let Ok(mut guard) = host.lock()
+            && guard.open
+            && guard.studio.active_tab == ThemesTab::Backgrounds
+        {
+            let _ = guard.studio.hydrate_default_background_emojis(chat_helpers);
         }
     }
 
@@ -1656,6 +1714,7 @@ impl AppThemesHost {
         if let Ok(mut guard) = host.lock() {
             guard.studio.set_target_peer(peer_id, peer_name);
             guard.studio.active_tab = ThemesTab::ChatThemes;
+            guard.studio.pending_scroll_to_share_theme = true;
             guard.open = true;
             guard.studio.night_scheduler.set_editing_theme(false);
             if guard.studio.has_backend() {
@@ -1727,8 +1786,14 @@ impl AppThemesHost {
         }
 
         let screen_rect = ctx.content_rect();
-        let panel_w = (screen_rect.width() * 0.78).clamp(520.0, 960.0);
-        let panel_h = (screen_rect.height() - 40.0).clamp(440.0, 780.0);
+        let max_w = (screen_rect.width() - 16.0).max(260.0);
+        let panel_w = if max_w < 520.0 {
+            max_w
+        } else {
+            (screen_rect.width() * 0.78).clamp(520.0, 960.0).min(max_w)
+        };
+        let max_h = (screen_rect.height() - 24.0).max(280.0);
+        let panel_h = (screen_rect.height() - 40.0).clamp(280.0, 780.0).min(max_h);
         let panel_pos = Pos2::new(
             screen_rect.center().x - panel_w / 2.0,
             screen_rect.center().y - panel_h / 2.0,

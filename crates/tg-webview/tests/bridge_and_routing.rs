@@ -284,12 +284,10 @@ fn parse_all_core_mini_app_events_from_tdesktop_array_wire_format() {
         other => panic!("unexpected event: {other:?}"),
     }
 
-    // Object wire format + forward-compatible unknown event
-    let (_, ev) = parse_mini_app_event(
-        r#"{"eventType":"web_app_future_feature","eventData":{"flag":true}}"#,
-        src,
-    )
-    .unwrap();
+    // Forward-compatible unknown event (array wire format; raw objects are rejected outside
+    // authenticated external-shell mode).
+    let (_, ev) =
+        parse_mini_app_event(r#"["web_app_future_feature", {"flag":true}]"#, src).unwrap();
     match ev {
         MiniAppEvent::Unknown {
             event_type,

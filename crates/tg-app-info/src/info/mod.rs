@@ -32,6 +32,8 @@ pub mod wrap_widget;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_wp78;
 
 pub use actions::{ProfileAction, ProfileActionsView};
 pub use backend::{
@@ -265,6 +267,7 @@ fn peer_profile_from_summary(summary: &PeerSummary) -> PeerProfile {
         bot_reads_all_messages: false,
         has_mini_app: false,
         media_counts: SharedMediaCounts::default(),
+        group_call: Default::default(),
     }
 }
 
@@ -642,5 +645,149 @@ impl InfoBackend for SinglePeerFallback {
     ) -> Result<bool, String> {
         self.inner
             .toggle_chat_star_gift_notifications(peer_id, enabled)
+    }
+    fn channel_management_state(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<crate::info::backend::ChannelManagementState> {
+        self.inner.channel_management_state(peer_id)
+    }
+    fn toggle_pre_history_hidden(&mut self, peer_id: PeerId, hidden: bool) -> Result<(), String> {
+        self.inner.toggle_pre_history_hidden(peer_id, hidden)
+    }
+    fn groups_for_discussion(
+        &self,
+    ) -> Result<Vec<crate::info::backend::DiscussionGroupCandidate>, String> {
+        self.inner.groups_for_discussion()
+    }
+    fn convert_to_gigagroup(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.inner.convert_to_gigagroup(peer_id)
+    }
+    fn deactivate_all_channel_usernames(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.inner.deactivate_all_channel_usernames(peer_id)
+    }
+    fn toggle_channel_forum(
+        &mut self,
+        peer_id: PeerId,
+        enabled: bool,
+        tabs: bool,
+    ) -> Result<(), String> {
+        self.inner.toggle_channel_forum(peer_id, enabled, tabs)
+    }
+    fn toggle_participants_hidden(&mut self, peer_id: PeerId, hidden: bool) -> Result<(), String> {
+        self.inner.toggle_participants_hidden(peer_id, hidden)
+    }
+    fn toggle_view_forum_as_messages(
+        &mut self,
+        peer_id: PeerId,
+        as_messages: bool,
+    ) -> Result<(), String> {
+        self.inner
+            .toggle_view_forum_as_messages(peer_id, as_messages)
+    }
+    fn set_boosts_to_unblock_restrictions(
+        &mut self,
+        peer_id: PeerId,
+        boosts: u32,
+    ) -> Result<(), String> {
+        self.inner
+            .set_boosts_to_unblock_restrictions(peer_id, boosts)
+    }
+    fn set_channel_sticker_set(
+        &mut self,
+        peer_id: PeerId,
+        set: crate::info::backend::ChannelStickerSetRef,
+    ) -> Result<(), String> {
+        self.inner.set_channel_sticker_set(peer_id, set)
+    }
+    fn set_channel_emoji_sticker_set(
+        &mut self,
+        peer_id: PeerId,
+        set: crate::info::backend::ChannelStickerSetRef,
+    ) -> Result<(), String> {
+        self.inner.set_channel_emoji_sticker_set(peer_id, set)
+    }
+    fn update_channel_paid_messages_price(
+        &mut self,
+        peer_id: PeerId,
+        broadcast_messages_allowed: bool,
+        stars_per_message: i64,
+    ) -> Result<(), String> {
+        self.inner.update_channel_paid_messages_price(
+            peer_id,
+            broadcast_messages_allowed,
+            stars_per_message,
+        )
+    }
+    fn toggle_channel_autotranslation(
+        &mut self,
+        peer_id: PeerId,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.inner.toggle_channel_autotranslation(peer_id, enabled)
+    }
+    fn delete_basic_chat(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.inner.delete_basic_chat(peer_id)
+    }
+    fn admins_with_invites(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Vec<crate::info::backend::AdminWithInvitesEntry>, String> {
+        self.inner.admins_with_invites(peer_id)
+    }
+    fn delete_contacts(&mut self, peer_ids: &[PeerId]) -> Result<(), String> {
+        self.inner.delete_contacts(peer_ids)
+    }
+    fn export_contact_token(
+        &self,
+    ) -> Result<tg_app_core::core_types::dto::contacts_extras::ExportedContactTokenInfo, String>
+    {
+        self.inner.export_contact_token()
+    }
+    fn import_contact_token(&mut self, token: &str) -> Result<PeerId, String> {
+        self.inner.import_contact_token(token)
+    }
+    fn export_no_paid_messages_token(
+        &self,
+        revoke: bool,
+        temporary: bool,
+    ) -> Result<
+        tg_app_core::core_types::dto::contacts_extras::ExportedNoPaidMessagesTokenInfo,
+        String,
+    > {
+        self.inner.export_no_paid_messages_token(revoke, temporary)
+    }
+    fn import_no_paid_messages_token(
+        &mut self,
+        peer_id: PeerId,
+        token: &str,
+    ) -> Result<
+        tg_app_core::core_types::dto::contacts_extras::NoPaidMessagesTokenImportResult,
+        String,
+    > {
+        self.inner.import_no_paid_messages_token(peer_id, token)
+    }
+    fn contact_note(&self, peer_id: PeerId) -> Option<tg_text::TextWithEntities> {
+        self.inner.contact_note(peer_id)
+    }
+    fn update_contact_note(
+        &mut self,
+        peer_id: PeerId,
+        note: tg_text::TextWithEntities,
+    ) -> Result<bool, String> {
+        self.inner.update_contact_note(peer_id, note)
+    }
+    fn delete_profile_photos(
+        &mut self,
+        photos: &[crate::info::backend::ProfilePhotoRef],
+    ) -> Result<Vec<i64>, String> {
+        self.inner.delete_profile_photos(photos)
+    }
+    fn upload_contact_profile_photo(
+        &mut self,
+        peer_id: PeerId,
+        request: tg_app_core::core_types::dto::contacts_extras::ContactProfilePhotoUpload,
+    ) -> Result<i64, String> {
+        self.inner.upload_contact_profile_photo(peer_id, request)
     }
 }

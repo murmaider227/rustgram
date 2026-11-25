@@ -11,10 +11,14 @@ use egui::{
     Ui, Vec2, WidgetInfo,
 };
 use tg_ui::painter::BoxShadow;
-use tg_ui::stand_in::{Align, BoxShadowStyle, Point, UnreadBadgeStyle};
+use tg_ui::stand_in::{
+    Align, BoxShadowStyle, Point, PopupMenuStyle, ToggleStyle, UnreadBadgeStyle,
+};
 use tg_ui::unread_badge::{UnreadBadgeKind, paint_unread_badge};
 use tg_ui::userpic::EmptyUserpic;
 use tg_ui::widgets::buttons::{IconKind, paint_icon};
+use tg_ui::widgets::media_marker::{paint_media_marker, split_media_marker};
+use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
 
 use crate::history::backend::{
     ContactStatusBanner, HistoryPeerInfo, MediaUploadStatus, PinnedMessageSummary,
@@ -32,6 +36,9 @@ pub const JOIN_REQUESTS_BAR_HEIGHT: f32 = 44.0;
 pub const BUSINESS_BOT_BAR_HEIGHT: f32 = 44.0;
 /// Height of one active outgoing upload progress row docked above the compose bar.
 pub const UPLOAD_PROGRESS_ROW_HEIGHT: f32 = 44.0;
+
+/// `st::topBarSkip` (info.style): the chat menu toggle overlaps its left neighbour by 5px.
+const TOP_BAR_SKIP: f32 = -5.0;
 
 /// Events emitted from the top bar or multi-select bar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,18 +74,303 @@ pub enum PinnedBarEvent {
     Unpin(MsgId),
 }
 
-/// Events emitted from the contact status banner.
+/// Events emitted from the contact status banner (`history_view_contact_status.cpp`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContactStatusEvent {
-    /// Add peer to contacts.
+    /// Add peer to contacts (`contacts.acceptContact` / `contacts.addContact`).
     AddContact,
-    /// Block or unblock peer.
+    /// Share own phone number with peer (`contacts.acceptContact`).
+    SharePhone,
+    /// Block or unblock peer (`contacts.block` / `contacts.unblock`).
     ToggleBlock,
-    /// Dismiss banner.
+    /// User clicked `"Report Spam"` — prompts inline destructive confirmation.
+    ReportSpam,
+    /// User confirmed `"Report"` in the inline Report Spam confirmation strip (`messages.reportSpam`).
+    ConfirmReportSpam,
+    /// User cancelled the inline Report Spam confirmation strip.
+    CancelReportSpam,
+    /// Dismiss banner (`messages.hidePeerSettingsBar`).
     Dismiss,
 }
 
-/// Paints the normal history top bar (`history_view_top_bar_widget.cpp`, height `54px`).
+/// Resolved bounding boxes for the contact status banner (used for painting and narrow-viewport tests).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContactStatusBarLayout {
+    /// Action button rects in left-to-right order.
+    pub action_rects: Vec<Rect>,
+    /// Dismiss (`×`) button rect on the right edge.
+    pub dismiss_rect: Rect,
+    /// Whether the bar is in compact narrow-viewport mode (`< 430px`).
+    pub compact: bool,
+}
+
+/// Computes non-overlapping bounding boxes for [`paint_contact_status_bar`] at any viewport width.
+#[must_use]
+pub fn compute_contact_status_bar_layout(
+    rect: Rect,
+    banner: &ContactStatusBanner,
+) -> ContactStatusBarLayout {
+    let compact = rect.width() < 430.0;
+    let dismiss_rect = Rect::from_center_size(
+        Pos2::new(rect.right() - 20.0, rect.center().y),
+        Vec2::splat(26.0),
+    );
+    let content_right = (dismiss_rect.left() - 6.0).max(rect.left() + 60.0);
+    let content_w = (content_right - rect.left()).max(60.0);
+
+    let action_rects = match banner {
+        ContactStatusBanner::AddOrBlock { .. } => {
+            // 3-way split: Add contact | Block user | Report Spam
+            let w1 = (content_w * 0.34).floor();
+            let w2 = (content_w * 0.31).floor();
+            let r1 = Rect::from_min_size(rect.min, Vec2::new(w1, rect.height()));
+            let r2 = Rect::from_min_size(
+                Pos2::new(r1.right(), rect.top()),
+                Vec2::new(w2, rect.height()),
+            );
+            let r3 = Rect::from_min_max(
+                Pos2::new(r2.right(), rect.top()),
+                Pos2::new(content_right, rect.bottom()),
+            );
+            vec![r1, r2, r3]
+        }
+        ContactStatusBanner::Blocked
+        | ContactStatusBanner::SharePhoneNumber { .. }
+        | ContactStatusBanner::ReportSpam { .. } => {
+            vec![Rect::from_min_max(
+                rect.min,
+                Pos2::new(content_right, rect.bottom()),
+            )]
+        }
+    };
+
+    ContactStatusBarLayout {
+        action_rects,
+        dismiss_rect,
+        compact,
+    }
+}
+
+/// Resolved bounding boxes for the history top bar (used by painting and narrow-viewport tests).
+///
+/// Mirrors `TopBarWidget::updateControlsGeometry`: buttons are laid out from the right edge
+/// (`_menuToggle`, `_infoToggle`, `_call` / `_groupCall`, `_search`) and the title starts after
+/// the back button and userpic (one-column) or at `st::topBarArrowPadding.right()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopBarLayout {
+    /// Clickable peer title + status region (opens the profile).
+    pub header_rect: Rect,
+    /// Clipped bounding box reserved for peer title & status text.
+    pub title_clip_rect: Rect,
+    /// Back button (`st::historyTopBarBack`, 52px) when the history can go back.
+    pub back_rect: Option<Rect>,
+    /// One-column userpic button (`st::topBarInfoButton`, 52px with a 42px photo).
+    pub avatar_rect: Option<Rect>,
+    /// Search button (`st::topBarSearch`).
+    pub search_rect: Rect,
+    /// Call (users) or group call (groups / channels) button.
+    pub call_rect: Option<Rect>,
+    /// Third-column profile toggle (`st::topBarInfo`), hidden in one-column mode.
+    pub info_rect: Option<Rect>,
+    /// Chat menu toggle (`st::topBarMenuToggle`, three dots).
+    pub menu_rect: Rect,
+    /// Whether the top bar is in one-column narrow-viewport mode (`< 480px`).
+    pub compact: bool,
+}
+
+/// Which call button `TopBarWidget` shows for a peer (`_call` / `_groupCall`).
+fn top_bar_call_kind(kind: PeerKind, is_saved_messages: bool, can_manage: bool) -> bool {
+    match kind {
+        PeerKind::User => !is_saved_messages,
+        PeerKind::Group | PeerKind::Channel => can_manage,
+    }
+}
+
+/// Computes non-overlapping bounding boxes for [`paint_top_bar`] at any viewport width.
+#[must_use]
+pub fn compute_top_bar_layout(
+    rect: Rect,
+    kind: PeerKind,
+    is_saved_messages: bool,
+    can_go_back: bool,
+) -> TopBarLayout {
+    compute_top_bar_layout_ext(rect, kind, is_saved_messages, can_go_back, true)
+}
+
+/// [`compute_top_bar_layout`] with the group-call permission (`canManageGroupCall`) explicit.
+#[must_use]
+pub fn compute_top_bar_layout_ext(
+    rect: Rect,
+    kind: PeerKind,
+    is_saved_messages: bool,
+    can_go_back: bool,
+    can_manage_group_call: bool,
+) -> TopBarLayout {
+    let compact = rect.width() < 480.0;
+    let button = |right: f32, width: f32| {
+        Rect::from_min_max(
+            Pos2::new(right - width, rect.top()),
+            Pos2::new(right, rect.bottom()),
+        )
+    };
+
+    let mut left = rect.left();
+    let back_rect = can_go_back.then(|| {
+        let r = Rect::from_min_size(Pos2::new(left, rect.top()), Vec2::new(52.0, rect.height()));
+        left = r.right();
+        r
+    });
+    let avatar_rect = (can_go_back && compact).then(|| {
+        let r = Rect::from_min_size(Pos2::new(left, rect.top()), Vec2::new(52.0, rect.height()));
+        left = r.right();
+        r
+    });
+    if back_rect.is_none() {
+        left = rect.left() + 17.0;
+    }
+
+    let mut right_taken = 0.0;
+    // `st::topBarMenuToggle` is 44px wide and the next button starts `topBarSkip` (-5px) inside
+    // it; the hit area keeps only the 39px that is not covered, so neighbours never overlap.
+    let menu_rect = button(rect.right(), 44.0 + TOP_BAR_SKIP);
+    right_taken += 44.0 + TOP_BAR_SKIP;
+    let info_rect = (!compact).then(|| {
+        let r = button(rect.right() - right_taken, 40.0);
+        right_taken += 40.0;
+        r
+    });
+    let call_rect = top_bar_call_kind(kind, is_saved_messages, can_manage_group_call).then(|| {
+        let r = button(rect.right() - right_taken, 40.0);
+        right_taken += 40.0;
+        r
+    });
+    let search_rect = button(rect.right() - right_taken, 40.0);
+    right_taken += 40.0 - 1.0;
+
+    let name_right = (rect.right() - right_taken - 3.0).max(left + 8.0);
+    let header_rect = Rect::from_min_max(
+        Pos2::new(left, rect.top()),
+        Pos2::new(name_right, rect.bottom()),
+    );
+    TopBarLayout {
+        header_rect,
+        title_clip_rect: header_rect,
+        back_rect,
+        avatar_rect,
+        search_rect,
+        call_rect,
+        info_rect,
+        menu_rect,
+        compact,
+    }
+}
+
+/// Truncates `text` with `'…'` so it fits strictly within `max_width` pixels.
+///
+/// Returns `(display_text, was_truncated)`.
+pub(crate) fn ellipsize_to_width(
+    painter: &egui::Painter,
+    text: &str,
+    font: &FontId,
+    max_width: f32,
+) -> (String, bool) {
+    if max_width <= 4.0 || text.is_empty() {
+        return (String::new(), !text.is_empty());
+    }
+    let full = painter.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE);
+    if full.size().x <= max_width {
+        return (text.to_owned(), false);
+    }
+    let ellipsis = "…";
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let mut candidate: String = chars[..mid].iter().collect();
+        candidate.push_str(ellipsis);
+        let w = painter
+            .layout_no_wrap(candidate, font.clone(), Color32::WHITE)
+            .size()
+            .x;
+        if w <= max_width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut out: String = chars[..lo].iter().collect();
+    let trimmed = out.trim_end().to_owned();
+    out = trimmed;
+    out.push_str(ellipsis);
+    (out, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Paints one top bar icon button (`IconButton` with `rippleAreaPosition(0, 7)`, size 40).
+fn paint_top_bar_icon_button(
+    ui: &mut Ui,
+    rect: Rect,
+    id: Id,
+    icon: tg_ui::tg_style::Icon,
+    icon_rect: Rect,
+    active: bool,
+    label: &str,
+    colors: &HistoryColors,
+) -> egui::Response {
+    let resp = ui.interact(rect, id, Sense::click());
+    let label_owned = label.to_owned();
+    resp.widget_info(|| WidgetInfo::selected(Role::Button, true, active, label_owned.clone()));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        let ripple = Rect::from_min_size(
+            Pos2::new(rect.left() + (rect.width() - 40.0) * 0.5, rect.top() + 7.0),
+            Vec2::splat(40.0),
+        );
+        ui.painter()
+            .circle_filled(ripple.center(), 20.0, colors.bar_bg_over);
+    }
+    let fg = if active {
+        colors.active_text_fg
+    } else {
+        colors.sub_text_fg
+    };
+    tg_app_core::ui_icons::paint_style_tinted(ui.painter(), icon_rect, icon, fg);
+    resp.on_hover_text(label)
+}
+
+/// Chat menu (`TopBarWidget::showPeerMenu`) items available from the top bar.
+fn top_bar_menu_items(peer: &HistoryPeerInfo) -> Vec<MenuItem> {
+    let mut items = Vec::new();
+    if !peer.summary.is_saved_messages {
+        let label = if peer.summary.muted {
+            tg_lang::tr::lng_context_unmute()
+        } else {
+            tg_lang::tr::lng_context_mute()
+        };
+        items.push(MenuItem::action("mute", label));
+    }
+    match peer.summary.kind {
+        PeerKind::Channel => {
+            items.push(MenuItem::action(
+                "direct_messages",
+                tg_lang::tr::lng_profile_direct_messages(),
+            ));
+        }
+        PeerKind::User if !peer.summary.is_saved_messages => {
+            items.push(MenuItem::action(
+                "no_forwards",
+                tg_lang::tr::lng_disable_sharing(),
+            ));
+        }
+        _ => {}
+    }
+    items
+}
+
+/// Paints the normal history top bar (`history_view_top_bar_widget.cpp`, height `54px`):
+/// title + status on the left (back button and userpic only in one-column mode), and
+/// search, call / group call, profile toggle and chat menu buttons on the right.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_top_bar(
     ui: &mut Ui,
@@ -89,236 +381,238 @@ pub fn paint_top_bar(
     search_open: bool,
     colors: &HistoryColors,
 ) -> Option<TopBarEvent> {
+    use tg_ui::tg_style::st;
+
     let mut event = None;
     let ui_colors = colors.ui_colors();
+    let layout = compute_top_bar_layout_ext(
+        rect,
+        peer.summary.kind,
+        peer.summary.is_saved_messages,
+        can_go_back,
+        peer.can_pin,
+    );
+    let base_id = Id::unique(("tg_hist_top", peer.summary.id.0));
 
     ui.painter()
         .rect_filled(rect, CornerRadius::ZERO, colors.bar_bg);
 
-    let mut left_x = rect.left() + 10.0;
+    let centered_icon = |r: Rect, size: Vec2| Rect::from_center_size(r.center(), size);
 
-    // Optional Back button
-    if can_go_back {
-        let back_rect =
-            Rect::from_center_size(Pos2::new(left_x + 16.0, rect.center().y), Vec2::splat(32.0));
-        let resp = ui.interact(back_rect, Id::unique("tg_hist_top_back"), Sense::click());
-        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Back"));
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            ui.painter()
-                .circle_filled(back_rect.center(), 16.0, colors.bar_bg_over);
-        }
-        paint_icon(
-            ui.painter(),
-            back_rect.shrink(7.0),
-            IconKind::Back,
-            colors.sub_text_fg,
+    if let Some(back_rect) = layout.back_rect {
+        let icon_rect = Rect::from_min_size(
+            Pos2::new(back_rect.left() + 11.0, back_rect.center().y - 12.0),
+            Vec2::splat(24.0),
         );
-        if resp.on_hover_text("Back").clicked() {
+        if paint_top_bar_icon_button(
+            ui,
+            back_rect,
+            base_id.with("back"),
+            st::history_top_bar_back.icon,
+            icon_rect,
+            false,
+            "Back",
+            colors,
+        )
+        .clicked()
+        {
             event = Some(TopBarEvent::Back);
         }
-        left_x = back_rect.right() + 6.0;
     }
 
-    // Right-side action icons (Info, Mute, Search)
-    let mut right_x = rect.right() - 10.0;
-
-    // Info toggle button
-    let info_rect = Rect::from_center_size(
-        Pos2::new(right_x - 16.0, rect.center().y),
-        Vec2::splat(32.0),
-    );
-    let info_resp = ui.interact(info_rect, Id::unique("tg_hist_top_info"), Sense::click());
-    info_resp
-        .widget_info(|| WidgetInfo::selected(Role::Button, true, info_open, "Toggle chat info"));
-    if info_resp.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        ui.painter()
-            .circle_filled(info_rect.center(), 16.0, colors.bar_bg_over);
-    }
-    paint_icon(
-        ui.painter(),
-        info_rect.shrink(7.0),
-        IconKind::Info,
-        if info_open {
-            colors.accent
+    if let Some(avatar_rect) = layout.avatar_rect {
+        let photo = Rect::from_center_size(
+            Pos2::new(avatar_rect.left() + 2.0 + 21.0, avatar_rect.center().y),
+            Vec2::splat(42.0),
+        );
+        if peer.summary.is_saved_messages {
+            EmptyUserpic::paint_saved_messages(ui.painter(), photo, &ui_colors);
         } else {
-            colors.sub_text_fg
-        },
-    );
-    if info_resp.on_hover_text("Toggle chat info").clicked() {
-        event = Some(TopBarEvent::ToggleInfo);
+            EmptyUserpic::for_peer(peer.summary.id.bare(), &peer.summary.title, &ui_colors)
+                .paint_circle(ui.painter(), photo);
+        }
+        let resp = ui.interact(avatar_rect, base_id.with("userpic"), Sense::click());
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Chat info"));
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            event = Some(TopBarEvent::ToggleInfo);
+        }
     }
-    right_x = info_rect.left() - 6.0;
 
-    // Search toggle button
-    let search_rect = Rect::from_center_size(
-        Pos2::new(right_x - 16.0, rect.center().y),
-        Vec2::splat(32.0),
-    );
-    let search_resp = ui.interact(
-        search_rect,
-        Id::unique("tg_hist_top_search"),
-        Sense::click(),
-    );
-    search_resp
-        .widget_info(|| WidgetInfo::selected(Role::Button, true, search_open, "Search in chat"));
-    if search_resp.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        ui.painter()
-            .circle_filled(search_rect.center(), 16.0, colors.bar_bg_over);
-    }
-    paint_icon(
-        ui.painter(),
-        search_rect.shrink(7.0),
-        IconKind::Search,
-        if search_open {
-            colors.accent
-        } else {
-            colors.sub_text_fg
-        },
-    );
-    if search_resp.on_hover_text("Search in chat").clicked() {
+    if paint_top_bar_icon_button(
+        ui,
+        layout.search_rect,
+        base_id.with("search"),
+        st::top_bar_search.icon,
+        centered_icon(layout.search_rect, Vec2::splat(32.0)),
+        search_open,
+        "Search in chat",
+        colors,
+    )
+    .clicked()
+    {
         event = Some(TopBarEvent::ToggleSearch);
     }
-    right_x = search_rect.left() - 6.0;
 
-    // Mute toggle pill
-    let mute_rect = Rect::from_center_size(
-        Pos2::new(right_x - 24.0, rect.center().y),
-        Vec2::new(48.0, 26.0),
-    );
-    let mute_resp = ui.interact(mute_rect, Id::unique("tg_hist_top_mute"), Sense::click());
-    let mute_label = if peer.summary.muted { "Muted" } else { "Mute" };
-    mute_resp
-        .widget_info(|| WidgetInfo::selected(Role::Button, true, peer.summary.muted, mute_label));
-    if mute_resp.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        ui.painter()
-            .rect_filled(mute_rect, CornerRadius::same(6), colors.bar_bg_over);
-    }
-    ui.painter().text(
-        mute_rect.center(),
-        Align2::CENTER_CENTER,
-        mute_label,
-        FontId::proportional(11.5),
-        if peer.summary.muted {
-            colors.accent
+    if let Some(call_rect) = layout.call_rect {
+        let (icon, label) = if matches!(peer.summary.kind, PeerKind::User) {
+            (
+                st::top_bar_call.icon,
+                tg_lang::tr::lng_profile_action_short_call(),
+            )
         } else {
-            colors.sub_text_fg
-        },
-    );
-    if mute_resp.on_hover_text("Toggle notifications").clicked() {
-        event = Some(TopBarEvent::ToggleMute);
+            (
+                st::top_bar_group_call.icon,
+                tg_lang::tr::lng_group_call_title(),
+            )
+        };
+        // Calls start from the profile's Call action; the button opens it.
+        if paint_top_bar_icon_button(
+            ui,
+            call_rect,
+            base_id.with("call"),
+            icon,
+            centered_icon(call_rect, Vec2::splat(32.0)),
+            false,
+            &label,
+            colors,
+        )
+        .clicked()
+        {
+            event = Some(TopBarEvent::ToggleInfo);
+        }
     }
-    right_x = mute_rect.left() - 6.0;
 
-    // 1:1 protected-chat sharing toggle (`messages.toggleNoForwards`)
-    if matches!(
-        peer.summary.kind,
-        tg_app_core::stand_in::types::PeerKind::User
-    ) && !peer.summary.is_saved_messages
+    if let Some(info_rect) = layout.info_rect
+        && paint_top_bar_icon_button(
+            ui,
+            info_rect,
+            base_id.with("info"),
+            st::top_bar_info.icon,
+            centered_icon(info_rect, Vec2::splat(32.0)),
+            info_open,
+            "Toggle chat info",
+            colors,
+        )
+        .clicked()
     {
-        let nf_rect = Rect::from_center_size(
-            Pos2::new(right_x - 16.0, rect.center().y),
-            Vec2::splat(30.0),
-        );
-        let nf_resp = ui.interact(
-            nf_rect,
-            Id::unique("tg_hist_top_noforwards"),
-            Sense::click(),
-        );
-        nf_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Protect chat sharing"));
-        if nf_resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            ui.painter()
-                .circle_filled(nf_rect.center(), 15.0, colors.bar_bg_over);
-        }
-        tg_app_core::ui_icons::paint_lock(ui.painter(), nf_rect.center(), 16.0, colors.sub_text_fg);
-        if nf_resp
-            .on_hover_text("Toggle protected sharing in this chat")
-            .clicked()
-        {
-            event = Some(TopBarEvent::ToggleNoForwards);
-        }
-        right_x = nf_rect.left() - 6.0;
+        event = Some(TopBarEvent::ToggleInfo);
     }
 
-    // Channel Direct Messages button (`history_view_top_bar_widget.cpp` monoforum entry).
-    if matches!(peer.summary.kind, PeerKind::Channel) {
-        let dm_w = 112.0;
-        let dm_rect = Rect::from_center_size(
-            Pos2::new(right_x - dm_w * 0.5, rect.center().y),
-            Vec2::new(dm_w, 26.0),
-        );
-        let dm_resp = ui.interact(
-            dm_rect,
-            Id::unique("tg_hist_top_direct_messages"),
-            Sense::click(),
-        );
-        dm_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Direct Messages"));
-        if dm_resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            ui.painter()
-                .rect_filled(dm_rect, CornerRadius::same(6), colors.bar_bg_over);
+    let menu_icon_rect = Rect::from_min_size(
+        Pos2::new(
+            layout.menu_rect.left() + 16.0 + TOP_BAR_SKIP,
+            layout.menu_rect.top() + 17.0,
+        ),
+        Vec2::new(8.0, 20.0),
+    );
+    let menu_items = top_bar_menu_items(peer);
+    let menu_state_id = base_id.with("menu_state");
+    let mut menu_state: PopupMenuState = ui
+        .data_mut(|d| d.get_temp(menu_state_id))
+        .unwrap_or_default();
+    let menu_style = PopupMenuStyle::default_popup(&ui_colors);
+    if paint_top_bar_icon_button(
+        ui,
+        layout.menu_rect,
+        base_id.with("menu"),
+        st::top_bar_menu_toggle.icon,
+        menu_icon_rect,
+        menu_state.is_open(),
+        &tg_lang::tr::lng_chat_menu(),
+        colors,
+    )
+    .clicked()
+        && !menu_items.is_empty()
+    {
+        if menu_state.is_open() {
+            menu_state.close();
+        } else {
+            menu_state.open_at(
+                ui.ctx(),
+                Pos2::new(
+                    layout.menu_rect.right() - 6.0 - menu_style.menu.width_min,
+                    rect.top() + 45.0,
+                ),
+                &menu_style,
+            );
         }
-        ui.painter().text(
-            dm_rect.center(),
-            Align2::CENTER_CENTER,
-            "Direct Messages",
-            FontId::proportional(11.5),
-            colors.accent,
-        );
-        if dm_resp
-            .on_hover_text("Open channel Direct Messages")
-            .clicked()
-        {
-            event = Some(TopBarEvent::OpenDirectMessages);
-        }
-        right_x = dm_rect.left() - 8.0;
     }
+    let toggle_style = ToggleStyle::default_toggle(&ui_colors);
+    if let Some(triggered) = menu_state.show(
+        ui.ctx(),
+        base_id.with("menu_popup"),
+        &menu_items,
+        &menu_style,
+        &toggle_style,
+    ) {
+        menu_state.close();
+        event = match triggered.as_str() {
+            "mute" => Some(TopBarEvent::ToggleMute),
+            "direct_messages" => Some(TopBarEvent::OpenDirectMessages),
+            "no_forwards" => Some(TopBarEvent::ToggleNoForwards),
+            _ => event,
+        };
+    }
+    ui.data_mut(|d| d.insert_temp(menu_state_id, menu_state));
 
-    // Clickable peer avatar + title + status/typing region
-    let hdr_rect = Rect::from_min_max(
-        Pos2::new(left_x, rect.top() + 4.0),
-        Pos2::new(right_x.max(left_x + 80.0), rect.bottom() - 4.0),
-    );
-    let avatar_rect = Rect::from_center_size(
-        Pos2::new(hdr_rect.left() + 19.0, hdr_rect.center().y),
-        Vec2::splat(36.0),
-    );
+    // Title + status (`TopBarWidget::paintTopBar`).
+    let text_clip = layout.title_clip_rect;
+    let text_x = text_clip.left();
+    let max_text_w = (text_clip.width() - 2.0).max(0.0);
+    let clipped_painter = ui.painter().with_clip_rect(text_clip);
+    let title_truncated;
     if peer.summary.is_saved_messages {
-        EmptyUserpic::paint_saved_messages(ui.painter(), avatar_rect, &ui_colors);
+        let font = FontId::new(14.0, tg_ui::fonts::family_semibold());
+        let (title, truncated) = ellipsize_to_width(
+            ui.painter(),
+            &tg_lang::tr::lng_saved_messages(),
+            &font,
+            max_text_w,
+        );
+        title_truncated = truncated;
+        clipped_painter.text(
+            Pos2::new(text_x, rect.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            font,
+            colors.bold_fg,
+        );
     } else {
-        EmptyUserpic::for_peer(peer.summary.id.bare(), &peer.summary.title, &ui_colors)
-            .paint_circle(ui.painter(), avatar_rect);
+        let title_font = FontId::new(13.0, tg_ui::fonts::family_semibold());
+        let (title_text, truncated) =
+            ellipsize_to_width(ui.painter(), &peer.summary.title, &title_font, max_text_w);
+        title_truncated = truncated;
+        clipped_painter.text(
+            Pos2::new(text_x, rect.top() + 8.0),
+            Align2::LEFT_TOP,
+            title_text,
+            title_font,
+            colors.bold_fg,
+        );
+        let (status_str, status_fg) = if let Some(ref typing) = peer.typing_text {
+            (typing.as_str(), colors.active_text_fg)
+        } else if peer.summary.status == "online" {
+            (peer.summary.status.as_str(), colors.active_text_fg)
+        } else {
+            (peer.summary.status.as_str(), colors.sub_text_fg)
+        };
+        let status_font = FontId::proportional(13.0);
+        let (status_text, _) =
+            ellipsize_to_width(ui.painter(), status_str, &status_font, max_text_w);
+        clipped_painter.text(
+            Pos2::new(text_x, rect.bottom() - 8.0),
+            Align2::LEFT_BOTTOM,
+            status_text,
+            status_font,
+            status_fg,
+        );
     }
 
-    let text_x = avatar_rect.right() + 10.0;
-    ui.painter().text(
-        Pos2::new(text_x, hdr_rect.top() + 5.0),
-        Align2::LEFT_TOP,
-        &peer.summary.title,
-        FontId::proportional(14.5),
-        colors.bold_fg,
-    );
-
-    let (status_str, status_fg) = if let Some(ref typing) = peer.typing_text {
-        (typing.as_str(), colors.active_text_fg)
-    } else if peer.summary.status == "online" {
-        (peer.summary.status.as_str(), colors.active_text_fg)
-    } else {
-        (peer.summary.status.as_str(), colors.sub_text_fg)
-    };
-    ui.painter().text(
-        Pos2::new(text_x, hdr_rect.top() + 24.0),
-        Align2::LEFT_TOP,
-        status_str,
-        FontId::proportional(12.0),
-        status_fg,
-    );
-
-    let hdr_resp = ui.interact(hdr_rect, Id::unique("tg_hist_top_peer"), Sense::click());
+    let hdr_rect = layout.header_rect;
+    let hdr_resp = ui.interact(hdr_rect, base_id.with("peer"), Sense::click());
     hdr_resp.widget_info(|| {
         WidgetInfo::labeled(
             Role::Button,
@@ -329,14 +623,16 @@ pub fn paint_top_bar(
     if hdr_resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    if hdr_resp
-        .on_hover_text("Click to toggle chat info")
-        .clicked()
-    {
+    let hdr_tooltip = if title_truncated {
+        format!("{} — Click to toggle chat info", peer.summary.title)
+    } else {
+        "Click to toggle chat info".to_owned()
+    };
+    if hdr_resp.on_hover_text(hdr_tooltip).clicked() {
         event = Some(TopBarEvent::ToggleInfo);
     }
 
-    // Bottom 1px divider
+    // Bottom 1px shadow line (`st::shadowFg`).
     ui.painter().line_segment(
         [
             Pos2::new(rect.left(), rect.bottom()),
@@ -541,21 +837,36 @@ pub fn paint_pinned_bar(
         colors.active_text_fg,
     );
     let clip_w = (click_rect.right() - text_x - 8.0).max(40.0);
+    let preview_clip = ui.painter().with_clip_rect(Rect::from_min_size(
+        Pos2::new(text_x, rect.top() + 24.0),
+        Vec2::new(clip_w, 19.0),
+    ));
+    // `MediaPoll::toPreview` / `MediaTodoList::toPreview`: the pinned text starts with the
+    // `dialogsMiniPollIcon` / `dialogsMiniTodoListIcon` icon emoji, not the "📊 " marker.
+    let (marker, preview_text) = match split_media_marker(&current.preview) {
+        Some((icon, rest)) => (Some(icon), rest),
+        None => (None, current.preview.as_str()),
+    };
+    let mut preview_x = text_x;
+    if let Some(icon) = marker {
+        preview_x += paint_media_marker(
+            &preview_clip,
+            Pos2::new(text_x, rect.top() + 24.0),
+            icon,
+            colors.sub_text_fg,
+            &tg_ui::tg_style::DefaultPaletteResolver,
+        );
+    }
     let preview_galley = ui.painter().layout_no_wrap(
-        current.preview.clone(),
+        preview_text.to_owned(),
         FontId::proportional(12.5),
         colors.sub_text_fg,
     );
-    ui.painter()
-        .with_clip_rect(Rect::from_min_size(
-            Pos2::new(text_x, rect.top() + 24.0),
-            Vec2::new(clip_w, 19.0),
-        ))
-        .galley(
-            Pos2::new(text_x, rect.top() + 24.0),
-            preview_galley,
-            colors.sub_text_fg,
-        );
+    preview_clip.galley(
+        Pos2::new(preview_x, rect.top() + 24.0),
+        preview_galley,
+        colors.sub_text_fg,
+    );
 
     if click_resp
         .on_hover_text("Click to jump to pinned message")
@@ -609,113 +920,268 @@ pub fn paint_contact_status_bar(
     banner: &ContactStatusBanner,
     colors: &HistoryColors,
 ) -> Option<ContactStatusEvent> {
+    paint_contact_status_bar_with_confirm(ui, rect, banner, false, colors)
+}
+
+/// Paints the contact status banner (`history_view_contact_status.cpp`, height `42px`),
+/// with optional inline destructive confirmation for `"Report Spam"`.
+pub fn paint_contact_status_bar_with_confirm(
+    ui: &mut Ui,
+    rect: Rect,
+    banner: &ContactStatusBanner,
+    confirming_report_spam: bool,
+    colors: &HistoryColors,
+) -> Option<ContactStatusEvent> {
     let mut event = None;
     ui.painter()
         .rect_filled(rect, CornerRadius::ZERO, colors.bar_bg);
 
-    let dismiss_rect = Rect::from_center_size(
-        Pos2::new(rect.right() - 20.0, rect.center().y),
-        Vec2::splat(26.0),
-    );
-    let content_right = dismiss_rect.left() - 6.0;
+    let layout = compute_contact_status_bar_layout(rect, banner);
+
+    if confirming_report_spam {
+        // Inline destructive confirmation strip (explicit verb + Cancel, Escape dismisses).
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            event = Some(ContactStatusEvent::CancelReportSpam);
+        }
+        let tint = Color32::from_rgba_unmultiplied(
+            colors.attention_fg.r(),
+            colors.attention_fg.g(),
+            colors.attention_fg.b(),
+            18,
+        );
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, tint);
+
+        let btn_h = 28.0;
+        let cy = rect.center().y;
+        let cancel_label = tg_lang::tr::lng_cancel();
+        let report_label = tg_lang::tr::lng_report_spam_ok();
+        let cancel_w = 64.0;
+        let report_w = 76.0;
+        let cancel_rect = Rect::from_min_size(
+            Pos2::new(rect.right() - 10.0 - cancel_w, cy - btn_h * 0.5),
+            Vec2::new(cancel_w, btn_h),
+        );
+        let report_rect = Rect::from_min_size(
+            Pos2::new(cancel_rect.left() - 6.0 - report_w, cy - btn_h * 0.5),
+            Vec2::new(report_w, btn_h),
+        );
+        let prompt_clip = Rect::from_min_max(
+            Pos2::new(rect.left() + 12.0, rect.top() + 2.0),
+            Pos2::new(
+                (report_rect.left() - 8.0).max(rect.left() + 40.0),
+                rect.bottom() - 2.0,
+            ),
+        );
+        let prompt_text = match banner {
+            ContactStatusBanner::ReportSpam {
+                is_channel: true, ..
+            } => "Report spam in this channel?",
+            ContactStatusBanner::ReportSpam {
+                is_channel: false, ..
+            } => "Report this chat for spam?",
+            _ => "Report this user for spam?",
+        };
+        let prompt_font = FontId::proportional(12.5);
+        let (fitted_prompt, _) =
+            ellipsize_to_width(ui.painter(), prompt_text, &prompt_font, prompt_clip.width());
+        ui.painter().with_clip_rect(prompt_clip).text(
+            Pos2::new(prompt_clip.left(), cy),
+            Align2::LEFT_CENTER,
+            fitted_prompt,
+            prompt_font,
+            colors.bold_fg,
+        );
+
+        let report_bg = Color32::from_rgba_unmultiplied(
+            colors.attention_fg.r(),
+            colors.attention_fg.g(),
+            colors.attention_fg.b(),
+            28,
+        );
+        if paint_bar_action_pill(
+            ui,
+            "tg_cs_confirm_report_spam",
+            report_rect,
+            &report_label,
+            report_bg,
+            colors.attention_fg,
+        ) {
+            event = Some(ContactStatusEvent::ConfirmReportSpam);
+        }
+        if paint_bar_action_pill(
+            ui,
+            "tg_cs_cancel_report_spam",
+            cancel_rect,
+            &cancel_label,
+            Color32::TRANSPARENT,
+            colors.sub_text_fg,
+        ) {
+            event = Some(ContactStatusEvent::CancelReportSpam);
+        }
+
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.left(), rect.bottom()),
+                Pos2::new(rect.right(), rect.bottom()),
+            ],
+            Stroke::new(1.0, colors.divider),
+        );
+        return event;
+    }
+
+    let paint_cell = |ui: &mut Ui,
+                      cell_rect: Rect,
+                      id_salt: &str,
+                      display_label: &str,
+                      accessible_label: &str,
+                      fg: Color32|
+     -> bool {
+        let resp = ui.interact(cell_rect, Id::unique(id_salt), Sense::click());
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, accessible_label));
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            ui.painter()
+                .rect_filled(cell_rect, CornerRadius::ZERO, colors.bar_bg_over);
+        }
+        if resp.has_focus() {
+            ui.painter().rect_stroke(
+                cell_rect.shrink(1.5),
+                CornerRadius::same(4),
+                Stroke::new(1.5, colors.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let font = FontId::proportional(if layout.compact { 12.0 } else { 12.5 });
+        let text_pad = 6.0;
+        let max_text_w = (cell_rect.width() - text_pad * 2.0).max(16.0);
+        let (fitted, truncated) =
+            ellipsize_to_width(ui.painter(), display_label, &font, max_text_w);
+        ui.painter()
+            .with_clip_rect(cell_rect.shrink2(Vec2::new(text_pad, 2.0)))
+            .text(cell_rect.center(), Align2::CENTER_CENTER, fitted, font, fg);
+        let resp = if truncated || display_label != accessible_label {
+            resp.on_hover_text(accessible_label)
+        } else {
+            resp
+        };
+        resp.clicked()
+    };
 
     match banner {
         ContactStatusBanner::AddOrBlock { .. } => {
-            let half_w = ((content_right - rect.left()) * 0.5).max(60.0);
-            let left_btn = Rect::from_min_size(rect.min, Vec2::new(half_w, rect.height()));
-            let right_btn = Rect::from_min_max(
-                Pos2::new(left_btn.right(), rect.top()),
-                Pos2::new(content_right, rect.bottom()),
-            );
+            let add_a11y = tg_lang::tr::lng_new_contact_add();
+            let block_a11y = tg_lang::tr::lng_new_contact_block();
+            let spam_a11y = tg_lang::tr::lng_report_spam();
+            let add_display = if layout.compact {
+                "Add".to_owned()
+            } else {
+                add_a11y.clone()
+            };
+            let block_display = if layout.compact {
+                "Block".to_owned()
+            } else {
+                block_a11y.clone()
+            };
+            let spam_display = if layout.compact {
+                "Report".to_owned()
+            } else {
+                spam_a11y.clone()
+            };
 
-            let add_resp = ui.interact(left_btn, Id::unique("tg_cs_add"), Sense::click());
-            add_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "ADD TO CONTACTS"));
-            if add_resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                ui.painter()
-                    .rect_filled(left_btn, CornerRadius::ZERO, colors.bar_bg_over);
-            }
-            ui.painter().text(
-                left_btn.center(),
-                Align2::CENTER_CENTER,
-                "ADD TO CONTACTS",
-                FontId::proportional(12.5),
+            if paint_cell(
+                ui,
+                layout.action_rects[0],
+                "tg_cs_add",
+                &add_display,
+                &add_a11y,
                 colors.active_text_fg,
-            );
-            if add_resp.clicked() {
+            ) {
                 event = Some(ContactStatusEvent::AddContact);
             }
 
-            // Center vertical divider
+            // Vertical divider between Add and Block
             ui.painter().line_segment(
                 [
-                    Pos2::new(left_btn.right(), rect.top() + 8.0),
-                    Pos2::new(left_btn.right(), rect.bottom() - 8.0),
+                    Pos2::new(layout.action_rects[0].right(), rect.top() + 8.0),
+                    Pos2::new(layout.action_rects[0].right(), rect.bottom() - 8.0),
                 ],
                 Stroke::new(1.0, colors.divider),
             );
 
-            let blk_resp = ui.interact(right_btn, Id::unique("tg_cs_block"), Sense::click());
-            blk_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "BLOCK USER"));
-            if blk_resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                ui.painter()
-                    .rect_filled(right_btn, CornerRadius::ZERO, colors.bar_bg_over);
-            }
-            ui.painter().text(
-                right_btn.center(),
-                Align2::CENTER_CENTER,
-                "BLOCK USER",
-                FontId::proportional(12.5),
+            if paint_cell(
+                ui,
+                layout.action_rects[1],
+                "tg_cs_block",
+                &block_display,
+                &block_a11y,
                 colors.attention_fg,
-            );
-            if blk_resp.clicked() {
+            ) {
                 event = Some(ContactStatusEvent::ToggleBlock);
+            }
+
+            // Vertical divider between Block and Report Spam
+            ui.painter().line_segment(
+                [
+                    Pos2::new(layout.action_rects[1].right(), rect.top() + 8.0),
+                    Pos2::new(layout.action_rects[1].right(), rect.bottom() - 8.0),
+                ],
+                Stroke::new(1.0, colors.divider),
+            );
+
+            if paint_cell(
+                ui,
+                layout.action_rects[2],
+                "tg_cs_report_spam",
+                &spam_display,
+                &spam_a11y,
+                colors.attention_fg,
+            ) {
+                event = Some(ContactStatusEvent::ReportSpam);
             }
         }
         ContactStatusBanner::Blocked => {
-            let btn = Rect::from_min_max(rect.min, Pos2::new(content_right, rect.bottom()));
-            let resp = ui.interact(btn, Id::unique("tg_cs_unblock"), Sense::click());
-            resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "UNBLOCK USER"));
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                ui.painter()
-                    .rect_filled(btn, CornerRadius::ZERO, colors.bar_bg_over);
-            }
-            ui.painter().text(
-                btn.center(),
-                Align2::CENTER_CENTER,
-                "UNBLOCK USER",
-                FontId::proportional(12.5),
+            let unblock_label = tg_lang::tr::lng_blocked_list_unblock();
+            if paint_cell(
+                ui,
+                layout.action_rects[0],
+                "tg_cs_unblock",
+                &unblock_label,
+                &unblock_label,
                 colors.active_text_fg,
-            );
-            if resp.clicked() {
+            ) {
                 event = Some(ContactStatusEvent::ToggleBlock);
             }
         }
         ContactStatusBanner::SharePhoneNumber { .. } => {
-            let btn = Rect::from_min_max(rect.min, Pos2::new(content_right, rect.bottom()));
-            let resp = ui.interact(btn, Id::unique("tg_cs_share"), Sense::click());
-            resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "SHARE MY PHONE NUMBER"));
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                ui.painter()
-                    .rect_filled(btn, CornerRadius::ZERO, colors.bar_bg_over);
-            }
-            ui.painter().text(
-                btn.center(),
-                Align2::CENTER_CENTER,
-                "SHARE MY PHONE NUMBER",
-                FontId::proportional(12.5),
+            let share_label = tg_lang::tr::lng_new_contact_share();
+            if paint_cell(
+                ui,
+                layout.action_rects[0],
+                "tg_cs_share",
+                &share_label,
+                &share_label,
                 colors.active_text_fg,
-            );
-            if resp.clicked() {
-                event = Some(ContactStatusEvent::AddContact);
+            ) {
+                event = Some(ContactStatusEvent::SharePhone);
+            }
+        }
+        ContactStatusBanner::ReportSpam { .. } => {
+            let spam_label = tg_lang::tr::lng_report_spam();
+            if paint_cell(
+                ui,
+                layout.action_rects[0],
+                "tg_cs_report_spam_only",
+                &spam_label,
+                &spam_label,
+                colors.attention_fg,
+            ) {
+                event = Some(ContactStatusEvent::ReportSpam);
             }
         }
     }
 
-    // Dismiss cross
+    // Dismiss cross (`messages.hidePeerSettingsBar`)
+    let dismiss_rect = layout.dismiss_rect;
     let dismiss_resp = ui.interact(dismiss_rect, Id::unique("tg_cs_dismiss"), Sense::click());
     dismiss_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Dismiss contact banner"));
     if dismiss_resp.hovered() {
@@ -723,13 +1189,17 @@ pub fn paint_contact_status_bar(
         ui.painter()
             .circle_filled(dismiss_rect.center(), 13.0, colors.bar_bg_over);
     }
+    if dismiss_resp.has_focus() {
+        ui.painter()
+            .circle_stroke(dismiss_rect.center(), 13.0, Stroke::new(1.5, colors.accent));
+    }
     paint_icon(
         ui.painter(),
         dismiss_rect.shrink(6.0),
         IconKind::Close,
         colors.sub_text_fg,
     );
-    if dismiss_resp.clicked() {
+    if dismiss_resp.on_hover_text("Dismiss").clicked() {
         event = Some(ContactStatusEvent::Dismiss);
     }
 
@@ -1196,4 +1666,52 @@ fn format_upload_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Height of the bottom START bar (`st::historyComposeButton.height`).
+pub const BOT_START_BAR_HEIGHT: f32 = 46.0;
+/// Text top offset inside the START bar (`st::historyComposeButton.textTop`).
+const BOT_START_TEXT_TOP: f32 = 14.0;
+
+/// Paints the bottom START bar shown in place of the composer for a bot chat with a pending
+/// `start` token or an empty history (`HistoryWidget::_botStart`, `isBotStart()`): a full-width
+/// `historyComposeButton` flat button with the upper-cased `lng_bot_start` label.
+///
+/// Returns `true` when the bar was clicked.
+pub fn paint_bot_start_bar(ui: &mut Ui, rect: Rect, colors: &HistoryColors) -> bool {
+    let label = tg_lang::tr::lng_bot_start().to_uppercase();
+    let resp = ui.interact(
+        rect,
+        ui.scope_id().with("tg_history_bot_start_bar"),
+        Sense::click(),
+    );
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label.clone()));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let bg = if resp.hovered() {
+        colors.bar_bg_over
+    } else {
+        colors.bar_bg
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::ZERO, bg);
+    painter.line_segment(
+        [
+            Pos2::new(rect.left(), rect.top()),
+            Pos2::new(rect.right(), rect.top()),
+        ],
+        Stroke::new(1.0, colors.divider),
+    );
+    painter.text(
+        Pos2::new(rect.center().x, rect.top() + BOT_START_TEXT_TOP),
+        Align2::CENTER_TOP,
+        label,
+        FontId::new(
+            tg_ui::fonts::font_id_from_style(tg_ui::tg_style::st::semibold_font).size,
+            tg_ui::fonts::family_semibold(),
+        ),
+        colors.active_text_fg,
+    );
+    resp.clicked()
 }

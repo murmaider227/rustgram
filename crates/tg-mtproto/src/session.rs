@@ -39,10 +39,10 @@ use crate::dc_options::{
 };
 use crate::error::{InvocationError, RpcError};
 use crate::message::{
-    CUT_CONTAINER_ON_BYTES, DecryptedEnvelope, MAX_GZIP_NESTING, MAX_UNPACKED_MESSAGE_LENGTH,
-    RequestId, body_needs_ack, build_encrypted_packet, gzip_pack_if_smaller, pack_container,
-    parse_encrypted_packet, unpack_container, unwrap_gzip_layers, wrap_init_connection,
-    wrap_invoke_after_msg,
+    CUT_CONTAINER_ON_BYTES, DecryptedEnvelope, ReceiveBudget, RequestId, body_needs_ack,
+    build_encrypted_packet, gzip_pack_if_smaller, gzip_unpack, pack_container,
+    parse_encrypted_packet, unpack_container_with_budget, unwrap_gzip_layers_with_budget,
+    wrap_init_connection, wrap_invoke_after_msg,
 };
 use crate::received_ids::{IDS_BUFFER_SIZE, ReceivedIdState, ReceivedIdsManager, RegisterIdResult};
 use crate::salts::SaltManager;
@@ -1113,20 +1113,14 @@ impl SessionState {
             RegisterIdResult::Duplicate => SessionAction::Continue,
             RegisterIdResult::TooOld => SessionAction::ResetSession,
             RegisterIdResult::Success => {
-                let mut budget = MAX_UNPACKED_MESSAGE_LENGTH;
+                let mut budget = ReceiveBudget::default();
                 let mut info = OuterInfo {
                     outer_msg_id: envelope.msg_id,
                     server_salt: passed_salt,
                     server_time,
                     bad_time,
                 };
-                self.handle_one_message(
-                    &envelope.body,
-                    &mut info,
-                    &mut budget,
-                    0,
-                    &mut outcome.events,
-                )
+                self.handle_one_message(&envelope.body, &mut info, &mut budget, &mut outcome.events)
             }
         };
         self.received_ids.shrink();
@@ -1149,8 +1143,7 @@ impl SessionState {
         &mut self,
         body: &[u8],
         info: &mut OuterInfo,
-        unpacked_budget: &mut usize,
-        gzip_depth: usize,
+        budget: &mut ReceiveBudget,
         events: &mut Vec<SessionEvent>,
     ) -> SessionAction {
         if body.len() < 4 {
@@ -1159,23 +1152,34 @@ impl SessionState {
         let ctor = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
         match ctor {
             GzipPacked::CONSTRUCTOR_ID => {
-                if gzip_depth >= MAX_GZIP_NESTING {
+                if budget.enter_nesting().is_err() {
                     return SessionAction::RestartConnection;
                 }
-                let Ok(unpacked) = unwrap_gzip_layers(body, unpacked_budget, gzip_depth) else {
-                    return SessionAction::RestartConnection;
+                let unpacked = match gzip_unpack(body, budget.bytes_remaining()) {
+                    Ok(unpacked) if budget.charge_bytes(unpacked.len()).is_ok() => unpacked,
+                    _ => {
+                        budget.leave_nesting();
+                        return SessionAction::RestartConnection;
+                    }
                 };
-                self.handle_one_message(&unpacked, info, unpacked_budget, gzip_depth + 1, events)
+                let res = self.handle_one_message(&unpacked, info, budget, events);
+                budget.leave_nesting();
+                res
             }
 
             MsgContainer::CONSTRUCTOR_ID => {
-                let Ok(messages) = unpack_container(body) else {
+                if budget.enter_nesting().is_err() {
+                    return SessionAction::RestartConnection;
+                }
+                let Ok(messages) = unpack_container_with_budget(body, budget) else {
+                    budget.leave_nesting();
                     return SessionAction::RestartConnection;
                 };
                 let mut result_action = SessionAction::Continue;
                 for inner in messages {
                     let inner_msg_id = inner.msg_id as u64;
                     if !is_valid_server_msg_id(inner_msg_id) {
+                        budget.leave_nesting();
                         return SessionAction::RestartConnection;
                     }
                     let need_ack = (inner.seqno & 1) != 0;
@@ -1184,15 +1188,12 @@ impl SessionState {
                     }
                     match self.received_ids.register_msg_id(inner_msg_id, need_ack) {
                         RegisterIdResult::Duplicate => continue,
-                        RegisterIdResult::TooOld => return SessionAction::ResetSession,
+                        RegisterIdResult::TooOld => {
+                            budget.leave_nesting();
+                            return SessionAction::ResetSession;
+                        }
                         RegisterIdResult::Success => {
-                            let res = self.handle_one_message(
-                                &inner.body.0,
-                                info,
-                                unpacked_budget,
-                                gzip_depth,
-                                events,
-                            );
+                            let res = self.handle_one_message(&inner.body.0, info, budget, events);
                             // Preserve FlushOutbound from inner handlers (e.g. bad_server_salt /
                             // bad_msg_notification resending a ping) and only clear info.bad_time
                             // inside handlers that actually validated time/salt.
@@ -1202,11 +1203,15 @@ impl SessionState {
                                 SessionAction::FlushOutbound => {
                                     result_action = SessionAction::FlushOutbound;
                                 }
-                                other => return other,
+                                other => {
+                                    budget.leave_nesting();
+                                    return other;
+                                }
                             }
                         }
                     }
                 }
+                budget.leave_nesting();
                 result_action
             }
 
@@ -1441,11 +1446,10 @@ impl SessionState {
                         return SessionAction::Continue;
                     }
                 }
-                let result_body =
-                    match unwrap_gzip_layers(&rpc.result.0, unpacked_budget, gzip_depth) {
-                        Ok(b) => b,
-                        Err(_) => return SessionAction::RestartConnection,
-                    };
+                let result_body = match unwrap_gzip_layers_with_budget(&rpc.result.0, budget) {
+                    Ok(b) => b,
+                    Err(_) => return SessionAction::RestartConnection,
+                };
                 if result_body.len() < 4 {
                     return SessionAction::RestartConnection;
                 }

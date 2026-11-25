@@ -319,7 +319,20 @@ impl DialogsLoader {
             state.pinned_in_flight = true;
         }
 
-        let response = match invoker.messages_get_dialogs(req).await {
+        // Both requests go out together, like `ApiWrap::requestDialogs` and
+        // `ApiWrap::requestPinnedDialogs` (apiwrap.cpp), instead of one round trip after the other.
+        let (response, pinned_response) = if need_pinned {
+            let (dialogs, pinned) = tokio::join!(
+                invoker.messages_get_dialogs(req),
+                invoker
+                    .messages_get_pinned_dialogs(tl_fns::messages::GetPinnedDialogs { folder_id }),
+            );
+            (dialogs, Some(pinned))
+        } else {
+            (invoker.messages_get_dialogs(req).await, None)
+        };
+
+        let response = match response {
             Ok(res) => res,
             Err(err) => {
                 if let Some(st) = self.folders.get_mut(&folder_id) {
@@ -332,11 +345,8 @@ impl DialogsLoader {
             }
         };
 
-        let pinned = if need_pinned {
-            match invoker
-                .messages_get_pinned_dialogs(tl_fns::messages::GetPinnedDialogs { folder_id })
-                .await
-            {
+        let pinned = if let Some(pinned_response) = pinned_response {
+            match pinned_response {
                 Ok(p) => {
                     self.register_peers_from_tl(&p.users, &p.chats);
                     for d in &p.dialogs {

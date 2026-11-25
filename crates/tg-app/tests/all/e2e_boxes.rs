@@ -25,8 +25,12 @@ fn open_main_menu(harness: &mut egui_kittest::Harness<'_, AppTestState>) {
     wait_for_label_settled(harness, "New Group");
 }
 
+/// The mock session's two side-menu bots ("Catalog Shop", "Quick Wallet") sit between
+/// My Profile and the separator (`SetupMenuBots`), 40 px each.
+const MOCK_SIDE_MENU_BOTS_H: f32 = 2.0 * 40.0;
+
 fn main_menu_item_pos(row_after_sep: usize) -> Pos2 {
-    let base_y = MAIN_MENU_COVER_HEIGHT + 6.0 + 42.0 + 8.0;
+    let base_y = MAIN_MENU_COVER_HEIGHT + 6.0 + 42.0 + MOCK_SIDE_MENU_BOTS_H + 8.0;
     Pos2::new(120.0, base_y + (row_after_sep as f32 + 0.5) * 42.0)
 }
 
@@ -39,7 +43,9 @@ fn box_create_group_flow() {
     open_main_menu(&mut harness);
     click_at(&mut harness, main_menu_item_pos(0));
     // Wait for BoxHost enter animation and Step 1 controls to settle.
-    wait_for_label_settled(&mut harness, "1d");
+    // UI parity (Package D): the compact `GroupInfoBox` keeps the TTL presets in its `⋮` menu.
+    let ttl_menu_label = tg_lang::tr::lng_manage_messages_ttl_menu();
+    wait_for_label_settled(&mut harness, &ttl_menu_label);
 
     // Find the Group Name TextInput inside the centered modal via AccessKit.
     let modal_center = WORKSPACE_SIZE * 0.5;
@@ -51,18 +57,17 @@ fn box_create_group_flow() {
     harness.step();
     type_text(&mut harness, "Rust QA Guild");
 
-    // Step 1 footer button ("Next") sits at the bottom-right of the centered BoxModal (width ~380px).
-    // Locate the "1d" selectable label (present in Step 1 auto-delete row) to anchor footer Y cleanly!
-    let auto_del_rect = harness.get_by_label("1d").rect();
-    let next_btn_pos = Pos2::new(modal_center.x + 140.0, auto_del_rect.max.y + 42.0);
-    click_at(&mut harness, next_btn_pos);
+    // Step 1 footer button ("Next").
+    harness
+        .get_by_label(&tg_lang::tr::lng_create_group_next())
+        .click();
     wait_until(
         &mut harness,
         DEFAULT_MAX_FRAMES,
         "CreateGroup wizard did not advance to Step 2 (Add Members)",
         |h| {
             !h.state().controller.is_animating()
-                && h.query_by_label("1d").is_none()
+                && h.query_by_label(&ttl_menu_label).is_none()
                 && h.query_all_by_role(egui::accesskit::Role::TextInput)
                     .any(|n| (n.rect().center().x - modal_center.x).abs() < 260.0)
         },
@@ -210,10 +215,13 @@ fn box_share_flow() {
         .len();
 
     // Open ShareBox cleanly via `handle_incoming_activation` (`-sendpath` path), which pushes `BoxKind::Share`.
+    // `-sendpath` accepts only absolute paths to existing files (SEC2 L11).
+    let notes = harness.state()._temp_dir.path().join("release_notes.pdf");
+    std::fs::write(&notes, b"%PDF").expect("write share file");
     let ctx = harness.ctx.clone();
     harness.state_mut().controller.handle_incoming_activation(
         IncomingActivation {
-            send_paths: vec![std::path::PathBuf::from("release_notes.pdf")],
+            send_paths: vec![notes],
             ..IncomingActivation::default()
         },
         &ctx,

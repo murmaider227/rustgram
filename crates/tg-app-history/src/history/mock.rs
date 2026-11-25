@@ -192,6 +192,11 @@ pub struct MockHistoryStore {
     summaries: HashMap<(PeerId, MsgId), MessageSummaryEntry>,
     applied_birthday: Option<(u8, u8, Option<u16>)>,
     applied_userpic_photo_id: Option<i64>,
+    accepted_contacts: Vec<PeerId>,
+    reported_spam_peers: Vec<PeerId>,
+    hidden_settings_bars: Vec<PeerId>,
+    blocked_from_replies:
+        Vec<tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest>,
 }
 
 impl Default for MockHistoryStore {
@@ -1132,6 +1137,10 @@ impl MockHistoryStore {
             summaries: HashMap::new(),
             applied_birthday: None,
             applied_userpic_photo_id: None,
+            accepted_contacts: Vec::new(),
+            reported_spam_peers: Vec::new(),
+            hidden_settings_bars: Vec::new(),
+            blocked_from_replies: Vec::new(),
         }
     }
 
@@ -1221,6 +1230,44 @@ impl MockHistoryStore {
     #[must_use]
     pub fn typing_log(&self) -> &[(PeerId, TypingAction)] {
         &self.typing_log
+    }
+
+    /// Sets the contact status banner for `peer_id` (used by tests).
+    pub fn set_contact_status(&mut self, peer_id: PeerId, banner: Option<ContactStatusBanner>) {
+        if let Some(info) = self.peers.get_mut(&peer_id) {
+            info.contact_status = banner;
+        }
+    }
+
+    /// Recorded `accept_contact` calls (used by tests).
+    #[must_use]
+    pub fn accepted_contacts(&self) -> &[PeerId] {
+        &self.accepted_contacts
+    }
+
+    /// Recorded `report_spam` calls (used by tests).
+    #[must_use]
+    pub fn reported_spam_peers(&self) -> &[PeerId] {
+        &self.reported_spam_peers
+    }
+
+    /// Recorded `hide_peer_settings_bar` calls (used by tests).
+    #[must_use]
+    pub fn hidden_settings_bars(&self) -> &[PeerId] {
+        &self.hidden_settings_bars
+    }
+
+    /// Recorded `block_from_replies` requests (used by tests).
+    #[must_use]
+    pub fn blocked_from_replies(
+        &self,
+    ) -> &[tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest] {
+        &self.blocked_from_replies
+    }
+
+    /// Registers a peer info entry in this mock store (used by tests).
+    pub fn register_peer(&mut self, info: HistoryPeerInfo) {
+        self.peers.insert(info.summary.id, info);
     }
 }
 
@@ -1560,7 +1607,7 @@ impl HistoryBackend for MockHistoryStore {
     fn mark_history_read(&mut self, peer_id: PeerId, max_id: MsgId) {
         if let Some(msgs) = self.histories.get_mut(&peer_id) {
             for m in msgs.iter_mut() {
-                if m.id <= max_id {
+                if !m.outgoing && m.id <= max_id {
                     m.is_read = true;
                 }
             }
@@ -1741,6 +1788,24 @@ impl HistoryBackend for MockHistoryStore {
         if let Some(info) = self.peers.get_mut(&peer_id) {
             info.contact_status = None;
         }
+    }
+
+    fn accept_contact(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.accepted_contacts.push(peer_id);
+        self.add_contact(peer_id);
+        Ok(())
+    }
+
+    fn report_spam(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        self.reported_spam_peers.push(peer_id);
+        self.dismiss_contact_status(peer_id);
+        Ok(true)
+    }
+
+    fn hide_peer_settings_bar(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        self.hidden_settings_bars.push(peer_id);
+        self.dismiss_contact_status(peer_id);
+        Ok(true)
     }
 
     fn toggle_block_peer(&mut self, peer_id: PeerId) {
@@ -2540,6 +2605,32 @@ impl HistoryBackend for MockHistoryStore {
         self.applied_userpic_photo_id = Some(photo_id);
         Ok(())
     }
+
+    fn block_from_replies(
+        &mut self,
+        request: tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest,
+    ) -> Result<(), String> {
+        self.blocked_from_replies.push(request);
+        if request.delete_message || request.delete_history {
+            let mut sender_to_purge: Option<(PeerId, PeerId)> = None;
+            for (&pid, msgs) in &self.histories {
+                if let Some(m) = msgs.iter().find(|m| m.id == request.msg_id) {
+                    sender_to_purge = Some((pid, m.from_id));
+                    break;
+                }
+            }
+            if let Some((pid, from_id)) = sender_to_purge
+                && let Some(msgs) = self.histories.get_mut(&pid)
+            {
+                if request.delete_history {
+                    msgs.retain(|m| m.from_id != from_id && m.id != request.msg_id);
+                } else {
+                    msgs.retain(|m| m.id != request.msg_id);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl MockHistoryStore {
@@ -2741,6 +2832,18 @@ impl HistoryBackend for MockHistoryBackendAdapter {
 
     fn add_contact(&mut self, peer_id: PeerId) {
         MOCK_HISTORY_STORE.with(|s| s.borrow_mut().add_contact(peer_id));
+    }
+
+    fn accept_contact(&mut self, peer_id: PeerId) -> Result<(), String> {
+        MOCK_HISTORY_STORE.with(|s| s.borrow_mut().accept_contact(peer_id))
+    }
+
+    fn report_spam(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        MOCK_HISTORY_STORE.with(|s| s.borrow_mut().report_spam(peer_id))
+    }
+
+    fn hide_peer_settings_bar(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        MOCK_HISTORY_STORE.with(|s| s.borrow_mut().hide_peer_settings_bar(peer_id))
     }
 
     fn toggle_block_peer(&mut self, peer_id: PeerId) {
@@ -3046,5 +3149,12 @@ impl HistoryBackend for MockHistoryBackendAdapter {
                 is_video,
             )
         })
+    }
+
+    fn block_from_replies(
+        &mut self,
+        request: tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest,
+    ) -> Result<(), String> {
+        MOCK_HISTORY_STORE.with(|s| s.borrow_mut().block_from_replies(request))
     }
 }

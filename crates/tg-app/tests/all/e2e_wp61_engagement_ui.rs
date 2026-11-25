@@ -449,9 +449,10 @@ fn wp61_read_receipts_dm_outbox_read_at_row() {
     right_click_at(&mut h, outgoing_rect.center());
     step_frames(&mut h, 10);
 
+    // WP-75: the row shows `Api::FormatReadDate` alone ("today at 14:02", tdesktop `WhenAction`).
     let read_at_node = h
-        .query_by_label_contains("Read at ")
-        .expect("1:1 DM outgoing read message should display 'Read at ...' row");
+        .query_by_label_contains(" at ")
+        .expect("1:1 DM outgoing read message should display the read date row");
     assert!(read_at_node.rect().is_positive());
 }
 
@@ -499,7 +500,9 @@ fn wp61_pull_to_next_channel_navigates_to_next_unread_channel() {
         "releasing pull-to-next-channel past threshold should navigate to CHANNEL_RELEASES"
     );
 
-    // 2. Clicking the accessible pull footer on CHANNEL_RELEASES navigates back to unread CHANNEL_DEV_LOG.
+    // Since Step 1 read `CHANNEL_DEV_LOG` to the bottom (marking it read as in tdesktop),
+    // scrolling `CHANNEL_RELEASES` to the bottom leaves no other unread channel, so no pull
+    // prompt appears even during overscroll (`FindNextUnreadChannel`).
     h.state_mut()
         .controller
         .main_widget_mut()
@@ -507,14 +510,57 @@ fn wp61_pull_to_next_channel_navigates_to_next_unread_channel() {
         .request_scroll_to_bottom(session_peers::CHANNEL_RELEASES);
     settle_layout(&mut h);
     let pull_prompt = tr::lng_pull_next_channel();
-    let footer_node = h
+    let now = h.ctx.input(|i| i.time);
+    h.state_mut()
+        .controller
+        .main_widget_mut()
+        .history_mut()
+        .pull_next_channel_mut()
+        .feed_bottom_overscroll(10.0, now, true);
+    step_frames(&mut h, 1);
+    assert!(
+        h.query_by_label_contains(&pull_prompt).is_none(),
+        "pull-to-next-channel footer must stay hidden once all other channels are read"
+    );
+
+    // 2. On a fresh workspace opened at `CHANNEL_RELEASES` (while `CHANNEL_DEV_LOG` is still
+    //    unread), the pull footer appears only while over-scrolling (WP-75); clicking it
+    //    navigates to unread `CHANNEL_DEV_LOG`.
+    let mut h2 = build_wp61_test_harness(DESKTOP_SIZE);
+    if let Some(session) = h2.state_mut().controller.session_mut() {
+        session.show_peer_history(
+            session_peers::CHANNEL_RELEASES,
+            SectionShow::default(),
+            MsgId::SHOW_AT_END,
+        );
+    }
+    settle_layout(&mut h2);
+    h2.state_mut()
+        .controller
+        .main_widget_mut()
+        .history_mut()
+        .request_scroll_to_bottom(session_peers::CHANNEL_RELEASES);
+    settle_layout(&mut h2);
+    assert!(
+        h2.query_by_label_contains(&pull_prompt).is_none(),
+        "no pull footer at rest"
+    );
+    let now = h2.ctx.input(|i| i.time);
+    h2.state_mut()
+        .controller
+        .main_widget_mut()
+        .history_mut()
+        .pull_next_channel_mut()
+        .feed_bottom_overscroll(10.0, now, true);
+    step_frames(&mut h2, 1);
+    let footer_node = h2
         .query_by_label_contains(&pull_prompt)
         .expect("pull-to-next-channel footer should display pull prompt");
     let footer_center = footer_node.rect().center();
-    click_at(&mut h, footer_center);
-    settle_layout(&mut h);
+    click_at(&mut h2, footer_center);
+    settle_layout(&mut h2);
 
-    let active_after_click = h.state().controller.session().map(|s| s.active_peer());
+    let active_after_click = h2.state().controller.session().map(|s| s.active_peer());
     assert_eq!(
         active_after_click,
         Some(session_peers::CHANNEL_DEV_LOG),
@@ -530,6 +576,11 @@ fn wp61_start_bot_deep_link_dispatches_rpc_without_composer_prefill() {
     h.state_mut()
         .controller
         .open_link("https://t.me/catalog_demo_bot?start=wp61_ref42");
+    settle_layout(&mut h);
+    // SEC2 L4: the link only shows START; nothing is sent until the user presses it.
+    assert!(handle.started_bots().is_empty());
+    h.get_by_label(&tg_lang::tr::lng_bot_start().to_uppercase())
+        .click();
     settle_layout(&mut h);
 
     let started = handle.started_bots();

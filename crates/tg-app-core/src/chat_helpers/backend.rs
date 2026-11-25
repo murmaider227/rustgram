@@ -193,6 +193,22 @@ pub enum PaidReactionPrivacy {
     Peer(PeerId),
 }
 
+/// Server-supplied emoji category/mood group returned by `messages.getEmojiGroups`
+/// (`Data::EmojiGroup` in `data/stickers/data_stickers.h`, `chat_helpers/emoji_list_widget.cpp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmojiGroupInfo {
+    /// Custom emoji document ID representing the group's icon.
+    pub icon_emoji_id: i64,
+    /// Group display title (e.g. `"Love"`, `"Approval"`).
+    pub title: String,
+    /// Unicode emoticons filtered when this mood group is selected.
+    pub emoticons: Vec<String>,
+    /// Whether this entry is the server's `emojiGroupPremium` sentinel group.
+    pub is_premium: bool,
+    /// Whether this entry is an `emojiGroupGreeting` group.
+    pub is_greeting: bool,
+}
+
 /// Decoded or raw media payload for a sticker preview.
 #[derive(Debug, Clone)]
 pub enum StickerMedia {
@@ -277,6 +293,12 @@ pub trait ChatHelpersBackend {
     /// Searches emoji by keyword or shortcode using `tg-chat`'s `EmojiKeywords` engine.
     fn search_emoji(&mut self, query: &str) -> Vec<EmojiKeywordResult>;
 
+    /// Returns cached or freshly fetched emoji mood/category groups from `messages.getEmojiGroups`
+    /// (`data/data_emoji_statuses.cpp:202-207`, `chat_helpers/emoji_list_widget.cpp`).
+    fn emoji_groups(&self) -> Result<Vec<EmojiGroupInfo>, String> {
+        Ok(Vec::new())
+    }
+
     // --- Stickers ---
 
     /// Whether the current user has Telegram Premium (controls Premium-locked sticker markers).
@@ -324,6 +346,16 @@ pub trait ChatHelpersBackend {
 
     /// Returns `true` if `set_id` is currently installed.
     fn is_set_installed(&self, set_id: StickerSetId) -> bool;
+
+    /// Looks up a hydrated sticker or custom-emoji pack section by `set_id`
+    /// (for packs returned by [`Self::search_emoji_sticker_sets`] or
+    /// [`Self::load_old_featured_stickers`]).
+    fn sticker_set_section(&self, set_id: StickerSetId) -> Option<StickerPanelSection> {
+        self.sticker_sections()
+            .into_iter()
+            .chain(self.featured_sticker_sections())
+            .find(|s| s.id == set_id)
+    }
 
     // --- GIFs ---
 

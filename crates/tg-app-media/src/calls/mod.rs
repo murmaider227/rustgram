@@ -151,6 +151,21 @@ impl AppCallsHost {
         self.open_recent_calls();
     }
 
+    /// Starts an outgoing 1:1 call and shows the call panel
+    /// (`Calls::Instance::startOutgoingCall`, e.g. from the profile Call button).
+    pub fn start_outgoing_call(
+        &mut self,
+        peer_id: tg_app_core::stand_in::types::PeerId,
+        video: bool,
+    ) {
+        let now_ms = self.elapsed_ms();
+        self.backend.start_outgoing_call(peer_id, video, now_ms);
+        self.backend.confirm_outgoing_call(video, now_ms);
+        if let Some(c) = self.backend.active_call() {
+            self.call_panel.reset_for_call(c, now_ms);
+        }
+    }
+
     /// Closes the Recent Calls dialog.
     pub fn close_recent_calls(&mut self) {
         self.recent_calls_box.open = false;

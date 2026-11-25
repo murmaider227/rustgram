@@ -70,8 +70,8 @@ pub struct MockWalletBackend {
     sessions: Vec<StoredSession>,
     next_session_id: u64,
     pending_connect: Option<PendingConnectApproval>,
-    pending_tx: Option<PendingTxApproval>,
-    pending_sign_data: Option<PendingSignDataApproval>,
+    pending_tx_queue: std::collections::VecDeque<PendingTxApproval>,
+    pending_sign_data_queue: std::collections::VecDeque<PendingSignDataApproval>,
     collectibles: Vec<NftItem>,
     jettons: Vec<JettonWalletBalance>,
     onramp_providers: Vec<OnrampProviderCard>,
@@ -105,8 +105,8 @@ impl MockWalletBackend {
             sessions: Vec::new(),
             next_session_id: 1,
             pending_connect: None,
-            pending_tx: None,
-            pending_sign_data: None,
+            pending_tx_queue: std::collections::VecDeque::new(),
+            pending_sign_data_queue: std::collections::VecDeque::new(),
             collectibles: Vec::new(),
             jettons: Vec::new(),
             onramp_providers: Vec::new(),
@@ -268,7 +268,7 @@ impl MockWalletBackend {
             };
             let demo_tc_emul =
                 demo_emul.to_ton_connect_emulation(&wallet_raw_for_emul, 1_200_000_000);
-            backend.pending_tx = Some(PendingTxApproval {
+            backend.pending_tx_queue.push_back(PendingTxApproval {
                 session_id,
                 dapp_name: "Demo Swap".to_owned(),
                 dapp_domain: "demoswap.example".to_owned(),
@@ -289,18 +289,20 @@ impl MockWalletBackend {
                 emulation: Some(demo_emul),
                 ton_connect_emulation: Some(demo_tc_emul),
             });
-            backend.pending_sign_data = Some(PendingSignDataApproval {
-                session_id,
-                dapp_name: "Demo Swap".to_owned(),
-                dapp_domain: "demoswap.example".to_owned(),
-                request: TonConnectSignDataRequest {
-                    request_id: "demo-sign-1".to_owned(),
-                    kind: "text".to_owned(),
-                    payload: "Authorize Demo Swap limit order #4821 (1.2 TON -> 6.42 USDt)"
-                        .to_owned(),
-                    schema: None,
-                },
-            });
+            backend
+                .pending_sign_data_queue
+                .push_back(PendingSignDataApproval {
+                    session_id,
+                    dapp_name: "Demo Swap".to_owned(),
+                    dapp_domain: "demoswap.example".to_owned(),
+                    request: TonConnectSignDataRequest {
+                        request_id: "demo-sign-1".to_owned(),
+                        kind: "text".to_owned(),
+                        payload: "Authorize Demo Swap limit order #4821 (1.2 TON -> 6.42 USDt)"
+                            .to_owned(),
+                        schema: None,
+                    },
+                });
         }
 
         let owner_raw = backend
@@ -639,7 +641,7 @@ impl WalletBackend for MockWalletBackend {
     }
 
     fn pending_tx_approval(&self) -> Option<PendingTxApproval> {
-        self.pending_tx.clone()
+        self.pending_tx_queue.front().cloned()
     }
 
     fn handle_ton_connect_link(&mut self, raw_link: &str) -> Result<(), String> {
@@ -722,15 +724,49 @@ impl WalletBackend for MockWalletBackend {
         self.pending_connect = None;
     }
 
-    fn approve_ton_connect_tx(&mut self) -> Result<SendReceipt, String> {
+    fn approve_ton_connect_tx(
+        &mut self,
+        request_id: &str,
+        content_hash: &str,
+    ) -> Result<SendReceipt, String> {
         let pending = self
-            .pending_tx
-            .clone()
+            .pending_tx_queue
+            .front()
+            .cloned()
             .ok_or_else(|| "No pending TON Connect transaction".to_owned())?;
+        if pending.request.request_id != request_id || pending.content_hash() != content_hash {
+            return Err(
+                "Pending TON Connect transaction changed before approval; review the current request"
+                    .to_owned(),
+            );
+        }
         let contract = self
             .contract
             .as_ref()
             .ok_or_else(|| "No wallet configured".to_owned())?;
+        let expected_network = if contract.testnet { "-3" } else { "-239" };
+        if let Some(ref net) = pending.request.network
+            && net.trim() != expected_network
+        {
+            return Err(format!(
+                "Transaction network '{}' does not match active wallet network '{}'",
+                net.trim(),
+                expected_network
+            ));
+        }
+        let now_u64 = self.now_unix.max(0) as u64;
+        if let Some(vu) = pending.request.valid_until
+            && vu <= now_u64
+        {
+            return Err("Transaction request has expired".to_owned());
+        }
+        if let Some(ref from_str) = pending.request.from {
+            let parsed_from = TonAddress::parse(from_str.trim()).map_err(|e| e.to_string())?;
+            let wallet_addr = contract.address().map_err(|e| e.to_string())?;
+            if parsed_from.address.to_raw() != wallet_addr.to_raw() {
+                return Err("Transaction 'from' address does not match active wallet".to_owned());
+            }
+        }
         let kp = self.load_keypair()?;
 
         let mut msgs = Vec::with_capacity(pending.request.messages.len());
@@ -749,7 +785,8 @@ impl WalletBackend for MockWalletBackend {
         let valid_until = pending
             .request
             .valid_until
-            .unwrap_or((self.now_unix as u64).saturating_add(300)) as u32;
+            .unwrap_or(now_u64.saturating_add(300))
+            .min(u64::from(u32::MAX)) as u32;
         let signed = contract
             .create_signed_transfer(&kp, self.seqno, valid_until, &msgs)
             .map_err(|e| e.to_string())?;
@@ -802,7 +839,7 @@ impl WalletBackend for MockWalletBackend {
                 status: WalletTxStatus::Success,
             },
         );
-        self.pending_tx = None;
+        self.pending_tx_queue.pop_front();
 
         Ok(SendReceipt {
             message_hash_hex: hash_hex,
@@ -811,7 +848,7 @@ impl WalletBackend for MockWalletBackend {
     }
 
     fn decline_ton_connect_tx(&mut self) {
-        if let Some(pending) = self.pending_tx.take()
+        if let Some(pending) = self.pending_tx_queue.pop_front()
             && let Some(stored) = self
                 .sessions
                 .iter()
@@ -826,14 +863,31 @@ impl WalletBackend for MockWalletBackend {
     }
 
     fn pending_sign_data(&self) -> Option<PendingSignDataApproval> {
-        self.pending_sign_data.clone()
+        self.pending_sign_data_queue.front().cloned()
     }
 
-    fn approve_ton_connect_sign_data(&mut self) -> Result<SignDataResult, String> {
+    fn approve_ton_connect_sign_data(
+        &mut self,
+        request_id: &str,
+        content_hash: &str,
+    ) -> Result<SignDataResult, String> {
         let pending = self
-            .pending_sign_data
-            .clone()
+            .pending_sign_data_queue
+            .front()
+            .cloned()
             .ok_or_else(|| "No pending TON Connect signData request".to_owned())?;
+        if pending.request.request_id != request_id || pending.content_hash() != content_hash {
+            return Err(
+                "Pending TON Connect signData request changed before approval; review the current request"
+                    .to_owned(),
+            );
+        }
+        if !tg_wallet::tonconnect::ton_connect_proof_domain_allowed(&pending.dapp_domain, "") {
+            return Err(format!(
+                "TON Connect signData domain '{}' is not allowed",
+                pending.dapp_domain
+            ));
+        }
         let contract = self
             .contract
             .as_ref()
@@ -862,12 +916,12 @@ impl WalletBackend for MockWalletBackend {
                 .build_sign_data_success_response(&pending.request.request_id, &signed)
                 .map_err(|e| e.to_string())?;
         }
-        self.pending_sign_data = None;
+        self.pending_sign_data_queue.pop_front();
         Ok(signed)
     }
 
     fn decline_ton_connect_sign_data(&mut self) {
-        if let Some(pending) = self.pending_sign_data.take()
+        if let Some(pending) = self.pending_sign_data_queue.pop_front()
             && let Some(stored) = self
                 .sessions
                 .iter()
@@ -891,20 +945,9 @@ impl WalletBackend for MockWalletBackend {
         };
         let stored = self.sessions.remove(pos);
         let _ = stored.session.build_disconnect_event(session_id);
-        if self
-            .pending_tx
-            .as_ref()
-            .is_some_and(|p| p.session_id == session_id)
-        {
-            self.pending_tx = None;
-        }
-        if self
-            .pending_sign_data
-            .as_ref()
-            .is_some_and(|p| p.session_id == session_id)
-        {
-            self.pending_sign_data = None;
-        }
+        self.pending_tx_queue.retain(|p| p.session_id != session_id);
+        self.pending_sign_data_queue
+            .retain(|p| p.session_id != session_id);
         Ok(())
     }
 

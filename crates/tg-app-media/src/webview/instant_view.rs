@@ -29,7 +29,8 @@ use tg_ui::widgets::buttons::IconKind;
 use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
 use tg_webview::{
     DEFAULT_CUSTOM_SCHEME, DataRequest, DataResponse, DataResult, MemoryDataStream, SchemeRouter,
-    WebView, WebViewBounds, WebViewCallbacks, WebViewConfig, availability, resolve_user_data_dir,
+    WebMessage, WebView, WebViewBounds, WebViewCallbacks, WebViewConfig, availability,
+    resolve_user_data_dir,
 };
 
 use crate::webview::backend::{AppWebViewEvent, ClipboardAccess, ExternalOpener, WebViewBackend};
@@ -79,8 +80,8 @@ const TOAST_DURATION: Duration = Duration::from_secs(3);
 /// Events posted asynchronously from WebView2 COM callbacks to [`InstantViewWindow`].
 #[derive(Debug, Clone)]
 pub enum IvBridgeEvent {
-    /// Raw JSON message posted by `tg-iv`'s `assets/page.js`.
-    BridgeMessage(String),
+    /// Raw WebView2 message (payload + verified `source_url`) posted by `tg-iv`'s `assets/page.js`.
+    BridgeMessage(WebMessage),
     /// Top-level navigation intercepted by `NavigationStarting` / `NewWindowRequested`.
     InterceptedTarget(LinkTarget),
     /// Native WebView2 zoom changed (e.g. via Ctrl+Scroll).
@@ -377,7 +378,7 @@ impl InstantViewWindow {
         let resource_bridge = IvResourceBridge::with_cache(prepared, media, cached_media);
         let search = IvSearchController::from_page(&page);
         let (tx_events, rx_events) = mpsc::channel();
-        let user_data_root = std::env::temp_dir().join("rustgram-webview");
+        let user_data_root = crate::webview::mini_app::default_webview_data_root();
 
         Self {
             controller,
@@ -420,18 +421,31 @@ impl InstantViewWindow {
         dark_mode: bool,
         initial_fragment: Option<&str>,
     ) -> std::io::Result<Self> {
+        let cache_dir = cache_dir.into();
+        let profile_root = cache_dir
+            .parent()
+            .map(|p| p.join("webview_profiles"))
+            .unwrap_or_else(|| cache_dir.join("webview_profiles"));
         let cache = IvCachedMedia::with_disk_dir(
             cache_dir,
             DEFAULT_CACHE_MAX_BYTES,
             DEFAULT_CACHE_MAX_ENTRIES,
         )?;
-        Ok(Self::with_media_cache(
-            page,
-            media,
-            Arc::new(cache),
-            dark_mode,
-            initial_fragment,
-        ))
+        let mut win =
+            Self::with_media_cache(page, media, Arc::new(cache), dark_mode, initial_fragment);
+        win.user_data_root = profile_root;
+        Ok(win)
+    }
+
+    /// Overrides the WebView2 user-data root folder used by this Instant View window.
+    pub fn set_user_data_root(&mut self, root: PathBuf) {
+        self.user_data_root = root;
+    }
+
+    /// Returns the resolved WebView2 user-data folder for this Instant View window.
+    #[must_use]
+    pub fn webview_user_data_dir(&self) -> PathBuf {
+        resolve_user_data_dir(&self.user_data_root, "iv")
     }
 
     /// Creates an Instant View window displaying an explicit runtime error (e.g. missing WebView2).
@@ -761,7 +775,30 @@ impl InstantViewWindow {
         }
     }
 
-    /// Evaluates a raw JSON bridge message from `page.js` and dispatches resulting actions.
+    /// Evaluates a WebView2 [`WebMessage`] (checking `source_url` against [`IV_ORIGIN`]) and
+    /// dispatches resulting actions.
+    pub fn handle_web_message(
+        &mut self,
+        msg: &WebMessage,
+        backend: &mut dyn WebViewBackend,
+        external: &dyn ExternalOpener,
+        clipboard: &dyn ClipboardAccess,
+    ) -> Vec<AppWebViewEvent> {
+        match self
+            .controller
+            .handle_bridge_json_from_source(&msg.text, &msg.source_url)
+        {
+            Ok(actions) => self.handle_controller_actions(actions, backend, external, clipboard),
+            Err(err) => {
+                tracing::debug!(%err, source = %msg.source_url, "Ignored unauthorized or invalid Instant View bridge message");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Evaluates a raw JSON bridge message from `page.js` (assuming the trusted [`IV_ORIGIN`]
+    /// sender; use [`Self::handle_web_message`] for untrusted WebView2 callbacks) and dispatches
+    /// resulting actions.
     pub fn handle_bridge_json(
         &mut self,
         raw_json: &str,
@@ -769,13 +806,11 @@ impl InstantViewWindow {
         external: &dyn ExternalOpener,
         clipboard: &dyn ClipboardAccess,
     ) -> Vec<AppWebViewEvent> {
-        match self.controller.handle_bridge_json(raw_json) {
-            Ok(actions) => self.handle_controller_actions(actions, backend, external, clipboard),
-            Err(err) => {
-                tracing::debug!(%err, "Ignored invalid Instant View bridge message");
-                Vec::new()
-            }
-        }
+        let msg = WebMessage {
+            text: raw_json.to_owned(),
+            source_url: format!("{IV_ORIGIN}/index.html"),
+        };
+        self.handle_web_message(&msg, backend, external, clipboard)
     }
 
     /// Routes a [`LinkTarget`] returned by `tg_iv::classify_link` or `navigation_policy`.
@@ -1774,8 +1809,8 @@ impl InstantViewWindow {
         let mut events = Vec::new();
         while let Ok(ev) = self.rx_events.try_recv() {
             match ev {
-                IvBridgeEvent::BridgeMessage(raw) => {
-                    events.extend(self.handle_bridge_json(&raw, backend, external, clipboard));
+                IvBridgeEvent::BridgeMessage(msg) => {
+                    events.extend(self.handle_web_message(&msg, backend, external, clipboard));
                 }
                 IvBridgeEvent::InterceptedTarget(target) => {
                     events.extend(self.route_link_target(target, backend, external));
@@ -1889,7 +1924,7 @@ impl InstantViewWindow {
         let ctx_fail = ctx.clone();
         let url_shared = Arc::clone(&self.current_url_shared);
 
-        let user_data_path = resolve_user_data_dir(&self.user_data_root, "iv");
+        let user_data_path = self.webview_user_data_dir();
         let config = WebViewConfig {
             opaque_bg: palette.window_bg,
             user_data_path: Some(user_data_path),
@@ -1900,7 +1935,7 @@ impl InstantViewWindow {
             scheme_router: Some(self.resource_bridge.router()),
             callbacks: WebViewCallbacks {
                 on_message: Some(Arc::new(move |msg| {
-                    let _ = tx_msg.send(IvBridgeEvent::BridgeMessage(msg.text));
+                    let _ = tx_msg.send(IvBridgeEvent::BridgeMessage(msg));
                     ctx_msg.request_repaint();
                 })),
                 on_navigation_policy: Some(Arc::new(move |uri, new_window| {

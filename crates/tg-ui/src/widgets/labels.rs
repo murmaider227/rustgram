@@ -183,19 +183,32 @@ pub fn divider_bar(ui: &mut Ui, height: f32, colors: &dyn Colors) -> Rect {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), h), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
-        let bg = colors.color("boxDividerBg");
-        let sh = colors.color("shadowFg");
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
-        ui.painter().rect_filled(
-            Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.min.y + 1.0)),
-            CornerRadius::ZERO,
-            sh,
-        );
-        ui.painter().rect_filled(
-            Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - 1.0), rect.max),
-            CornerRadius::ZERO,
-            sh,
-        );
+        paint_box_divider(ui.painter(), rect, colors);
     }
     rect
+}
+
+/// Paints `BoxContentDivider` into `rect`: `boxDividerBg` with the soft `boxDividerTop` shadow
+/// fading over its first three rows and the faint `boxDividerBottom` row.
+pub fn paint_box_divider(painter: &egui::Painter, rect: Rect, colors: &dyn Colors) {
+    painter.rect_filled(rect, CornerRadius::ZERO, colors.color("boxDividerBg"));
+    let shadow = colors.color("shadowFg");
+    let row = |y: f32| {
+        Rect::from_min_max(
+            Pos2::new(rect.left(), y),
+            Pos2::new(rect.right(), (y + 1.0).min(rect.bottom())),
+        )
+    };
+    for (offset, strength) in [(0.0, 0.61), (1.0, 0.36), (2.0, 0.13)] {
+        painter.rect_filled(
+            row(rect.top() + offset),
+            CornerRadius::ZERO,
+            shadow.gamma_multiply(strength),
+        );
+    }
+    painter.rect_filled(
+        row(rect.bottom() - 1.0),
+        CornerRadius::ZERO,
+        shadow.gamma_multiply(0.13),
+    );
 }

@@ -1,11 +1,11 @@
-//! Main Settings landing page: profile cover, live settings search, colored category rows,
-//! Default Interface Scale slider, Telegram Premium placeholder row, and version footer.
+//! Main Settings landing page: profile cover, settings search (opened from the header search
+//! icon), section rows, Default Interface Scale slider, Premium rows, and the help rows.
 //!
 //! Port origin: `Telegram/SourceFiles/settings/sections/settings_main.cpp`,
 //! `Telegram/SourceFiles/settings/settings_search.cpp`, and
 //! `Telegram/SourceFiles/settings/sections/settings_premium.cpp` (placeholder row only).
 
-use egui::{Color32, CornerRadius, CursorIcon, Sense, Ui, Vec2};
+use egui::{Align2, Color32, CornerRadius, CursorIcon, Id, Pos2, Rect, Sense, Ui, Vec2};
 use tg_core::{CoreSettings, GlobalConfig};
 use tg_lang::tr;
 use tg_ui::fonts::font_id_from_style;
@@ -23,8 +23,8 @@ use super::recent_searches::RecentSettingsSearches;
 use super::scale::render_scale_controls;
 use super::strings;
 use super::widgets::{
-    SettingsIconKind, paint_tinted_icon, settings_card, settings_divider, settings_row,
-    settings_row_pad_x, subsection_title,
+    SETTINGS_LIST_SKIP, SettingsIconKind, paint_tinted_icon, settings_card, settings_divider,
+    settings_row, settings_row_pad_x, settings_section_divider, subsection_title,
 };
 
 /// Indexed settings search entry mirroring `Settings::SearchEntry` (`settings_search.cpp`).
@@ -204,6 +204,35 @@ pub fn search_settings(query: &str) -> Vec<&'static SettingsSearchEntry> {
         .collect()
 }
 
+/// `InputField` id salt of the Main Settings search field.
+const SEARCH_FIELD_SALT: &str = "settings_main_search";
+
+/// Context-data key of the "settings search is open" flag toggled by the header search icon.
+fn search_open_id() -> Id {
+    Id::unique("tg_settings_main_search_open")
+}
+
+/// Returns whether the Main Settings search field is open (`settings_search.cpp`).
+#[must_use]
+pub fn settings_search_open(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(search_open_id()))
+        .unwrap_or(false)
+}
+
+/// Context-data key of the "focus the search field when it is next shown" flag.
+fn search_focus_id() -> Id {
+    Id::unique("tg_settings_main_search_focus")
+}
+
+/// Opens or closes the Main Settings search field (header search icon). Opening focuses the
+/// field like `Settings::Search::setInnerFocus`.
+pub fn set_settings_search_open(ctx: &egui::Context, open: bool) {
+    ctx.data_mut(|d| {
+        d.insert_temp(search_open_id(), open);
+        d.insert_temp(search_focus_id(), open);
+    });
+}
+
 /// Output emitted by [`render_main_settings_page`].
 #[derive(Debug, Clone, Default)]
 pub struct MainPageOutput {
@@ -263,25 +292,37 @@ pub fn render_main_settings_page_with_extras(
     let mut out = MainPageOutput::default();
     let profile = backend.profile();
     let pad_x = settings_row_pad_x();
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     if recent_searches.is_empty() && !core.recent_settings_searches.is_empty() {
         *recent_searches = RecentSettingsSearches::from_core_settings(core);
     }
 
-    // 1. Live Settings Search field (`settings_search.cpp`).
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
-        let avail = (ui.available_width() - pad_x).max(180.0);
-        InputField::single_line(
-            "settings_main_search",
-            search_query,
-            strings::SEARCH_SETTINGS_PLACEHOLDER,
-            InputFieldStyle::rounded_search(colors),
-        )
-        .width(avail)
-        .show(ui);
-    });
+    // 1. Settings search field (`settings_search.cpp`), shown once the header search icon opens it.
+    let search_open = settings_search_open(ui.ctx()) || !search_query.is_empty();
+    if search_open {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.add_space(pad_x);
+            let avail = (ui.available_width() - pad_x).max(180.0);
+            if ui
+                .ctx()
+                .data_mut(|d| d.remove_temp::<bool>(search_focus_id()))
+                .unwrap_or(false)
+            {
+                let edit_id = ui.make_persistent_id(SEARCH_FIELD_SALT).with("_edit");
+                ui.memory_mut(|m| m.request_focus(edit_id));
+            }
+            InputField::single_line(
+                SEARCH_FIELD_SALT,
+                search_query,
+                strings::SEARCH_SETTINGS_PLACEHOLDER,
+                InputFieldStyle::rounded_search(colors),
+            )
+            .width(avail)
+            .show(ui);
+        });
+    }
 
     if !search_query.trim().is_empty() {
         faq_suggestions.ensure_loaded(backend);
@@ -447,14 +488,21 @@ pub fn render_main_settings_page_with_extras(
         settings_divider(ui, None, colors);
     }
 
-    // 2. Profile Cover (`Cover` in `settings_main.cpp` using `st::settings_photo_*` & `st::settings_cover_*`).
-    let photo_top = st::settings_photo_top.scaled().max(12) as f32;
+    // 2. Profile cover (`Cover` in `settings_main.cpp`): 72 px photo at `settingsPhotoLeft/Top`,
+    // name / phone / username at `settingsNameLeft` and `settingsName/Phone/UsernameTop`.
+    let photo_top = st::settings_photo_top.scaled().max(8) as f32;
     let photo_left = st::settings_photo_left.scaled().max(pad_x as i32) as f32;
-    let photo_size = st::info_profile_cover.photo.size.width.scaled().max(68) as f32;
-    ui.add_space(photo_top);
-    ui.horizontal(|ui| {
-        ui.add_space(photo_left);
-        let (av_rect, av_resp) = ui.allocate_exact_size(Vec2::splat(photo_size), Sense::click());
+    let photo_size = 72.0_f32;
+    let cover_h = photo_top + photo_size + st::settings_photo_bottom.scaled().max(16) as f32;
+    let name_left = 112.0_f32;
+    let (cover_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), cover_h), Sense::hover());
+    {
+        let av_rect = Rect::from_min_size(
+            Pos2::new(cover_rect.left() + photo_left, cover_rect.top() + photo_top),
+            Vec2::splat(photo_size),
+        );
+        let av_resp = ui.interact(av_rect, ui.scope_id().with("cover_photo"), Sense::click());
         let userpic =
             EmptyUserpic::for_color_index(profile.photo_color_index, &profile.full_name(), colors);
         userpic.paint_circle(ui.painter(), av_rect);
@@ -465,87 +513,102 @@ pub fn render_main_settings_page_with_extras(
             out.navigate = Some(SettingsSection::Information);
         }
 
-        let name_gap = (st::settings_name_left.scaled() as f32 - photo_left - photo_size).max(14.0);
-        ui.add_space(name_gap);
-        ui.vertical(|ui| {
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(profile.full_name())
-                    .font(font_id_from_style(st::settings_cover_name.style.font))
-                    .color(resolve_color_ref(st::settings_cover_name.text_fg, colors)),
+        // Right-aligned QR code button (`st::info_profile_labeled_button_qr`).
+        let qr_btn_size = 36.0_f32;
+        let qr_rect = Rect::from_center_size(
+            Pos2::new(
+                cover_rect.right() - pad_x - qr_btn_size * 0.5 + 8.0,
+                av_rect.center().y,
+            ),
+            Vec2::splat(qr_btn_size),
+        );
+        let qr_resp = ui.interact(qr_rect, ui.scope_id().with("cover_qr"), Sense::click());
+        if qr_resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            ui.painter().circle_filled(
+                qr_rect.center(),
+                qr_btn_size * 0.5,
+                colors.color("windowBgOver"),
             );
-            let phone_text = if profile.phone_hidden {
-                strings::PHONE_NUMBER_HIDDEN.to_owned()
-            } else {
-                profile.phone.clone()
-            };
-            let phone_resp = ui.add(
-                egui::Label::new(
-                    egui::RichText::new(phone_text)
-                        .font(font_id_from_style(st::normal_font))
-                        .color(colors.color("windowFg")),
-                )
-                .sense(Sense::click()),
-            );
-            if phone_resp.clicked() && !profile.phone_hidden {
-                ui.ctx().copy_text(profile.phone.clone());
-                out.toast = Some(strings::PHONE_COPIED_TOAST.to_owned());
-            }
+        }
+        paint_tinted_icon(
+            ui.painter(),
+            qr_rect,
+            st::menu_icon_qr_code,
+            colors,
+            Some(colors.color("windowActiveTextFg")),
+        );
+        if qr_resp.on_hover_text(strings::PROFILE_QR_TOOLTIP).clicked() {
+            *qr_open = !*qr_open;
+        }
 
-            let uname_label = if profile.username.is_empty() {
-                tr::lng_settings_username_add()
-            } else {
-                format!("@{}", profile.username)
-            };
-            let uname_resp = ui.add(
-                egui::Label::new(
-                    egui::RichText::new(uname_label)
-                        .font(font_id_from_style(st::normal_font))
-                        .color(colors.color("windowActiveTextFg")),
-                )
-                .sense(Sense::click()),
-            );
-            if uname_resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            }
-            if uname_resp.clicked() {
-                if profile.username.is_empty() {
-                    out.navigate = Some(SettingsSection::Information);
-                } else {
-                    let link = format!("https://t.me/{}", profile.username);
-                    ui.ctx().copy_text(link);
-                    out.toast = Some(tr::lng_username_copied());
-                }
-            }
-        });
+        let text_left = cover_rect.left() + name_left;
+        let text_w = (qr_rect.left() - 8.0 - text_left).max(40.0);
+        let painter = ui.painter().with_clip_rect(Rect::from_min_max(
+            Pos2::new(text_left, cover_rect.top()),
+            Pos2::new(text_left + text_w, cover_rect.bottom()),
+        ));
+        painter.text(
+            Pos2::new(text_left, cover_rect.top() + 12.0),
+            Align2::LEFT_TOP,
+            profile.full_name(),
+            egui::FontId::new(16.0, tg_ui::fonts::family_semibold()),
+            resolve_color_ref(st::settings_cover_name.text_fg, colors),
+        );
 
-        // Right-aligned QR code button (`st::menu_icon_qr_code` / `st::info_profile_labeled_button_qr`).
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(pad_x);
-            let qr_btn_size = st::info_profile_labeled_button_qr.width.scaled().max(36) as f32;
-            let (qr_rect, qr_resp) =
-                ui.allocate_exact_size(Vec2::splat(qr_btn_size), Sense::click());
-            if qr_resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                ui.painter().circle_filled(
-                    qr_rect.center(),
-                    qr_btn_size * 0.5,
-                    colors.color("windowBgOver"),
-                );
+        let phone_text = if profile.phone_hidden {
+            strings::PHONE_NUMBER_HIDDEN.to_owned()
+        } else {
+            format_cover_phone(&profile.phone)
+        };
+        let small = font_id_from_style(st::normal_font);
+        let phone_rect = painter.text(
+            Pos2::new(text_left, cover_rect.top() + 37.0),
+            Align2::LEFT_TOP,
+            &phone_text,
+            small.clone(),
+            colors.color("windowFg"),
+        );
+        let phone_resp = ui.interact(
+            phone_rect,
+            ui.scope_id().with("cover_phone"),
+            Sense::click(),
+        );
+        if phone_resp.clicked() && !profile.phone_hidden {
+            ui.ctx().copy_text(phone_text.clone());
+            out.toast = Some(strings::PHONE_COPIED_TOAST.to_owned());
+        }
+
+        let uname_label = if profile.username.is_empty() {
+            tr::lng_settings_username_add()
+        } else {
+            format!("@{}", profile.username)
+        };
+        let uname_rect = painter.text(
+            Pos2::new(text_left, cover_rect.top() + 58.0),
+            Align2::LEFT_TOP,
+            uname_label,
+            small,
+            colors.color("windowSubTextFg"),
+        );
+        let uname_resp = ui.interact(
+            uname_rect,
+            ui.scope_id().with("cover_username"),
+            Sense::click(),
+        );
+        if uname_resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if uname_resp.clicked() {
+            if profile.username.is_empty() {
+                out.navigate = Some(SettingsSection::Information);
+            } else {
+                let link = format!("https://t.me/{}", profile.username);
+                ui.ctx().copy_text(link);
+                out.toast = Some(tr::lng_username_copied());
             }
-            paint_tinted_icon(
-                ui.painter(),
-                qr_rect,
-                st::menu_icon_qr_code,
-                colors,
-                Some(colors.color("windowActiveTextFg")),
-            );
-            if qr_resp.on_hover_text(strings::PROFILE_QR_TOOLTIP).clicked() {
-                *qr_open = !*qr_open;
-            }
-        });
-    });
-    ui.add_space(st::settings_photo_bottom.scaled().max(6) as f32);
+        }
+    }
 
     if *qr_open {
         ui.add_space(4.0);
@@ -588,9 +651,10 @@ pub fn render_main_settings_page_with_extras(
         });
     }
 
-    settings_divider(ui, None, colors);
+    settings_section_divider(ui, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
-    // 3. Main Settings Categories (`SetupSections` in `settings_main.cpp`).
+    // 3. Main Settings sections (`BuildSectionButtons` in `settings_main.cpp`).
     let sections: [(String, SettingsIconKind, SettingsSection, Option<&str>); 9] = [
         (
             tr::lng_settings_my_account(),
@@ -617,7 +681,7 @@ pub fn render_main_settings_page_with_extras(
             None,
         ),
         (
-            tr::lng_settings_section_filters(),
+            strings::CHAT_FOLDERS_TITLE.to_owned(),
             SettingsIconKind::Folders,
             SettingsSection::Folders,
             None,
@@ -629,8 +693,8 @@ pub fn render_main_settings_page_with_extras(
             None,
         ),
         (
-            tr::lng_settings_section_call_settings(),
-            SettingsIconKind::Calls,
+            tr::lng_settings_section_devices(),
+            SettingsIconKind::Mic,
             SettingsSection::Calls,
             None,
         ),
@@ -665,20 +729,17 @@ pub fn render_main_settings_page_with_extras(
         }
     }
 
-    settings_divider(ui, None, colors);
+    section_break(ui, colors);
 
-    // Built-in TON Wallet entry (gated by `WalletAppConfig::is_available`).
-    crate::wallet::AppWalletHost::render_settings_entry(ui, colors);
-
-    // 4. Default Interface Scale (`SetupDefaultScale` in `settings_main.cpp`).
+    // 4. Default Interface Scale (`BuildInterfaceScale` in `settings_main.cpp`).
     render_scale_controls(ui, global, false, colors);
 
-    settings_divider(ui, None, colors);
+    section_break(ui, colors);
 
-    // 5. Telegram Premium, Stars, Gifts, Affiliate, and Business entry points (`settings_main.cpp`).
+    // 5. Premium section (`BuildPremiumSection`): Premium, Stars, TON, Business, Send a Gift.
     if settings_row(
         ui,
-        strings::PREMIUM_TITLE,
+        &tr::lng_premium_summary_title(),
         None,
         None,
         Some(SettingsIconKind::Premium),
@@ -692,7 +753,7 @@ pub fn render_main_settings_page_with_extras(
     }
     if settings_row(
         ui,
-        "My Stars",
+        &tr::lng_settings_credits(),
         None,
         None,
         Some(SettingsIconKind::Stars),
@@ -704,37 +765,13 @@ pub fn render_main_settings_page_with_extras(
     {
         out.open_payments = Some(tg_app_core::core_types::window_types::PaymentsScreen::Stars);
     }
+
+    // Built-in TON Wallet entry (tdesktop's `main/currency` row, gated by `WalletAppConfig`).
+    crate::wallet::AppWalletHost::render_settings_entry(ui, colors);
+
     if settings_row(
         ui,
-        "Send a Gift",
-        None,
-        None,
-        Some(SettingsIconKind::Gift),
-        false,
-        false,
-        colors,
-    )
-    .clicked()
-    {
-        out.open_payments = Some(tg_app_core::core_types::window_types::PaymentsScreen::StarGifts);
-    }
-    if settings_row(
-        ui,
-        "Stars Affiliate",
-        None,
-        None,
-        Some(SettingsIconKind::Affiliate),
-        false,
-        false,
-        colors,
-    )
-    .clicked()
-    {
-        out.open_payments = Some(tg_app_core::core_types::window_types::PaymentsScreen::Affiliate);
-    }
-    if settings_row(
-        ui,
-        "Telegram Business",
+        &tr::lng_business_title(),
         None,
         None,
         Some(SettingsIconKind::Business),
@@ -746,12 +783,26 @@ pub fn render_main_settings_page_with_extras(
     {
         out.open_business = true;
     }
-
-    settings_divider(ui, None, colors);
-
-    // 6. Help / FAQ & Version footer (`SetupHelp` in `settings_main.cpp`).
-    let faq_label = tr::lng_settings_faq();
     if settings_row(
+        ui,
+        strings::SEND_A_GIFT_TITLE,
+        None,
+        None,
+        Some(SettingsIconKind::Gift),
+        false,
+        false,
+        colors,
+    )
+    .clicked()
+    {
+        out.open_payments = Some(tg_app_core::core_types::window_types::PaymentsScreen::StarGifts);
+    }
+
+    section_break(ui, colors);
+
+    // 6. Help section (`BuildHelpSection`): FAQ (with the keys legend button), Features, Ask.
+    let faq_label = tr::lng_settings_faq();
+    let faq_resp = settings_row(
         ui,
         &faq_label,
         None,
@@ -760,23 +811,84 @@ pub fn render_main_settings_page_with_extras(
         false,
         false,
         colors,
+    );
+    let legend_rect = Rect::from_center_size(
+        Pos2::new(
+            faq_resp.rect.right() - pad_x - 8.0,
+            faq_resp.rect.center().y,
+        ),
+        Vec2::splat(28.0),
+    );
+    let legend_resp = ui.interact(
+        legend_rect,
+        ui.scope_id().with("faq_keys_legend"),
+        Sense::click(),
+    );
+    paint_tinted_icon(
+        ui.painter(),
+        legend_rect,
+        st::settings_faq_keys_legend_icon,
+        colors,
+        None,
+    );
+    if legend_resp
+        .on_hover_text(tr::lng_keys_legend_title())
+        .clicked()
+    {
+        out.toast = Some(tr::lng_keys_legend_title());
+    } else if faq_resp.clicked() {
+        out.toast = Some(strings::FAQ_URL_TOAST.to_owned());
+    }
+    if settings_row(
+        ui,
+        &tr::lng_settings_features(),
+        None,
+        None,
+        Some(SettingsIconKind::Features),
+        false,
+        false,
+        colors,
     )
     .clicked()
     {
-        out.toast = Some(strings::FAQ_URL_TOAST.to_owned());
+        out.toast = Some(strings::FEATURES_URL_TOAST.to_owned());
     }
-
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
-        let footer = strings::MAIN_FOOTER_TEMPLATE.replace("{version}", tg_core::APP_VERSION_STR);
-        ui.label(
-            egui::RichText::new(footer)
-                .font(egui::FontId::new(11.5, tg_ui::fonts::family_regular()))
-                .color(colors.color("windowSubTextFg")),
-        );
-    });
-    ui.add_space(18.0);
+    if settings_row(
+        ui,
+        &tr::lng_settings_ask_question(),
+        None,
+        None,
+        Some(SettingsIconKind::Discussion),
+        false,
+        false,
+        colors,
+    )
+    .clicked()
+    {
+        out.toast = Some(tr::lng_settings_ask_sure());
+    }
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     out
+}
+
+/// `addSkip()` + `addDivider()` + `addSkip()` between two `settings_main.cpp` sections.
+fn section_break(ui: &mut Ui, colors: &dyn Colors) {
+    ui.add_space(SETTINGS_LIST_SKIP);
+    settings_section_divider(ui, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
+}
+
+/// Formats the cover phone in international format (`Ui::FormatPhone`, e.g. `+999 66 1 2345`).
+fn format_cover_phone(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(' ') {
+        return trimmed.to_owned();
+    }
+    let formatted = tg_lang::countries::format_phone(trimmed);
+    if formatted.starts_with('+') {
+        formatted
+    } else {
+        format!("+{formatted}")
+    }
 }

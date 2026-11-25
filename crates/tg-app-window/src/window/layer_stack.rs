@@ -141,6 +141,12 @@ impl LayerStack {
         });
     }
 
+    /// Returns the text of the currently active toast notification, if any.
+    #[must_use]
+    pub fn toast_text(&self) -> Option<&str> {
+        self.toast.as_ref().map(|t| t.text.as_str())
+    }
+
     /// Renders any active modal box and toast over the main window.
     pub fn show_boxes_and_toasts(
         &mut self,

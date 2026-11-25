@@ -16,7 +16,7 @@ use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 
 /// Default GitHub repository slug (`owner/repo`) queried for releases.
-pub const DEFAULT_GITHUB_REPO: &str = "rustgram/rustgram";
+pub const DEFAULT_GITHUB_REPO: &str = "murmaider227/rustgram";
 
 /// Default main application executable name on Windows.
 pub const DEFAULT_EXE_NAME: &str = "rustgram.exe";

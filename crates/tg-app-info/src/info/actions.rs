@@ -8,17 +8,16 @@ use egui::{Align2, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Ui, Vec2
 use tg_lang::tr;
 use tg_ui::fonts::{family_regular, font_id_from_style};
 use tg_ui::icons::paint_style_icon;
-use tg_ui::stand_in::{Colors, ToggleStyle};
+use tg_ui::stand_in::Colors;
 use tg_ui::tg_style::{Icon, st};
 use tg_ui::theme::{ColorsResolver, resolve_color_ref};
-use tg_ui::widgets::checkbox::Toggle;
 use tg_ui::widgets::labels::divider_bar;
 
 use crate::info::backend::{InfoPeerKind, PeerProfile, SharedMediaTab};
 use crate::info::strings;
 use crate::info::values::{
-    DEFAULT_FRAGMENT_PHONE_PREFIXES, format_auto_delete_ttl, format_birthday, format_slowmode,
-    format_username_link, is_collectible_phone,
+    DEFAULT_FRAGMENT_PHONE_PREFIXES, format_auto_delete_ttl, format_birthday, format_username_link,
+    is_collectible_phone,
 };
 use tg_app_core::stand_in::types::PeerId;
 
@@ -100,7 +99,20 @@ pub enum ProfileAction {
     SuggestBirthday,
     /// Open the inline Report Profile Photo dialog (`account.reportProfilePhoto`).
     ReportProfilePhoto,
+    /// Open the inline Contact Note editor (`contacts.updateContactNote`).
+    EditContactNote,
+    /// Open the inline Delete Contact confirmation (`contacts.deleteContacts`).
+    DeleteContact,
+    /// Open the inline Delete Own Profile Photo confirmation (`photos.deletePhotos`).
+    DeleteOwnProfilePhoto,
+    /// Open the inline Suggest / Set Contact Profile Photo dialog (`photos.uploadContactProfilePhoto`).
+    SuggestContactPhoto,
+    /// Open Attached Stickers modal for this peer's profile photo (`messages.getAttachedStickers`).
+    ViewAttachedStickers,
 }
+
+/// Shared media counter row: tab, count, icon and plural label (`lng_profile_photos`, ...).
+type MediaCountRow = (SharedMediaTab, u32, Icon, fn(i64) -> String);
 
 /// Renders the details, notifications toggle, media counts, and actions for a [`PeerProfile`].
 pub struct ProfileActionsView;
@@ -131,24 +143,46 @@ impl ProfileActionsView {
         today_ymd: (u16, u8, u8),
         colors: &dyn Colors,
     ) -> Option<ProfileAction> {
+        Self::show_with_today_and_photo_ref(ui, peer, in_third_column, today_ymd, false, colors)
+    }
+
+    /// Renders all info values and action rows for `peer`, enabling profile-photo delete/report
+    /// actions only when `has_active_photo_ref` is `true` (a real server `ProfilePhotoRef` is loaded).
+    pub fn show_with_today_and_photo_ref(
+        ui: &mut Ui,
+        peer: &PeerProfile,
+        in_third_column: bool,
+        today_ymd: (u16, u8, u8),
+        has_active_photo_ref: bool,
+        colors: &dyn Colors,
+    ) -> Option<ProfileAction> {
         let mut action = None;
 
         // 1. Info Details block (`info_profile_values.cpp`)
+        let hidden_phone = phone_is_hidden(peer);
         let has_details = peer.phone.is_some()
+            || hidden_phone
             || !peer.usernames.is_empty()
             || !peer.bio.is_empty()
             || peer.birthday.is_some()
-            || peer.invite_link.is_some()
+            || (peer.invite_link.is_some() && peer.is_public)
             || peer.linked_discussion_peer.is_some()
             || peer.auto_delete_ttl_seconds > 0;
 
         if has_details {
-            ui.add_space(4.0);
-            let mut info_icon_shown = false;
-            if let Some(phone) = &peer.phone
+            ui.add_space(INFO_SECTION_SKIP);
+            if hidden_phone {
+                // `PhoneOrHiddenValue`: no phone, username or bio -> "Hidden" (not copyable).
+                info_value_row(
+                    ui,
+                    &tr::lng_info_mobile_hidden(),
+                    &tr::lng_info_mobile_label(),
+                    false,
+                    colors,
+                );
+            } else if let Some(phone) = &peer.phone
                 && !phone.is_empty()
             {
-                info_icon_shown = true;
                 let collectible_phone =
                     is_collectible_phone(phone, DEFAULT_FRAGMENT_PHONE_PREFIXES);
                 let caption = if collectible_phone {
@@ -156,14 +190,7 @@ impl ProfileActionsView {
                 } else {
                     tr::lng_info_mobile_label()
                 };
-                if info_value_row(
-                    ui,
-                    phone,
-                    &caption,
-                    Some(&st::info_icon_information),
-                    collectible_phone,
-                    colors,
-                ) {
+                if info_value_row(ui, phone, &caption, collectible_phone, colors) {
                     if collectible_phone {
                         action = Some(ProfileAction::OpenCollectibleInfo {
                             peer_id: peer.id,
@@ -187,13 +214,7 @@ impl ProfileActionsView {
                         tr::lng_info_about_label()
                     }
                 };
-                let leading = if !info_icon_shown {
-                    info_icon_shown = true;
-                    Some(&st::info_icon_information)
-                } else {
-                    None
-                };
-                info_multiline_row(ui, &peer.bio, &caption, leading, colors);
+                info_multiline_row(ui, &peer.bio, &caption, colors);
             }
 
             if let Some(primary) = peer.primary_username() {
@@ -228,18 +249,21 @@ impl ProfileActionsView {
                         tr::lng_info_usernames_label()
                     )
                 };
-                let leading = if !info_icon_shown {
-                    info_icon_shown = true;
-                    Some(&st::info_icon_information)
-                } else {
-                    None
-                };
                 let primary_is_collectible = peer
                     .usernames
                     .iter()
                     .find(|u| u.is_active && u.username == primary)
                     .is_some_and(|u| !u.is_editable);
-                if info_value_row(ui, &value, &caption, leading, true, colors) {
+                let (clicked, qr_clicked) = info_value_row_with_qr(
+                    ui,
+                    &value,
+                    &caption,
+                    peer.kind != InfoPeerKind::SavedMessages,
+                    colors,
+                );
+                if qr_clicked {
+                    action = Some(ProfileAction::OpenQrCode);
+                } else if clicked {
                     if primary_is_collectible {
                         action = Some(ProfileAction::OpenCollectibleInfo {
                             peer_id: peer.id,
@@ -278,15 +302,9 @@ impl ProfileActionsView {
                         }
                     });
                 }
-            } else if let Some(invite) = &peer.invite_link {
-                let leading = if !info_icon_shown {
-                    info_icon_shown = true;
-                    Some(&st::info_icon_information)
-                } else {
-                    None
-                };
+            } else if let Some(invite) = peer.invite_link.as_ref().filter(|_| peer.is_public) {
                 let invite_lbl = tr::lng_create_group_invite_link();
-                if info_value_row(ui, invite, &invite_lbl, leading, true, colors) {
+                if info_value_row(ui, invite, &invite_lbl, true, colors) {
                     action = Some(ProfileAction::CopyValue {
                         label: invite_lbl,
                         value: invite.clone(),
@@ -299,18 +317,12 @@ impl ProfileActionsView {
                 let is_today =
                     crate::info::birthday_effect::is_birthday_today(*bday, today_m, today_d);
                 let text = format_birthday(bday, Some(today_y));
-                let leading = if !info_icon_shown {
-                    info_icon_shown = true;
-                    Some(&st::info_icon_information)
-                } else {
-                    None
-                };
                 let label = if is_today {
                     tr::lng_info_birthday_today_label()
                 } else {
                     tr::lng_info_birthday_label()
                 };
-                info_value_row(ui, &text, &label, leading, is_today, colors);
+                info_value_row(ui, &text, &label, is_today, colors);
             }
 
             if let Some((linked_id, linked_title)) = &peer.linked_discussion_peer {
@@ -319,13 +331,7 @@ impl ProfileActionsView {
                 } else {
                     tr::lng_manage_linked_channel()
                 };
-                let leading = if !info_icon_shown {
-                    info_icon_shown = true;
-                    Some(&st::info_icon_information)
-                } else {
-                    None
-                };
-                if info_value_row(ui, linked_title, &caption, leading, true, colors) {
+                if info_value_row(ui, linked_title, &caption, true, colors) {
                     action = Some(ProfileAction::OpenLinkedDiscussion(Some(*linked_id)));
                 }
             }
@@ -336,186 +342,95 @@ impl ProfileActionsView {
                     strings::AUTO_DELETE_AFTER_PREFIX,
                     format_auto_delete_ttl(peer.auto_delete_ttl_seconds)
                 );
-                let leading = if !info_icon_shown {
-                    Some(&st::menu_icon_ttl)
-                } else {
-                    None
-                };
-                if info_value_row(
-                    ui,
-                    &ttl_text,
-                    strings::AUTO_DELETE_CAPTION,
-                    leading,
-                    false,
-                    colors,
-                ) && peer.can_edit
+                if info_value_row(ui, &ttl_text, strings::AUTO_DELETE_CAPTION, false, colors)
+                    && peer.can_edit
                 {
                     action = Some(ProfileAction::OpenAutoDelete);
                 }
             }
         }
 
-        // 2. Notifications toggle row (hidden for Saved Messages)
-        if peer.kind != InfoPeerKind::SavedMessages {
-            ui.add_space(4.0);
-            let mut notifications_on = !peer.muted;
-            if toggle_action_row(
+        // 2. "ADD TO CONTACTS" main button (`DetailsFiller::makeAddAsContact`).
+        if peer.kind == InfoPeerKind::User
+            && !peer.is_contact
+            && main_button(ui, &tr::lng_info_add_as_contact().to_uppercase(), colors)
+        {
+            action = Some(ProfileAction::OpenAddContact);
+        }
+        let _ = (in_third_column, has_active_photo_ref);
+
+        action
+    }
+
+    /// Renders the shared media counters (`1 photo`, `1 file`, ...) with tdesktop's
+    /// `infoIconMedia*` icons (`info_profile_shared_media_classic.cpp`), plus groups in common.
+    /// Returns `true` when at least one row was drawn.
+    pub fn show_media_counts(
+        ui: &mut Ui,
+        peer: &PeerProfile,
+        colors: &dyn Colors,
+        action: &mut Option<ProfileAction>,
+    ) -> bool {
+        let counts = &peer.media_counts;
+        let rows: [MediaCountRow; 6] = [
+            (
+                SharedMediaTab::PhotosVideos,
+                counts.photos_videos,
+                st::info_icon_media_photo,
+                tr::lng_profile_photos,
+            ),
+            (
+                SharedMediaTab::Files,
+                counts.files,
+                st::info_icon_media_file,
+                tr::lng_profile_files,
+            ),
+            (
+                SharedMediaTab::Music,
+                counts.music,
+                st::info_icon_media_audio,
+                tr::lng_profile_songs,
+            ),
+            (
+                SharedMediaTab::Links,
+                counts.links,
+                st::info_icon_media_link,
+                tr::lng_profile_shared_links,
+            ),
+            (
+                SharedMediaTab::Voice,
+                counts.voice,
+                st::info_icon_media_voice,
+                tr::lng_profile_audios,
+            ),
+            (
+                SharedMediaTab::Gifs,
+                counts.gifs,
+                st::info_icon_media_gif,
+                tr::lng_profile_gifs,
+            ),
+        ];
+        let mut any = false;
+        for (tab, count, icon, label) in rows {
+            if count == 0 {
+                continue;
+            }
+            any = true;
+            if action_row(
                 ui,
-                &tr::lng_chart_title_mute(),
-                &mut notifications_on,
+                &icon,
+                &label(i64::from(count)),
+                None,
+                false,
+                false,
                 colors,
             ) {
-                action = Some(ProfileAction::ToggleNotifications(peer.id));
+                *action = Some(ProfileAction::OpenSharedMedia(tab));
             }
         }
-
-        // Primary action button (Send Message / Open Mini App)
-        if !in_third_column && peer.kind != InfoPeerKind::SavedMessages {
-            let label = if peer.kind.is_channel() {
-                strings::OPEN_CHANNEL.to_owned()
-            } else {
-                tr::lng_profile_send_message()
-            };
-            if action_row(ui, &st::menu_icon_send, &label, None, false, true, colors) {
-                action = Some(ProfileAction::SendMessage(peer.id));
-            }
-        }
-        if peer.kind == InfoPeerKind::Bot
-            && peer.has_mini_app
-            && action_row(
-                ui,
-                &st::menu_icon_star,
-                &tr::lng_profile_open_app(),
-                Some(strings::MINI_APP_BADGE),
-                false,
-                true,
-                colors,
-            )
-        {
-            action = Some(ProfileAction::OpenBotMiniApp(peer.id));
-        }
-        if peer.kind == InfoPeerKind::Bot
-            && action_row(
-                ui,
-                &st::menu_icon_stats,
-                &tr::lng_bot_earn_title(),
-                None,
-                false,
-                false,
-                colors,
-            )
-        {
-            action = Some(ProfileAction::OpenStatistics(peer.id));
-        }
-        if peer.kind == InfoPeerKind::Bot
-            && action_row(
-                ui,
-                &st::menu_icon_admin,
-                "Verify Peers",
-                None,
-                false,
-                false,
-                colors,
-            )
-        {
-            action = Some(ProfileAction::OpenVerifyPeers);
-        }
-        if peer.kind == InfoPeerKind::Bot
-            && peer.can_edit
-            && action_row(
-                ui,
-                &st::info_icon_edit,
-                "Edit Bot Info",
-                None,
-                false,
-                false,
-                colors,
-            )
-        {
-            action = Some(ProfileAction::OpenEditBotInfo);
-        }
-
-        ui.add_space(4.0);
-
-        // Extended Profile tabs & utilities (WP-26): Stories, Peer Gifts, Saved Music, QR Code, Emoji Avatar
-        if matches!(
-            peer.kind,
-            InfoPeerKind::User | InfoPeerKind::SavedMessages | InfoPeerKind::Channel
-        ) && action_row(
-            ui,
-            &st::menu_icon_boosts,
-            "Stories & Albums",
-            None,
-            false,
-            false,
-            colors,
-        ) {
-            action = Some(ProfileAction::OpenStories);
-        }
-        if matches!(
-            peer.kind,
-            InfoPeerKind::User | InfoPeerKind::SavedMessages | InfoPeerKind::Channel
-        ) && action_row(ui, &st::menu_icon_star, "Gifts", None, false, false, colors)
-        {
-            action = Some(ProfileAction::OpenPeerGifts);
-        }
-        if matches!(peer.kind, InfoPeerKind::User | InfoPeerKind::SavedMessages)
-            && action_row(
-                ui,
-                &st::info_icon_media_group,
-                "Saved Music",
-                None,
-                false,
-                false,
-                colors,
-            )
-        {
-            action = Some(ProfileAction::OpenSavedMusic);
-        }
-        if peer.kind != InfoPeerKind::SavedMessages
-            && action_row(
-                ui,
-                &st::info_icon_share,
-                "QR Code",
-                None,
-                false,
-                false,
-                colors,
-            )
-        {
-            action = Some(ProfileAction::OpenQrCode);
-        }
-        if peer.can_edit
-            && action_row(
-                ui,
-                &st::menu_icon_palette,
-                "Emoji Avatar",
-                None,
-                false,
-                false,
-                colors,
-            )
-        {
-            action = Some(ProfileAction::OpenEmojiUserpic);
-        }
-        if peer.kind == InfoPeerKind::User
-            && action_row(
-                ui,
-                &st::menu_icon_star,
-                &tr::lng_suggest_birthday(),
-                None,
-                false,
-                false,
-                colors,
-            )
-        {
-            action = Some(ProfileAction::SuggestBirthday);
-        }
-
-        if matches!(peer.kind, InfoPeerKind::User | InfoPeerKind::Bot)
-            && peer.media_counts.common_groups > 0
-        {
-            let label = tr::lng_profile_common_groups(i64::from(peer.media_counts.common_groups));
+        if matches!(peer.kind, InfoPeerKind::User | InfoPeerKind::Bot) && counts.common_groups > 0 {
+            any = true;
+            let label = tr::lng_profile_common_groups(i64::from(counts.common_groups));
             if action_row(
                 ui,
                 &st::info_icon_media_group,
@@ -525,108 +440,10 @@ impl ProfileActionsView {
                 false,
                 colors,
             ) {
-                action = Some(ProfileAction::OpenCommonGroups);
+                *action = Some(ProfileAction::OpenCommonGroups);
             }
         }
-
-        // Management summary rows on groups/channels (compact right above Members/Media tabs)
-        if peer.kind.is_group() || peer.kind.is_channel() {
-            ui.add_space(4.0);
-            divider_bar(ui, 6.0, colors);
-            ui.add_space(4.0);
-
-            if peer.can_edit {
-                let manage_label = if peer.kind.is_channel() {
-                    tr::lng_manage_channel_title()
-                } else {
-                    tr::lng_manage_group_title()
-                };
-                if action_row(
-                    ui,
-                    &st::info_icon_edit,
-                    &manage_label,
-                    None,
-                    false,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenEditPeer);
-                }
-            }
-            if peer.can_manage_permissions && peer.kind.is_group() {
-                let badge = if peer.slowmode_seconds > 0 {
-                    format!(
-                        "{} {}",
-                        strings::SLOW_MODE_PREFIX,
-                        format_slowmode(peer.slowmode_seconds)
-                    )
-                } else {
-                    strings::EDIT_BADGE.to_owned()
-                };
-                if action_row(
-                    ui,
-                    &st::menu_icon_permissions,
-                    &tr::lng_manage_peer_permissions(),
-                    Some(&badge),
-                    false,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenPermissions);
-                }
-            }
-            if peer.can_manage_admins {
-                let count_s = peer.admins_count.to_string();
-                if action_row(
-                    ui,
-                    &st::menu_icon_admin,
-                    &tr::lng_manage_peer_administrators(),
-                    Some(&count_s),
-                    false,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenAdministrators);
-                }
-            }
-            if action_row(
-                ui,
-                &st::menu_icon_stats,
-                &tr::lng_stats_title(),
-                None,
-                false,
-                false,
-                colors,
-            ) {
-                action = Some(ProfileAction::OpenStatistics(peer.id));
-            }
-            if action_row(
-                ui,
-                &st::menu_icon_boosts,
-                &tr::lng_boosts_title(),
-                None,
-                false,
-                false,
-                colors,
-            ) {
-                action = Some(ProfileAction::OpenBoosts(peer.id));
-            }
-            if peer.kind.is_channel()
-                && action_row(
-                    ui,
-                    &st::info_icon_media_group,
-                    &tr::lng_similar_channels_title(),
-                    None,
-                    false,
-                    false,
-                    colors,
-                )
-            {
-                action = Some(ProfileAction::OpenSimilarChannels);
-            }
-        }
-
-        action
+        any
     }
 
     /// Renders secondary peer actions (Share, Block, Report, Leave/Delete) below inline tabs.
@@ -635,264 +452,111 @@ impl ProfileActionsView {
         peer: &PeerProfile,
         colors: &dyn Colors,
     ) -> Option<ProfileAction> {
+        Self::show_footer_actions_with_photo_ref(ui, peer, false, colors)
+    }
+
+    /// Renders secondary peer actions below inline tabs, enabling `"Report Profile Photo"` only
+    /// when `has_active_photo_ref` is `true` (a real server `ProfilePhotoRef` is loaded).
+    pub fn show_footer_actions_with_photo_ref(
+        ui: &mut Ui,
+        peer: &PeerProfile,
+        has_active_photo_ref: bool,
+        colors: &dyn Colors,
+    ) -> Option<ProfileAction> {
         let mut action = None;
         if peer.kind == InfoPeerKind::SavedMessages {
             return None;
         }
 
-        ui.add_space(4.0);
-        divider_bar(ui, 8.0, colors);
-        ui.add_space(4.0);
-
+        let _ = has_active_photo_ref;
         match peer.kind {
-            InfoPeerKind::User => {
-                if !peer.is_contact
-                    && action_row(
-                        ui,
-                        &st::info_icon_add_member,
-                        &tr::lng_info_add_as_contact(),
-                        None,
-                        false,
-                        false,
-                        colors,
-                    )
-                {
-                    action = Some(ProfileAction::OpenAddContact);
-                }
-                if action_row(
-                    ui,
-                    &st::info_icon_share,
-                    &tr::lng_info_share_contact(),
-                    None,
-                    false,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenSharePeer);
-                }
-                if peer.can_edit
-                    && action_row(
-                        ui,
-                        &st::info_icon_edit,
-                        &tr::lng_chatbots_edit_username(),
-                        None,
-                        false,
-                        false,
-                        colors,
-                    )
-                {
-                    action = Some(ProfileAction::OpenEditUsername);
-                }
-                let block_label = if peer.is_blocked {
-                    tr::lng_profile_unblock_user()
-                } else {
-                    tr::lng_profile_block_user()
+            InfoPeerKind::User | InfoPeerKind::Bot => {
+                ui.add_space(INFO_SECTION_SKIP);
+                divider_bar(ui, 8.0, colors);
+                ui.add_space(INFO_SECTION_SKIP);
+                let bot = peer.kind == InfoPeerKind::Bot;
+                let label = match (bot, peer.is_blocked) {
+                    (false, false) => tr::lng_profile_block_user(),
+                    (false, true) => tr::lng_profile_unblock_user(),
+                    (true, false) => tr::lng_profile_block_bot(),
+                    (true, true) => tr::lng_profile_restart_bot(),
                 };
-                let block_icon = if peer.is_blocked {
-                    &st::menu_icon_unblock
-                } else {
-                    &st::info_icon_block
+                let icon = match (bot, peer.is_blocked) {
+                    (_, false) => &st::info_icon_block,
+                    (false, true) => &st::menu_icon_unblock,
+                    (true, true) => &st::menu_icon_restart_bot,
                 };
-                if action_row(
-                    ui,
-                    block_icon,
-                    &block_label,
-                    None,
-                    !peer.is_blocked,
-                    false,
-                    colors,
-                ) {
+                if action_row(ui, icon, &label, None, !peer.is_blocked, false, colors) {
                     action = Some(ProfileAction::ToggleBlock(peer.id));
                 }
-                if action_row(
-                    ui,
-                    &st::info_icon_report,
-                    "Report Profile Photo",
-                    None,
-                    true,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::ReportProfilePhoto);
-                }
-                if action_row(
-                    ui,
-                    &st::info_icon_delete_red,
-                    &tr::lng_profile_delete_conversation(),
-                    None,
-                    true,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenDeleteOrLeave);
-                }
             }
-            InfoPeerKind::Bot => {
-                let privacy_note = if peer.bot_reads_all_messages {
-                    tr::lng_status_bot_reads_all()
-                } else {
-                    strings::PRIVACY_MODE_ENABLED.to_owned()
-                };
-                let cmd_badge = format!("{} {}", peer.bot_commands_count, strings::BOT_CMDS_SUFFIX);
-                action_row(
-                    ui,
-                    &st::menu_icon_bot_commands,
-                    &privacy_note,
-                    Some(&cmd_badge),
-                    false,
-                    false,
-                    colors,
-                );
-                if action_row(
-                    ui,
-                    &st::info_icon_share,
-                    strings::SHARE_BOT,
-                    None,
-                    false,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenSharePeer);
-                }
-                let stop_label = if peer.is_blocked {
-                    tr::lng_profile_restart_bot()
-                } else {
-                    tr::lng_profile_block_bot()
-                };
-                let stop_icon = if peer.is_blocked {
-                    &st::menu_icon_restart_bot
-                } else {
-                    &st::info_icon_block
-                };
-                if action_row(
-                    ui,
-                    stop_icon,
-                    &stop_label,
-                    None,
-                    !peer.is_blocked,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::ToggleBlock(peer.id));
-                }
-                if action_row(
-                    ui,
-                    &st::info_icon_report,
-                    &tr::lng_report_bot_title(),
-                    None,
-                    true,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenReport);
-                }
-            }
-            InfoPeerKind::Group | InfoPeerKind::Supergroup => {
-                if action_row(
-                    ui,
-                    &st::info_icon_share,
-                    strings::SHARE_GROUP,
-                    None,
-                    false,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenSharePeer);
-                }
-                if action_row(
-                    ui,
-                    &st::info_icon_report,
-                    &tr::lng_report_group_title(),
-                    None,
-                    true,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenReport);
-                }
-                if action_row(
-                    ui,
-                    &st::info_icon_leave,
-                    &tr::lng_profile_leave_group(),
-                    None,
-                    true,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenDeleteOrLeave);
-                }
-            }
-            InfoPeerKind::Channel => {
-                if action_row(
-                    ui,
-                    &st::info_icon_share,
-                    strings::SHARE_CHANNEL,
-                    None,
-                    false,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenSharePeer);
-                }
-                if action_row(
-                    ui,
-                    &st::info_icon_report,
-                    &tr::lng_report_title(),
-                    None,
-                    true,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenReport);
-                }
-                if action_row(
-                    ui,
-                    &st::info_icon_leave,
-                    &tr::lng_profile_leave_channel(),
-                    None,
-                    true,
-                    false,
-                    colors,
-                ) {
-                    action = Some(ProfileAction::OpenDeleteOrLeave);
-                }
-            }
-            InfoPeerKind::SavedMessages => {}
+            InfoPeerKind::Group
+            | InfoPeerKind::Supergroup
+            | InfoPeerKind::Channel
+            | InfoPeerKind::SavedMessages => {}
         }
 
         action
     }
 }
 
+/// `st::infoProfileButton`: padding (79, 10, 8, 8) around a 20 px text line, the 24 px icon at
+/// `iconLeft` = 22 drawn at its natural size.
+const PROFILE_BUTTON_HEIGHT: f32 = 38.0;
+const PROFILE_BUTTON_ICON_LEFT: f32 = 22.0;
+const PROFILE_BUTTON_ICON_SIZE: f32 = 24.0;
+const PROFILE_BUTTON_TEXT_LEFT: f32 = 79.0;
+
+/// `PhoneOrHiddenValue` (`info_profile_values.cpp`): a user (or bot) with no visible phone,
+/// username and bio shows the phone line as "Hidden" instead of dropping it.
+fn phone_is_hidden(peer: &PeerProfile) -> bool {
+    matches!(peer.kind, InfoPeerKind::User | InfoPeerKind::Bot)
+        && peer.phone.as_deref().is_none_or(str::is_empty)
+        && peer.primary_username().is_none()
+        && peer.bio.is_empty()
+}
+
+/// `defaultVerticalListSkip`, around the info blocks and dividers of the profile.
+pub(crate) const INFO_SECTION_SKIP: f32 = 6.0;
+
+/// `st::infoProfileLabeledPadding` = (23, 9, 20, 7): the labeled info lines
+/// (`DetailsFiller::addInfoLine`) have no icon in 7.4.6; the text starts at 23 px.
+const LABELED_PAD_LEFT: f32 = 23.0;
+const LABELED_PAD_TOP: f32 = 9.0;
+const LABELED_PAD_RIGHT: f32 = 20.0;
+const LABELED_PAD_BOTTOM: f32 = 7.0;
+/// One `defaultFlatLabel` line (13 px Open Sans) and the gap above the grey label under it.
+const LABELED_LINE_HEIGHT: f32 = 19.0;
+const LABELED_LABEL_SKIP: f32 = 2.0;
+
 fn info_value_row(
     ui: &mut Ui,
     value: &str,
     caption: &str,
-    leading_icon: Option<&Icon>,
     is_link: bool,
     colors: &dyn Colors,
 ) -> bool {
     let width = ui.available_width().max(180.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 46.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(
+            width,
+            LABELED_PAD_TOP + 2.0 * LABELED_LINE_HEIGHT + LABELED_LABEL_SKIP + LABELED_PAD_BOTTOM,
+        ),
+        Sense::click(),
+    );
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::accesskit::Role::Label,
+            true,
+            format!("{value}, {caption}"),
+        )
+    });
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, colors.color("windowBgOver"));
     }
-    if let Some(ic) = leading_icon {
-        let icon_rect = Rect::from_center_size(
-            Pos2::new(rect.min.x + 30.0, rect.center().y),
-            Vec2::splat(20.0),
-        );
-        paint_style_icon(
-            ui.painter(),
-            icon_rect,
-            *ic,
-            &ColorsResolver(colors),
-            Some(resolve_color_ref(st::info_icon_fg, colors)),
-        );
-    }
-    let text_x = rect.min.x + 56.0;
+    let text_x = rect.min.x + LABELED_PAD_LEFT;
     let val_fg = if is_link {
         colors.color("windowActiveTextFg")
     } else {
@@ -900,114 +564,128 @@ fn info_value_row(
     };
     let clip = Rect::from_min_max(
         Pos2::new(text_x, rect.min.y),
-        Pos2::new(rect.max.x - 14.0, rect.max.y),
+        Pos2::new(rect.max.x - LABELED_PAD_RIGHT, rect.max.y),
     );
     let p = ui.painter().with_clip_rect(clip);
     p.text(
-        Pos2::new(text_x, rect.min.y + 7.0),
+        Pos2::new(text_x, rect.min.y + LABELED_PAD_TOP),
         Align2::LEFT_TOP,
         value,
         font_id_from_style(st::normal_font),
         val_fg,
     );
     p.text(
-        Pos2::new(text_x, rect.min.y + 26.0),
+        Pos2::new(
+            text_x,
+            rect.min.y + LABELED_PAD_TOP + LABELED_LINE_HEIGHT + LABELED_LABEL_SKIP,
+        ),
         Align2::LEFT_TOP,
         caption,
-        FontId::new(11.5, family_regular()),
+        font_id_from_style(st::normal_font),
         colors.color("windowSubTextFg"),
     );
     resp.clicked()
 }
 
-fn info_multiline_row(
+/// `info_value_row` with tdesktop's `infoProfileLabeledButtonQr` at the right edge.
+/// Returns `(row_clicked, qr_clicked)`.
+fn info_value_row_with_qr(
     ui: &mut Ui,
     value: &str,
     caption: &str,
-    leading_icon: Option<&Icon>,
+    show_qr: bool,
     colors: &dyn Colors,
-) {
+) -> (bool, bool) {
+    let top = ui.cursor().min.y;
+    let clicked = info_value_row(ui, value, caption, true, colors);
+    if !show_qr {
+        return (clicked, false);
+    }
+    let right = ui.min_rect().max.x.max(ui.max_rect().max.x);
+    let row_h =
+        LABELED_PAD_TOP + 2.0 * LABELED_LINE_HEIGHT + LABELED_LABEL_SKIP + LABELED_PAD_BOTTOM;
+    let qr_rect = Rect::from_center_size(
+        Pos2::new(right - 30.0, top + row_h * 0.5),
+        Vec2::splat(34.0),
+    );
+    let resp = ui.interact(
+        qr_rect,
+        ui.make_persistent_id(("info_username_qr", value)),
+        Sense::click(),
+    );
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, "QR Code"));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        ui.painter()
+            .circle_filled(qr_rect.center(), 17.0, colors.color("windowBgOver"));
+    }
+    paint_style_icon(
+        ui.painter(),
+        qr_rect,
+        st::info_profile_labeled_button_qr.icon,
+        &ColorsResolver(colors),
+        Some(colors.color("windowActiveTextFg")),
+    );
+    (clicked && !resp.clicked(), resp.clicked())
+}
+
+/// Uppercase semibold `lightButtonFg` button (`st::infoMainButton`, `AddMainButton`).
+fn main_button(ui: &mut Ui, label: &str, colors: &dyn Colors) -> bool {
     let width = ui.available_width().max(180.0);
-    let text_w = (width - 72.0).max(100.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, label));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, colors.color("windowBgOver"));
+    }
+    ui.painter().text(
+        Pos2::new(rect.min.x + 23.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::new(
+            font_id_from_style(st::semibold_font).size,
+            tg_ui::fonts::family_semibold(),
+        ),
+        colors.color("lightButtonFg"),
+    );
+    resp.clicked()
+}
+
+fn info_multiline_row(ui: &mut Ui, value: &str, caption: &str, colors: &dyn Colors) {
+    let width = ui.available_width().max(180.0);
+    let text_w = (width - LABELED_PAD_LEFT - LABELED_PAD_RIGHT).max(100.0);
     let galley = ui.painter().layout(
         value.to_owned(),
         font_id_from_style(st::normal_font),
         colors.color("windowFg"),
         text_w,
     );
-    let total_h = (galley.size().y + 28.0).max(46.0);
+    let total_h = LABELED_PAD_TOP
+        + galley.size().y.max(LABELED_LINE_HEIGHT)
+        + LABELED_LABEL_SKIP
+        + LABELED_LINE_HEIGHT
+        + LABELED_PAD_BOTTOM;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, total_h), Sense::hover());
-    if let Some(ic) = leading_icon {
-        let icon_rect = Rect::from_center_size(
-            Pos2::new(rect.min.x + 30.0, rect.min.y + 18.0),
-            Vec2::splat(20.0),
-        );
-        paint_style_icon(
-            ui.painter(),
-            icon_rect,
-            *ic,
-            &ColorsResolver(colors),
-            Some(resolve_color_ref(st::info_icon_fg, colors)),
-        );
-    }
-    let text_x = rect.min.x + 56.0;
+    let text_x = rect.min.x + LABELED_PAD_LEFT;
     ui.painter().galley(
-        Pos2::new(text_x, rect.min.y + 6.0),
+        Pos2::new(text_x, rect.min.y + LABELED_PAD_TOP),
         galley.clone(),
         colors.color("windowFg"),
     );
     ui.painter().text(
-        Pos2::new(text_x, rect.min.y + 10.0 + galley.size().y),
+        Pos2::new(
+            text_x,
+            rect.min.y
+                + LABELED_PAD_TOP
+                + galley.size().y.max(LABELED_LINE_HEIGHT)
+                + LABELED_LABEL_SKIP,
+        ),
         Align2::LEFT_TOP,
         caption,
-        FontId::new(11.5, family_regular()),
+        font_id_from_style(st::normal_font),
         colors.color("windowSubTextFg"),
     );
-}
-
-fn toggle_action_row(ui: &mut Ui, label: &str, checked: &mut bool, colors: &dyn Colors) -> bool {
-    let width = ui.available_width().max(180.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 44.0), Sense::click());
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        ui.painter()
-            .rect_filled(rect, CornerRadius::ZERO, colors.color("windowBgOver"));
-    }
-    let icon_rect = Rect::from_center_size(
-        Pos2::new(rect.min.x + 30.0, rect.center().y),
-        Vec2::splat(20.0),
-    );
-    paint_style_icon(
-        ui.painter(),
-        icon_rect,
-        st::menu_icon_notifications,
-        &ColorsResolver(colors),
-        Some(resolve_color_ref(st::info_icon_fg, colors)),
-    );
-    ui.painter().text(
-        Pos2::new(rect.min.x + 56.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        font_id_from_style(st::info_profile_button.style.font),
-        colors.color("windowFg"),
-    );
-
-    let tog_st = ToggleStyle::default_toggle(colors);
-    let tsize = Toggle::toggle_size(&tog_st);
-    let tog_rect = Rect::from_min_size(
-        Pos2::new(
-            rect.max.x - tsize.x - 18.0,
-            rect.center().y - tsize.y * 0.5 - 4.0,
-        ),
-        Vec2::new(tsize.x, tsize.y + 8.0),
-    );
-    let mut t_ui = ui.new_child(egui::UiBuilder::new().max_rect(tog_rect));
-    let toggle_resp = Toggle::new(checked, tog_st).show(&mut t_ui);
-    if resp.clicked() && !toggle_resp.clicked() {
-        *checked = !*checked;
-        return true;
-    }
-    toggle_resp.changed()
 }
 
 fn action_row(
@@ -1019,31 +697,66 @@ fn action_row(
     accent: bool,
     colors: &dyn Colors,
 ) -> bool {
+    action_row_enabled(
+        ui,
+        icon,
+        label,
+        right_badge,
+        attention,
+        accent,
+        true,
+        colors,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn action_row_enabled(
+    ui: &mut Ui,
+    icon: &Icon,
+    label: &str,
+    right_badge: Option<&str>,
+    attention: bool,
+    accent: bool,
+    enabled: bool,
+    colors: &dyn Colors,
+) -> bool {
     let width = ui.available_width().max(180.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 42.0), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, label));
-    if resp.hovered() {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, PROFILE_BUTTON_HEIGHT), sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, label));
+    if enabled && resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, colors.color("windowBgOver"));
     }
-    let fg = if attention {
+    let fg = if !enabled {
+        colors.color("windowSubTextFg")
+    } else if attention {
         colors.color("attentionButtonFg")
     } else if accent {
         colors.color("windowActiveTextFg")
     } else {
         colors.color("windowFg")
     };
-    let icon_fg = if attention {
+    let icon_fg = if !enabled {
+        colors.color("windowSubTextFg")
+    } else if attention {
         colors.color("attentionButtonFg")
     } else if accent {
         colors.color("windowActiveTextFg")
     } else {
         resolve_color_ref(st::info_icon_fg, colors)
     };
-    let icon_rect = Rect::from_center_size(
-        Pos2::new(rect.min.x + 30.0, rect.center().y),
-        Vec2::splat(20.0),
+    let icon_rect = Rect::from_min_size(
+        Pos2::new(
+            rect.min.x + PROFILE_BUTTON_ICON_LEFT,
+            rect.center().y - PROFILE_BUTTON_ICON_SIZE * 0.5,
+        ),
+        Vec2::splat(PROFILE_BUTTON_ICON_SIZE),
     );
     paint_style_icon(
         ui.painter(),
@@ -1054,7 +767,7 @@ fn action_row(
     );
 
     ui.painter().text(
-        Pos2::new(rect.min.x + 56.0, rect.center().y),
+        Pos2::new(rect.min.x + PROFILE_BUTTON_TEXT_LEFT, rect.center().y),
         Align2::LEFT_CENTER,
         label,
         font_id_from_style(st::info_profile_button.style.font),
@@ -1067,7 +780,9 @@ fn action_row(
             Align2::RIGHT_CENTER,
             badge,
             FontId::new(12.5, family_regular()),
-            if attention {
+            if !enabled {
+                colors.color("windowSubTextFg")
+            } else if attention {
                 colors.color("attentionButtonFg")
             } else {
                 colors.color("windowActiveTextFg")
@@ -1075,5 +790,9 @@ fn action_row(
         );
     }
 
+    if !enabled {
+        resp.on_hover_text("Profile photo metadata is not loaded yet.");
+        return false;
+    }
     resp.clicked()
 }

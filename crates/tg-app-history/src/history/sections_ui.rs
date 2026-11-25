@@ -4442,9 +4442,39 @@ pub struct SelfForwardsTaggerState {
     pub was_hovered: bool,
     /// Optional inline tag-label rename state `(emoji, title_draft)`.
     pub renaming_tag: Option<(String, String)>,
+    /// Server-provided default Saved Messages tag reaction emojis loaded via
+    /// `messages.getDefaultTagReactions` (`history_view_self_forwards_tagger.cpp`).
+    pub cached_default_tags: Vec<String>,
+    /// Whether `default_tag_reactions` has already been queried for this session.
+    default_tags_loaded: bool,
 }
 
 impl SelfForwardsTaggerState {
+    /// Returns `true` once server default tag reactions have been fetched via
+    /// `ChatHelpersBackend::default_tag_reactions`.
+    #[must_use]
+    pub const fn has_loaded_default_tags(&self) -> bool {
+        self.default_tags_loaded
+    }
+
+    /// Populates `cached_default_tags` from `messages.getDefaultTagReactions`.
+    pub fn seed_default_tag_reactions(
+        &mut self,
+        reactions: &[tg_app_core::chat_helpers::backend::DefaultTagReaction],
+    ) {
+        self.default_tags_loaded = true;
+        self.cached_default_tags.clear();
+        for item in reactions {
+            let em = match item {
+                tg_app_core::chat_helpers::backend::DefaultTagReaction::Emoji(s) => s.trim(),
+                tg_app_core::chat_helpers::backend::DefaultTagReaction::Paid => "⭐",
+                tg_app_core::chat_helpers::backend::DefaultTagReaction::CustomEmoji(_) => continue,
+            };
+            if !em.is_empty() && !self.cached_default_tags.iter().any(|e| e == em) {
+                self.cached_default_tags.push(em.to_owned());
+            }
+        }
+    }
     /// Opens the inline tag selector for messages just forwarded to Saved Messages.
     pub fn show_for_forwarded(
         &mut self,
@@ -4571,10 +4601,27 @@ impl SelfForwardsTaggerState {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if ui.small_button("×").clicked() {
+                                            let close_btn = egui::Button::new(
+                                                egui::RichText::new("×")
+                                                    .size(12.5)
+                                                    .color(colors.sub_text_fg),
+                                            )
+                                            .fill(colors.bar_bg_over)
+                                            .stroke(Stroke::new(1.0, colors.divider))
+                                            .corner_radius(CornerRadius::same(6));
+                                            if ui.add(close_btn).clicked() {
                                                 self.hide();
                                             }
-                                            if ui.small_button("View").clicked() {
+                                            let view_btn = egui::Button::new(
+                                                egui::RichText::new("View")
+                                                    .strong()
+                                                    .size(11.5)
+                                                    .color(colors.active_text_fg),
+                                            )
+                                            .fill(colors.bar_bg_over)
+                                            .stroke(Stroke::new(1.0, colors.divider))
+                                            .corner_radius(CornerRadius::same(6));
+                                            if ui.add(view_btn).clicked() {
                                                 action = Some(
                                                     SelfForwardsTaggerAction::OpenSavedMessages(
                                                         saved_peer_id,
@@ -4587,34 +4634,143 @@ impl SelfForwardsTaggerState {
                                 });
                                 ui.add_space(4.0);
                                 ui.label(
-                                    egui::RichText::new(
-                                        "Add a tag to find this message easily (right-click a tag to rename):",
-                                    )
+                                    egui::RichText::new(tg_lang::tr::lng_add_tag_selector(
+                                        count as i64,
+                                    ))
                                     .size(11.5)
                                     .color(colors.sub_text_fg),
                                 );
                                 ui.add_space(6.0);
 
-                                // Build reaction strip from saved tags + default quick reactions.
+                                // Build reaction strip from saved tags + server default tag reactions
+                                // (`messages.getDefaultTagReactions`), falling back to built-in quick
+                                // emojis only when the backend catalog is empty.
                                 let mut strip: Vec<(String, Option<String>)> = saved_tags
                                     .iter()
                                     .map(|t| (t.emoji.clone(), t.title.clone()))
                                     .collect();
-                                for fallback in ["❤️", "👍", "🔥", "⭐", "🎉", "😁", "🤔", "📌"] {
-                                    if !strip.iter().any(|(e, _)| e == fallback) {
-                                        strip.push((fallback.to_owned(), None));
+                                if !self.cached_default_tags.is_empty() {
+                                    for em in &self.cached_default_tags {
+                                        if !strip.iter().any(|(e, _)| e == em) {
+                                            strip.push((em.clone(), None));
+                                        }
+                                    }
+                                } else {
+                                    for fallback in ["❤️", "👍", "🔥", "⭐", "🎉", "😁", "🤔", "📌"]
+                                    {
+                                        if !strip.iter().any(|(e, _)| e == fallback) {
+                                            strip.push((fallback.to_owned(), None));
+                                        }
                                     }
                                 }
                                 strip.truncate(8);
 
+                                let emoji_cache = ui.ctx().data_mut(|d| {
+                                    d.get_temp_mut_or_insert_with(
+                                        Id::unique("tg_self_forwards_tagger_emoji_cache"),
+                                        || {
+                                            std::sync::Arc::new(std::sync::Mutex::new(
+                                                EmojiTextureCache::new(),
+                                            ))
+                                        },
+                                    )
+                                    .clone()
+                                });
                                 ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                                     for (em, title_opt) in &strip {
                                         let label = match title_opt {
                                             Some(t) if !t.is_empty() => format!("{em} {t}"),
                                             _ => em.clone(),
                                         };
-                                        let resp = ui.button(&label);
-                                        if resp.clicked() {
+                                        let title_w = title_opt
+                                            .as_deref()
+                                            .filter(|t| !t.is_empty())
+                                            .map(|t| {
+                                                ui.painter()
+                                                    .layout_no_wrap(
+                                                        t.to_owned(),
+                                                        FontId::proportional(12.0),
+                                                        colors.text_fg,
+                                                    )
+                                                    .size()
+                                                    .x
+                                                    + 6.0
+                                            })
+                                            .unwrap_or(0.0);
+                                        let chip_w = (32.0 + title_w).max(34.0);
+                                        let (chip_rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(chip_w, 30.0),
+                                            Sense::click(),
+                                        );
+                                        resp.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::Role::Button,
+                                                true,
+                                                label.clone(),
+                                            )
+                                        });
+                                        if resp.hovered() {
+                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        let chip_fill = if resp.hovered() {
+                                            color_lerp(colors.bar_bg_over, colors.accent, 0.14)
+                                        } else {
+                                            colors.bar_bg_over
+                                        };
+                                        let chip_stroke = if resp.hovered() || resp.has_focus() {
+                                            Stroke::new(1.2, colors.accent)
+                                        } else {
+                                            Stroke::new(1.0, colors.divider)
+                                        };
+                                        ui.painter().rect_filled(
+                                            chip_rect,
+                                            CornerRadius::same(15),
+                                            chip_fill,
+                                        );
+                                        ui.painter().rect_stroke(
+                                            chip_rect,
+                                            CornerRadius::same(15),
+                                            chip_stroke,
+                                            StrokeKind::Inside,
+                                        );
+                                        let icon_center = if title_w > 0.0 {
+                                            Pos2::new(chip_rect.left() + 16.0, chip_rect.center().y)
+                                        } else {
+                                            chip_rect.center()
+                                        };
+                                        let icon_rect =
+                                            Rect::from_center_size(icon_center, Vec2::splat(18.0));
+                                        if let Ok(mut cache) = emoji_cache.lock() {
+                                            let _ = cache.paint_emoji_str(
+                                                ui.painter(),
+                                                ui.ctx(),
+                                                em,
+                                                icon_rect,
+                                                Color32::WHITE,
+                                            );
+                                        }
+                                        if let Some(t) =
+                                            title_opt.as_deref().filter(|t| !t.is_empty())
+                                        {
+                                            ui.painter().text(
+                                                Pos2::new(
+                                                    icon_rect.right() + 4.0,
+                                                    chip_rect.center().y,
+                                                ),
+                                                Align2::LEFT_CENTER,
+                                                t,
+                                                FontId::proportional(12.0),
+                                                colors.text_fg,
+                                            );
+                                        }
+                                        let activated = resp.clicked()
+                                            || (resp.has_focus()
+                                                && ui.input(|i| {
+                                                    i.key_pressed(Key::Enter)
+                                                        || i.key_pressed(Key::Space)
+                                                }));
+                                        if activated {
                                             action = Some(SelfForwardsTaggerAction::ApplyTag {
                                                 saved_peer_id,
                                                 msg_ids: forwarded_msg_ids.clone(),

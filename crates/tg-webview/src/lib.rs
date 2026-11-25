@@ -46,8 +46,9 @@ pub use bridge::{
     VerifyAgeParams, ViewportParams, VisibilityParams, WEB_PROXY_STORAGE_TOKEN,
     WebProxyBridgeMessage, build_web_proxy_carrier_config, decode_mini_app_event,
     format_dynamic_viewport_script, format_post_event_script, format_raw_post_event_script,
-    is_shell_namespace_command, mini_app_init_script, origin_check_script, origin_from_url,
-    origins_match, parse_hex_color, parse_mini_app_event, parse_native_message,
+    is_external_shell_origin, is_shell_namespace_command, mini_app_init_script,
+    origin_check_script, origin_from_url, origins_match, parse_hex_color, parse_mini_app_event,
+    parse_mini_app_event_with_shell, parse_native_message, parse_native_message_with_shell,
     parse_web_proxy_bridge_message, resolve_ripple_color, web_proxy_close_script,
     web_proxy_heartbeat_probe_script, web_proxy_init_script,
 };
@@ -76,7 +77,7 @@ pub use interface::{
 };
 pub use mini_app::{
     CLIPBOARD_READ_TIMEOUT, MiniAppAction, MiniAppButtonState, MiniAppController,
-    MiniAppPanelConfig, MiniAppPanelState, OPEN_LINK_TIMEOUT,
+    MiniAppPanelConfig, MiniAppPanelState, OPEN_LINK_TIMEOUT, telegram_link_from_path,
 };
 
 /// Queries whether the WebView2 runtime is installed and reports supported capabilities.

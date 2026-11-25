@@ -74,8 +74,8 @@ use tg_app_core::payments::backend::{
     BoostsGiveawayBundle, CatalogGiftItem, CheckoutBundle, CreditsOverviewBundle, GiveawayInfoItem,
     PaidMediaPreview, PaidReactionContext, PassportBackend, PassportSessionBundle,
     PassportUnlockResult, PassportVerificationChallenge, PaymentSubmitOutcome, PaymentsBackend,
-    PremiumFeatureItem, PremiumInvoicePreview, PremiumPromoBundle, ReceivedGiftAction,
-    ReceivedGiftItem, StarGiftsBundle, ValidatedInfoResult,
+    PremiumFeatureItem, PremiumInvoicePreview, PremiumPromoBundle, PremiumPromoLogEvent,
+    ReceivedGiftAction, ReceivedGiftItem, StarGiftsBundle, ValidatedInfoResult,
 };
 use tg_app_core::stand_in::types::{MsgId, PeerId};
 
@@ -1615,6 +1615,21 @@ impl PaymentsBackend for LiveSession {
             premium_limits: PremiumLimits::new(true),
             features,
         })
+    }
+
+    fn log_premium_promo_event(&self, event: &PremiumPromoLogEvent) -> Result<bool, String> {
+        let mapped = match event {
+            PremiumPromoLogEvent::ScreenShow { order, source } => {
+                crate::live_extras::NonPersonalAppLogEvent::PremiumPromoScreenShow {
+                    order: order.clone(),
+                    source: source.clone(),
+                }
+            }
+            PremiumPromoLogEvent::ScreenAccept => {
+                crate::live_extras::NonPersonalAppLogEvent::PremiumPromoScreenAccept
+            }
+        };
+        crate::live_extras::save_app_log(self, &[mapped])
     }
 
     fn preview_premium_invoice(

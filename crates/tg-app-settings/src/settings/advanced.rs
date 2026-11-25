@@ -690,6 +690,9 @@ fn theme_mode_from_colors(colors: &dyn Colors) -> tg_app_core::stand_in::theme::
     }
 }
 
+/// Vertical skip around dividers and titles (`Builder::addSkip`).
+const SECTION_SKIP: f32 = 8.0;
+
 /// Renders the Advanced settings section (`settings_advanced.cpp`).
 #[allow(clippy::too_many_arguments)]
 pub fn render_advanced_section(
@@ -705,6 +708,7 @@ pub fn render_advanced_section(
     colors: &dyn Colors,
 ) -> AdvancedOutput {
     let mut out = AdvancedOutput::default();
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     if !state.platform_probed {
         state.platform_probed = true;
@@ -742,42 +746,29 @@ pub fn render_advanced_section(
         settings_divider(ui, None, colors);
     }
 
-    // 1. Data and Storage (`BuildDataStorageSection`).
+    // 1. Data and storage (`BuildDataStorageSection`): Connection type, Download path,
+    // Manage local storage, Downloads, Ask download path.
+    ui.add_space(SECTION_SKIP);
     subsection_title(ui, &tr::lng_settings_data_storage(), colors);
 
-    let proxy_active = core.proxy.is_enabled() || core.proxy.is_system();
-    let proxy_status_text =
-        format_proxy_connection_status(connection_status, proxy_active, &EnglishStrings);
-    let conn_label = match core.proxy.settings() {
-        ProxySettingsMode::Enabled => {
-            if core.proxy.selected().is_valid() {
-                let base = format_proxy_label(core.proxy.selected());
-                if !proxy_status_text.is_empty() {
-                    format!("{proxy_status_text} · {base}")
-                } else {
-                    base
-                }
-            } else {
-                strings::CONNECTION_PROXY_NONE.to_owned()
-            }
-        }
-        ProxySettingsMode::System => {
-            if !proxy_status_text.is_empty() {
-                format!("{proxy_status_text} · {}", strings::CONNECTION_SYSTEM_PROXY)
-            } else {
-                strings::CONNECTION_SYSTEM_PROXY.to_owned()
-            }
-        }
-        ProxySettingsMode::Disabled => strings::CONNECTION_TCP_DIRECT.to_owned(),
+    // `connectionType` in `settings_advanced.cpp`: "Default (TCP used)" unless a proxy is
+    // enabled ("TCP with proxy"); the system-proxy mode counts as not enabled.
+    let transport = "TCP";
+    let conn_label = if core.proxy.settings() == ProxySettingsMode::Enabled
+        && core.proxy.selected().is_valid()
+    {
+        tr::lng_connection_proxy(transport)
+    } else {
+        tr::lng_connection_auto(transport)
     };
     if settings_row(
         ui,
-        strings::CONNECTION_TYPE_TITLE,
+        &tr::lng_settings_connection_type(),
         None,
         Some(&conn_label),
         Some(SettingsIconKind::Network),
         false,
-        true,
+        false,
         colors,
     )
     .clicked()
@@ -811,17 +802,17 @@ pub fn render_advanced_section(
     }
 
     let dl_path_label = if core.download_path.is_empty() {
-        strings::DOWNLOAD_PATH_DEFAULT.to_owned()
+        tr::lng_download_path_default()
     } else {
         core.download_path.clone()
     };
     if !core.ask_download_path
         && settings_row(
             ui,
-            strings::DOWNLOAD_PATH_TITLE,
+            &tr::lng_download_path(),
             None,
             Some(&dl_path_label),
-            Some(SettingsIconKind::Download),
+            Some(SettingsIconKind::Folder),
             false,
             false,
             colors,
@@ -843,27 +834,15 @@ pub fn render_advanced_section(
         });
     }
 
-    settings_toggle_row(
-        ui,
-        strings::ASK_DOWNLOAD_PATH,
-        None,
-        None,
-        &mut core.ask_download_path,
-        true,
-        colors,
-    );
-
-    let storage_stats = backend.local_storage_stats();
-    let storage_label = format_bytes(storage_stats.total_bytes());
     let manage_storage_lbl = tr::lng_settings_manage_local_storage();
     if settings_row(
         ui,
         &manage_storage_lbl,
         None,
-        Some(&storage_label),
-        Some(SettingsIconKind::Storage),
+        None,
+        Some(SettingsIconKind::LocalStorage),
         false,
-        true,
+        false,
         colors,
     )
     .clicked()
@@ -877,22 +856,30 @@ pub fn render_advanced_section(
         ui.add_space(4.0);
     }
 
-    let export_lbl = tr::lng_settings_export_data();
     if settings_row(
         ui,
-        &export_lbl,
-        Some(strings::EXPORT_DATA_SUBTITLE),
+        &tr::lng_downloads_section(),
         None,
-        Some(SettingsIconKind::Export),
+        None,
+        Some(SettingsIconKind::Download),
         false,
-        true,
+        false,
         colors,
     )
     .clicked()
     {
-        crate::export::AppExportHost::open_full_export(ui.ctx(), theme_mode_from_colors(colors));
-        out.open_full_export = true;
+        out.toast = Some(tr::lng_downloads_section());
     }
+
+    settings_toggle_row(
+        ui,
+        strings::ASK_DOWNLOAD_PATH,
+        None,
+        None,
+        &mut core.ask_download_path,
+        true,
+        colors,
+    );
 
     if state.panel == AdvancedSubPanel::ExportData {
         ui.add_space(4.0);
@@ -900,22 +887,28 @@ pub fn render_advanced_section(
         ui.add_space(4.0);
     }
 
+    ui.add_space(SECTION_SKIP);
     settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
 
-    // 2. Automatic Media Download (`BuildAutoDownloadSection`).
-    subsection_title(ui, strings::AUTO_MEDIA_DOWNLOAD_TITLE, colors);
+    // 2. Automatic media download (`BuildAutoDownloadSection`): per-source split toggles.
+    subsection_title(ui, &tr::lng_media_auto_settings(), colors);
     let mut ad = backend.auto_download();
     for source in AutoDownloadSource::ALL {
         let mut enabled = ad.has_enabled_types(source);
-        let summary = ad.source_summary(source);
-        let (clicked, toggled) = settings_split_toggle_row(
-            ui,
-            source.title(),
-            &summary,
-            Some(SettingsIconKind::Download),
-            &mut enabled,
-            colors,
-        );
+        let (title, icon) = match source {
+            AutoDownloadSource::Private => {
+                (tr::lng_media_auto_in_private(), SettingsIconKind::Account)
+            }
+            AutoDownloadSource::Groups => {
+                (tr::lng_media_auto_in_groups(), SettingsIconKind::Groups)
+            }
+            AutoDownloadSource::Channels => {
+                (tr::lng_media_auto_in_channels(), SettingsIconKind::Channel)
+            }
+        };
+        let (clicked, toggled) =
+            settings_split_toggle_row(ui, &title, "", Some(icon), &mut enabled, colors);
         if toggled {
             if enabled {
                 ad.set_defaults_for_source(source);
@@ -936,59 +929,60 @@ pub fn render_advanced_section(
 
     settings_divider(ui, None, colors);
 
-    // 3. Performance & Power Saving (`settings_power_saving.cpp`).
-    subsection_title(ui, strings::PERF_POWER_SAVING_TITLE, colors);
-    let power_summary = power_saving_summary(core);
-    let power_menu_lbl = tr::lng_settings_power_menu();
-    if settings_row(
+    // 3. Window title bar (`BuildWindowTitleSection`): checkboxes.
+    subsection_title(ui, &tr::lng_settings_window_system(), colors);
+    let mut show_chat_name = !core.window_title_content.hide_chat_name;
+    if settings_checkbox_row(
         ui,
-        &power_menu_lbl,
-        Some(strings::POWER_REDUCE_SUBTITLE),
-        Some(&power_summary),
-        Some(SettingsIconKind::Power),
-        false,
+        &mut show_chat_name,
+        &tr::lng_settings_title_chat_name(),
         true,
         colors,
     )
-    .clicked()
+    .changed()
     {
-        toggle_panel(&mut state.panel, AdvancedSubPanel::PowerSaving);
+        core.window_title_content.hide_chat_name = !show_chat_name;
     }
-
-    if state.panel == AdvancedSubPanel::PowerSaving {
-        ui.add_space(4.0);
-        render_power_saving_panel(
+    let mut show_account_name = !core.window_title_content.hide_account_name;
+    // tdesktop adds this checkbox only with more than one account.
+    if core.accounts_order.len() > 1
+        && settings_checkbox_row(
             ui,
-            &mut state.power_saving,
-            &mut state.power_saving_expanded,
-            core,
+            &mut show_account_name,
+            strings::WINDOW_TITLE_ACCOUNT_NAME,
+            true,
             colors,
-        );
-        ui.add_space(4.0);
+        )
+        .changed()
+    {
+        core.window_title_content.hide_account_name = !show_account_name;
     }
-
-    settings_toggle_row(
+    let mut show_total_unread = !core.window_title_content.hide_total_unread;
+    if settings_checkbox_row(
         ui,
-        strings::HARDWARE_VIDEO_DECODING,
-        None,
-        None,
-        &mut core.hardware_accelerated_video,
+        &mut show_total_unread,
+        &tr::lng_settings_title_total_count(),
+        true,
+        colors,
+    )
+    .changed()
+    {
+        core.window_title_content.hide_total_unread = !show_total_unread;
+    }
+    let native_frame_lbl = tr::lng_settings_native_frame();
+    settings_checkbox_row(
+        ui,
+        &mut core.native_window_frame,
+        &native_frame_lbl,
         true,
         colors,
     );
-    settings_toggle_row(
-        ui,
-        strings::DISABLE_OPENGL,
-        None,
-        None,
-        &mut core.disable_opengl,
-        true,
-        colors,
-    );
 
+    ui.add_space(SECTION_SKIP);
     settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
 
-    // 4. System Integration (`tg-platform`: tray, autostart, close behavior, window title).
+    // 4. System integration (`BuildSystemIntegrationSection`): checkboxes.
     subsection_title(ui, &tr::lng_settings_native_title(), colors);
 
     let mut show_tray = matches!(core.work_mode, WorkMode::WindowAndTray | WorkMode::TrayOnly);
@@ -997,17 +991,10 @@ pub fn render_advanced_section(
         WorkMode::WindowAndTray | WorkMode::WindowOnly
     );
     let tray_lbl = tr::lng_settings_workmode_tray();
-    let tray_changed = settings_toggle_row(ui, &tray_lbl, None, None, &mut show_tray, true, colors);
+    let tray_changed = settings_checkbox_row(ui, &mut show_tray, &tray_lbl, true, colors).changed();
     let taskbar_lbl = tr::lng_settings_workmode_window();
-    let taskbar_changed = settings_toggle_row(
-        ui,
-        &taskbar_lbl,
-        None,
-        None,
-        &mut show_taskbar,
-        true,
-        colors,
-    );
+    let taskbar_changed =
+        settings_checkbox_row(ui, &mut show_taskbar, &taskbar_lbl, true, colors).changed();
     if tray_changed || taskbar_changed {
         core.work_mode = match (show_taskbar, show_tray) {
             (true, true) => WorkMode::WindowAndTray,
@@ -1017,12 +1004,10 @@ pub fn render_advanced_section(
         };
     }
 
-    settings_toggle_row(
+    settings_checkbox_row(
         ui,
-        strings::MONOCHROME_TRAY_ICON,
-        None,
-        None,
         &mut core.tray_icon_monochrome,
+        &tr::lng_settings_monochrome_icon(),
         show_tray,
         colors,
     );
@@ -1063,7 +1048,7 @@ pub fn render_advanced_section(
     );
 
     let autostart_lbl = tr::lng_settings_auto_start();
-    let autostart_subtitle = match state.autostart_state {
+    let _autostart_hint = match state.autostart_state {
         StartupTaskState::DisabledByUser => "Disabled in Windows Startup Apps settings",
         StartupTaskState::DisabledByPolicy => "Disabled by your organization's policy",
         StartupTaskState::EnabledByPolicy => "Enabled by your organization's policy",
@@ -1072,15 +1057,14 @@ pub fn render_advanced_section(
         }
     };
     let can_toggle_autostart = state.autostart_state.can_toggle();
-    if settings_toggle_row(
+    let autostart_resp = settings_checkbox_row(
         ui,
-        &autostart_lbl,
-        Some(autostart_subtitle),
-        None,
         &mut global.auto_start,
+        &autostart_lbl,
         can_toggle_autostart,
         colors,
-    ) {
+    );
+    if autostart_resp.changed() {
         let provider = resolve_autostart_provider(&state.autostart_provider, &global.working_dir);
         let desired = global.auto_start;
         match provider.set_enabled(desired) {
@@ -1166,43 +1150,22 @@ pub fn render_advanced_section(
     }
 
     let start_min_lbl = tr::lng_settings_start_min();
-    settings_toggle_row(
+    settings_checkbox_row(
         ui,
-        &start_min_lbl,
-        None,
-        None,
         &mut global.start_minimized,
+        &start_min_lbl,
         global.auto_start,
         colors,
     );
 
     let send_to_lbl = tr::lng_settings_add_sendto();
-    if settings_toggle_row(
-        ui,
-        &send_to_lbl,
-        None,
-        None,
-        &mut global.send_to_menu,
-        true,
-        colors,
-    ) {
+    if settings_checkbox_row(ui, &mut global.send_to_menu, &send_to_lbl, true, colors).changed() {
         let res = apply_send_to_shortcut(global.send_to_menu);
         out.toast = Some(match res {
             Ok(()) => strings::SEND_TO_UPDATED_TOAST.to_owned(),
             Err(err) => format!("Preference saved (SendTo shortcut: {err})"),
         });
     }
-
-    let native_frame_lbl = tr::lng_settings_native_frame();
-    settings_toggle_row(
-        ui,
-        &native_frame_lbl,
-        None,
-        None,
-        &mut core.native_window_frame,
-        true,
-        colors,
-    );
 
     if !state.restore_windows_loaded && !global.working_dir.as_os_str().is_empty() {
         state.restore_windows_policy = SavedWindowsSnapshot::load_from(&global.working_dir).policy;
@@ -1242,47 +1205,63 @@ pub fn render_advanced_section(
         });
     }
 
-    // Window title bar options (`CoreSettings::window_title_content`).
-    ui.add_space(6.0);
-    subsection_title(ui, &tr::lng_settings_window_system(), colors);
-    let mut show_chat_name = !core.window_title_content.hide_chat_name;
-    if settings_checkbox_row(
+    ui.add_space(SECTION_SKIP);
+    settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
+
+    // 5. Performance (`BuildPerformanceSection`).
+    subsection_title(ui, &tr::lng_settings_performance(), colors);
+    let power_summary = power_saving_summary(core);
+    let power_menu_lbl = tr::lng_settings_power_menu();
+    if settings_row(
         ui,
-        &mut show_chat_name,
-        strings::WINDOW_TITLE_CHAT_NAME,
-        true,
+        &power_menu_lbl,
+        None,
+        Some(&power_summary),
+        Some(SettingsIconKind::Power),
+        false,
+        false,
         colors,
     )
-    .changed()
+    .clicked()
     {
-        core.window_title_content.hide_chat_name = !show_chat_name;
-    }
-    let mut show_account_name = !core.window_title_content.hide_account_name;
-    if settings_checkbox_row(
-        ui,
-        &mut show_account_name,
-        strings::WINDOW_TITLE_ACCOUNT_NAME,
-        true,
-        colors,
-    )
-    .changed()
-    {
-        core.window_title_content.hide_account_name = !show_account_name;
-    }
-    let mut show_total_unread = !core.window_title_content.hide_total_unread;
-    if settings_checkbox_row(
-        ui,
-        &mut show_total_unread,
-        strings::WINDOW_TITLE_UNREAD,
-        true,
-        colors,
-    )
-    .changed()
-    {
-        core.window_title_content.hide_total_unread = !show_total_unread;
+        toggle_panel(&mut state.panel, AdvancedSubPanel::PowerSaving);
     }
 
+    if state.panel == AdvancedSubPanel::PowerSaving {
+        ui.add_space(4.0);
+        render_power_saving_panel(
+            ui,
+            &mut state.power_saving,
+            &mut state.power_saving_expanded,
+            core,
+            colors,
+        );
+        ui.add_space(4.0);
+    }
+
+    settings_toggle_row(
+        ui,
+        strings::HARDWARE_VIDEO_DECODING,
+        None,
+        None,
+        &mut core.hardware_accelerated_video,
+        true,
+        colors,
+    );
+    settings_toggle_row(
+        ui,
+        strings::DISABLE_OPENGL,
+        None,
+        None,
+        &mut core.disable_opengl,
+        true,
+        colors,
+    );
+
+    ui.add_space(SECTION_SKIP);
     settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
 
     // 5. Spell Checker (`tg-platform::spellcheck`).
     subsection_title(ui, &tr::lng_settings_spellchecker(), colors);
@@ -1385,6 +1364,26 @@ pub fn render_advanced_section(
     }
 
     settings_divider(ui, None, colors);
+
+    // Export Telegram data (`BuildExportSection`).
+    if settings_row(
+        ui,
+        &tr::lng_settings_export_data(),
+        None,
+        None,
+        Some(SettingsIconKind::Export),
+        false,
+        false,
+        colors,
+    )
+    .clicked()
+    {
+        crate::export::AppExportHost::open_full_export(ui.ctx(), theme_mode_from_colors(colors));
+        out.open_full_export = true;
+    }
+    ui.add_space(SECTION_SKIP);
+    settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
 
     // 6. Version & Updates (`SetupUpdate` in `settings_advanced.cpp`) + Debug / Secret Codes.
     if !update_at_top {
@@ -1641,7 +1640,7 @@ fn render_proxy_editor(
                     .font(font_id_from_style(st::box_title_font))
                     .color(colors.color("windowBoldFg")),
             );
-            let proxy_active = core.proxy.is_enabled() || core.proxy.is_system();
+            let proxy_active = core.proxy.is_enabled();
             let indicator =
                 format_proxy_connection_status(connection_status, proxy_active, &EnglishStrings);
             if !indicator.is_empty() {
@@ -1703,8 +1702,7 @@ fn render_proxy_editor(
                     core.proxy.set_selected(last_valid);
                 }
                 core.proxy.set_settings(mode);
-                out.proxy_enabled =
-                    Some(mode == ProxySettingsMode::Enabled || mode == ProxySettingsMode::System);
+                out.proxy_enabled = Some(mode == ProxySettingsMode::Enabled);
                 proxy_dirty = true;
             }
         }
@@ -2661,17 +2659,47 @@ fn render_power_saving_group(
     );
 
     let header_text = format!("{title}  {enabled_count}/{total_count}");
-    ui.painter().text(
-        Pos2::new(full_rect.left() + 28.0, full_rect.center().y),
-        Align2::LEFT_CENTER,
-        header_text,
-        font_id_from_style(st::semibold_font),
-        if editable {
-            colors.color("windowBoldFg")
-        } else {
-            colors.color("windowSubTextFg")
+    let text_x = full_rect.left() + 28.0;
+    let text_max_w = (right_rect.left() - 8.0 - text_x).max(40.0);
+    let header_fg = if editable {
+        colors.color("windowBoldFg")
+    } else {
+        colors.color("windowSubTextFg")
+    };
+    let mut header_job = egui::text::LayoutJob {
+        wrap: egui::text::TextWrapping {
+            max_width: text_max_w,
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        },
+        ..Default::default()
+    };
+    header_job.append(
+        &header_text,
+        0.0,
+        egui::text::TextFormat {
+            font_id: font_id_from_style(st::semibold_font),
+            color: header_fg,
+            ..Default::default()
         },
     );
+    let header_galley = ui.painter().layout_job(header_job);
+    let header_elided = header_galley.elided;
+    let text_clip = Rect::from_min_max(
+        Pos2::new(text_x, full_rect.top()),
+        Pos2::new(right_rect.left() - 4.0, full_rect.bottom()),
+    );
+    ui.painter().with_clip_rect(text_clip).galley(
+        Pos2::new(text_x, full_rect.center().y - header_galley.size().y * 0.5),
+        header_galley,
+        header_fg,
+    );
+    left_resp
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, header_text.clone()));
+    if header_elided {
+        let _ = left_resp.on_hover_text(header_text);
+    }
 
     if editable && right_resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -2680,15 +2708,33 @@ fn render_power_saving_group(
         group_enabled = !group_enabled;
         set_power_saving_group_enabled(core, group_mask, group_enabled);
     }
+    right_resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::Role::CheckBox,
+            editable,
+            group_enabled,
+            format!("Toggle {title}"),
+        )
+    });
 
     let toggle_st = ToggleStyle::default_toggle(colors);
     let tsize = Toggle::toggle_size(&toggle_st);
     let toggle_rect = Rect::from_center_size(right_rect.center(), tsize);
+    let anim_secs = if ui.style().animation_time <= 0.0 {
+        0.0
+    } else {
+        (toggle_st.duration_ms as f32 / 1000.0).min(0.20)
+    };
+    let toggled_val = f64::from(ui.ctx().animate_bool_with_time(
+        right_resp.id,
+        group_enabled,
+        anim_secs,
+    ));
     paint_toggle_view(
         ui.painter(),
         toggle_rect,
         &toggle_st,
-        if group_enabled { 1.0 } else { 0.0 },
+        toggled_val,
         if editable { 1.0 } else { 0.45 },
     );
 

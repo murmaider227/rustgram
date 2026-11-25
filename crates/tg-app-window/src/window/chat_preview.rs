@@ -16,8 +16,8 @@ use egui::{
 };
 use serde::{Deserialize, Serialize};
 use tg_platform::frameless::{
-    DEFAULT_RESIZE_BORDER_PX, DEFAULT_TITLE_BAR_HEIGHT_PX, FramelessHitZone, ResizeEdge,
-    apply_frameless_aero_snap, apply_window_dark_mode, hit_test_frameless,
+    DEFAULT_RESIZE_BORDER_PX, FramelessHitZone, ResizeEdge, apply_frameless_aero_snap,
+    apply_window_dark_mode, hit_test_frameless,
 };
 use tg_ui::fonts::font_id_from_style;
 use tg_ui::tg_style::st;
@@ -981,12 +981,18 @@ impl FramelessTitleBarState {
         }
     }
 
-    /// Renders a custom frameless window title bar with drag, double-click maximize, resize edge
-    /// triggers (via `ViewportCommand::BeginResizeDrag`), and Minimize/Maximize/Close buttons.
+    /// Renders tdesktop's custom frameless window title bar (`Ui::Platform::TitleWidget`,
+    /// `st::defaultWindowTitle`): a 24 px `titleBg` strip with no caption text, drag and
+    /// double-click maximize, resize edge triggers (`ViewportCommand::BeginResize`) and the
+    /// 36 px Minimize / Maximize / Close buttons.
+    ///
+    /// The strip is painted on its own `Order::Middle` layer so the host panel's separator
+    /// line never shows (tdesktop's `titleShadow` is a near-transparent `#00000003`).
     pub fn show_title_bar(&mut self, ui: &mut Ui, title: &str, palette: &Palette) {
         let ctx = ui.ctx().clone();
         let viewport_rect = ctx.viewport_rect();
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let controls_w = WINDOW_TITLE_BUTTON_WIDTH * 3.0;
 
         // Handle outer border resize hit-testing when not maximized.
         if let Some(pointer) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -997,8 +1003,8 @@ impl FramelessTitleBarState {
                 viewport_rect.height(),
                 maximized,
                 DEFAULT_RESIZE_BORDER_PX,
-                DEFAULT_TITLE_BAR_HEIGHT_PX,
-                138.0,
+                WINDOW_TITLE_HEIGHT,
+                controls_w,
             );
             if let FramelessHitZone::Resize(edge) = zone {
                 let (cursor, dir) = map_resize_edge(edge);
@@ -1011,13 +1017,18 @@ impl FramelessTitleBarState {
 
         let bar_rect = Rect::from_min_size(
             ui.max_rect().min,
-            Vec2::new(ui.available_width().max(120.0), DEFAULT_TITLE_BAR_HEIGHT_PX),
+            Vec2::new(ui.available_width().max(120.0), WINDOW_TITLE_HEIGHT),
         );
         let (_, _) = ui.allocate_exact_size(bar_rect.size(), Sense::hover());
-        ui.painter()
-            .rect_filled(bar_rect, CornerRadius::ZERO, palette.window_bg);
+        let painter = ctx
+            .layer_painter(egui::LayerId::new(
+                Order::Middle,
+                Id::unique("tg_frameless_title_paint"),
+            ))
+            .with_clip_rect(bar_rect);
+        let colors = TitleColors::from_palette(palette);
+        painter.rect_filled(bar_rect, CornerRadius::ZERO, colors.bg);
 
-        let controls_w = 138.0;
         let drag_rect = Rect::from_min_max(
             bar_rect.min,
             Pos2::new(
@@ -1027,9 +1038,10 @@ impl FramelessTitleBarState {
         );
         let drag_resp = ui.interact(
             drag_rect,
-            Id::unique("tg_frameless_caption"),
+            ui.make_persistent_id("tg_frameless_caption"),
             Sense::click_and_drag(),
         );
+        drag_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, title));
         if drag_resp.drag_started() {
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         }
@@ -1037,15 +1049,6 @@ impl FramelessTitleBarState {
             ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
         }
 
-        ui.painter().text(
-            Pos2::new(bar_rect.left() + 12.0, bar_rect.center().y),
-            Align2::LEFT_CENTER,
-            title,
-            font_id_from_style(st::semibold_font),
-            palette.window_fg,
-        );
-
-        let btn_w = 46.0;
         let buttons = [
             ("Minimize", 0usize),
             (if maximized { "Restore" } else { "Maximize" }, 1usize),
@@ -1053,66 +1056,33 @@ impl FramelessTitleBarState {
         ];
         for (aria_label, idx) in buttons {
             let btn_rect = Rect::from_min_size(
-                Pos2::new(bar_rect.right() - btn_w * (3 - idx) as f32, bar_rect.top()),
-                Vec2::new(btn_w, bar_rect.height()),
+                Pos2::new(
+                    bar_rect.right() - WINDOW_TITLE_BUTTON_WIDTH * (3 - idx) as f32,
+                    bar_rect.top(),
+                ),
+                Vec2::new(WINDOW_TITLE_BUTTON_WIDTH, bar_rect.height()),
             );
             let resp = ui.interact(
                 btn_rect,
-                Id::unique(("tg_frameless_btn", idx)),
+                ui.make_persistent_id(("tg_frameless_btn", idx)),
                 Sense::click(),
             );
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, aria_label));
+            let close = idx == 2;
             if resp.hovered() {
-                let hover_bg = if idx == 2 {
-                    Color32::from_rgb(0xE8, 0x11, 0x23)
+                let hover_bg = if close {
+                    colors.close_bg_over
                 } else {
-                    palette.window_bg_over
+                    colors.button_bg_over
                 };
-                ui.painter()
-                    .rect_filled(btn_rect, CornerRadius::ZERO, hover_bg);
+                painter.rect_filled(btn_rect, CornerRadius::ZERO, hover_bg);
             }
-            let fg = if idx == 2 && resp.hovered() {
-                Color32::WHITE
-            } else {
-                palette.window_fg
+            let fg = match (close, resp.hovered()) {
+                (true, true) => colors.close_fg_over,
+                (false, true) => colors.button_fg_over,
+                _ => colors.button_fg,
             };
-            let stroke = Stroke::new(1.1, fg);
-            let c = btn_rect.center();
-            match idx {
-                0 => {
-                    ui.painter().line_segment(
-                        [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 5.0, c.y)],
-                        stroke,
-                    );
-                }
-                1 if maximized => {
-                    let front =
-                        Rect::from_center_size(Pos2::new(c.x - 1.0, c.y + 1.0), Vec2::splat(7.5));
-                    let back_top = Pos2::new(front.left() + 2.0, front.top() - 2.0);
-                    let back_right = Pos2::new(front.right() + 2.0, front.top() - 2.0);
-                    let back_bottom = Pos2::new(front.right() + 2.0, front.bottom() - 2.0);
-                    ui.painter().line_segment([back_top, back_right], stroke);
-                    ui.painter().line_segment([back_right, back_bottom], stroke);
-                    ui.painter()
-                        .rect_stroke(front, CornerRadius::ZERO, stroke, StrokeKind::Inside);
-                }
-                1 => {
-                    let sq = Rect::from_center_size(c, Vec2::splat(9.0));
-                    ui.painter()
-                        .rect_stroke(sq, CornerRadius::ZERO, stroke, StrokeKind::Inside);
-                }
-                _ => {
-                    let r = 4.5;
-                    ui.painter().line_segment(
-                        [Pos2::new(c.x - r, c.y - r), Pos2::new(c.x + r, c.y + r)],
-                        stroke,
-                    );
-                    ui.painter().line_segment(
-                        [Pos2::new(c.x - r, c.y + r), Pos2::new(c.x + r, c.y - r)],
-                        stroke,
-                    );
-                }
-            }
+            paint_title_glyph(&painter, btn_rect.center(), idx, maximized, fg);
             if resp.clicked() {
                 match idx {
                     0 => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
@@ -1120,6 +1090,98 @@ impl FramelessTitleBarState {
                     _ => ctx.send_viewport_cmd(ViewportCommand::Close),
                 }
             }
+        }
+    }
+}
+
+/// Window title bar height (`st::windowTitleHeight`).
+pub const WINDOW_TITLE_HEIGHT: f32 = 24.0;
+/// Window title control button width (`st::windowTitleButtonWidth`).
+pub const WINDOW_TITLE_BUTTON_WIDTH: f32 = 36.0;
+
+/// `titleBg` / `titleButton*` colors (`colors.palette`) derived from the shell palette:
+/// `titleBg` is `windowBgOver` (#F1F1F1 Day), buttons use `titleButtonFg` (#ababab) on
+/// `titleButtonBgOver` (#e5e5e5) with the red `titleButtonCloseBgOver` (#e81123).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TitleColors {
+    /// `titleBg` / `titleBgActive`.
+    pub bg: Color32,
+    /// `titleButtonFg`.
+    pub button_fg: Color32,
+    /// `titleButtonBgOver`.
+    pub button_bg_over: Color32,
+    /// `titleButtonFgOver`.
+    pub button_fg_over: Color32,
+    /// `titleButtonCloseBgOver`.
+    pub close_bg_over: Color32,
+    /// `titleButtonCloseFgOver` (`windowFgActive`).
+    pub close_fg_over: Color32,
+}
+
+impl TitleColors {
+    /// Resolves title colors from the shell palette.
+    #[must_use]
+    pub fn from_palette(palette: &Palette) -> Self {
+        let bg = palette.window_bg_over;
+        Self {
+            bg,
+            button_fg: mix(palette.window_sub_text_fg, bg, 0.25),
+            button_bg_over: mix(bg, palette.window_fg, 0.05),
+            button_fg_over: palette.window_sub_text_fg,
+            close_bg_over: Color32::from_rgb(0xE8, 0x11, 0x23),
+            close_fg_over: Color32::WHITE,
+        }
+    }
+}
+
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let lerp = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
+}
+
+/// Draws the 10 px `title_button_minimize` / `_maximize` / `_restore` / `_close` glyphs.
+fn paint_title_glyph(painter: &egui::Painter, c: Pos2, idx: usize, maximized: bool, fg: Color32) {
+    let stroke = Stroke::new(1.0, fg);
+    let c = Pos2::new(c.x.round() + 0.5, c.y.round() + 0.5);
+    match idx {
+        0 => {
+            painter.line_segment(
+                [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 5.0, c.y)],
+                stroke,
+            );
+        }
+        1 if maximized => {
+            let front = Rect::from_min_size(Pos2::new(c.x - 5.0, c.y - 3.0), Vec2::splat(8.0));
+            painter.rect_stroke(front, CornerRadius::ZERO, stroke, StrokeKind::Middle);
+            painter.line_segment(
+                [
+                    Pos2::new(c.x - 3.0, c.y - 5.0),
+                    Pos2::new(c.x + 5.0, c.y - 5.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(c.x + 5.0, c.y - 5.0),
+                    Pos2::new(c.x + 5.0, c.y + 3.0),
+                ],
+                stroke,
+            );
+        }
+        1 => {
+            let sq = Rect::from_center_size(c, Vec2::splat(10.0));
+            painter.rect_stroke(sq, CornerRadius::ZERO, stroke, StrokeKind::Middle);
+        }
+        _ => {
+            let r = 5.0;
+            painter.line_segment(
+                [Pos2::new(c.x - r, c.y - r), Pos2::new(c.x + r, c.y + r)],
+                stroke,
+            );
+            painter.line_segment(
+                [Pos2::new(c.x - r, c.y + r), Pos2::new(c.x + r, c.y - r)],
+                stroke,
+            );
         }
     }
 }

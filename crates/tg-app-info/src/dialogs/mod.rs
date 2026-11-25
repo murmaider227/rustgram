@@ -11,9 +11,11 @@
 
 pub use tg_app_core::dialogs::backend;
 pub mod community;
+pub mod entry_menu;
 pub mod filters_menu;
 pub mod inner;
 pub mod layout;
+pub mod mini_preview;
 pub mod mock;
 pub mod quick_action;
 pub mod search;
@@ -326,6 +328,8 @@ fn dialog_item_from_stand_in(entry: &DialogEntry) -> DialogItem {
             unread_muted: entry.peer.muted,
             ..Default::default()
         },
+        is_contact: false,
+        media_preview: None,
         has_bot_app_button: false,
     }
 }

@@ -49,6 +49,10 @@ pub const COLLECTIBLE_SET_ID: u64 = 0xFFFF_FFFF_FFFF_FFF8;
 /// `kUpdateTimeout = crl::time(3600'000)` in `data/stickers/data_stickers.h:272`.
 pub const STICKERS_UPDATE_TIMEOUT_MS: u64 = 3_600_000;
 
+/// Maximum character length for a sticker/custom-emoji pack title
+/// (`kMaxSetNameLength = 50` in `boxes/sticker_set_box.cpp:327`).
+pub const MAX_STICKER_SET_TITLE_LEN: usize = 50;
+
 /// Sticker set category (`Data::StickersType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StickersType {
@@ -1482,6 +1486,141 @@ impl StickersSyncManager {
                 Err(api_err)
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Pack owner actions (`boxes/sticker_set_box.cpp`, `api/api_stickers_creator.cpp`)
+    // -------------------------------------------------------------------------
+
+    /// Renames an owned sticker or custom-emoji pack via `stickers.renameStickerSet` and feeds
+    /// the returned `messages.StickerSet` into the local store
+    /// (`boxes/sticker_set_box.cpp:327-363`).
+    ///
+    /// Trims leading/trailing whitespace and rejects empty titles or titles longer than
+    /// [`MAX_STICKER_SET_TITLE_LEN`] Unicode scalar values without issuing an RPC. On
+    /// `messages.stickerSetNotModified`, falls back to `messages.getStickerSet(hash = 0)`.
+    pub async fn rename_sticker_set<C: RpcClient>(
+        &mut self,
+        rpc: &C,
+        spec: &StickerSetSpec,
+        title: &str,
+        now_ms: u64,
+    ) -> Result<Option<u64>, ApiError> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::InvalidState(
+                "sticker set title must not be empty".to_owned(),
+            ));
+        }
+        if trimmed.chars().count() > MAX_STICKER_SET_TITLE_LEN {
+            return Err(ApiError::InvalidState(format!(
+                "sticker set title exceeds maximum length of {MAX_STICKER_SET_TITLE_LEN} characters"
+            )));
+        }
+        let resp = rpc
+            .invoke(&tl_fns::stickers::RenameStickerSet {
+                stickerset: spec.to_tl(),
+                title: trimmed.to_owned(),
+            })
+            .await
+            .map_err(Into::into)?;
+        match resp {
+            tl_enums::messages::StickerSet::StickerSet(full) => {
+                let set_id = self.feed_set_full(&full, (now_ms / 1000) as i32);
+                self.sets_by_spec.insert(spec.clone(), set_id);
+                Ok(Some(set_id))
+            }
+            tl_enums::messages::StickerSet::NotModified => {
+                self.get_sticker_set(rpc, spec, Some(0), now_ms).await
+            }
+        }
+    }
+
+    /// Reorders a sticker inside an owned pack via `stickers.changeStickerPosition` and feeds
+    /// the updated `messages.StickerSet` into the local store
+    /// (`StickerSetBox::Inner::requestReorder`, `boxes/sticker_set_box.cpp:1585-1613`).
+    pub async fn change_sticker_position<C: RpcClient>(
+        &mut self,
+        rpc: &C,
+        sticker: tl_enums::InputDocument,
+        position: i32,
+        now_ms: u64,
+    ) -> Result<Option<u64>, ApiError> {
+        if position < 0 {
+            return Err(ApiError::InvalidState(format!(
+                "sticker position {position} must be non-negative"
+            )));
+        }
+        let resp = rpc
+            .invoke(&tl_fns::stickers::ChangeStickerPosition { sticker, position })
+            .await
+            .map_err(Into::into)?;
+        match resp {
+            tl_enums::messages::StickerSet::StickerSet(full) => {
+                let set_id = self.feed_set_full(&full, (now_ms / 1000) as i32);
+                Ok(Some(set_id))
+            }
+            tl_enums::messages::StickerSet::NotModified => Ok(None),
+        }
+    }
+
+    /// Removes a sticker from an owned pack via `stickers.removeStickerFromSet` and feeds
+    /// the updated `messages.StickerSet` into the local store
+    /// (`boxes/sticker_set_box.cpp:1939-1957`).
+    pub async fn remove_sticker_from_set<C: RpcClient>(
+        &mut self,
+        rpc: &C,
+        sticker: tl_enums::InputDocument,
+        now_ms: u64,
+    ) -> Result<Option<u64>, ApiError> {
+        let resp = rpc
+            .invoke(&tl_fns::stickers::RemoveStickerFromSet { sticker })
+            .await
+            .map_err(Into::into)?;
+        match resp {
+            tl_enums::messages::StickerSet::StickerSet(full) => {
+                let set_id = self.feed_set_full(&full, (now_ms / 1000) as i32);
+                Ok(Some(set_id))
+            }
+            tl_enums::messages::StickerSet::NotModified => Ok(None),
+        }
+    }
+
+    /// Permanently deletes an owned sticker or custom-emoji pack via `stickers.deleteStickerSet`
+    /// and evicts it from every local order list and cache map
+    /// (`Api::DeleteStickerSet`, `api/api_stickers_creator.cpp:364-382` /
+    /// `boxes/sticker_set_box.cpp:922`).
+    pub async fn delete_sticker_set<C: RpcClient>(
+        &mut self,
+        rpc: &C,
+        set_id: u64,
+        fallback_spec: Option<&StickerSetSpec>,
+    ) -> Result<bool, ApiError> {
+        let stickerset = if let Some(set) = self.sets.get(&set_id) {
+            set.to_input_sticker_set()
+        } else if let Some(spec) = fallback_spec {
+            spec.to_tl()
+        } else {
+            return Err(ApiError::InvalidState(format!(
+                "sticker set {set_id} is not cached and no fallback InputStickerSet was provided"
+            )));
+        };
+        let ok = rpc
+            .invoke(&tl_fns::stickers::DeleteStickerSet { stickerset })
+            .await
+            .map_err(Into::into)?;
+        if ok {
+            self.sets_order.retain(|&id| id != set_id);
+            self.mask_sets_order.retain(|&id| id != set_id);
+            self.emoji_sets_order.retain(|&id| id != set_id);
+            self.archived_sets_order.retain(|&id| id != set_id);
+            self.archived_mask_sets_order.retain(|&id| id != set_id);
+            self.featured_sets_order.retain(|&id| id != set_id);
+            self.featured_emoji_sets_order.retain(|&id| id != set_id);
+            self.sets.remove(&set_id);
+            self.sets_by_spec.retain(|_, &mut id| id != set_id);
+        }
+        Ok(ok)
     }
 
     // -------------------------------------------------------------------------

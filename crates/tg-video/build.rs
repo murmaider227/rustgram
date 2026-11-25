@@ -1,5 +1,39 @@
+//! Build script for `tg-video`: compiles the C FFmpeg decode/encode shims and links against a
+//! shared FFmpeg development build pointed to by `FFMPEG_DIR`.
+//!
+//! ## Expected FFmpeg version
+//! - **Supported series:** FFmpeg 7.x or 8.x (GPL shared build; tested with FFmpeg 8.1.x).
+//! - **Tested ABI major versions (FFmpeg 8.1.x):**
+//!   `libavformat 62.x`, `libavcodec 62.x`, `libavutil 60.x`, `libswscale 9.x`, `libswresample 6.x`.
+//! - **Minimum supported ABI major versions (FFmpeg 7.0+):**
+//!   `libavformat >= 61`, `libavcodec >= 61`, `libavutil >= 59`, `libswscale >= 8`, `libswresample >= 5`.
+//! - **Security note:** Always ship a current patched FFmpeg 7.x/8.x build. Because general
+//!   shared builds enable hundreds of demuxers/decoders, `csrc/tg_ffmpeg_shim.c` and
+//!   `csrc/tg_ffmpeg_encode.c` enforce `protocol_whitelist`, `format_whitelist`, and
+//!   `codec_whitelist` to match Telegram Desktop's minimal FFmpeg build surface.
+
 use std::env;
 use std::path::PathBuf;
+
+/// Minimum supported `LIBAVFORMAT_VERSION_MAJOR` (FFmpeg 7.0 = 61; FFmpeg 8.x = 62).
+const MIN_LIBAVFORMAT_MAJOR: u32 = 61;
+/// Minimum supported `LIBAVCODEC_VERSION_MAJOR` (FFmpeg 7.0 = 61; FFmpeg 8.x = 62).
+const MIN_LIBAVCODEC_MAJOR: u32 = 61;
+
+fn parse_version_major(header_path: &std::path::Path, macro_name: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(header_path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("#define") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        if parts.next() == Some(macro_name) {
+            return parts.next()?.parse::<u32>().ok();
+        }
+    }
+    None
+}
 
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
@@ -56,6 +90,27 @@ fn main() {
         eprintln!(
             "error: FFMPEG_DIR is set to {:?}, but {:?} directory was not found.",
             ffmpeg_dir, lib_dir
+        );
+        std::process::exit(1);
+    }
+
+    if let Some(avformat_major) = parse_version_major(
+        &include_dir.join("libavformat").join("version_major.h"),
+        "LIBAVFORMAT_VERSION_MAJOR",
+    ) && avformat_major < MIN_LIBAVFORMAT_MAJOR
+    {
+        eprintln!(
+            "error: FFmpeg libavformat major version {avformat_major} is older than the minimum supported version {MIN_LIBAVFORMAT_MAJOR} (FFmpeg 7.0+ / 8.x required)."
+        );
+        std::process::exit(1);
+    }
+    if let Some(avcodec_major) = parse_version_major(
+        &include_dir.join("libavcodec").join("version_major.h"),
+        "LIBAVCODEC_VERSION_MAJOR",
+    ) && avcodec_major < MIN_LIBAVCODEC_MAJOR
+    {
+        eprintln!(
+            "error: FFmpeg libavcodec major version {avcodec_major} is older than the minimum supported version {MIN_LIBAVCODEC_MAJOR} (FFmpeg 7.0+ / 8.x required)."
         );
         std::process::exit(1);
     }

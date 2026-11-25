@@ -409,7 +409,9 @@ fn saved_gift_to_received_item(saved: &SavedStarGift, session: &Session) -> Rece
 // 3. Saved Profile Music (`users.getSavedMusic`, `account.saveMusic`)
 // =============================================================================
 
-/// Fetches saved profile audio tracks for `peer_id` via `users.getSavedMusic`.
+/// Fetches saved profile audio tracks for `peer_id` via `users.getSavedMusic` and
+/// refreshes the signed-in account's saved music ID list via `account.getSavedMusicIds`
+/// (throttled to 30 s, matching `Data::SavedMusic::loadIds` in `data/data_saved_music.cpp:71-92`).
 pub fn peer_saved_music(
     live: &LiveSession,
     peer_id: PeerId,
@@ -419,6 +421,8 @@ pub fn peer_saved_music(
     let Some(id) = input_user(live, peer_id) else {
         return Ok(Vec::new());
     };
+    let data_peer = to_data_peer(peer_id);
+    let is_self = read_session(live, |s| s.self_peer_id() == data_peer);
     let req = tl_fns::users::GetSavedMusic {
         id,
         offset: offset.max(0),
@@ -426,11 +430,19 @@ pub fn peer_saved_music(
         hash: 0,
     };
     let res = invoke_rpc(live, req)?;
+    let _ = crate::live_extras::load_saved_music_ids(live, false);
     match res {
         tl_enums::users::SavedMusic::SavedMusic(m) => Ok(m
             .documents
             .into_iter()
             .filter_map(tl_doc_to_saved_music)
+            .map(|mut track| {
+                if !is_self {
+                    track.saved_on_profile =
+                        crate::live_extras::has_saved_music_id(live, track.document_id);
+                }
+                track
+            })
             .collect()),
         tl_enums::users::SavedMusic::NotModified(_) => Ok(Vec::new()),
     }
@@ -1077,9 +1089,7 @@ pub fn report_profile_photo(
     reason: ReportReason,
     comment: &str,
 ) -> Result<(), String> {
-    if photo.id == 0 {
-        return Err("Profile photo ID cannot be zero.".to_owned());
-    }
+    crate::profile_info_extras::validate_profile_photo_ref(&photo)?;
     let Some(peer) = input_peer(live, peer_id) else {
         return Err("Peer not found.".to_owned());
     };

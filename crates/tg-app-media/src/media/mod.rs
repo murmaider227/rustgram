@@ -23,6 +23,8 @@ pub mod round_video_capture;
 pub mod strings;
 pub mod style;
 #[cfg(test)]
+mod tests_seca;
+#[cfg(test)]
 mod tests_wp14;
 pub mod video_stream;
 pub mod zoom;

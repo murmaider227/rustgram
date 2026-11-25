@@ -144,6 +144,48 @@ pub fn photo_to_location(photo: &PhotoData) -> ResolvedMediaLocation {
     }
 }
 
+/// Builds an [`InputFileLocation`] for a [`PhotoData`]'s grid-appropriate thumbnail size
+/// (`"m"` 320px box preferred, then `"x"` 800px, then `"s"` 100px, then smallest downloadable
+/// non-stripped size), matching tdesktop's `Info::Media::Photo` thumbnail selection.
+#[must_use]
+pub fn photo_thumb_location(photo: &PhotoData) -> Option<ResolvedMediaLocation> {
+    let downloadable: Vec<_> = photo
+        .sizes
+        .iter()
+        .filter(|s| !s.kind.is_empty() && s.kind != "i" && s.kind != "j")
+        .collect();
+    if downloadable.is_empty() {
+        return None;
+    }
+    let chosen = ["m", "x", "s"]
+        .into_iter()
+        .find_map(|pref| downloadable.iter().copied().find(|s| s.kind == pref))
+        .or_else(|| {
+            downloadable
+                .iter()
+                .copied()
+                .min_by_key(|s| (i64::from(s.width) * i64::from(s.height), s.size))
+        })?;
+    let size = u64::try_from(chosen.size).unwrap_or(0);
+    Some(ResolvedMediaLocation {
+        dc_id: photo.dc_id,
+        location: tl_enums::InputFileLocation::InputPhotoFileLocation(
+            tl_types::InputPhotoFileLocation {
+                id: photo.id.0 as i64,
+                access_hash: photo.access_hash as i64,
+                file_reference: photo.file_reference.clone(),
+                thumb_size: chosen.kind.clone(),
+            },
+        ),
+        size,
+        cache_key: CacheKey {
+            high: photo.id.0,
+            low: 4,
+        },
+        ext_hint: Some("jpg".to_owned()),
+    })
+}
+
 /// Builds an [`InputFileLocation`] for a [`DocumentData`]'s best downloadable thumbnail, if any.
 #[must_use]
 pub fn document_thumb_location(doc: &DocumentData) -> Option<ResolvedMediaLocation> {
@@ -2634,26 +2676,81 @@ impl PlaylistProvider for LivePlaylistProvider {
     }
 }
 
-/// Launches a downloaded local file in the OS default application via `ShellExecuteW`
-/// (`tg_platform::system_info::open_file`), after sanitizing and marking the NTFS
-/// Internet Zone identifier (`PostprocessDownloaded`).
+/// Returns `true` if launching `path` externally requires explicit user confirmation
+/// (`Data::LaunchWithWarning` in `data/data_document_resolver.cpp:91`).
 ///
-/// When `RUSTGRAM_NO_SHELL_OPEN=1` (or legacy `TGFORK_NO_SHELL_OPEN=1`) is set (e.g. headless CI/tests), validates that the file
-/// exists on disk and skips invoking the desktop shell so tests never spawn OS viewer windows.
+/// Covers Windows executable/script types (`WINDOWS_EXECUTABLE_EXTS`), unknown extensions,
+/// extensionless files (which can resolve sibling `.bat`/`.exe` on Windows), and IP-revealing
+/// extensions (`.svg`, `.html`, `.m3u`, ...).
+#[must_use]
+pub fn path_requires_launch_confirmation(path: &std::path::Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return true;
+    };
+    let ext = tg_media::document::file_extension(file_name);
+    if ext.is_empty() {
+        return true;
+    }
+    if tg_media::document::is_ip_revealing_filename(file_name) {
+        return true;
+    }
+    matches!(
+        tg_media::document::detect_name_type(file_name),
+        tg_media::document::NameType::Executable | tg_media::document::NameType::Unknown
+    )
+}
+
+fn default_shell_launcher(p: &std::path::Path) -> anyhow::Result<()> {
+    if std::env::var_os("RUSTGRAM_NO_SHELL_OPEN").is_some()
+        || std::env::var_os("TGFORK_NO_SHELL_OPEN").is_some()
+    {
+        return Ok(());
+    }
+    tg_platform::system_info::open_file(p).map_err(|err| anyhow!("{err}"))
+}
+
+/// Launches a downloaded benign local file in the OS default application via `ShellExecuteW`
+/// (`tg_platform::system_info::open_file`), refusing executable, unknown, extensionless, or
+/// IP-revealing files unless [`launch_external_file_confirmed`] is used, and failing closed if
+/// marking the NTFS Internet Zone identifier (`:Zone.Identifier`) fails.
+///
+/// When `RUSTGRAM_NO_SHELL_OPEN=1` (or legacy `TGFORK_NO_SHELL_OPEN=1`) is set (e.g. headless CI/tests),
+/// validates policy, file existence, and Zone.Identifier marking, then skips invoking the desktop shell.
 pub fn launch_external_file(path: &std::path::Path) -> anyhow::Result<()> {
-    launch_external_file_with(path, |p| {
-        if std::env::var_os("RUSTGRAM_NO_SHELL_OPEN").is_some()
-            || std::env::var_os("TGFORK_NO_SHELL_OPEN").is_some()
-        {
-            return Ok(());
-        }
-        tg_platform::system_info::open_file(p).map_err(|err| anyhow!("{err}"))
-    })
+    launch_external_file_with(path, default_shell_launcher)
+}
+
+/// Launches a downloaded local file AFTER the user has explicitly confirmed the launch warning
+/// dialog (`Data::LaunchWithWarning`), still enforcing file existence and NTFS `:Zone.Identifier`
+/// marking before invoking the shell.
+pub fn launch_external_file_confirmed(path: &std::path::Path) -> anyhow::Result<()> {
+    launch_external_file_confirmed_with_zone_marker(
+        path,
+        tg_platform::system_info::mark_downloaded_zone_identifier,
+        default_shell_launcher,
+    )
 }
 
 /// Testable core of [`launch_external_file`] accepting a custom shell launcher closure.
 pub fn launch_external_file_with<F>(path: &std::path::Path, launcher: F) -> anyhow::Result<()>
 where
+    F: FnOnce(&std::path::Path) -> anyhow::Result<()>,
+{
+    launch_external_file_with_zone_marker(
+        path,
+        tg_platform::system_info::mark_downloaded_zone_identifier,
+        launcher,
+    )
+}
+
+/// Testable core of [`launch_external_file`] accepting custom Zone.Identifier and launcher hooks.
+pub fn launch_external_file_with_zone_marker<Z, F>(
+    path: &std::path::Path,
+    zone_marker: Z,
+    launcher: F,
+) -> anyhow::Result<()>
+where
+    Z: FnOnce(&std::path::Path) -> tg_platform::Result<()>,
     F: FnOnce(&std::path::Path) -> anyhow::Result<()>,
 {
     if !path.is_file() {
@@ -2662,7 +2759,43 @@ where
             path.display()
         ));
     }
-    let _ = tg_platform::system_info::mark_downloaded_zone_identifier(path);
+    if path_requires_launch_confirmation(path) {
+        return Err(anyhow!(
+            "confirmation required before launching '{}'",
+            path.display()
+        ));
+    }
+    zone_marker(path).map_err(|err| {
+        anyhow!(
+            "failed to mark Zone.Identifier on '{}': {err}",
+            path.display()
+        )
+    })?;
+    launcher(path)
+}
+
+/// Testable core of [`launch_external_file_confirmed`] accepting custom Zone.Identifier and launcher hooks.
+pub fn launch_external_file_confirmed_with_zone_marker<Z, F>(
+    path: &std::path::Path,
+    zone_marker: Z,
+    launcher: F,
+) -> anyhow::Result<()>
+where
+    Z: FnOnce(&std::path::Path) -> tg_platform::Result<()>,
+    F: FnOnce(&std::path::Path) -> anyhow::Result<()>,
+{
+    if !path.is_file() {
+        return Err(anyhow!(
+            "cannot open external file: '{}' does not exist",
+            path.display()
+        ));
+    }
+    zone_marker(path).map_err(|err| {
+        anyhow!(
+            "failed to mark Zone.Identifier on '{}': {err}",
+            path.display()
+        )
+    })?;
     launcher(path)
 }
 

@@ -87,10 +87,12 @@ struct ComposeExtrasLiveState {
     use_platform_translation: bool,
     platform_translator: crate::wp40_polish::PlatformTranslatorSlot,
 
-    // Reactions (`messages.getAvailableReactions`, `setDefaultReaction`, `getSavedReactionTags`)
+    // Reactions (`messages.getAvailableReactions`, `messages.getTopReactions`, `setDefaultReaction`, `getSavedReactionTags`)
     available_reactions_hash: i32,
     available_reactions_loaded: bool,
     available_reactions: Vec<AvailableReactionItem>,
+    reactions_sync: tg_api::cached_lists::ReactionsSync,
+    top_reactions_loaded: bool,
     default_reaction: String,
     saved_tags_cache: HashMap<Option<PeerId>, (i64, Vec<SavedReactionTagItem>)>,
 
@@ -122,6 +124,8 @@ impl Default for ComposeExtrasLiveState {
             available_reactions_hash: 0,
             available_reactions_loaded: false,
             available_reactions: Vec::new(),
+            reactions_sync: tg_api::cached_lists::ReactionsSync::default(),
+            top_reactions_loaded: false,
             default_reaction: "👍".to_owned(),
             saved_tags_cache: HashMap::new(),
             available_effects_hash: 0,
@@ -1225,6 +1229,157 @@ impl LiveSession {
         }
     }
 
+    /// Returns cached top reaction emojis from `messages.getTopReactions` (fetching once on first
+    /// call via `tg_api::cached_lists::ReactionsSync::refresh_top`, matching `Data::Reactions`).
+    pub(crate) fn top_reactions_live(&self) -> Vec<String> {
+        let already = with_compose_extras(self, |st| {
+            st.top_reactions_loaded
+                .then(|| top_reaction_strings(&st.reactions_sync.top, true))
+        });
+        if let Some(list) = already {
+            return list;
+        }
+        self.refresh_top_reactions_live(true)
+    }
+
+    /// Explicitly refreshes top reactions via `tg_api::cached_lists::ReactionsSync::refresh_top`
+    /// (`messages.getTopReactions(limit = 14, hash)`), preserving cache on `NotModified` and
+    /// resetting `top_hash = 0` on RPC error (`data_message_reactions.cpp:972-991`).
+    pub fn refresh_top_reactions_live(&self, force: bool) -> Vec<String> {
+        let mut sync_snapshot = with_compose_extras(self, |st| st.reactions_sync.clone());
+        let now_ms = (now_unix_i32().max(0) as u64).saturating_mul(1_000);
+        let rpc = self.runtime().rpc().clone();
+        let res = block_on_runtime(self.runtime().tokio_handle(), async move {
+            let outcome = with_rpc_timeout(
+                COMPOSE_EXTRAS_RPC_TIMEOUT,
+                sync_snapshot.refresh_top(&rpc, now_ms, force),
+            )
+            .await;
+            (sync_snapshot, outcome)
+        });
+        match res {
+            (updated_sync, Ok(_)) => {
+                let items = top_reaction_strings(&updated_sync.top, true);
+                with_compose_extras(self, |st| {
+                    st.reactions_sync = updated_sync;
+                    st.top_reactions_loaded = true;
+                });
+                items
+            }
+            (updated_sync, Err(err)) => {
+                debug!(error = %err, "messages.getTopReactions failed");
+                with_compose_extras(self, |st| {
+                    // Preserve `top_hash = 0` reset performed by `ReactionsSync::refresh_top`.
+                    st.reactions_sync.top_hash = updated_sync.top_hash;
+                    top_reaction_strings(&st.reactions_sync.top, true)
+                })
+            }
+        }
+    }
+
+    /// Returns the ordered emoji list for the message context-menu reaction strip following
+    /// tdesktop's `Data::LookupPossibleReactions` (`data_message_reactions.cpp:180-351`):
+    /// user's favorite/default reaction rotated to front, followed by `messages.getTopReactions`,
+    /// followed by remaining active `messages.getAvailableReactions`, filtered by `peer_id`'s
+    /// allowed reactions policy and account Premium status.
+    pub(crate) fn reaction_strip_emojis_live(&self, peer_id: Option<PeerId>) -> Vec<String> {
+        let top = self.top_reactions_live();
+        let available = self.available_reactions_live();
+        let fav = self.default_reaction_live();
+
+        let (is_premium, peer_allowed) = read_session(self, |s| {
+            let premium = s
+                .peer(s.self_peer_id())
+                .and_then(|p| p.as_user())
+                .is_some_and(|u| u.is_premium());
+            let allowed = peer_id.and_then(|pid| {
+                let dp = to_data_peer(pid);
+                match s.peer(dp)? {
+                    tg_data::Peer::Chat(c)
+                        if c.common.loaded_status >= tg_data::LoadedStatus::Full =>
+                    {
+                        Some(c.allowed_reactions.clone())
+                    }
+                    tg_data::Peer::Channel(ch)
+                        if ch.common.loaded_status >= tg_data::LoadedStatus::Full =>
+                    {
+                        Some(ch.allowed_reactions.clone())
+                    }
+                    _ => None,
+                }
+            });
+            (premium, allowed)
+        });
+
+        let allowed_filter = |emoji: &str| -> bool {
+            let is_custom = emoji.starts_with("custom:");
+            if is_custom && !is_premium {
+                return false;
+            }
+            match &peer_allowed {
+                None => !is_custom,
+                Some(allowed) => match allowed.kind {
+                    tg_data::AllowedReactionsType::All => true,
+                    tg_data::AllowedReactionsType::Default => !is_custom,
+                    tg_data::AllowedReactionsType::Some => {
+                        let target = reaction_str_to_data(emoji);
+                        allowed.some.contains(&target)
+                    }
+                },
+            }
+        };
+
+        if let Some(ref allowed) = peer_allowed
+            && allowed.kind == tg_data::AllowedReactionsType::Some
+            && allowed.some.is_empty()
+        {
+            return Vec::new();
+        }
+
+        let mut ordered = Vec::new();
+        let mut push_unique = |emoji: String| {
+            if !emoji.is_empty() && allowed_filter(&emoji) && !ordered.contains(&emoji) {
+                ordered.push(emoji);
+            }
+        };
+
+        for emoji in top {
+            // Skip premium-only standard reactions for non-premium accounts when known in `available`.
+            let blocked_by_premium = !is_premium
+                && available
+                    .iter()
+                    .find(|a| a.emoji == emoji)
+                    .is_some_and(|a| a.is_premium);
+            if !blocked_by_premium {
+                push_unique(emoji);
+            }
+        }
+        for item in &available {
+            if !item.inactive && (is_premium || !item.is_premium) {
+                push_unique(item.emoji.clone());
+            }
+        }
+        if let Some(ref allowed) = peer_allowed
+            && allowed.kind == tg_data::AllowedReactionsType::Some
+        {
+            for id in &allowed.some {
+                if let Some(emoji) = data_reaction_to_strip_string(id, is_premium) {
+                    push_unique(emoji);
+                }
+            }
+        }
+
+        // Rotate favorite/default reaction to the front if present (`data_message_reactions.cpp:317`).
+        if let Some(pos) = ordered.iter().position(|e| e == &fav)
+            && pos > 0
+        {
+            let item = ordered.remove(pos);
+            ordered.insert(0, item);
+        }
+
+        ordered
+    }
+
     /// Toggles `emoji` reaction on `msg_id` while supporting multiple reactions per message
     /// (up to 3 simultaneous reactions for Telegram Premium accounts, 1 for standard accounts).
     pub(crate) fn toggle_reaction_live(
@@ -1890,4 +2045,20 @@ impl LiveSession {
         });
         parsed
     }
+}
+
+fn data_reaction_to_strip_string(id: &ReactionId, allow_custom: bool) -> Option<String> {
+    match id {
+        ReactionId::Emoji(e) if !e.is_empty() => Some(e.clone()),
+        ReactionId::Custom(doc_id) if allow_custom && !doc_id.is_zero() => {
+            Some(format!("custom:{}", doc_id.0))
+        }
+        ReactionId::Paid | ReactionId::Emoji(_) | ReactionId::Custom(_) => None,
+    }
+}
+
+fn top_reaction_strings(list: &[ReactionId], allow_custom: bool) -> Vec<String> {
+    list.iter()
+        .filter_map(|id| data_reaction_to_strip_string(id, allow_custom))
+        .collect()
 }

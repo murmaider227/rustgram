@@ -23,7 +23,9 @@ pub use tg_app_live::{
 };
 
 pub use crate::live_host::host;
-pub use crate::live_host::host::{LiveActiveWorkspace, LiveAppHost, LiveHostState};
+pub use crate::live_host::host::{
+    LiveActiveWorkspace, LiveAppHost, LiveBootstrapPrefetch, LiveHostState,
+};
 pub use crate::live_host::multi_account;
 pub use crate::live_host::multi_account::{
     ManagedAccountEntry, ManagedAccountSummary, MultiAccountFrameAction, MultiAccountNotifyBackend,

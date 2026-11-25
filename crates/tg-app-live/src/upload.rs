@@ -2763,19 +2763,29 @@ pub(super) fn accept_terms_of_service(live: &mut LiveSession, tos_id: &str) -> R
     Ok(())
 }
 
-/// Decodes raw image bytes into top-down RGBA8 `(width, height, rgba_bytes)` applying `rotation_degrees`.
+/// Decodes raw image bytes into top-down RGBA8 `(width, height, rgba_bytes)` applying
+/// `rotation_degrees`, enforcing [`tg_media::image::READ_BYTES_LIMIT`] and
+/// [`tg_media::image::READ_MAX_AREA`] before pixel decoding.
 pub fn decode_image_for_clipboard(
     bytes: &[u8],
     rotation_degrees: i32,
 ) -> anyhow::Result<(u32, u32, Vec<u8>)> {
-    let decoded = image::load_from_memory(bytes)
-        .map_err(|e| anyhow!("failed to decode media image for clipboard: {e}"))?;
-    let transformed = if rotation_degrees % 360 != 0 {
-        transform_dynamic_image(&decoded, rotation_degrees, false, false)
+    let decoded = tg_media::image::read_image(tg_media::image::ReadArgs {
+        content: bytes.to_vec(),
+        ..Default::default()
+    })
+    .map_err(|e| anyhow!("failed to decode media image for clipboard: {e}"))?;
+    let rgba = if rotation_degrees % 360 != 0 {
+        transform_dynamic_image(
+            &image::DynamicImage::ImageRgba8(decoded.image),
+            rotation_degrees,
+            false,
+            false,
+        )
+        .to_rgba8()
     } else {
-        decoded
+        decoded.image
     };
-    let rgba = transformed.to_rgba8();
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
         return Err(anyhow!("decoded media image has zero dimensions"));
@@ -2961,4 +2971,47 @@ pub(crate) fn apply_users_and_chats_sync(
         let mut guard = arc.write().await;
         apply_tl_users_and_chats(&mut guard, &users_owned, &chats_owned);
     });
+}
+
+#[cfg(test)]
+mod sec2c_tests {
+    use super::*;
+
+    fn encode_1bit_gray_png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::One);
+            let mut writer = encoder.write_header().expect("png header");
+            let row_bytes = (width as usize).div_ceil(8);
+            let mut stream = writer.stream_writer().expect("png stream writer");
+            let row = vec![0_u8; row_bytes];
+            for _ in 0..height {
+                std::io::Write::write_all(&mut stream, &row).expect("write png row");
+            }
+            stream.finish().expect("finish png");
+        }
+        out
+    }
+
+    #[test]
+    fn sec2c_w5_decode_image_for_clipboard_rejects_oversized_pixel_dimensions() {
+        // 12_100 * 9_100 = 110_110_000 pixels > tg_media::image::READ_MAX_AREA (108_576_768).
+        let oversized_png = encode_1bit_gray_png(12_100, 9_100);
+        let err = decode_image_for_clipboard(&oversized_png, 0)
+            .expect_err("oversized clipboard image must be rejected before pixel decode");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("limit") || msg.contains("area"),
+            "expected area limit error, got: {err}"
+        );
+
+        // Small image with 90-degree rotation still decodes cleanly.
+        let small_png = encode_1bit_gray_png(8, 4);
+        let (w, h, rgba) =
+            decode_image_for_clipboard(&small_png, 90).expect("small clipboard image must decode");
+        assert_eq!((w, h), (4, 8));
+        assert_eq!(rgba.len(), 4 * 8 * 4);
+    }
 }

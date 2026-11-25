@@ -22,8 +22,14 @@ use tg_ui::widgets::labels::{FlatLabel, divider_bar};
 pub const SETTINGS_TOP_BAR_HEIGHT: f32 = 54.0;
 /// Standard horizontal padding for settings rows (`st::settings_button.padding.left`, `22px`).
 pub const SETTINGS_ROW_PAD_X: f32 = 22.0;
-/// Standard settings row height (`44px`).
-pub const SETTINGS_ROW_HEIGHT: f32 = 44.0;
+/// Settings row height with an icon (`st::settings_button`: padding 10 + 10 around the 20 px line).
+pub const SETTINGS_ROW_HEIGHT: f32 = 40.0;
+/// Settings row height without an icon (`st::settings_button_no_icon`: padding 10 + 8).
+pub const SETTINGS_ROW_HEIGHT_NO_ICON: f32 = 38.0;
+/// Height of a two-line settings row (title + status label, e.g. `SetupSplitToggle`).
+pub const SETTINGS_ROW_HEIGHT_TWO_LINE: f32 = 48.0;
+/// Size of a `menu_icons.style` outline icon painted at the left of a settings row.
+const SETTINGS_ICON_SIZE: f32 = 24.0;
 
 /// Returns the scaled settings top bar height from `st::info_top_bar_height`.
 #[must_use]
@@ -49,7 +55,10 @@ fn settings_text_left_with_icon() -> f32 {
     st::settings_button.padding.left.scaled().max(58) as f32
 }
 
-/// Colored badge icon descriptor matching `Settings::IconDescriptor` (`settings_common.cpp` + `colors.palette`).
+/// Settings row icon matching `Settings::IconDescriptor` in `settings_common.cpp`.
+///
+/// tdesktop 7.4 paints these as monochrome `menu_icons.style` outline icons in their own
+/// `menuIconColor`; only Premium and Stars keep their colored glyphs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsIconKind {
     Account,
@@ -87,55 +96,39 @@ pub enum SettingsIconKind {
     Username,
     Birthday,
     Logout,
+    /// Two-Step Verification (`menuIcon2SV`).
+    TwoStep,
+    /// Connected websites (`menuIconIpAddress`).
+    IpAddress,
+    /// Passkeys (`menuIconPermissions`).
+    Passkeys,
+    /// Flash the taskbar icon (`menuIconDockBounce`).
+    DockBounce,
+    /// Contact joined Telegram (`menuIconInvite`).
+    Invite,
+    /// Pinned messages (`menuIconPin`).
+    Pin,
+    /// Groups (`menuIconGroups`).
+    Groups,
+    /// Channels (`menuIconChannel`).
+    Channel,
+    /// Reactions (`menuIconGroupReactions`).
+    Reactions,
+    /// Telegram Features (`menuIconEmojiObjects`).
+    Features,
+    /// Ask a Question (`menuIconDiscussion`).
+    Discussion,
+    /// Night mode / auto-night (`menuIconNightMode`).
+    NightMode,
+    /// Your name color (`menuIconChangeColors`).
+    NameColor,
+    /// Chat folder (`menuIconShowInFolder`).
+    Folder,
+    /// Manage local storage (`menuIconStorage`).
+    LocalStorage,
 }
 
 impl SettingsIconKind {
-    /// Background fill color from tdesktop's `settingsIconBg1..8` palette tokens
-    /// matching `settings_main.cpp` and `settings_common.cpp`.
-    #[must_use]
-    pub fn bg_color(self, colors: &dyn Colors) -> Color32 {
-        let key = match self {
-            // Red (`#f06964`): Notifications, Blocked, Logout, Mic
-            Self::Notifications | Self::Blocked | Self::Logout | Self::Mic => "settingsIconBg1",
-            // Green (`#6dc534`): Privacy, Local Passcode, Calls, Speaker, Phone
-            Self::Privacy | Self::Lock | Self::Calls | Self::Speaker | Self::Phone => {
-                "settingsIconBg2"
-            }
-            // Amber/Orange (`#ed9f20`): Chat, Power/Battery, Auto-Delete Timer, Brush, Sticker, 2FA Key, Stars
-            Self::Chat
-            | Self::Power
-            | Self::Timer
-            | Self::Brush
-            | Self::Sticker
-            | Self::Key
-            | Self::Stars => "settingsIconBg3",
-            // Sky Blue (`#56b3f5`): Account, Folders, Devices/Sessions, Storage, Download, Username, Business
-            Self::Account
-            | Self::Folders
-            | Self::Sessions
-            | Self::Storage
-            | Self::Download
-            | Self::Username
-            | Self::Business => "settingsIconBg4",
-            // Indigo (`#7595ff`): Scale, Network, Camera, Debug, Affiliate
-            Self::Scale | Self::Network | Self::Camera | Self::Debug | Self::Affiliate => {
-                "settingsIconBg5"
-            }
-            // Purple (`#b580e2`): Advanced, Language, Birthday, Gift
-            Self::Advanced | Self::Language | Self::Birthday | Self::Gift => "settingsIconBg6",
-            // Coral Orange (`#f2925b`): Help/FAQ, Export
-            Self::Help | Self::Export => "settingsIconBg8",
-            // Telegram Premium accent
-            Self::Premium => "premiumButtonBg2",
-        };
-        let c = colors.color(key);
-        if c.a() == 0 {
-            colors.color("windowBgActive")
-        } else {
-            c
-        }
-    }
-
     /// Real `tg_style::Icon` from `menu_icons.style` / `settings.style`.
     #[must_use]
     pub fn style_icon(self) -> Icon {
@@ -149,11 +142,11 @@ impl SettingsIconKind {
             Self::Calls => st::menu_icon_calls_receive,
             Self::Power => st::menu_icon_power_usage,
             Self::Language => st::menu_icon_translate,
-            Self::Scale => st::settings_icon_interface_scale,
+            Self::Scale => st::menu_icon_show_in_chat,
             Self::Premium | Self::Stars => st::menu_icon_premium,
             Self::Gift => st::menu_icon_gift_premium,
             Self::Affiliate => st::menu_icon_link,
-            Self::Business => st::menu_icon_manage,
+            Self::Business => st::menu_icon_shop,
             Self::Help => st::menu_icon_faq,
             Self::Debug => st::menu_icon_experimental,
             Self::Sessions => st::menu_icon_devices,
@@ -173,33 +166,186 @@ impl SettingsIconKind {
             Self::Username => st::menu_icon_username,
             Self::Birthday => st::menu_icon_gift_premium,
             Self::Logout => st::menu_icon_leave_attention,
+            Self::TwoStep => st::menu_icon2_sv,
+            Self::IpAddress => st::menu_icon_ip_address,
+            Self::Passkeys => st::menu_icon_permissions,
+            Self::DockBounce => st::menu_icon_dock_bounce,
+            Self::Invite => st::menu_icon_invite,
+            Self::Pin => st::menu_icon_pin,
+            Self::Groups => st::menu_icon_groups,
+            Self::Channel => st::menu_icon_channel,
+            Self::Reactions => st::menu_icon_group_reactions,
+            Self::Features => st::menu_icon_emoji_objects,
+            Self::Discussion => st::menu_icon_discussion,
+            Self::NightMode => st::menu_icon_night_mode,
+            Self::NameColor => st::menu_icon_change_colors,
+            Self::Folder => st::menu_icon_show_in_folder,
+            Self::LocalStorage => st::menu_icon_storage,
         }
+    }
+
+    /// Tint for the few icons tdesktop paints in color (Premium star, Stars coin); `None`
+    /// keeps the icon's own `menuIconColor`.
+    #[must_use]
+    pub fn tint(self, colors: &dyn Colors) -> Option<Color32> {
+        let token = match self {
+            Self::Premium => "premiumButtonBg2",
+            Self::Stars => "creditsBg1",
+            _ => return None,
+        };
+        let c = colors.color(token);
+        (c.a() != 0).then_some(c)
     }
 }
 
-/// Paints a Telegram Desktop settings icon badge: colored rounded square (`st::settings_icon_radius`)
-/// with the real `tg-style` icon tinted in `settingsIconFg` (`white`) through `tg-ui`'s icon cache.
+/// Paints a Telegram Desktop settings row icon: the monochrome `menu_icons.style` outline glyph
+/// in its own `menuIconColor` (Premium / Stars in their accent colors), no badge background.
 pub fn paint_settings_icon(
     painter: &egui::Painter,
     rect: Rect,
     kind: SettingsIconKind,
     colors: &dyn Colors,
 ) {
-    let radius = st::settings_icon_radius.scaled().clamp(1, 255) as u8;
-    let bg = kind.bg_color(colors);
-    painter.rect_filled(rect, CornerRadius::same(radius), bg);
+    if let Some(stops) = premium_star_stops(kind, colors)
+        && paint_premium_star(painter, rect, &stops)
+    {
+        return;
+    }
+    let resolver = ColorsResolver(colors);
+    paint_style_icon(
+        painter,
+        rect,
+        kind.style_icon(),
+        &resolver,
+        kind.tint(colors),
+    );
+}
 
-    let fg = {
-        let token = colors.color("settingsIconFg");
-        if token.a() == 0 {
-            Color32::WHITE
-        } else {
-            token
+/// tdesktop's Premium star (`icons/settings/star.svg`, GPL-3.0) that `AddPremiumStar` paints
+/// on the Premium and Stars rows instead of a menu icon.
+const PREMIUM_STAR_SVG: &str = include_str!("assets/premium_star.svg");
+
+/// Gradient stops of `AddPremiumStar`: `Ui::Premium::ButtonGradientStops` for Premium,
+/// `CreditsIconGradientStops` for Stars. `None` for every other row icon.
+fn premium_star_stops(kind: SettingsIconKind, colors: &dyn Colors) -> Option<Vec<(f32, Color32)>> {
+    let stops = match kind {
+        SettingsIconKind::Premium => vec![
+            (0.0, colors.color("premiumButtonBg1")),
+            (0.6, colors.color("premiumButtonBg2")),
+            (1.0, colors.color("premiumButtonBg3")),
+        ],
+        SettingsIconKind::Stars => vec![
+            (0.0, colors.color("creditsBg1")),
+            (1.0, colors.color("creditsBg2")),
+        ],
+        _ => return None,
+    };
+    stops.iter().all(|(_, c)| c.a() != 0).then_some(stops)
+}
+
+/// `Ui::Premium::ColorizedSvg`: the star with its white fill replaced by a bottom-left to
+/// top-right linear gradient over `stops`.
+fn colorized_premium_star_svg(stops: &[(f32, Color32)]) -> String {
+    let stops_xml: String = stops
+        .iter()
+        .map(|(offset, c)| {
+            format!(
+                "<stop offset='{offset}' stop-color='#{:02x}{:02x}{:02x}'/>",
+                c.r(),
+                c.g(),
+                c.b()
+            )
+        })
+        .collect();
+    let gradient = format!(
+        "<linearGradient id='Gradient2' x1='0' x2='1' y1='1' y2='0'>{stops_xml}</linearGradient>"
+    );
+    PREMIUM_STAR_SVG
+        .replace("gradientPlaceholder", &gradient)
+        .replace("#fff", "url(#Gradient2)")
+}
+
+/// Paints the gradient Premium star badge: `settingsButtonNoIcon.style.font->ascent` tall,
+/// centered on the 24 px menu icon slot. Returns `false` if the SVG could not be rendered.
+fn paint_premium_star(painter: &egui::Painter, icon_rect: Rect, stops: &[(f32, Color32)]) -> bool {
+    let ctx = painter.ctx();
+    let ppp = ctx.pixels_per_point();
+    let font = font_id_from_style(st::settings_button_no_icon.style.font);
+    let side = ctx
+        .fonts_mut(|f| f.row_height(&font) * 0.78)
+        .round()
+        .max(8.0);
+    let px = (side * ppp).round().max(1.0) as u32;
+    let key = stops.iter().fold(u64::from(px), |acc, (o, c)| {
+        acc.wrapping_mul(1_000_003)
+            ^ u64::from(u32::from_le_bytes(c.to_array()))
+            ^ u64::from(o.to_bits())
+    });
+    let id = egui::Id::unique(("tg_settings_premium_star", key));
+    let texture = match ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
+        Some(cached) => cached,
+        None => {
+            let rendered = rasterize_svg(&colorized_premium_star_svg(stops), px).map(|image| {
+                ctx.load_texture(
+                    format!("tg_settings_premium_star_{key}"),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            ctx.data_mut(|d| d.insert_temp(id, rendered.clone()));
+            rendered
         }
     };
-    let resolver = ColorsResolver(colors);
-    let inner = rect.shrink(3.0);
-    paint_style_icon(painter, inner, kind.style_icon(), &resolver, Some(fg));
+    let Some(texture) = texture else {
+        return false;
+    };
+    let rect = Rect::from_center_size(icon_rect.center(), Vec2::splat(side));
+    painter.image(
+        texture.id(),
+        rect,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    true
+}
+
+/// Renders `svg` into a `px`×`px` image, keeping the aspect ratio and centering it.
+fn rasterize_svg(svg: &str, px: u32) -> Option<egui::ColorImage> {
+    let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px)?;
+    let size = tree.size();
+    let scale = (px as f32 / size.width().max(1.0)).min(px as f32 / size.height().max(1.0));
+    let dx = (px as f32 - size.width() * scale) * 0.5;
+    let dy = (px as f32 - size.height() * scale) * 0.5;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, dx, dy),
+        &mut pixmap.as_mut(),
+    );
+    Some(egui::ColorImage::from_rgba_premultiplied(
+        [px as usize, px as usize],
+        pixmap.data(),
+    ))
+}
+
+/// Rect of the row icon at `st::settings_button.icon_left`, centered vertically.
+fn settings_icon_rect(row: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            row.left() + settings_icon_left(),
+            row.center().y - SETTINGS_ICON_SIZE * 0.5,
+        ),
+        Vec2::splat(SETTINGS_ICON_SIZE),
+    )
+}
+
+/// Row height for a single-line settings row (`settings_button` vs `settings_button_no_icon`).
+fn single_line_row_height(has_icon: bool) -> f32 {
+    if has_icon {
+        SETTINGS_ROW_HEIGHT
+    } else {
+        SETTINGS_ROW_HEIGHT_NO_ICON
+    }
 }
 
 /// Paints a `tg_style::Icon` centered in `rect` with an optional tint color override.
@@ -266,21 +412,33 @@ pub fn settings_top_bar(
             );
 
             if let Some(label) = right_action {
+                // Main Settings header (`settings_main.cpp` `fillTopBarMenu`): search icon and
+                // the ⋮ menu whose main entry is "Edit profile" (`right_action`).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(st::settings_button_right_skip.scaled().max(14) as f32);
-                    let resp = ui.add(
-                        egui::Button::new(
-                            egui::RichText::new(label)
-                                .font(font_id_from_style(st::semibold_font))
-                                .color(colors.color("windowActiveTextFg")),
-                        )
-                        .frame(false),
+                    ui.add_space(6.0);
+                    let menu_resp = top_bar_icon_button(
+                        ui,
+                        st::info_top_bar_menu.icon,
+                        st::info_top_bar_menu.icon_over,
+                        label,
+                        bar_h,
+                        colors,
                     );
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                    }
-                    if resp.clicked() {
+                    if menu_resp.clicked() {
                         right_clicked = true;
+                    }
+                    let search_label = tr::lng_dlg_filter();
+                    let search_resp = top_bar_icon_button(
+                        ui,
+                        st::info_top_bar_search.icon,
+                        st::info_top_bar_search.icon_over,
+                        &search_label,
+                        bar_h,
+                        colors,
+                    );
+                    if search_resp.clicked() {
+                        let open = super::main_page::settings_search_open(ui.ctx());
+                        super::main_page::set_settings_search_open(ui.ctx(), !open);
                     }
                 });
             }
@@ -296,6 +454,33 @@ pub fn settings_top_bar(
     );
 
     (back_clicked, right_clicked)
+}
+
+/// 40 px header icon button (`st::info_top_bar_search` / `st::info_top_bar_menu`).
+fn top_bar_icon_button(
+    ui: &mut Ui,
+    icon: Icon,
+    icon_over: Icon,
+    label: &str,
+    bar_h: f32,
+    colors: &dyn Colors,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(40.0, bar_h.min(40.0)), Sense::click());
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
+    let hovered = resp.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        ui.painter()
+            .circle_filled(rect.center(), 18.0, colors.color("windowBgOver"));
+    }
+    paint_tinted_icon(
+        ui.painter(),
+        rect,
+        if hovered { icon_over } else { icon },
+        colors,
+        None,
+    );
+    resp.on_hover_text(label)
 }
 
 /// Renders a colored subsection header (`Ui::AddSubsectionTitle`, `st::default_subsection_title`).
@@ -315,6 +500,16 @@ pub fn subsection_title(ui: &mut Ui, title: &str, colors: &dyn Colors) {
     });
     ui.add_space(pad.bottom.scaled().max(4) as f32);
 }
+
+/// tdesktop's `Ui::AddDivider` band (`BoxContentDivider`, `boxDividerHeight` = 8 px). Callers
+/// add the `defaultVerticalListSkip` (6 px) around it, as `SectionBuilder::addSkip` does.
+pub fn settings_section_divider(ui: &mut Ui, colors: &dyn Colors) -> Rect {
+    let height = st::box_divider_height.scaled().max(1) as f32;
+    divider_bar(ui, height, colors)
+}
+
+/// `defaultVerticalListSkip`: the skip `SectionBuilder::addSkip` puts around a divider.
+pub const SETTINGS_LIST_SKIP: f32 = 6.0;
 
 /// Renders a gray divider band (`Ui::AddDivider`) with optional muted explanatory footer (`Ui::AddDividerText`).
 pub fn settings_divider(ui: &mut Ui, description: Option<&str>, colors: &dyn Colors) {
@@ -393,6 +588,9 @@ fn layout_elided_single_line(
 }
 
 /// Full-width clickable settings row (`Ui::SettingsButton` with optional icon, right value, subtitle, or red attention style).
+///
+/// `_show_chevron` is kept for call-site compatibility: tdesktop 7.4 draws no trailing chevrons
+/// on settings rows.
 #[allow(clippy::too_many_arguments)]
 pub fn settings_row(
     ui: &mut Ui,
@@ -401,16 +599,15 @@ pub fn settings_row(
     right_label: Option<&str>,
     icon: Option<SettingsIconKind>,
     attention: bool,
-    show_chevron: bool,
+    _show_chevron: bool,
     colors: &dyn Colors,
 ) -> Response {
     let w = ui.available_width().max(200.0);
     let pad_x = settings_row_pad_x();
-    let base_h = (st::settings_button.height.scaled() as f32).max(SETTINGS_ROW_HEIGHT);
     let h = if subtitle.is_some() {
-        base_h + 12.0
+        SETTINGS_ROW_HEIGHT_TWO_LINE
     } else {
-        base_h
+        single_line_row_height(icon.is_some())
     };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
     let a11y_label = match right_label {
@@ -429,36 +626,15 @@ pub fn settings_row(
     }
 
     let text_x = if let Some(kind) = icon {
-        let icon_size = 28.0_f32;
-        let icon_rect = Rect::from_min_size(
-            Pos2::new(
-                rect.left() + settings_icon_left(),
-                rect.center().y - icon_size * 0.5,
-            ),
-            Vec2::splat(icon_size),
-        );
-        paint_settings_icon(ui.painter(), icon_rect, kind, colors);
+        paint_settings_icon(ui.painter(), settings_icon_rect(rect), kind, colors);
         rect.left() + settings_text_left_with_icon()
     } else {
         rect.left() + pad_x
     };
 
-    // Reserve right-side chrome (chevron + right-aligned label) first so the left title and
-    // subtitle truncate cleanly with an ellipsis and maintain a consistent clearance gap.
-    let mut right_x =
-        rect.right() - st::settings_button_right_skip.scaled().max(pad_x as i32) as f32;
-    if show_chevron {
-        let chev_rect =
-            Rect::from_center_size(Pos2::new(right_x - 4.0, rect.center().y), Vec2::splat(16.0));
-        paint_tinted_icon(
-            ui.painter(),
-            chev_rect,
-            st::menu_icon_submenu_arrow,
-            colors,
-            Some(colors.color("windowSubTextFg")),
-        );
-        right_x -= 18.0;
-    }
+    // Reserve the right-aligned label first so the left title and subtitle truncate cleanly
+    // with an ellipsis and keep a consistent clearance gap.
+    let right_x = rect.right() - st::settings_button_right_skip.scaled().max(pad_x as i32) as f32;
 
     let right_fg = colors.color("windowActiveTextFg");
     let right_galley = right_label.filter(|v| !v.is_empty()).map(|val| {
@@ -514,8 +690,8 @@ pub fn settings_row(
         let sub_galley = layout_elided_single_line(ui.painter(), sub, sub_font, sub_fg, text_max_w);
         was_truncated |= sub_galley.elided;
 
-        text_painter.galley(Pos2::new(text_x, rect.top() + 10.0), title_galley, title_fg);
-        text_painter.galley(Pos2::new(text_x, rect.top() + 30.0), sub_galley, sub_fg);
+        text_painter.galley(Pos2::new(text_x, rect.top() + 4.0), title_galley, title_fg);
+        text_painter.galley(Pos2::new(text_x, rect.top() + 25.0), sub_galley, sub_fg);
     } else {
         let title_y = rect.center().y - title_galley.size().y * 0.5;
         text_painter.galley(Pos2::new(text_x, title_y), title_galley, title_fg);
@@ -533,6 +709,10 @@ pub fn settings_row(
 }
 
 /// Full-width settings row with a `tg-ui` toggle switch on the right (`settingsButton` + `toggleOn`).
+///
+/// Wraps both title and optional subtitle strictly left of the toggle switch (growing the row
+/// height dynamically like tdesktop's multi-line `SettingsButton`), preserving a consistent
+/// [`SETTINGS_ROW_TEXT_RIGHT_GAP`] clearance so text never runs under the toggle at 390 px.
 pub fn settings_toggle_row(
     ui: &mut Ui,
     title: &str,
@@ -544,12 +724,48 @@ pub fn settings_toggle_row(
 ) -> bool {
     let w = ui.available_width().max(200.0);
     let pad_x = settings_row_pad_x();
-    let base_h = (st::settings_button.height.scaled() as f32).max(SETTINGS_ROW_HEIGHT);
-    let h = if subtitle.is_some() {
-        base_h + 12.0
+    let base_h = single_line_row_height(icon.is_some());
+
+    let toggle_st = ToggleStyle::default_toggle(colors);
+    let tsize = Toggle::toggle_size(&toggle_st);
+    let right_skip = st::settings_button_right_skip.scaled().max(pad_x as i32) as f32;
+    let text_offset_x = if icon.is_some() {
+        settings_text_left_with_icon()
     } else {
-        base_h
+        pad_x
     };
+    let text_max_w =
+        (w - right_skip - tsize.x - SETTINGS_ROW_TEXT_RIGHT_GAP - text_offset_x).max(48.0);
+
+    let fg = if enabled {
+        resolve_color_ref(st::settings_button.text_fg, colors)
+    } else {
+        colors.color("windowSubTextFg")
+    };
+    let title_font = font_id_from_style(st::settings_button.style.font);
+    let sub_font = egui::FontId::new(
+        (title_font.size - 1.5).max(11.5),
+        tg_ui::fonts::family_regular(),
+    );
+    let sub_fg = colors.color("windowSubTextFg");
+
+    let title_galley = ui
+        .painter()
+        .layout(title.to_owned(), title_font, fg, text_max_w);
+    let sub_galley = subtitle.filter(|s| !s.is_empty()).map(|sub| {
+        ui.painter()
+            .layout(sub.to_owned(), sub_font, sub_fg, text_max_w)
+    });
+
+    let pad_v = 10.0_f32;
+    let sub_gap = 3.0_f32;
+    let h = if let Some(ref sg) = sub_galley {
+        (pad_v + title_galley.size().y + sub_gap + sg.size().y + pad_v)
+            .max(SETTINGS_ROW_HEIGHT_TWO_LINE)
+    } else {
+        (pad_v + title_galley.size().y + pad_v).max(base_h)
+    };
+
     let sense = if enabled {
         Sense::click()
     } else {
@@ -565,74 +781,63 @@ pub fn settings_toggle_row(
             resolve_color_ref(st::settings_button.text_bg_over, colors),
         );
     }
+    if enabled && resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            CornerRadius::same(4),
+            Stroke::new(1.5, colors.color("windowActiveTextFg")),
+            StrokeKind::Inside,
+        );
+    }
     if enabled && resp.clicked() {
         *checked = !*checked;
         changed = true;
     }
+    // The accessible name stays the row title (what users and tests look the row up by);
+    // the subtitle is description text, not part of the name.
     resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, enabled, *checked, title));
 
     let text_x = if let Some(kind) = icon {
-        let icon_size = 28.0_f32;
-        let icon_rect = Rect::from_min_size(
-            Pos2::new(
-                rect.left() + settings_icon_left(),
-                rect.center().y - icon_size * 0.5,
-            ),
-            Vec2::splat(icon_size),
-        );
-        paint_settings_icon(ui.painter(), icon_rect, kind, colors);
+        paint_settings_icon(ui.painter(), settings_icon_rect(rect), kind, colors);
         rect.left() + settings_text_left_with_icon()
     } else {
         rect.left() + pad_x
     };
 
-    let fg = if enabled {
-        resolve_color_ref(st::settings_button.text_fg, colors)
-    } else {
-        colors.color("windowSubTextFg")
-    };
-    let title_font = font_id_from_style(st::settings_button.style.font);
-    let sub_font = egui::FontId::new(
-        (title_font.size - 1.5).max(11.5),
-        tg_ui::fonts::family_regular(),
+    let toggle_left = rect.right() - right_skip - tsize.x;
+    let text_clip = Rect::from_min_max(
+        Pos2::new(text_x, rect.top()),
+        Pos2::new(
+            (text_x + text_max_w).min(toggle_left - SETTINGS_ROW_TEXT_RIGHT_GAP * 0.5),
+            rect.bottom(),
+        ),
     );
+    let text_painter = ui.painter().with_clip_rect(text_clip);
 
-    if let Some(sub) = subtitle {
-        ui.painter().text(
-            Pos2::new(text_x, rect.top() + 10.0),
-            Align2::LEFT_TOP,
-            title,
-            title_font,
-            fg,
-        );
-        ui.painter().text(
-            Pos2::new(text_x, rect.top() + 30.0),
-            Align2::LEFT_TOP,
-            sub,
-            sub_font,
-            colors.color("windowSubTextFg"),
-        );
+    if let Some(sg) = sub_galley {
+        let content_h = title_galley.size().y + sub_gap + sg.size().y;
+        let top_y = (rect.center().y - content_h * 0.5).max(rect.top() + pad_v * 0.8);
+        let sub_y = top_y + title_galley.size().y + sub_gap;
+        text_painter.galley(Pos2::new(text_x, top_y), title_galley, fg);
+        text_painter.galley(Pos2::new(text_x, sub_y), sg, sub_fg);
     } else {
-        ui.painter().text(
-            Pos2::new(text_x, rect.center().y),
-            Align2::LEFT_CENTER,
-            title,
-            title_font,
-            fg,
-        );
+        let title_y = rect.center().y - title_galley.size().y * 0.5;
+        text_painter.galley(Pos2::new(text_x, title_y), title_galley, fg);
     }
 
-    let toggle_st = ToggleStyle::default_toggle(colors);
-    let tsize = Toggle::toggle_size(&toggle_st);
-    let right_skip = st::settings_button_right_skip.scaled().max(pad_x as i32) as f32;
     let toggle_rect = Rect::from_min_size(
-        Pos2::new(
-            rect.right() - right_skip - tsize.x,
-            rect.center().y - tsize.y * 0.5,
-        ),
+        Pos2::new(toggle_left, rect.center().y - tsize.y * 0.5),
         tsize,
     );
-    let toggled_val = if *checked { 1.0 } else { 0.0 };
+    let anim_secs = if ui.style().animation_time <= 0.0 {
+        0.0
+    } else {
+        (toggle_st.duration_ms as f32 / 1000.0).min(0.20)
+    };
+    let toggled_val = f64::from(
+        ui.ctx()
+            .animate_bool_with_time(resp.id, *checked, anim_secs),
+    );
     paint_toggle_view(
         ui.painter(),
         toggle_rect,
@@ -646,6 +851,9 @@ pub fn settings_toggle_row(
 
 /// Split settings row: left side opens details, right side toggles a switch (`SetupSplitToggle`).
 ///
+/// Wraps title and subtitle strictly left of the vertical divider and right-hand toggle zone so
+/// text never collides with the toggle on narrow (390 px) viewports.
+///
 /// Returns `(row_clicked, toggle_changed)`.
 pub fn settings_split_toggle_row(
     ui: &mut Ui,
@@ -657,8 +865,42 @@ pub fn settings_split_toggle_row(
 ) -> (bool, bool) {
     let w = ui.available_width().max(220.0);
     let pad_x = settings_row_pad_x();
-    let h = 56.0;
     let toggle_zone_w = 68.0;
+    let text_offset_x = if icon.is_some() {
+        settings_text_left_with_icon()
+    } else {
+        pad_x
+    };
+    let text_max_w = (w - toggle_zone_w - SETTINGS_ROW_TEXT_RIGHT_GAP - text_offset_x).max(48.0);
+
+    let title_fg = resolve_color_ref(st::settings_button.text_fg, colors);
+    let sub_fg = colors.color("windowSubTextFg");
+    let title_font = font_id_from_style(st::settings_button.style.font);
+    let sub_font = egui::FontId::new(
+        (title_font.size - 1.5).max(11.5),
+        tg_ui::fonts::family_regular(),
+    );
+    let title_galley = ui
+        .painter()
+        .layout(title.to_owned(), title_font, title_fg, text_max_w);
+    let sub_galley = if subtitle.is_empty() {
+        None
+    } else {
+        Some(
+            ui.painter()
+                .layout(subtitle.to_owned(), sub_font, sub_fg, text_max_w),
+        )
+    };
+
+    let pad_v = 6.0_f32;
+    let sub_gap = 1.0_f32;
+    let h = if let Some(ref sg) = sub_galley {
+        (pad_v + title_galley.size().y + sub_gap + sg.size().y + pad_v)
+            .max(SETTINGS_ROW_HEIGHT_TWO_LINE)
+    } else {
+        (pad_v + title_galley.size().y + pad_v).max(SETTINGS_ROW_HEIGHT)
+    };
+
     let (full_rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
 
     let left_rect = Rect::from_min_max(
@@ -688,53 +930,60 @@ pub fn settings_split_toggle_row(
         ui.painter()
             .rect_filled(left_rect, CornerRadius::ZERO, over_bg);
     }
+    if left_resp.has_focus() {
+        ui.painter().rect_stroke(
+            left_rect.shrink(1.0),
+            CornerRadius::same(4),
+            Stroke::new(1.5, colors.color("windowActiveTextFg")),
+            StrokeKind::Inside,
+        );
+    }
     if right_resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         ui.painter()
             .rect_filled(right_rect, CornerRadius::ZERO, over_bg);
     }
+    if right_resp.has_focus() {
+        ui.painter().rect_stroke(
+            right_rect.shrink(1.0),
+            CornerRadius::same(4),
+            Stroke::new(1.5, colors.color("windowActiveTextFg")),
+            StrokeKind::Inside,
+        );
+    }
 
     let text_x = if let Some(kind) = icon {
-        let icon_size = 28.0_f32;
-        let icon_rect = Rect::from_min_size(
-            Pos2::new(
-                full_rect.left() + settings_icon_left(),
-                full_rect.center().y - icon_size * 0.5,
-            ),
-            Vec2::splat(icon_size),
-        );
-        paint_settings_icon(ui.painter(), icon_rect, kind, colors);
+        paint_settings_icon(ui.painter(), settings_icon_rect(full_rect), kind, colors);
         full_rect.left() + settings_text_left_with_icon()
     } else {
         full_rect.left() + pad_x
     };
 
-    let title_font = font_id_from_style(st::settings_button.style.font);
-    let sub_font = egui::FontId::new(
-        (title_font.size - 1.5).max(11.5),
-        tg_ui::fonts::family_regular(),
+    let text_clip = Rect::from_min_max(
+        Pos2::new(text_x, full_rect.top()),
+        Pos2::new(
+            (text_x + text_max_w).min(right_rect.left() - SETTINGS_ROW_TEXT_RIGHT_GAP * 0.5),
+            full_rect.bottom(),
+        ),
     );
+    let text_painter = ui.painter().with_clip_rect(text_clip);
 
-    ui.painter().text(
-        Pos2::new(text_x, full_rect.top() + 10.0),
-        Align2::LEFT_TOP,
-        title,
-        title_font,
-        resolve_color_ref(st::settings_button.text_fg, colors),
-    );
-    ui.painter().text(
-        Pos2::new(text_x, full_rect.top() + 30.0),
-        Align2::LEFT_TOP,
-        subtitle,
-        sub_font,
-        colors.color("windowSubTextFg"),
-    );
+    if let Some(sg) = sub_galley {
+        let content_h = title_galley.size().y + sub_gap + sg.size().y;
+        let top_y = (full_rect.center().y - content_h * 0.5).max(full_rect.top() + pad_v);
+        let sub_y = top_y + title_galley.size().y + sub_gap;
+        text_painter.galley(Pos2::new(text_x, top_y), title_galley, title_fg);
+        text_painter.galley(Pos2::new(text_x, sub_y), sg, sub_fg);
+    } else {
+        let title_y = full_rect.center().y - title_galley.size().y * 0.5;
+        text_painter.galley(Pos2::new(text_x, title_y), title_galley, title_fg);
+    }
 
     // Subtle vertical divider line between main button and toggle.
     ui.painter().line_segment(
         [
-            Pos2::new(right_rect.left(), full_rect.top() + 14.0),
-            Pos2::new(right_rect.left(), full_rect.bottom() - 14.0),
+            Pos2::new(right_rect.left(), full_rect.top() + 6.0),
+            Pos2::new(right_rect.left(), full_rect.bottom() - 6.0),
         ],
         Stroke::new(1.0, colors.color("shadowFg")),
     );
@@ -750,14 +999,26 @@ pub fn settings_split_toggle_row(
 
     let toggle_st = ToggleStyle::default_toggle(colors);
     let tsize = Toggle::toggle_size(&toggle_st);
-    let toggle_rect = Rect::from_center_size(right_rect.center(), tsize);
-    paint_toggle_view(
-        ui.painter(),
-        toggle_rect,
-        &toggle_st,
-        if *checked { 1.0 } else { 0.0 },
-        1.0,
+    // Same right edge as plain toggle rows (`st::settings_button_right_skip`).
+    let right_skip = st::settings_button_right_skip.scaled().max(pad_x as i32) as f32;
+    let toggle_rect = Rect::from_min_size(
+        Pos2::new(
+            full_rect.right() - right_skip - tsize.x,
+            full_rect.center().y - tsize.y * 0.5,
+        ),
+        tsize,
     );
+    let anim_secs = if ui.style().animation_time <= 0.0 {
+        0.0
+    } else {
+        (toggle_st.duration_ms as f32 / 1000.0).min(0.20)
+    };
+    let toggled_val = f64::from(ui.ctx().animate_bool_with_time(
+        right_resp.id,
+        *checked,
+        anim_secs,
+    ));
+    paint_toggle_view(ui.painter(), toggle_rect, &toggle_st, toggled_val, 1.0);
 
     (left_resp.clicked(), toggled_changed)
 }
@@ -942,6 +1203,189 @@ mod tests {
         assert!(
             !wide_elided,
             "passkey title should render in full at 1440px width"
+        );
+    }
+
+    #[test]
+    fn settings_toggle_row_wraps_privacy_subtitles_left_of_toggle_at_390px() {
+        let ctx = egui::Context::default();
+        tg_ui::fonts::register_tdesktop_fonts(&ctx);
+        let colors = LiveThemeColors::default();
+        let rows = [
+            (
+                "Archive and mute",
+                "Automatically archive and mute new chats from people not in your contacts",
+            ),
+            (
+                "Hide read time",
+                "Hide the exact time you read messages in private chats",
+            ),
+            (
+                "Require Premium for new non-contact chats",
+                "Only contacts and Telegram Premium users can start new private chats with you.",
+            ),
+            (
+                "Charge Stars for messages from non-contacts",
+                "Require Telegram Stars for messages from users who are not your contacts.",
+            ),
+            (
+                "Show 18+ Content",
+                "Do not hide media that contains content suitable only for adults.",
+            ),
+        ];
+
+        let mut narrow_heights = Vec::new();
+        let mut narrow_gaps = Vec::new();
+        let mut wide_heights = Vec::new();
+
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(390.0, 900.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_max_width(390.0);
+                let pad_x = settings_row_pad_x();
+                let toggle_st = ToggleStyle::default_toggle(&colors);
+                let tsize = Toggle::toggle_size(&toggle_st);
+                let right_skip = st::settings_button_right_skip.scaled().max(pad_x as i32) as f32;
+                let toggle_left = 390.0 - right_skip - tsize.x;
+                let text_max_w =
+                    (390.0 - right_skip - tsize.x - SETTINGS_ROW_TEXT_RIGHT_GAP - pad_x).max(48.0);
+                let title_font = font_id_from_style(st::settings_button.style.font);
+                let sub_font = egui::FontId::new(
+                    (title_font.size - 1.5).max(11.5),
+                    tg_ui::fonts::family_regular(),
+                );
+
+                for &(title, sub) in &rows {
+                    let y0 = ui.cursor().top();
+                    let mut checked = false;
+                    let _ = settings_toggle_row(
+                        ui,
+                        title,
+                        Some(sub),
+                        None,
+                        &mut checked,
+                        true,
+                        &colors,
+                    );
+                    let y1 = ui.cursor().top();
+                    narrow_heights.push(y1 - y0);
+
+                    let tg = ui.painter().layout(
+                        title.to_owned(),
+                        title_font.clone(),
+                        colors.color("windowFg"),
+                        text_max_w,
+                    );
+                    let sg = ui.painter().layout(
+                        sub.to_owned(),
+                        sub_font.clone(),
+                        colors.color("windowSubTextFg"),
+                        text_max_w,
+                    );
+                    let max_text_right = pad_x + tg.size().x.max(sg.size().x);
+                    narrow_gaps.push(toggle_left - max_text_right);
+                }
+            },
+        );
+        out.textures_delta.clear();
+
+        let mut out_wide = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 900.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_max_width(1000.0);
+                for &(title, sub) in &rows {
+                    let y0 = ui.cursor().top();
+                    let mut checked = false;
+                    let _ = settings_toggle_row(
+                        ui,
+                        title,
+                        Some(sub),
+                        None,
+                        &mut checked,
+                        true,
+                        &colors,
+                    );
+                    wide_heights.push(ui.cursor().top() - y0);
+                }
+            },
+        );
+        out_wide.textures_delta.clear();
+
+        for (i, &(title, _)) in rows.iter().enumerate() {
+            assert!(
+                narrow_gaps[i] >= SETTINGS_ROW_TEXT_RIGHT_GAP - 1.0,
+                "row {title:?} must keep >= {SETTINGS_ROW_TEXT_RIGHT_GAP}px clearance left of toggle at 390px (got {:.1}px)",
+                narrow_gaps[i]
+            );
+            assert!(
+                narrow_heights[i] > wide_heights[i],
+                "row {title:?} should wrap and grow taller at 390px ({:.1}px) than 1000px ({:.1}px)",
+                narrow_heights[i],
+                wide_heights[i]
+            );
+        }
+    }
+
+    #[test]
+    fn settings_split_toggle_row_wraps_long_subtitle_left_of_divider_at_390px() {
+        let ctx = egui::Context::default();
+        tg_ui::fonts::register_tdesktop_fonts(&ctx);
+        let colors = LiveThemeColors::default();
+        let long_sub = "Custom notification alerts with exceptions across private chats and groups";
+        let mut narrow_h = 0.0_f32;
+        let mut gap = 0.0_f32;
+
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(390.0, 300.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_max_width(390.0);
+                let y0 = ui.cursor().top();
+                let mut checked = true;
+                let _ = settings_split_toggle_row(
+                    ui,
+                    "Private chats",
+                    long_sub,
+                    Some(SettingsIconKind::Notifications),
+                    &mut checked,
+                    &colors,
+                );
+                narrow_h = ui.cursor().top() - y0;
+
+                let text_x = settings_text_left_with_icon();
+                let divider_x = 390.0 - 68.0;
+                let text_max_w = (divider_x - SETTINGS_ROW_TEXT_RIGHT_GAP - text_x).max(48.0);
+                let title_font = font_id_from_style(st::settings_button.style.font);
+                let sub_font = egui::FontId::new(
+                    (title_font.size - 1.5).max(11.5),
+                    tg_ui::fonts::family_regular(),
+                );
+                let sg = ui.painter().layout(
+                    long_sub.to_owned(),
+                    sub_font,
+                    colors.color("windowSubTextFg"),
+                    text_max_w,
+                );
+                gap = divider_x - (text_x + sg.size().x);
+            },
+        );
+        out.textures_delta.clear();
+
+        assert!(
+            narrow_h > 56.0,
+            "split toggle row must expand height to fit wrapped subtitle at 390px (got {narrow_h:.1}px)"
+        );
+        assert!(
+            gap >= SETTINGS_ROW_TEXT_RIGHT_GAP - 1.0,
+            "split toggle subtitle must stay left of vertical divider (got gap {gap:.1}px)"
         );
     }
 }

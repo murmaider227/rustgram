@@ -302,6 +302,13 @@ static AVCodecContext *open_stream_codec(
         codec_ctx->opaque = codec_ctx;
     }
 
+    err = av_opt_set(codec_ctx, "codec_whitelist", TG_CODEC_WHITELIST, 0);
+    if (err < 0) {
+        avcodec_free_context(&codec_ctx);
+        if (out_error) *out_error = err;
+        return NULL;
+    }
+
     err = avcodec_open2(codec_ctx, codec, NULL);
     if (err < 0) {
         avcodec_free_context(&codec_ctx);
@@ -425,8 +432,19 @@ TgMediaContext *tg_media_open_custom_io(
     }
     ctx->fmt->pb = ctx->avio;
     ctx->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
-    /* RestrictToCustomIO: prevent demuxers from resolving external URLs/files. */
-    av_opt_set(ctx->fmt, "protocol_whitelist", "", 0);
+    /* RestrictToCustomIO + container/codec whitelists matching tdesktop's minimal FFmpeg build. */
+    int wl_err = av_opt_set(ctx->fmt, "protocol_whitelist", "", 0);
+    if (wl_err >= 0) {
+        wl_err = av_opt_set(ctx->fmt, "format_whitelist", TG_FORMAT_WHITELIST, 0);
+    }
+    if (wl_err >= 0) {
+        wl_err = av_opt_set(ctx->fmt, "codec_whitelist", TG_CODEC_WHITELIST, 0);
+    }
+    if (wl_err < 0) {
+        if (out_error) *out_error = wl_err;
+        tg_media_close(ctx);
+        return NULL;
+    }
 
     AVDictionary *dict = NULL;
     av_dict_set(&dict, "usetoc", "1", 0);

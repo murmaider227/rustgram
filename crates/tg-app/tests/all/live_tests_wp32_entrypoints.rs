@@ -385,6 +385,22 @@ fn shutdown_runtime(
     }
 }
 
+/// A profile in the side column only gets the `⋮` menu once the Info stack has history
+/// (`WrapWidget::setupTopBarMenuToggle`: `wrap() != Side || hasStackHistory()`); give it one.
+fn give_side_profile_stack_history(
+    harness: &mut egui_kittest::Harness<'static, WindowController>,
+    peer: PeerId,
+) {
+    let info = harness.state_mut().main_widget_mut().third_info_mut();
+    info.set_peer(peer);
+    // The same profile on another media tab is a new stack entry (identical ones are dropped).
+    info.push_section(tg_app::info::wrap_widget::InfoSection::Profile {
+        peer_id: peer,
+        media_tab: tg_app::info::backend::SharedMediaTab::Files,
+    });
+    step_n(harness, 3);
+}
+
 fn make_live_harness(ctrl: WindowController) -> egui_kittest::Harness<'static, WindowController> {
     HarnessBuilder::default()
         .with_size(Vec2::new(1280.0, 820.0))
@@ -475,8 +491,21 @@ fn kittest_edit_bot_info_click_path_and_rpc() {
 
     let mut harness = make_live_harness(ctrl);
     step_n(&mut harness, 3);
+    give_side_profile_stack_history(&mut harness, editable_bot_peer);
 
-    // Click the live "Edit Bot Info" row on the managed bot's profile!
+    // "Edit Bot Info" lives in the profile `⋮` menu (rightmost "More actions" button).
+    let more = harness
+        .get_all_by_label("More actions")
+        .max_by(|a, b| {
+            a.rect()
+                .min
+                .x
+                .partial_cmp(&b.rect().min.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("profile More actions button");
+    more.click();
+    step_n(&mut harness, 3);
     harness.get_by_label("Edit Bot Info").click();
     step_n(&mut harness, 3);
 
@@ -706,6 +735,7 @@ fn kittest_chat_import_menu_select_file_and_rpc() {
 
     let mut harness = make_live_harness(ctrl);
     step_n(&mut harness, 3);
+    give_side_profile_stack_history(&mut harness, friend_peer);
 
     // Open the Info top-bar 3-dots menu and click "Import Chat History".
     harness.get_by_label("More actions").click();

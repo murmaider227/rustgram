@@ -6,14 +6,15 @@
 
 use std::ops::Range;
 
-use egui::{CursorIcon, Id, Pos2, Rect, ScrollArea, Sense, Ui, Vec2};
-use tg_ui::stand_in::{PopupMenuStyle, ToggleStyle};
-use tg_ui::widgets::buttons::IconKind;
-use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
+use egui::{CursorIcon, Pos2, Rect, ScrollArea, Sense, Ui, Vec2};
+use tg_ui::stand_in::PopupMenuStyle;
+use tg_ui::tg_style::st;
+use tg_ui::widgets::menu::MenuItem;
 
 use crate::dialogs::backend::{
-    ArchiveSummary, DialogListQuery, DialogPeerKind, DialogsBackend, SpecialRowKind,
+    ArchiveSummary, DialogItem, DialogListQuery, DialogPeerKind, DialogsBackend, SpecialRowKind,
 };
+use crate::dialogs::entry_menu::{EntryMenu, EntryMenuRow};
 use crate::dialogs::layout::{
     COLLAPSED_ARCHIVE_HEIGHT, DialogColors, RowPaintState, paint_archive_row, paint_dialog_row,
     row_style_for,
@@ -43,6 +44,103 @@ pub enum InnerAction {
     OpenBotApp(PeerId),
     /// Informational toast emitted after a context menu operation (e.g. Archive / Delete).
     Toast(String),
+    /// `"Open in new window"` (`SessionController::showInNewWindow`).
+    OpenInNewWindow(PeerId),
+    /// `"Block user"` / `"Unblock user"` / `"Block bot"` / `"Restart bot"` (`Filler::addBlockUser`).
+    ToggleBlock(PeerId),
+    /// Mute submenu "Mute for..." (`PickMuteBox`).
+    OpenMuteFor(PeerId),
+    /// Mute submenu "Select tone" (`RingtonesBox`).
+    OpenSelectTone(PeerId),
+}
+
+/// Runs the chat-list block row for `peer_id`: blocks or unblocks through the same
+/// `InfoBackend::toggle_block_user` call as the profile's Block row and returns tdesktop's
+/// `"{user} is now blocked"` toast after blocking a user (bots are blocked without a toast,
+/// unblocking shows none).
+pub fn toggle_block_from_chat_list<B>(backend: &mut B, peer_id: PeerId) -> Option<String>
+where
+    B: DialogsBackend + tg_app_core::info::backend::InfoBackend + ?Sized,
+{
+    let item = DialogsBackend::dialog_by_peer(backend, peer_id);
+    let blocked = tg_app_core::info::backend::InfoBackend::toggle_block_user(backend, peer_id);
+    let user = item.filter(|i| i.kind == DialogPeerKind::User)?;
+    let short_name = user.title.split_whitespace().next().unwrap_or(&user.title);
+    blocked.then(|| tg_lang::tr::lng_new_contact_block_done(short_name))
+}
+
+/// Menu ids of the Mute submenu rows (`FillMuteMenu` in `menu/menu_mute.cpp`).
+pub const MUTE_SELECT_TONE_ACTION: &str = "mute_select_tone";
+/// "Disable sound" / "Enable sound".
+pub const MUTE_SOUND_TOGGLE_ACTION: &str = "mute_sound_toggle";
+/// "Mute for..." (opens `PickMuteBox`).
+pub const MUTE_FOR_ACTION: &str = "mute_for";
+/// "Mute forever".
+pub const MUTE_FOREVER_ACTION: &str = "mute_forever";
+
+/// The Mute submenu of an unmuted chat (`FillMuteMenu`): "Select tone", "Disable sound" (or
+/// "Enable sound" when the chat is silent), "Mute for...", and the red "Mute forever".
+#[must_use]
+pub fn mute_submenu_rows(silent: bool) -> Vec<EntryMenuRow> {
+    vec![
+        EntryMenuRow::action(
+            MUTE_SELECT_TONE_ACTION,
+            tg_lang::tr::lng_mute_menu_sound_select(),
+            Some(st::menu_icon_sound_select),
+        ),
+        if silent {
+            EntryMenuRow::action(
+                MUTE_SOUND_TOGGLE_ACTION,
+                tg_lang::tr::lng_mute_menu_sound_on(),
+                Some(st::menu_icon_sound_on),
+            )
+        } else {
+            EntryMenuRow::action(
+                MUTE_SOUND_TOGGLE_ACTION,
+                tg_lang::tr::lng_mute_menu_sound_off(),
+                Some(st::menu_icon_sound_off),
+            )
+        },
+        EntryMenuRow::action(
+            MUTE_FOR_ACTION,
+            tg_lang::tr::lng_mute_menu_duration(),
+            Some(st::menu_icon_mute_for),
+        ),
+        EntryMenuRow::attention(
+            MUTE_FOREVER_ACTION,
+            tg_lang::tr::lng_mute_menu_duration_forever(),
+            Some(st::menu_icon_mute),
+        ),
+    ]
+}
+
+/// Menu id of the chat-list block / unblock row.
+pub const BLOCK_USER_ACTION: &str = "block_user";
+
+/// The chat-list `"Block user"` row (`Filler::fillContextMenuActions` adds it only for users who
+/// are not contacts; `Filler::addBlockUser` skips self, Replies and Verification Codes). The label
+/// and icon follow `blockText` and the `menuIconBlock` / `menuIconUnblock` /
+/// `menuIconRestartBot` choice.
+#[must_use]
+pub fn block_user_row(item: &DialogItem, blocked: bool) -> Option<EntryMenuRow> {
+    let is_user = matches!(item.kind, DialogPeerKind::User | DialogPeerKind::Bot);
+    if !is_user || item.is_contact || item.special != SpecialRowKind::None {
+        return None;
+    }
+    let bot = item.kind == DialogPeerKind::Bot;
+    let (label, icon) = match (bot, blocked) {
+        (false, false) => (tg_lang::tr::lng_profile_block_user(), st::menu_icon_block),
+        (true, false) => (tg_lang::tr::lng_profile_block_bot(), st::menu_icon_block),
+        (false, true) => (
+            tg_lang::tr::lng_profile_unblock_user(),
+            st::menu_icon_unblock,
+        ),
+        (true, true) => (
+            tg_lang::tr::lng_profile_restart_bot(),
+            st::menu_icon_restart_bot,
+        ),
+    };
+    Some(EntryMenuRow::action(BLOCK_USER_ACTION, label, Some(icon)))
 }
 
 /// Computes the visible `[from, to)` row range for uniform-height virtualized scrolling.
@@ -195,7 +293,7 @@ pub struct DialogsInnerWidget {
     last_list: DialogListQuery,
     keyboard_selected_peer: Option<PeerId>,
     pinned_drag: Option<PinnedDragState>,
-    context_menu: PopupMenuState,
+    context_menu: EntryMenu,
     context_target: Option<ContextTarget>,
     scroll_offset_y: f32,
     pending_scroll_to_y: Option<f32>,
@@ -228,7 +326,7 @@ impl DialogsInnerWidget {
             last_list: DialogListQuery::Filter(FilterId::ALL),
             keyboard_selected_peer: None,
             pinned_drag: None,
-            context_menu: PopupMenuState::new(),
+            context_menu: EntryMenu::default(),
             context_target: None,
             scroll_offset_y: 0.0,
             pending_scroll_to_y: None,
@@ -386,6 +484,9 @@ impl DialogsInnerWidget {
         });
 
         let mut slice = backend.dialog_slice(list, 0, self.loaded_limit);
+        let chats_loading = matches!(list, DialogListQuery::Filter(FilterId::ALL))
+            && slice.entries.is_empty()
+            && !backend.chats_list_loaded();
         if matches!(list, DialogListQuery::Filter(FilterId::ALL)) {
             let groups = backend.community_groups();
             if groups.iter().any(|g| g.collapsed_in_dialogs) {
@@ -442,6 +543,12 @@ impl DialogsInnerWidget {
                 should_load_more = true;
             }
 
+            if chats_loading {
+                if !narrow {
+                    paint_chats_list_loading(ui, width, &colors);
+                }
+                return;
+            }
             if slice.entries.is_empty() && archive_summary.is_none() {
                 if !narrow {
                     ui.add_space(36.0);
@@ -810,25 +917,41 @@ impl DialogsInnerWidget {
 
         // Open right-click context menu if requested.
         if let Some((target, pos)) = open_menu {
-            let menu_style = PopupMenuStyle::default_popup(&colors);
             self.context_target = Some(target);
-            self.context_menu.open_at(ui.ctx(), pos, &menu_style);
+            self.context_menu.open_at(ui.ctx(), pos);
         }
 
-        // Render active context menu (`FillDialogsEntryMenu` in `window_peer_menu.cpp`).
+        // Render active context menu (`Filler::fillContextMenuActions` in `window_peer_menu.cpp`).
         if let Some(target) = self.context_target {
-            let menu_style = PopupMenuStyle::default_popup(&colors);
-            let toggle_style = ToggleStyle::default_toggle(&colors);
-            let items = build_context_menu_items(target, backend, list);
+            let menu_style = PopupMenuStyle::from_tg(&st::popup_menu_with_icons, &colors);
+            let rows = build_context_menu_rows(target, backend, list);
             if let Some(triggered) = self.context_menu.show(
                 ui.ctx(),
-                Id::unique("tg_dialogs_row_ctx_menu"),
-                &items,
+                ui.scope_id().with("tg_dialogs_row_ctx_menu"),
+                &rows,
                 &menu_style,
-                &toggle_style,
-            ) && let Some(toast) = execute_context_action(&triggered, target, backend, list)
-            {
-                action = Some(InnerAction::Toast(toast));
+                &colors,
+            ) {
+                if let (ContextTarget::Dialog(peer_id), "new_window") = (target, triggered.as_str())
+                {
+                    action = Some(InnerAction::OpenInNewWindow(peer_id));
+                } else if let (ContextTarget::Dialog(peer_id), BLOCK_USER_ACTION) =
+                    (target, triggered.as_str())
+                {
+                    action = Some(InnerAction::ToggleBlock(peer_id));
+                } else if let (ContextTarget::Dialog(peer_id), MUTE_FOR_ACTION) =
+                    (target, triggered.as_str())
+                {
+                    action = Some(InnerAction::OpenMuteFor(peer_id));
+                } else if let (ContextTarget::Dialog(peer_id), MUTE_SELECT_TONE_ACTION) =
+                    (target, triggered.as_str())
+                {
+                    action = Some(InnerAction::OpenSelectTone(peer_id));
+                } else if let Some(toast) =
+                    execute_context_action(&triggered, target, backend, list)
+                {
+                    action = Some(InnerAction::Toast(toast));
+                }
             }
             if !self.context_menu.is_open() {
                 self.context_target = None;
@@ -839,29 +962,103 @@ impl DialogsInnerWidget {
     }
 }
 
-fn build_context_menu_items(
-    target: ContextTarget,
+/// Draws tdesktop's chat-list loading state: `lng_contacts_loading` in `st::dialogsEmptyLabel`,
+/// `dialogsEmptySkip` from each side and centred in the first `dialogsEmptyHeight` pixels
+/// (`InnerWidget::refreshEmpty` / `resizeEmpty`, `dialogs_inner_widget.cpp:5282,5372-5377`).
+fn paint_chats_list_loading(ui: &mut Ui, width: f32, colors: &DialogColors<'_>) {
+    let skip = st::dialogs_empty_skip.0 as f32;
+    let area_h = st::dialogs_empty_height.0 as f32;
+    let label = &st::dialogs_empty_label;
+    let galley = ui.painter().layout(
+        tg_lang::tr::lng_contacts_loading(),
+        tg_ui::fonts::font_id_from_style(label.style.font),
+        colors.sub_text_fg(),
+        (width - 2.0 * skip).max(label.min_width.0 as f32),
+    );
+    let (area, _) = ui.allocate_exact_size(Vec2::new(width, area_h), Sense::hover());
+    let pos = Pos2::new(
+        (area.center().x - galley.size().x / 2.0).round(),
+        (area.top() + (area_h - galley.size().y) / 2.0).round(),
+    );
+    ui.painter().galley(pos, galley, colors.sub_text_fg());
+}
+
+/// Builds the dialog row context menu items for `peer_id` in `list`
+/// (`Filler::fillContextMenuActions` in `window_peer_menu.cpp`), flattened to
+/// [`MenuItem`]s (submenu rows are listed after their parent).
+#[must_use]
+pub fn dialog_context_menu_items(
+    peer_id: PeerId,
     backend: &dyn DialogsBackend,
     list: DialogListQuery,
 ) -> Vec<MenuItem> {
+    fn flatten(rows: &[EntryMenuRow], out: &mut Vec<MenuItem>) {
+        for row in rows {
+            match row {
+                EntryMenuRow::Separator => out.push(MenuItem::Separator),
+                EntryMenuRow::Item(item) => {
+                    let mut entry = MenuItem::action(item.id.clone(), item.label.clone());
+                    if let Some(icon) = item.icon {
+                        entry = entry.with_style_icon(icon);
+                    }
+                    if item.attention {
+                        entry = entry.attention();
+                    }
+                    if !item.submenu.is_empty() {
+                        entry = entry.with_submenu();
+                    }
+                    out.push(entry);
+                    flatten(&item.submenu, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    flatten(
+        &build_context_menu_rows(ContextTarget::Dialog(peer_id), backend, list),
+        &mut out,
+    );
+    out
+}
+
+/// Builds the chats-list context menu rows for `peer_id` in `list`
+/// (`Filler::fillContextMenuActions` in `window_peer_menu.cpp`).
+#[must_use]
+pub fn dialog_context_menu_rows(
+    peer_id: PeerId,
+    backend: &dyn DialogsBackend,
+    list: DialogListQuery,
+) -> Vec<EntryMenuRow> {
+    build_context_menu_rows(ContextTarget::Dialog(peer_id), backend, list)
+}
+
+fn build_context_menu_rows(
+    target: ContextTarget,
+    backend: &dyn DialogsBackend,
+    list: DialogListQuery,
+) -> Vec<EntryMenuRow> {
     match target {
         ContextTarget::Archive => {
             let collapsed = backend.archive_collapsed();
             vec![
-                MenuItem::action(
+                EntryMenuRow::action(
                     "archive_toggle_collapse",
                     if collapsed {
                         tg_lang::tr::lng_context_archive_expand()
                     } else {
                         tg_lang::tr::lng_context_archive_collapse()
                     },
-                )
-                .with_icon(IconKind::Info),
-                MenuItem::action(
+                    Some(if collapsed {
+                        st::menu_icon_expand
+                    } else {
+                        st::menu_icon_collapse
+                    }),
+                ),
+                EntryMenuRow::action(
                     "archive_mark_read",
                     tg_lang::tr::lng_context_mark_read_all(),
-                )
-                .with_icon(IconKind::Check),
+                    Some(st::menu_icon_mark_read),
+                ),
             ]
         }
         ContextTarget::Dialog(peer_id) => {
@@ -869,109 +1066,162 @@ fn build_context_menu_items(
                 return Vec::new();
             };
             let is_saved = item.special == SpecialRowKind::SavedMessages;
-            let mut items = Vec::new();
+            let is_promoted = backend
+                .promo_data()
+                .is_some_and(|promo| promo.promo_peer == Some(peer_id));
+            let mut rows = Vec::new();
 
-            if !is_saved {
-                items.push(
-                    MenuItem::action(
-                        "toggle_archive",
-                        if item.archived {
-                            tg_lang::tr::lng_archived_remove()
-                        } else {
-                            tg_lang::tr::lng_archived_add()
-                        },
-                    )
-                    .with_icon(IconKind::Bookmark),
-                );
+            // `addNewWindow` + `AddSeparatorAndShiftUp`.
+            rows.push(EntryMenuRow::action(
+                "new_window",
+                tg_lang::tr::lng_context_new_window(),
+                Some(st::menu_icon_new_window),
+            ));
+            rows.push(EntryMenuRow::Separator);
+
+            if is_promoted {
+                rows.push(EntryMenuRow::action(
+                    "hide_promo",
+                    tg_lang::tr::lng_context_hide_psa(),
+                    Some(st::menu_icon_remove),
+                ));
             }
 
-            // Check whether pinned in the active list.
+            // `addToggleArchive` (`CanArchive`: never Saved Messages).
+            if !is_saved {
+                rows.push(EntryMenuRow::action(
+                    "toggle_archive",
+                    if item.archived {
+                        tg_lang::tr::lng_archived_remove()
+                    } else {
+                        tg_lang::tr::lng_archived_add()
+                    },
+                    Some(if item.archived {
+                        st::menu_icon_unarchive
+                    } else {
+                        st::menu_icon_archive
+                    }),
+                ));
+            }
+
+            // `addTogglePin`.
             let slice = backend.dialog_slice(list, 0, 20);
             let is_pinned_here = slice
                 .entries
                 .iter()
                 .take(slice.pinned_count)
                 .any(|d| d.peer_id == peer_id);
-            items.push(
-                MenuItem::action(
-                    "toggle_pin",
-                    if is_pinned_here {
-                        tg_lang::tr::lng_context_unpin_from_top()
-                    } else {
-                        tg_lang::tr::lng_context_pin_to_top()
-                    },
-                )
-                .with_icon(IconKind::Star),
-            );
+            rows.push(EntryMenuRow::action(
+                "toggle_pin",
+                if is_pinned_here {
+                    tg_lang::tr::lng_context_unpin_from_top()
+                } else {
+                    tg_lang::tr::lng_context_pin_to_top()
+                },
+                Some(if is_pinned_here {
+                    st::menu_icon_unpin
+                } else {
+                    st::menu_icon_pin
+                }),
+            ));
 
+            // `addToggleMuteSubmenu` (`PeerMenuAddMuteSubmenuAction`; never for self).
             if !is_saved {
-                items.push(
-                    MenuItem::action(
-                        "toggle_mute",
-                        if item.muted {
-                            tg_lang::tr::lng_context_unmute()
-                        } else {
-                            tg_lang::tr::lng_context_mute()
-                        },
-                    )
-                    .with_icon(IconKind::Settings),
-                );
+                if item.muted {
+                    rows.push(EntryMenuRow::action(
+                        "unmute",
+                        tg_lang::tr::lng_context_unmute(),
+                        Some(st::menu_icon_unmute),
+                    ));
+                } else {
+                    let silent = backend.dialog_notify_sound(peer_id).none;
+                    rows.push(EntryMenuRow::submenu(
+                        tg_lang::tr::lng_context_mute(),
+                        Some(st::menu_icon_mute),
+                        mute_submenu_rows(silent),
+                    ));
+                }
             }
 
-            items.push(
-                MenuItem::action(
-                    "toggle_read",
-                    if item.badges.unread {
-                        tg_lang::tr::lng_context_mark_read()
-                    } else {
-                        tg_lang::tr::lng_context_mark_unread()
-                    },
-                )
-                .with_icon(IconKind::Check),
-            );
+            // `addToggleUnreadMark`.
+            rows.push(EntryMenuRow::action(
+                "toggle_read",
+                if item.badges.unread {
+                    tg_lang::tr::lng_context_mark_read()
+                } else {
+                    tg_lang::tr::lng_context_mark_unread()
+                },
+                Some(if item.badges.unread {
+                    st::menu_icon_mark_read
+                } else {
+                    st::menu_icon_mark_unread
+                }),
+            ));
 
-            // Folder membership shortcut for custom folders.
-            let folders = backend.chat_folders();
-            if let Some(custom) = folders
-                .iter()
-                .find(|f| f.id != FilterId::ALL && f.title != "Unread")
-            {
-                let in_folder = item.folders.contains(&custom.id);
-                items.push(
-                    MenuItem::action(
-                        format!("folder_toggle:{}", custom.id.0),
-                        if in_folder {
-                            strings::remove_from_named_folder(&custom.title)
-                        } else {
-                            strings::add_to_named_folder(&custom.title)
-                        },
-                    )
-                    .with_icon(IconKind::Plus),
-                );
+            // `addToggleFolder` -> `FillChooseFilterMenu`.
+            let folders: Vec<_> = backend
+                .chat_folders()
+                .into_iter()
+                .filter(|f| f.id != FilterId::ALL)
+                .collect();
+            if !folders.is_empty() {
+                let sub = folders
+                    .iter()
+                    .map(|f| {
+                        EntryMenuRow::action(
+                            format!("folder_toggle:{}", f.id.0),
+                            f.title.clone(),
+                            item.folders
+                                .contains(&f.id)
+                                .then_some(st::media_player_menu_check),
+                        )
+                    })
+                    .collect();
+                rows.push(EntryMenuRow::submenu(
+                    tg_lang::tr::lng_filters_menu_add(),
+                    Some(st::menu_icon_add_to_folder),
+                    sub,
+                ));
             }
 
-            items.push(MenuItem::Separator);
-            items.push(
-                MenuItem::action("clear_history", tg_lang::tr::lng_profile_clear_history())
-                    .with_icon(IconKind::Edit),
-            );
-            if !is_saved {
-                let delete_label = match item.kind {
-                    DialogPeerKind::Channel => tg_lang::tr::lng_profile_leave_channel(),
-                    DialogPeerKind::Group | DialogPeerKind::Forum => {
-                        tg_lang::tr::lng_profile_leave_group()
-                    }
-                    DialogPeerKind::User | DialogPeerKind::Bot => {
-                        tg_lang::tr::lng_profile_delete_conversation()
-                    }
-                };
-                items.push(
-                    MenuItem::action("delete_chat", delete_label)
-                        .with_icon(IconKind::Trash)
-                        .attention(),
-                );
+            // `if (!user->isContact()) addBlockUser();` (never self, Replies or Verification Codes).
+            if let Some(row) = block_user_row(&item, backend.is_peer_blocked(peer_id)) {
+                rows.push(row);
             }
-            items
+
+            // `addClearHistory` (channels only when the user can delete messages).
+            if item.kind != DialogPeerKind::Channel {
+                rows.push(EntryMenuRow::action(
+                    "clear_history",
+                    tg_lang::tr::lng_profile_clear_history(),
+                    Some(st::menu_icon_clear),
+                ));
+            }
+            // `addDeleteChat` / `addLeaveChat`.
+            match item.kind {
+                DialogPeerKind::User | DialogPeerKind::Bot => {
+                    rows.push(EntryMenuRow::attention(
+                        "delete_chat",
+                        tg_lang::tr::lng_profile_delete_conversation(),
+                        Some(st::menu_icon_delete_attention),
+                    ));
+                }
+                DialogPeerKind::Group | DialogPeerKind::Forum => {
+                    rows.push(EntryMenuRow::attention(
+                        "delete_chat",
+                        tg_lang::tr::lng_profile_leave_group(),
+                        Some(st::menu_icon_leave_attention),
+                    ));
+                }
+                DialogPeerKind::Channel => {
+                    rows.push(EntryMenuRow::attention(
+                        "delete_chat",
+                        tg_lang::tr::lng_profile_leave_channel(),
+                        Some(st::menu_icon_leave_attention),
+                    ));
+                }
+            }
+            rows
         }
     }
 }
@@ -1015,6 +1265,29 @@ fn execute_context_action(
                 return Some(strings::TOAST_ADDED_TO_FOLDER.to_owned());
             }
             match action_id {
+                MUTE_FOREVER_ACTION | "unmute" => {
+                    let seconds = if action_id == "unmute" { 0 } else { i32::MAX };
+                    match backend.mute_dialog_for(peer_id, seconds) {
+                        Ok(true) => Some(strings::TOAST_MUTED.to_owned()),
+                        Ok(false) => Some(strings::TOAST_UNMUTED.to_owned()),
+                        Err(_) => {
+                            let muted = backend.toggle_mute_dialog(peer_id);
+                            Some(if muted {
+                                strings::TOAST_MUTED.to_owned()
+                            } else {
+                                strings::TOAST_UNMUTED.to_owned()
+                            })
+                        }
+                    }
+                }
+                MUTE_SOUND_TOGGLE_ACTION => {
+                    let silent = backend.dialog_notify_sound(peer_id).none;
+                    backend.set_dialog_sound_enabled(peer_id, silent).err()
+                }
+                "hide_promo" => match backend.hide_promo_data(peer_id) {
+                    Ok(_) => Some("Announcement hidden".to_owned()),
+                    Err(err) => Some(err),
+                },
                 "toggle_archive" => {
                     let archived = backend.toggle_archive(peer_id);
                     Some(if archived {

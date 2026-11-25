@@ -17,7 +17,10 @@ use tg_ui::stand_in::Colors;
 use tg_ui::tg_style::st;
 use tg_ui::userpic::EmptyUserpic;
 
-use crate::info::backend::PeerProfile;
+use crate::info::backend::{InfoBackend, InfoPeerKind, PeerProfile};
+use tg_app_core::core_types::dto::contacts_extras::{
+    ExportedContactTokenInfo, ExportedNoPaidMessagesTokenInfo,
+};
 use tg_app_core::stand_in::types::PeerId;
 
 /// Error correction level matching tdesktop's `Qr::Redundancy::Quartile`.
@@ -121,6 +124,18 @@ impl PeerQrMatrix {
     }
 }
 
+/// Active state of the paid-message fee-waiver QR code (`FreeMode` in `peer_qr_box.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FreeMessagesCodeMode {
+    /// Normal profile link (paid-message fee applies).
+    #[default]
+    Fee,
+    /// Temporary fee-waiver QR link with an expiry countdown (`temporary = true`).
+    Temporary,
+    /// Permanent fee-waiver QR link with no time limit (`temporary = false`).
+    Permanent,
+}
+
 /// Interactive actions emitted from [`PeerQrBoxState::show_body`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerQrBodyAction {
@@ -142,6 +157,19 @@ pub enum PeerQrBodyAction {
         /// Encoded PNG image bytes.
         bytes: Vec<u8>,
     },
+    /// Refresh or export a temporary contact QR token (`contacts.exportContactToken`).
+    RefreshContactToken,
+    /// Export or reset a paid-message fee-waiver QR token (`contacts.exportNoPaidMessagesToken`,
+    /// `info_profile_free_codes.cpp:37-57`).
+    ExportNoPaidMessagesToken {
+        /// `true` to revoke the previous fee-waiver token and mint a replacement.
+        revoke: bool,
+        /// `true` for a temporary expiring code, `false` for a permanent code.
+        temporary: bool,
+    },
+    /// Restore the plain profile QR link so the paid-message fee applies again
+    /// (`tr::lng_no_paid_token_menu_restore`).
+    RestoreMessageFee,
 }
 
 /// Stateful Profile QR Card modal box (`Ui::PeerQrBox`).
@@ -151,10 +179,14 @@ pub struct PeerQrBoxState {
     pub peer_id: PeerId,
     /// Display title of the peer.
     pub peer_title: String,
-    /// Display handle (`"@username"` or `"Invite Link"`).
+    /// Display handle (`"@username"`, `"Invite Link"`, or temporary token countdown).
     pub display_handle: String,
-    /// Encoded QR target URL (`https://t.me/...` or `tg://user?id=...`).
+    /// Encoded QR target URL (`https://t.me/...`, `https://t.me/contact/...`, or `tg://user?id=...`).
     pub link: String,
+    /// Original non-waiver link preserved so "Restore message fee" returns to it cleanly.
+    pub plain_link: String,
+    /// Original non-waiver handle label preserved alongside [`Self::plain_link`].
+    pub plain_display_handle: String,
     /// Avatar color index for fallback initials circle.
     pub avatar_color_index: u8,
     /// Selected swatch index inside [`PEER_QR_SWATCHES`].
@@ -165,12 +197,27 @@ pub struct PeerQrBoxState {
     pub matrix: Option<PeerQrMatrix>,
     /// Optional status feedback shown inside the box (e.g. "Link copied").
     pub status_message: Option<String>,
+    /// `true` when this QR code was generated from `contacts.exportContactToken`.
+    pub is_contact_token: bool,
+    /// Unix timestamp when the temporary contact QR token expires (`info_profile_qr_link.cpp`).
+    pub token_expires_unix: Option<i32>,
+    /// `true` when the peer supports exporting a temporary contact token (users without username).
+    pub can_export_contact_token: bool,
+    /// `true` when the peer supports exporting a paid-message fee-waiver QR code
+    /// (`contacts.exportNoPaidMessagesToken`).
+    pub can_export_free_message_token: bool,
+    /// Active fee-waiver QR code mode (`Fee`, `Temporary`, or `Permanent`).
+    pub free_code_mode: FreeMessagesCodeMode,
+    /// Optional Unix expiration timestamp of the active temporary fee-waiver token.
+    pub free_token_expires_unix: Option<i32>,
 }
 
 impl PeerQrBoxState {
     /// Constructs a QR card for `peer`, resolving the best shareable link.
     #[must_use]
     pub fn from_profile(peer: &PeerProfile) -> Self {
+        let can_export_contact_token =
+            matches!(peer.kind, InfoPeerKind::User | InfoPeerKind::SavedMessages);
         let (link, display_handle) = if let Some(u) = peer.primary_username() {
             (format!("https://t.me/{u}"), format!("@{u}"))
         } else if let Some(ref inv) = peer.invite_link {
@@ -186,14 +233,115 @@ impl PeerQrBoxState {
         Self {
             peer_id: peer.id,
             peer_title: peer.title.clone(),
+            plain_display_handle: display_handle.clone(),
             display_handle,
+            plain_link: link.clone(),
             link,
             avatar_color_index: peer.color_index,
             swatch_index,
             dark_card: false,
             matrix,
             status_message: None,
+            is_contact_token: false,
+            token_expires_unix: None,
+            can_export_contact_token,
+            can_export_free_message_token: can_export_contact_token,
+            free_code_mode: FreeMessagesCodeMode::Fee,
+            free_token_expires_unix: None,
         }
+    }
+
+    /// Constructs a QR card for `peer`, automatically calling `contacts.exportContactToken`
+    /// when a user has no public username or invite link (`info_profile_qr_link.cpp:139-232`).
+    #[must_use]
+    pub fn from_profile_with_backend(peer: &PeerProfile, backend: &dyn InfoBackend) -> Self {
+        let mut state = Self::from_profile(peer);
+        if state.can_export_contact_token
+            && peer.primary_username().is_none()
+            && peer.invite_link.is_none()
+        {
+            match backend.export_contact_token() {
+                Ok(info) => state.apply_contact_token(&info),
+                Err(err) => {
+                    state.status_message =
+                        Some(format!("{} ({err})", tr::lng_peer_qr_link_unavailable()));
+                }
+            }
+        }
+        state
+    }
+
+    /// Applies a temporary contact QR token returned by `contacts.exportContactToken`.
+    pub fn apply_contact_token(&mut self, info: &ExportedContactTokenInfo) {
+        self.link = info.url.clone();
+        self.plain_link = info.url.clone();
+        self.matrix = PeerQrMatrix::encode(&self.link);
+        self.is_contact_token = true;
+        self.token_expires_unix = Some(info.expires);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(info.expires - 900, |d| d.as_secs() as i32);
+        let remaining = (info.expires - now).max(0);
+        self.display_handle = format!("Contact QR · {}:{:02}", remaining / 60, remaining % 60);
+        self.plain_display_handle = self.display_handle.clone();
+        self.free_code_mode = FreeMessagesCodeMode::Fee;
+        self.free_token_expires_unix = None;
+        self.status_message = Some("Temporary contact QR link exported.".to_owned());
+    }
+
+    /// Applies a paid-message fee-waiver token returned by `contacts.exportNoPaidMessagesToken`
+    /// (`SetupFreeCodes::applyCode` in `peer_qr_box.cpp:720-762`) and returns the toast message.
+    pub fn apply_no_paid_messages_token(
+        &mut self,
+        info: &ExportedNoPaidMessagesTokenInfo,
+        revoke: bool,
+        temporary: bool,
+    ) -> String {
+        if info.url.is_empty() {
+            if revoke {
+                self.restore_plain_link();
+            }
+            let unavailable = tr::lng_peer_qr_link_unavailable();
+            self.status_message = Some(unavailable.clone());
+            return unavailable;
+        }
+        self.link = info.url.clone();
+        self.matrix = PeerQrMatrix::encode(&self.link);
+        if temporary {
+            self.free_code_mode = FreeMessagesCodeMode::Temporary;
+            self.free_token_expires_unix = info.expires;
+            let countdown = format_free_code_countdown(info.expires);
+            self.display_handle = tr::lng_no_paid_token_pill_temporary(&countdown);
+            let toast = if revoke {
+                tr::lng_no_paid_token_toast_reset()
+            } else {
+                tr::lng_no_paid_token_toast_expires(&countdown)
+            };
+            self.status_message = Some(toast.clone());
+            toast
+        } else {
+            self.free_code_mode = FreeMessagesCodeMode::Permanent;
+            self.free_token_expires_unix = None;
+            self.display_handle = tr::lng_no_paid_token_pill_permanent();
+            let toast = if revoke {
+                tr::lng_no_paid_token_toast_reset()
+            } else {
+                tr::lng_no_paid_token_toast_permanent()
+            };
+            self.status_message = Some(toast.clone());
+            toast
+        }
+    }
+
+    /// Restores the plain profile QR link so the paid-message fee applies again
+    /// (`SetupFreeCodes::returnToFee` in `peer_qr_box.cpp:716-719`).
+    pub fn restore_plain_link(&mut self) {
+        self.link = self.plain_link.clone();
+        self.display_handle = self.plain_display_handle.clone();
+        self.matrix = PeerQrMatrix::encode(&self.link);
+        self.free_code_mode = FreeMessagesCodeMode::Fee;
+        self.free_token_expires_unix = None;
+        self.status_message = Some(tr::lng_no_paid_token_toast_restored());
     }
 
     /// Constructs a QR card for an explicit link and title (useful for tests & invite links).
@@ -206,17 +354,26 @@ impl PeerQrBoxState {
         avatar_color_index: u8,
     ) -> Self {
         let link = link.into();
+        let display_handle = display_handle.into();
         let matrix = PeerQrMatrix::encode(&link);
         Self {
             peer_id,
             peer_title: peer_title.into(),
-            display_handle: display_handle.into(),
+            plain_display_handle: display_handle.clone(),
+            display_handle,
+            plain_link: link.clone(),
             link,
             avatar_color_index,
             swatch_index: usize::from(avatar_color_index) % PEER_QR_SWATCHES.len(),
             dark_card: false,
             matrix,
             status_message: None,
+            is_contact_token: false,
+            token_expires_unix: None,
+            can_export_contact_token: false,
+            can_export_free_message_token: false,
+            free_code_mode: FreeMessagesCodeMode::Fee,
+            free_token_expires_unix: None,
         }
     }
 
@@ -273,18 +430,20 @@ impl PeerQrBoxState {
     /// Builds the `tg-ui` [`BoxModal`] descriptor.
     #[must_use]
     pub fn to_modal(&self, id: &str) -> BoxModal {
-        BoxModal::new(id, "QR Code")
+        let mut modal = BoxModal::new(id, "QR Code")
             .width(st::box_wide_width.0 as f32)
             .with_left_button(BoxButton::default_btn("share_qr", "Share"))
             .add_button(BoxButton::default_btn("copy_qr_link", "Copy Link"))
-            .add_button(BoxButton::default_btn("close", tr::lng_close()))
+            .add_button(BoxButton::default_btn("close", tr::lng_close()));
+        modal.max_content_height = 510.0;
+        modal
     }
 
     /// Renders the QR card, theme swatch strip, dark/light toggle, and Save PNG button.
     pub fn show_body(&mut self, ui: &mut Ui, colors: &dyn Colors) -> Option<PeerQrBodyAction> {
         let mut action = None;
         let swatch = self.active_swatch();
-        let width = ui.available_width().max(260.0);
+        let width = (ui.available_width() - 14.0).max(240.0);
 
         // 1. Styled QR Card surface
         let card_h = 286.0;
@@ -415,8 +574,8 @@ impl PeerQrBoxState {
 
         ui.add_space(8.0);
 
-        // 3. Dark card toggle + Save PNG + Link readout
-        ui.horizontal(|ui| {
+        // 3. Dark card toggle + Save PNG + Share Theme + Temporary Contact QR export
+        ui.horizontal_wrapped(|ui| {
             let mode_lbl = if self.dark_card {
                 "Light Card"
             } else {
@@ -455,14 +614,109 @@ impl PeerQrBoxState {
                     peer_title: self.peer_title.clone(),
                 });
             }
+            if self.can_export_contact_token {
+                let token_btn = if self.is_contact_token {
+                    "Refresh Contact QR"
+                } else {
+                    "Temporary Contact QR"
+                };
+                if ui.button(token_btn).clicked() {
+                    action = Some(PeerQrBodyAction::RefreshContactToken);
+                }
+            }
         });
 
+        // 4. Paid-message fee-waiver QR link controls (`contacts.exportNoPaidMessagesToken`,
+        //    `SetupFreeCodes` in `peer_qr_box.cpp:672-920`)
+        if self.can_export_free_message_token {
+            ui.add_space(8.0);
+            match self.free_code_mode {
+                FreeMessagesCodeMode::Fee => {
+                    if qr_pill_button(
+                        ui,
+                        "Allow Free Messages",
+                        colors.color("windowBgOver"),
+                        colors.color("windowActiveTextFg"),
+                    ) {
+                        action = Some(PeerQrBodyAction::ExportNoPaidMessagesToken {
+                            revoke: false,
+                            temporary: true,
+                        });
+                    }
+                }
+                FreeMessagesCodeMode::Temporary | FreeMessagesCodeMode::Permanent => {
+                    let is_temp = self.free_code_mode == FreeMessagesCodeMode::Temporary;
+                    let badge_text = if is_temp {
+                        let countdown = format_free_code_countdown(self.free_token_expires_unix);
+                        tr::lng_no_paid_token_pill_temporary(&countdown)
+                    } else {
+                        tr::lng_no_paid_token_pill_permanent()
+                    };
+                    ui.horizontal(|ui| {
+                        let font = FontId::new(12.0, family_semibold());
+                        let galley =
+                            ui.painter()
+                                .layout_no_wrap(badge_text.clone(), font, Color32::WHITE);
+                        let (pill_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(galley.size().x + 18.0, 26.0),
+                            Sense::hover(),
+                        );
+                        ui.painter().rect_filled(
+                            pill_rect,
+                            CornerRadius::same(13),
+                            colors.color("activeButtonBg"),
+                        );
+                        ui.painter().galley(
+                            Pos2::new(
+                                pill_rect.center().x - galley.size().x * 0.5,
+                                pill_rect.center().y - galley.size().y * 0.5,
+                            ),
+                            galley,
+                            Color32::WHITE,
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button(tr::lng_no_paid_token_menu_reset()).clicked() {
+                            action = Some(PeerQrBodyAction::ExportNoPaidMessagesToken {
+                                revoke: true,
+                                temporary: is_temp,
+                            });
+                        }
+                        let timer_lbl = if is_temp {
+                            tr::lng_no_paid_token_menu_disable_timer()
+                        } else {
+                            tr::lng_no_paid_token_menu_enable_timer()
+                        };
+                        if ui.button(timer_lbl).clicked() {
+                            action = Some(PeerQrBodyAction::ExportNoPaidMessagesToken {
+                                revoke: false,
+                                temporary: !is_temp,
+                            });
+                        }
+                        if ui.button(tr::lng_no_paid_token_menu_restore()).clicked() {
+                            action = Some(PeerQrBodyAction::RestoreMessageFee);
+                        }
+                    });
+                }
+            }
+        }
+
         ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(&self.link)
-                .font(FontId::new(11.5, family_regular()))
-                .color(colors.color("windowSubTextFg")),
-        );
+        if self.is_contact_token {
+            ui.label(
+                egui::RichText::new("Temporary contact link expires automatically for privacy.")
+                    .font(FontId::new(11.5, family_regular()))
+                    .color(colors.color("windowSubTextFg")),
+            );
+        }
+        ui.allocate_ui(Vec2::new(width, 0.0), |ui| {
+            ui.label(
+                egui::RichText::new(&self.link)
+                    .font(FontId::new(11.5, family_regular()))
+                    .color(colors.color("windowSubTextFg")),
+            );
+        });
 
         if let Some(ref status) = self.status_message {
             ui.add_space(4.0);
@@ -507,4 +761,40 @@ pub fn paint_qr_matrix(
             painter.rect_filled(r, CornerRadius::same(rounding), fg);
         }
     }
+}
+
+fn format_free_code_countdown(expires_unix: Option<i32>) -> String {
+    let Some(exp) = expires_unix else {
+        return "60:00".to_owned();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(exp.saturating_sub(3_600), |d| d.as_secs() as i32);
+    let remaining = (exp - now).max(60);
+    if remaining >= 3_600 {
+        format!("{}m", (remaining + 59) / 60)
+    } else {
+        format!("{}:{:02}", remaining / 60, remaining % 60)
+    }
+}
+
+fn qr_pill_button(ui: &mut Ui, label: &str, bg: Color32, fg: Color32) -> bool {
+    let font = FontId::new(12.0, family_semibold());
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, fg);
+    let size = Vec2::new(galley.size().x + 20.0, 28.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    ui.painter().rect_filled(rect, CornerRadius::same(14), bg);
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        fg,
+    );
+    resp.clicked()
 }

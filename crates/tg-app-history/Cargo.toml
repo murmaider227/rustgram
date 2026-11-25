@@ -14,6 +14,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tg-app-core = { path = "../tg-app-core" }
 tg-app-info = { path = "../tg-app-info" }
+tg-app-settings = { path = "../tg-app-settings" }
 tg-app-media = { path = "../tg-app-media" }
 tg-audio = { path = "../tg-audio" }
 tg-bots = { path = "../tg-bots" }
@@ -41,4 +42,8 @@ eframe = { workspace = true }
 egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
 png = "0.18.1"
 tempfile = "3.27.0"
+tg-api = { path = "../tg-api" }
+tg-app-live = { path = "../tg-app-live" }
+tg-session = { path = "../tg-session" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 winit = "0.30.13"

@@ -163,6 +163,14 @@ impl MockMediaBackend {
                 allows_delete: true,
                 allows_save: true,
                 local_path: None,
+                grouped_id: None,
+                attached_stickers_media: Some(
+                    tg_app_core::chat_helpers::backend::AttachedStickersMedia::Photo {
+                        id: 880_001,
+                        access_hash: 0x5A5A_1001,
+                        file_reference: vec![0xA1, 0xB2, 0xC3, 0xD4],
+                    },
+                ),
             },
             MediaItem {
                 id: MOCK_PHOTO_PORTRAIT_ID,
@@ -184,6 +192,8 @@ impl MockMediaBackend {
                 allows_delete: true,
                 allows_save: true,
                 local_path: None,
+                grouped_id: None,
+                attached_stickers_media: None,
             },
             MediaItem {
                 id: MOCK_PHOTO_AURORA_ID,
@@ -205,6 +215,8 @@ impl MockMediaBackend {
                 allows_delete: true,
                 allows_save: true,
                 local_path: None,
+                grouped_id: None,
+                attached_stickers_media: None,
             },
         ];
 
@@ -380,6 +392,8 @@ impl MockMediaBackend {
             allows_delete: true,
             allows_save: true,
             local_path: Some(path.clone()),
+            grouped_id: None,
+            attached_stickers_media: None,
         };
         if let Ok(mut guard) = self.state.lock() {
             if let Some(existing) = guard.items.iter_mut().find(|i| i.id == id) {
@@ -411,6 +425,32 @@ impl MockMediaBackend {
             .lock()
             .map(|g| g.actions.clone())
             .unwrap_or_default()
+    }
+
+    /// Inserts or replaces an in-memory media item for tests.
+    pub fn insert_item(&self, item: MediaItem, bytes: Vec<u8>) {
+        if let Ok(mut guard) = self.state.lock() {
+            let id = item.id;
+            if let Some(existing) = guard.items.iter_mut().find(|i| i.id == id) {
+                *existing = item;
+            } else {
+                guard.items.push(item);
+            }
+            guard.data.insert(id, StoredMediaData::Memory(bytes));
+        }
+    }
+
+    /// Sets or clears the attached-stickers media reference on a mock item (used in tests).
+    pub fn set_item_attached_stickers(
+        &self,
+        id: MediaItemId,
+        media: Option<tg_app_core::chat_helpers::backend::AttachedStickersMedia>,
+    ) {
+        if let Ok(mut guard) = self.state.lock()
+            && let Some(item) = guard.items.iter_mut().find(|i| i.id == id)
+        {
+            item.attached_stickers_media = media;
+        }
     }
 }
 
@@ -474,11 +514,8 @@ impl MediaBackend for MockMediaBackend {
 
     fn save_to_disk(&self, id: MediaItemId, destination: &Path) -> anyhow::Result<PathBuf> {
         let bytes = self.load_bytes(id)?;
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(destination, bytes)?;
-        let out = destination.to_path_buf();
+        let out = tg_platform::file_safety::write_unique_file_at_destination(destination, &bytes)
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
         if let Ok(mut guard) = self.state.lock() {
             guard.actions.push(MockActionLog::Saved(id, out.clone()));
         }

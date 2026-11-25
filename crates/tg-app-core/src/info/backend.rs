@@ -545,6 +545,53 @@ impl MediaItem {
     }
 }
 
+/// Thumbnail fetch state for a shared-media grid tile (photo, video, or GIF)
+/// (`Info::Media::Photo` / `Info::Media::Video` in `info_media_list_widget.cpp`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SharedMediaThumb {
+    /// No thumbnail metadata or bytes are available (render synthetic `preview_rgb` fallback).
+    #[default]
+    Unavailable,
+    /// Full thumbnail download is in flight (or only a stripped preview exists); optional
+    /// Telegram stripped JPEG bytes (`photoStrippedSize`, starts with `0x01`) may be rendered
+    /// blurred while loading.
+    Loading {
+        /// Optional stripped JPEG thumbnail bytes for immediate low-res preview.
+        stripped_thumb: Option<Vec<u8>>,
+    },
+    /// Downloaded thumbnail image bytes (JPEG/PNG/WebP) ready to decode and display.
+    Ready {
+        /// Encoded image bytes.
+        bytes: Vec<u8>,
+    },
+}
+
+/// Group call / live stream state on a peer profile (`PeerData::groupCall` +
+/// `PeerData::canManageGroupCall`, `info_profile_top_bar.cpp:1405-1420`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProfileGroupCallState {
+    /// `true` when the group or channel currently has an active voice/video chat or live stream
+    /// (`ChatFlags::CALL_ACTIVE` / `ChannelFlags::CALL_ACTIVE`, or loaded `InputGroupCall`).
+    pub active: bool,
+    /// `true` when the active call currently has participants (`CALL_NOT_EMPTY`).
+    pub has_participants: bool,
+    /// Active server group-call identifier `(call_id, access_hash)` when loaded from
+    /// `ChatFull.call` / `ChannelFull.call` or `updateGroupCall`.
+    pub call_id: Option<(i64, u64)>,
+    /// `true` when the current account has permission to start or manage a group call /
+    /// live stream in this group or channel (`PeerData::canManageGroupCall`).
+    pub can_manage: bool,
+}
+
+impl ProfileGroupCallState {
+    /// Returns `true` when the profile top bar should show the Video chat / Live stream button
+    /// (`peer->groupCall() || (!peer->isUser() && peer->canManageGroupCall())`).
+    #[must_use]
+    pub const fn show_button(&self) -> bool {
+        self.active || self.can_manage
+    }
+}
+
 /// Complete peer profile model rendered by the Info/Profile screen and Edit Peer boxes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerProfile {
@@ -616,6 +663,8 @@ pub struct PeerProfile {
     pub has_mini_app: bool,
     /// Shared media and common groups counts.
     pub media_counts: SharedMediaCounts,
+    /// Active group call / live stream status and start permission (for the Video chat button).
+    pub group_call: ProfileGroupCallState,
 }
 
 impl PeerProfile {
@@ -1104,6 +1153,16 @@ pub trait InfoBackend: Send {
 
     /// Returns shared media items for `peer_id` in `tab`, filtered by `query`.
     fn shared_media(&self, peer_id: PeerId, tab: SharedMediaTab, query: &str) -> Vec<MediaItem>;
+
+    /// Loads or returns the cached thumbnail image for a shared-media item (`msg_id` in `peer_id`).
+    ///
+    /// Live backends serve cached bytes immediately (`SharedMediaThumb::Ready`) or start an
+    /// asynchronous `upload.getFile` thumbnail download without blocking the UI thread, returning
+    /// `SharedMediaThumb::Loading { stripped_thumb }` while the download is in flight
+    /// (`info_media_list_widget.cpp`).
+    fn shared_media_thumb(&self, _peer_id: PeerId, _msg_id: i32) -> SharedMediaThumb {
+        SharedMediaThumb::Unavailable
+    }
 
     /// Toggles notification mute state for `peer_id` and returns the new `muted` flag.
     fn toggle_notifications(&mut self, peer_id: PeerId) -> bool;
@@ -2143,6 +2202,17 @@ pub trait InfoBackend: Send {
         Err("Updating contact notes is not supported by this backend.".to_owned())
     }
 
+    /// Returns the real server [`ProfilePhotoRef`] (`id`, `access_hash`, `file_reference`)
+    /// for `peer_id`'s currently active profile photo, resolved from cached `UserFull` /
+    /// `ChatFull` / `ChannelFull` metadata or `photos.getUserPhotos`.
+    ///
+    /// Returns `None` when the peer has no active profile photo or no valid server photo
+    /// reference is known — implementations MUST NEVER fabricate an `InputPhoto` from
+    /// `peer_id` or `access_hash == 0` (`api/api_peer_photo.cpp`).
+    fn active_profile_photo_ref(&self, _peer_id: PeerId) -> Option<ProfilePhotoRef> {
+        None
+    }
+
     /// Deletes one or more of the signed-in account's own profile photos (`photos.deletePhotos`,
     /// `api/api_peer_photo.cpp`).
     fn delete_profile_photos(&mut self, _photos: &[ProfilePhotoRef]) -> Result<Vec<i64>, String> {
@@ -2190,7 +2260,8 @@ pub enum ProfileMainTab {
     Gifs,
 }
 
-/// Reference to a server profile photo (`InputPhoto`) for `account.reportProfilePhoto`.
+/// Reference to a server profile photo (`InputPhoto`) for `photos.deletePhotos`,
+/// `account.reportProfilePhoto`, and `messages.getAttachedStickers`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfilePhotoRef {
     /// Server photo ID.
@@ -2454,7 +2525,7 @@ pub struct ChannelManagementState {
     pub boosts_applied: u32,
     /// Stars charged per message (`0` = free).
     pub stars_per_message: i64,
-    /// Whether direct messages are enabled for a broadcast channel (`!ChannelFlags::MONOFORUM_DISABLED`).
+    /// Whether direct messages are enabled for a broadcast channel (`Channel::broadcast_messages_allowed`).
     pub broadcast_messages_allowed: bool,
     /// Whether channel auto-translation is enabled (`ChannelFlags::AUTO_TRANSLATION`).
     pub autotranslation: bool,

@@ -9,14 +9,12 @@
 //! - `Telegram/SourceFiles/api/api_stickers_creator.cpp`:
 //!   - `Api::DeleteStickerSet` (`api_stickers_creator.cpp:364-382`)
 
+use tg_api::MAX_STICKER_SET_TITLE_LEN;
 use tg_chat::DocumentId as ChatDocId;
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 
 use crate::session::LiveSession;
 use tg_app_core::session_api::StickerSetPreview;
-
-/// Maximum character length for a pack title (`kMaxSetNameLength = 50` in `sticker_set_box.cpp:327`).
-const MAX_STICKER_SET_TITLE_LEN: usize = 50;
 
 impl LiveSession {
     fn resolve_owner_input_sticker_set(

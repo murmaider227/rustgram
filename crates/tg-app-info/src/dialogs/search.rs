@@ -26,11 +26,21 @@ use crate::dialogs::backend::{
 use crate::dialogs::layout::{
     DialogColors, RowPaintState, SEARCHED_BAR_HEIGHT, measure_text_i32, paint_dialog_row,
     paint_global_peer_row, paint_message_search_row, paint_peer_avatar, paint_section_bar,
-    paint_semibold_text,
+    paint_semibold_text, paint_sponsored_peer_row,
 };
 use crate::dialogs::strings;
+use tg_app_core::core_types::dto::contacts_extras::SponsoredPeerInfo;
 use tg_app_core::stand_in::theme::Palette;
 use tg_app_core::stand_in::types::{MsgId, PeerId};
+
+use crate::info::backend::{InfoBackend, MediaItem, SharedMediaTab};
+use crate::info::global_media::{
+    GLOBAL_MEDIA_PAGE_SIZE, GlobalMediaAction, GlobalMediaPage, GlobalMediaSection,
+};
+
+/// Minimum query character length before requesting sponsored search peers
+/// (`kMinSponsoredQueryLength = 4` in `api/api_peer_search.cpp:19`).
+pub const MIN_SPONSORED_QUERY_LEN: usize = 4;
 
 /// Height of a hashtag suggestion row (`st::mentionHeight = 40px`).
 pub const HASHTAG_ROW_HEIGHT: f32 = 40.0;
@@ -121,6 +131,8 @@ pub enum SearchViewAction {
     ToggleTag(String),
     /// Load more message results (pagination).
     LoadMoreMessages,
+    /// Toggle inline disclosure info for a sponsored search peer (`"Ad ⋮"`).
+    ToggleSponsoredInfo(PeerId),
 }
 
 /// Selectable row key inside search mode for keyboard Up/Down navigation.
@@ -130,6 +142,8 @@ pub enum SearchKeyboardItem {
     Hashtag(String),
     /// Local chat hit.
     LocalChat(PeerId),
+    /// Sponsored search peer hit (`contacts.getSponsoredPeers`).
+    SponsoredPeer(PeerId),
     /// Global search peer hit.
     GlobalPeer(PeerId),
     /// Message search hit.
@@ -162,6 +176,19 @@ pub struct DialogsSearchState {
     pub messages_limit: usize,
     /// Keyboard-highlighted flat row index in the current search view.
     pub keyboard_index: Option<usize>,
+    /// Last query string sent to `DialogsBackend::sponsored_peers`.
+    pub sponsored_query: String,
+    /// Cached sponsored search results for [`Self::sponsored_query`].
+    pub sponsored_peers: Vec<SponsoredPeerInfo>,
+    /// Sponsored peer whose `"Ad ⋮"` disclosure card is currently expanded.
+    pub sponsored_info_open: Option<PeerId>,
+    /// Active global media tab (`Photos` ... `Voice`); `None` while a scope tab is active.
+    pub media_tab: Option<SearchStripMedia>,
+    /// Global media results for [`Self::media_tab`] (`messages.searchGlobal`).
+    pub media_results: GlobalMediaPage,
+    /// Maximum global media results requested (grows with "Load more").
+    pub media_limit: usize,
+    media_results_key: Option<(SearchStripMedia, String, usize)>,
 }
 
 impl Default for DialogsSearchState {
@@ -175,6 +202,13 @@ impl Default for DialogsSearchState {
             top_peers_expanded: false,
             messages_limit: 40,
             keyboard_index: None,
+            sponsored_query: String::new(),
+            sponsored_peers: Vec::new(),
+            sponsored_info_open: None,
+            media_tab: None,
+            media_results: GlobalMediaPage::default(),
+            media_limit: GLOBAL_MEDIA_PAGE_SIZE,
+            media_results_key: None,
         }
     }
 }
@@ -205,6 +239,29 @@ impl DialogsSearchState {
         self.top_peers_expanded = false;
         self.messages_limit = 40;
         self.keyboard_index = None;
+        self.sponsored_query.clear();
+        self.sponsored_peers.clear();
+        self.sponsored_info_open = None;
+    }
+
+    /// Refreshes [`Self::sponsored_peers`] from `backend.sponsored_peers` when the query
+    /// satisfies tdesktop's `Api::PeerSearch::request` rules (`Type::WithSponsored` and
+    /// `query.len() >= kMinSponsoredQueryLength = 4`, non-hashtag/cashtag, global Chats tab).
+    pub fn sync_sponsored_peers(&mut self, query: &str, backend: &dyn DialogsBackend) {
+        let trimmed = query.trim();
+        let eligible = should_query_sponsored_peers(self, trimmed);
+        if !eligible {
+            self.sponsored_query.clear();
+            self.sponsored_peers.clear();
+            self.sponsored_info_open = None;
+            return;
+        }
+        if self.sponsored_query == trimmed {
+            return;
+        }
+        self.sponsored_query = trimmed.to_owned();
+        self.sponsored_info_open = None;
+        self.sponsored_peers = backend.sponsored_peers(trimmed).unwrap_or_default();
     }
 
     /// Moves keyboard selection across `total_items` by `delta` (`+1` or `-1`).
@@ -230,6 +287,18 @@ impl DialogsSearchState {
     }
 }
 
+/// Returns `true` when `query` and `state` qualify for a `contacts.getSponsoredPeers` lookup
+/// (`Api::PeerSearch::request` in `api/api_peer_search.cpp:40-62`).
+#[must_use]
+pub fn should_query_sponsored_peers(state: &DialogsSearchState, query: &str) -> bool {
+    let trimmed = query.trim();
+    state.tab == SearchTab::Chats
+        && state.in_peer.is_none()
+        && !state.in_archive
+        && trimmed.chars().count() >= MIN_SPONSORED_QUERY_LEN
+        && is_hash_or_cashtag_search_query(trimmed) == HashOrCashtag::None
+}
+
 /// Builds the flat ordered list of keyboard-selectable items for the current search results.
 #[must_use]
 pub fn collect_search_keyboard_items(
@@ -237,7 +306,18 @@ pub fn collect_search_keyboard_items(
     results: &SearchResults,
     recent_peers: &[crate::dialogs::backend::RecentPeerItem],
 ) -> Vec<SearchKeyboardItem> {
-    if query.trim().is_empty() && results.is_empty() {
+    collect_search_keyboard_items_with_sponsored(query, results, &[], recent_peers)
+}
+
+/// Builds the flat ordered list of keyboard-selectable items including sponsored search peers.
+#[must_use]
+pub fn collect_search_keyboard_items_with_sponsored(
+    query: &str,
+    results: &SearchResults,
+    sponsored_peers: &[SponsoredPeerInfo],
+    recent_peers: &[crate::dialogs::backend::RecentPeerItem],
+) -> Vec<SearchKeyboardItem> {
+    if query.trim().is_empty() && results.is_empty() && sponsored_peers.is_empty() {
         return recent_peers
             .iter()
             .map(|r| SearchKeyboardItem::RecentPeer(r.peer_id))
@@ -246,6 +326,7 @@ pub fn collect_search_keyboard_items(
     let mut items = Vec::with_capacity(
         results.hashtags.len()
             + results.local_chats.len()
+            + sponsored_peers.len()
             + results.global_peers.len()
             + results.messages.len(),
     );
@@ -254,6 +335,9 @@ pub fn collect_search_keyboard_items(
     }
     for c in &results.local_chats {
         items.push(SearchKeyboardItem::LocalChat(c.peer_id));
+    }
+    for sp in sponsored_peers {
+        items.push(SearchKeyboardItem::SponsoredPeer(sp.peer_id));
     }
     for g in &results.global_peers {
         items.push(SearchKeyboardItem::GlobalPeer(g.peer_id));
@@ -267,7 +351,239 @@ pub fn collect_search_keyboard_items(
     items
 }
 
-/// Renders the search scope tab strip (`Chats | Channels | Apps | Posts`) and optional search tags.
+/// Height of the search tabs strip (`st::dialogsSearchTabs.height`).
+pub const SEARCH_TABS_HEIGHT: f32 = 33.0;
+
+/// One label of the search tabs strip (`Dialogs::Suggestions` tab keys, `dialogs_suggestions.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStripTab {
+    /// Chats / Channels / Apps / Posts scope.
+    Scope(SearchTab),
+    /// Global media list (`Tab::Media`): Photos, Videos, Links, Files, Music, Voice.
+    Media(SearchStripMedia),
+}
+
+/// Media kinds of the search tabs strip, in tdesktop order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStripMedia {
+    /// `lng_all_photos`.
+    Photos,
+    /// `lng_all_videos`.
+    Videos,
+    /// `lng_all_links`.
+    Links,
+    /// `lng_all_files`.
+    Files,
+    /// `lng_all_music`.
+    Music,
+    /// `lng_all_voice`.
+    Voice,
+}
+
+/// All ten search strip tabs in tdesktop order (Downloads only appears with downloads).
+pub const SEARCH_STRIP_TABS: [SearchStripTab; 10] = [
+    SearchStripTab::Scope(SearchTab::Chats),
+    SearchStripTab::Scope(SearchTab::Channels),
+    SearchStripTab::Scope(SearchTab::Apps),
+    SearchStripTab::Scope(SearchTab::PublicPosts),
+    SearchStripTab::Media(SearchStripMedia::Photos),
+    SearchStripTab::Media(SearchStripMedia::Videos),
+    SearchStripTab::Media(SearchStripMedia::Links),
+    SearchStripTab::Media(SearchStripMedia::Files),
+    SearchStripTab::Media(SearchStripMedia::Music),
+    SearchStripTab::Media(SearchStripMedia::Voice),
+];
+
+impl SearchStripTab {
+    /// Localized label (`dialogs_suggestions.cpp` `labels`).
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Scope(tab) => tab.label(),
+            Self::Media(SearchStripMedia::Photos) => tg_lang::tr::lng_all_photos(),
+            Self::Media(SearchStripMedia::Videos) => tg_lang::tr::lng_all_videos(),
+            Self::Media(SearchStripMedia::Links) => tg_lang::tr::lng_all_links(),
+            Self::Media(SearchStripMedia::Files) => tg_lang::tr::lng_all_files(),
+            Self::Media(SearchStripMedia::Music) => tg_lang::tr::lng_all_music(),
+            Self::Media(SearchStripMedia::Voice) => tg_lang::tr::lng_all_voice(),
+        }
+    }
+}
+
+/// Paints the `st::dialogsSearchTabs` slider (semibold labels, `strictSkip` 18 px, snapped bar)
+/// inside `bar`, horizontally scrollable when it does not fit. Returns the clicked tab; the
+/// media tabs switch the column to global media results (`dialogs_search_from_controllers.cpp`).
+fn show_search_tabs_strip(
+    ui: &mut Ui,
+    bar: Rect,
+    active: SearchStripTab,
+    colors: &DialogColors<'_>,
+) -> Option<SearchStripTab> {
+    const PADDING: f32 = 9.0;
+    const SKIP: f32 = 18.0;
+    const LABEL_TOP: f32 = 7.0;
+    const BAR_TOP: f32 = 30.0;
+    let font = font_id_from_style(st::semibold_font);
+    let labels: Vec<(SearchStripTab, String, f32)> = SEARCH_STRIP_TABS
+        .iter()
+        .map(|tab| {
+            let label = tab.label();
+            let w = measure_text_i32(ui.painter(), &label, font.clone()) as f32;
+            (*tab, label, w)
+        })
+        .collect();
+    let total = PADDING * 2.0
+        + labels.iter().map(|(_, _, w)| *w).sum::<f32>()
+        + SKIP * (labels.len().saturating_sub(1)) as f32;
+    let mut clicked = None;
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+    ScrollArea::horizontal()
+        .id_salt("tg_search_tabs_strip")
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(&mut child, |ui| {
+            let (strip, _) = ui.allocate_exact_size(
+                Vec2::new(total.max(bar.width()), bar.height()),
+                Sense::hover(),
+            );
+            let mut x = strip.left() + PADDING;
+            for (idx, (tab, label, w)) in labels.iter().enumerate() {
+                let hit = Rect::from_min_size(
+                    Pos2::new(x - SKIP * 0.5, strip.top()),
+                    Vec2::new(w + SKIP, strip.height()),
+                );
+                let is_active = *tab == active;
+                let resp =
+                    ui.interact(hit, ui.scope_id().with(("search_tab", idx)), Sense::click());
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::Role::Tab, true, is_active, label.clone())
+                });
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    clicked = Some(*tab);
+                }
+                let fg = if is_active {
+                    colors.color("lightButtonFg")
+                } else {
+                    colors.sub_text_fg()
+                };
+                paint_semibold_text(
+                    ui.painter(),
+                    Pos2::new(x, strip.top() + LABEL_TOP),
+                    Align2::LEFT_TOP,
+                    label,
+                    font.clone(),
+                    fg,
+                );
+                if is_active {
+                    ui.painter().rect_filled(
+                        Rect::from_min_max(
+                            Pos2::new(x, strip.top() + BAR_TOP),
+                            Pos2::new(x + w, strip.bottom()),
+                        ),
+                        CornerRadius {
+                            nw: 2,
+                            ne: 2,
+                            sw: 0,
+                            se: 0,
+                        },
+                        colors.color("lightButtonFg"),
+                    );
+                }
+                x += w + SKIP;
+            }
+        });
+    clicked
+}
+
+impl SearchStripMedia {
+    /// Global media section queried for this tab (`Storage::SharedMediaType`); Photos and
+    /// Videos share the photo/video section and are split by item kind.
+    #[must_use]
+    pub const fn shared_media_tab(self) -> SharedMediaTab {
+        match self {
+            Self::Photos | Self::Videos => SharedMediaTab::PhotosVideos,
+            Self::Links => SharedMediaTab::Links,
+            Self::Files => SharedMediaTab::Files,
+            Self::Music => SharedMediaTab::Music,
+            Self::Voice => SharedMediaTab::Voice,
+        }
+    }
+
+    fn keeps(self, item: &MediaItem) -> bool {
+        match self {
+            Self::Photos => matches!(item, MediaItem::Photo { .. }),
+            Self::Videos => matches!(item, MediaItem::Video { .. }),
+            Self::Links | Self::Files | Self::Music | Self::Voice => true,
+        }
+    }
+}
+
+/// Loads global media results for the active media tab and `query` through
+/// `InfoBackend::global_media` (`messages.searchGlobal` in live mode), refreshing only when
+/// the tab, query or limit changed. Call once per frame before rendering the search column.
+pub fn sync_global_media(state: &mut DialogsSearchState, query: &str, backend: &dyn InfoBackend) {
+    let Some(media) = state.media_tab else {
+        state.media_results_key = None;
+        return;
+    };
+    let key = (media, query.trim().to_owned(), state.media_limit);
+    if state.media_results_key.as_ref() == Some(&key) {
+        return;
+    }
+    let mut page = backend.global_media(media.shared_media_tab(), &key.1, state.media_limit);
+    page.entries.retain(|e| media.keeps(&e.item));
+    state.media_results = page;
+    state.media_results_key = Some(key);
+}
+
+fn show_global_media_results(
+    ui: &mut Ui,
+    state: &mut DialogsSearchState,
+    media: SearchStripMedia,
+    palette: &Palette,
+) -> Option<SearchViewAction> {
+    let selected = std::collections::HashSet::new();
+    let dialog_colors = DialogColors::new(palette);
+    let colors: &dyn tg_ui::stand_in::Colors = &dialog_colors;
+    if state.media_results.entries.is_empty() {
+        ui.add_space(36.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new(tg_lang::tr::lng_search_tab_no_results())
+                    .font(FontId::new(13.0, family_regular()))
+                    .color(colors.color("windowSubTextFg")),
+            );
+        });
+        return None;
+    }
+    match GlobalMediaSection::show_entries(
+        ui,
+        media.shared_media_tab(),
+        &state.media_results,
+        &selected,
+        colors,
+    )? {
+        GlobalMediaAction::OpenMedia {
+            peer_id, item_id, ..
+        } => Some(SearchViewAction::OpenMessage {
+            peer_id,
+            msg_id: MsgId(item_id),
+        }),
+        GlobalMediaAction::OpenSourceChat { peer_id, msg_id } => {
+            Some(SearchViewAction::OpenMessage { peer_id, msg_id })
+        }
+        GlobalMediaAction::LoadMore => {
+            state.media_limit += GLOBAL_MEDIA_PAGE_SIZE;
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Renders the search scope tab strip and optional search tags.
 pub fn show_search_header_tabs(
     ui: &mut Ui,
     state: &mut DialogsSearchState,
@@ -277,54 +593,25 @@ pub fn show_search_header_tabs(
     let colors = DialogColors::new(palette);
     let mut action = None;
     let width = ui.available_width();
-    let (_, tab_bar) = ui.allocate_space(Vec2::new(width, 34.0));
+    let (_, tab_bar) = ui.allocate_space(Vec2::new(width, SEARCH_TABS_HEIGHT));
     ui.painter()
         .rect_filled(tab_bar, CornerRadius::ZERO, colors.window_bg());
-
-    let tab_w = (width / SearchTab::ALL.len() as f32).max(52.0);
-    let font = font_id_from_style(st::searched_bar_font);
-    for (idx, tab) in SearchTab::ALL.iter().copied().enumerate() {
-        let r = Rect::from_min_size(
-            Pos2::new(tab_bar.left() + idx as f32 * tab_w, tab_bar.top()),
-            Vec2::new(tab_w, tab_bar.height()),
-        );
-        let resp = ui.interact(r, ui.scope_id().with(("search_tab", idx)), Sense::click());
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        let active = state.tab == tab;
-        let fg = if active {
-            colors.active_text_fg()
-        } else if resp.hovered() {
-            colors.bold_fg()
-        } else {
-            colors.sub_text_fg()
-        };
-        let label = tab.label();
-        if active {
-            paint_semibold_text(
-                ui.painter(),
-                r.center(),
-                Align2::CENTER_CENTER,
-                &label,
-                font.clone(),
-                fg,
-            );
-            ui.painter().rect_filled(
-                Rect::from_min_max(
-                    Pos2::new(r.left() + 8.0, r.bottom() - 2.5),
-                    Pos2::new(r.right() - 8.0, r.bottom()),
-                ),
-                CornerRadius::same(2),
-                colors.color("windowBgActive"),
-            );
-        } else {
-            ui.painter()
-                .text(r.center(), Align2::CENTER_CENTER, label, font.clone(), fg);
-        }
-        if resp.clicked() {
+    let active = state
+        .media_tab
+        .map_or(SearchStripTab::Scope(state.tab), SearchStripTab::Media);
+    match show_search_tabs_strip(ui, tab_bar, active, &colors) {
+        Some(SearchStripTab::Scope(tab)) => {
+            state.media_tab = None;
             action = Some(SearchViewAction::SetTab(tab));
         }
+        Some(SearchStripTab::Media(media)) => {
+            if state.media_tab != Some(media) {
+                state.media_limit = GLOBAL_MEDIA_PAGE_SIZE;
+            }
+            state.media_tab = Some(media);
+            state.keyboard_index = None;
+        }
+        None => {}
     }
     ui.painter().line_segment(
         [
@@ -386,6 +673,10 @@ pub fn show_search_body(
 ) -> Option<SearchViewAction> {
     let colors = DialogColors::new(palette);
     let width = ui.available_width();
+
+    if let Some(media) = state.media_tab {
+        return show_global_media_results(ui, state, media, palette);
+    }
 
     if query.trim().is_empty() && state.selected_tag.is_none() {
         if state.tab == SearchTab::PublicPosts {
@@ -490,15 +781,6 @@ pub fn show_search_body(
 
     // 2. Local chats & contacts (`_filterResults` in `dialogs_inner_widget.cpp:1605-1621`).
     if !results.local_chats.is_empty() {
-        let (_, bar_rect) = ui.allocate_space(Vec2::new(width, SEARCHED_BAR_HEIGHT));
-        paint_section_bar(
-            ui.painter(),
-            bar_rect,
-            &tg_lang::tr::lng_recent_chats(),
-            None,
-            &colors,
-        );
-
         let row_h = st::dialogs_row_height.0 as f32;
         for item in &results.local_chats {
             let (row_rect, resp) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
@@ -531,8 +813,9 @@ pub fn show_search_body(
         }
     }
 
-    // 3. Global search section (`_peerSearchResults`, `lng_search_global_results`).
-    if !results.global_peers.is_empty() {
+    // 3. Global search section (`_peerSearchResults`, `lng_search_global_results`),
+    //    with sponsored peers (`contacts.getSponsoredPeers`) listed first as in tdesktop.
+    if !state.sponsored_peers.is_empty() || !results.global_peers.is_empty() {
         let (_, bar_rect) = ui.allocate_space(Vec2::new(width, SEARCHED_BAR_HEIGHT));
         paint_section_bar(
             ui.painter(),
@@ -543,6 +826,81 @@ pub fn show_search_body(
         );
 
         let row_h = st::dialogs_row_height.0 as f32;
+        for peer in &state.sponsored_peers {
+            let (row_rect, resp) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+            let selected = resp.hovered() || state.keyboard_index == Some(flat_idx);
+            let hover_pos = ui.ctx().pointer_hover_pos();
+            let approx_badge_hovered = hover_pos.is_some_and(|p| {
+                row_rect.contains(p) && p.x > row_rect.right() - 62.0 && p.y < row_rect.top() + 34.0
+            });
+            let row_aria = format!("{} (Sponsored)", peer.title);
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, row_aria.clone())
+            });
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            let ad_rect = paint_sponsored_peer_row(
+                ui.painter(),
+                row_rect,
+                peer,
+                peer.peer_id == active_peer,
+                selected,
+                approx_badge_hovered,
+                palette,
+                &colors,
+            );
+            let ad_resp = ui.interact(
+                ad_rect,
+                ui.scope_id().with(("sponsored_ad_btn", peer.peer_id.0)),
+                Sense::click(),
+            );
+            ad_resp.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::Role::Button,
+                    true,
+                    format!("About sponsored result {}", peer.title),
+                )
+            });
+            if ad_resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if ad_resp.clicked() {
+                action = Some(SearchViewAction::ToggleSponsoredInfo(peer.peer_id));
+            } else if resp.clicked() {
+                action = Some(SearchViewAction::OpenPeer(peer.peer_id));
+            }
+
+            if state.sponsored_info_open == Some(peer.peer_id) {
+                let info_line = peer
+                    .sponsor_info
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or(peer.additional_info.as_deref().filter(|s| !s.is_empty()))
+                    .unwrap_or("Sponsored search result shown based on your search query.");
+                let (info_rect, _) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::hover());
+                ui.painter().rect_filled(
+                    info_rect,
+                    CornerRadius::ZERO,
+                    colors.color("windowBgRipple"),
+                );
+                let info_font = font_id_from_style(st::searched_bar_font);
+                let info_left = info_rect.left() + 14.0;
+                let info_max_w = (info_rect.right() - info_left - 12.0).max(24.0) as i32;
+                let elided = elide_text_right(info_line, info_max_w, |s| {
+                    measure_text_i32(ui.painter(), s, info_font.clone())
+                });
+                ui.painter().text(
+                    Pos2::new(info_left, info_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    elided,
+                    info_font,
+                    colors.sub_text_fg(),
+                );
+            }
+            flat_idx += 1;
+        }
+
         for peer in &results.global_peers {
             let (row_rect, resp) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
             let selected = resp.hovered() || state.keyboard_index == Some(flat_idx);
@@ -659,7 +1017,7 @@ pub fn show_search_body(
         }
     }
 
-    if results.is_empty() {
+    if results.is_empty() && state.sponsored_peers.is_empty() {
         ui.add_space(36.0);
         ui.vertical_centered(|ui| {
             ui.label(
@@ -746,7 +1104,11 @@ fn show_search_suggestions(
     colors: &DialogColors<'_>,
 ) -> Option<SearchViewAction> {
     let mut action = None;
-    let top_peers = backend.top_peers();
+    let top_peers = if backend.top_peers_enabled() {
+        backend.top_peers()
+    } else {
+        Vec::new()
+    };
     if !top_peers.is_empty() {
         let (_, bar_rect) = ui.allocate_space(Vec2::new(width, SEARCHED_BAR_HEIGHT));
         let in_row = (width / TOP_PEER_CELL_WIDTH).floor().max(1.0) as usize;

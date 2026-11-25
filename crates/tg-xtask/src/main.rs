@@ -9,10 +9,9 @@ use rand::rngs::OsRng;
 
 use tg_updater::version::{UpdateChannel, Version};
 use tg_xtask::XtaskError;
-use tg_xtask::dist::{
-    DistOptions, find_workspace_root, read_workspace_version, resolve_target_dir, run_dist,
-};
+use tg_xtask::dist::{DistOptions, find_workspace_root, resolve_target_dir, run_dist};
 use tg_xtask::icon::render_svg_to_ico;
+use tg_xtask::winrc::resolve_release_version;
 
 fn main() -> ExitCode {
     match run() {
@@ -136,7 +135,7 @@ fn run_dist_cli(args: &[String]) -> Result<(), XtaskError> {
 
     let version = match version_arg {
         Some(v) => Version::parse(&v)?,
-        None => read_workspace_version(&workspace_root)?,
+        None => resolve_release_version(&workspace_root, None)?,
     };
 
     let channel = match channel_arg.as_deref() {

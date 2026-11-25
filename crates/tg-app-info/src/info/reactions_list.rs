@@ -6,10 +6,13 @@
 //! - `Telegram/SourceFiles/api/api_who_reacted.cpp`
 //! - `Telegram/SourceFiles/info/polls/info_polls_results_widget.cpp`
 
+use std::sync::{Arc, Mutex};
+
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Key, Margin, Pos2, Rect,
     RichText, ScrollArea, Sense, Stroke, Ui, Vec2,
 };
+use tg_emoji::EmojiTextureCache;
 use tg_lang::tr;
 use tg_stats::{ChartPalette, ChartViewType, StatisticalGraph};
 use tg_ui::userpic::EmptyUserpic;
@@ -19,6 +22,7 @@ use crate::statistics::backend::{
     StatsBackend, SupergroupStatsBundle,
 };
 use crate::statistics::chart_widget::ChartWidgetState;
+use tg_app_core::chat_helpers::backend::PaidReactionPrivacy;
 use tg_app_core::history::backend::{
     MessageReactionsPage, PollAttachment, PollVoterEntry, PollVotesPage, ReactionCounter,
     ReactionPeerEntry,
@@ -26,6 +30,47 @@ use tg_app_core::history::backend::{
 use tg_app_core::history::sections_model::ScheduleDateTime;
 use tg_app_core::history::theme::HistoryColors;
 use tg_app_core::stand_in::types::{MsgId, PeerId};
+use tg_app_core::ui_icons::{paint_close_cross, paint_select_check, paint_star};
+
+const PAID_STAR_GOLD: Color32 = Color32::from_rgb(0xFF, 0xB8, 0x00);
+
+/// Paints a reaction emoji (gold star for `"⭐"`, Twemoji sprite via per-context `tg-emoji` cache).
+fn paint_reaction_glyph(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    emoji: &str,
+    rect: Rect,
+    fallback_color: Color32,
+) {
+    if emoji == "⭐" || emoji == "★" {
+        paint_star(
+            painter,
+            rect.center(),
+            rect.width().min(rect.height()) * 0.48,
+            PAID_STAR_GOLD,
+        );
+        return;
+    }
+    let cache = ctx.data_mut(|d| {
+        d.get_temp_mut_or_insert_with(Id::unique("tg_reactions_list_emoji_cache"), || {
+            Arc::new(Mutex::new(EmojiTextureCache::new()))
+        })
+        .clone()
+    });
+    let painted = cache
+        .lock()
+        .map(|mut guard| guard.paint_emoji_str(painter, ctx, emoji, rect, Color32::WHITE))
+        .unwrap_or(false);
+    if !painted {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            emoji,
+            FontId::proportional((rect.height() * 0.85).clamp(11.0, 18.0)),
+            fallback_color,
+        );
+    }
+}
 
 /// Default page size requested for reactions list and poll voters pagination.
 pub const PEER_LIST_PAGE_LIMIT: usize = 50;
@@ -45,9 +90,18 @@ pub enum ReactionsListAction {
     LoadMore(String),
     /// User clicked a reacting peer row to open their profile/chat.
     OpenPeer(PeerId),
+    /// User toggled paid-reaction leaderboard privacy (`messages.togglePaidReactionPrivacy`).
+    TogglePaidPrivacy(PaidReactionPrivacy),
+    /// User reported a participant's reaction (`messages.reportReaction`).
+    ReportReaction(PeerId),
+    /// User removed a participant's reaction from this message (`messages.deleteParticipantReaction`).
+    DeleteParticipantReaction(PeerId),
+    /// User removed all reactions by a participant in this chat (`messages.deleteParticipantReactions`).
+    DeleteParticipantReactions(PeerId),
 }
 
-/// Stateful Who-Reacted list widget displaying per-reaction filter tabs and reacting peers.
+/// Stateful Who-Reacted list widget displaying per-reaction filter tabs, paid-reaction privacy
+/// toggle, reaction moderation actions, and reacting peers.
 #[derive(Debug, Clone)]
 pub struct ReactionsListWidget {
     /// Peer owning the target message.
@@ -66,6 +120,12 @@ pub struct ReactionsListWidget {
     pub next_offset: Option<String>,
     /// Optional error message if loading failed.
     pub error: Option<String>,
+    /// Active paid-reaction privacy state when the message has paid (`"⭐"`) reactions.
+    pub paid_privacy: Option<PaidReactionPrivacy>,
+    /// Whether the current user can moderate (delete) participant reactions in this chat.
+    pub can_moderate: bool,
+    /// Peer ID whose inline moderation actions menu is currently expanded, if any.
+    pub active_row_menu: Option<PeerId>,
 }
 
 impl ReactionsListWidget {
@@ -77,6 +137,11 @@ impl ReactionsListWidget {
         summary: Vec<ReactionCounter>,
         initial_page: MessageReactionsPage,
     ) -> Self {
+        let has_paid = summary.iter().any(|r| r.emoji == "⭐" || r.emoji == "★")
+            || initial_page
+                .entries
+                .iter()
+                .any(|e| e.emoji == "⭐" || e.emoji == "★");
         Self {
             peer_id,
             msg_id,
@@ -86,6 +151,48 @@ impl ReactionsListWidget {
             entries: initial_page.entries,
             next_offset: initial_page.next_offset,
             error: None,
+            paid_privacy: has_paid.then_some(PaidReactionPrivacy::Default),
+            can_moderate: false,
+            active_row_menu: None,
+        }
+    }
+
+    /// Configures initial paid-reaction leaderboard privacy state for this modal.
+    #[must_use]
+    pub fn with_paid_privacy(mut self, privacy: Option<PaidReactionPrivacy>) -> Self {
+        self.paid_privacy = privacy;
+        self
+    }
+
+    /// Enables or disables participant reaction deletion actions (admin moderation).
+    #[must_use]
+    pub const fn with_moderation(mut self, can_moderate: bool) -> Self {
+        self.can_moderate = can_moderate;
+        self
+    }
+
+    /// Returns `true` if the message carries a paid (`"⭐"`) reaction or an explicit privacy state.
+    #[must_use]
+    pub fn has_paid_reaction(&self) -> bool {
+        self.paid_privacy.is_some()
+            || self
+                .summary
+                .iter()
+                .any(|r| r.emoji == "⭐" || r.emoji == "★")
+            || self
+                .entries
+                .iter()
+                .any(|e| e.emoji == "⭐" || e.emoji == "★")
+    }
+
+    /// Removes all rows belonging to `participant_id` after moderation deletion succeeds.
+    pub fn remove_participant_entries(&mut self, participant_id: PeerId) {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.peer_id != participant_id);
+        let removed = before.saturating_sub(self.entries.len()) as u32;
+        self.total_count = self.total_count.saturating_sub(removed);
+        if self.active_row_menu == Some(participant_id) {
+            self.active_row_menu = None;
         }
     }
 
@@ -137,14 +244,127 @@ impl ReactionsListWidget {
                     .color(colors.bold_fg),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("×").clicked() {
+                let (close_rect, close_resp) =
+                    ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+                close_resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::Role::Button, true, "Close reactions list")
+                });
+                if close_resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    ui.painter()
+                        .circle_filled(close_rect.center(), 13.0, colors.bar_bg_over);
+                }
+                paint_close_cross(ui.painter(), close_rect.center(), 14.0, colors.sub_text_fg);
+                if close_resp.on_hover_text(tr::lng_close()).clicked() {
                     action = Some(ReactionsListAction::Close);
                 }
             });
         });
         ui.add_space(6.0);
 
-        // Filter tabs: All + per-emoji tabs
+        // Paid-reaction privacy toggle (`messages.togglePaidReactionPrivacy`)
+        if self.has_paid_reaction() {
+            let current = self.paid_privacy.unwrap_or(PaidReactionPrivacy::Default);
+            let show_in_top = !matches!(current, PaidReactionPrivacy::Anonymous);
+            let row_w = ui.available_width().max(200.0);
+            let (row_rect, row_resp) =
+                ui.allocate_exact_size(Vec2::new(row_w, 34.0), Sense::click());
+            let toggle_label = tr::lng_paid_react_show_in_top();
+            row_resp.widget_info(|| {
+                egui::WidgetInfo::selected(egui::Role::CheckBox, true, show_in_top, &toggle_label)
+            });
+            if row_resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            ui.painter().rect_filled(
+                row_rect,
+                CornerRadius::same(8),
+                if row_resp.hovered() {
+                    colors.bar_bg_over
+                } else {
+                    Color32::from_rgba_unmultiplied(
+                        colors.accent.r(),
+                        colors.accent.g(),
+                        colors.accent.b(),
+                        14,
+                    )
+                },
+            );
+            let star_rect = Rect::from_center_size(
+                Pos2::new(row_rect.left() + 16.0, row_rect.center().y),
+                Vec2::splat(14.0),
+            );
+            paint_star(ui.painter(), star_rect.center(), 6.5, PAID_STAR_GOLD);
+
+            let badge_text = if show_in_top {
+                "Visible".to_owned()
+            } else {
+                tr::lng_paid_react_anonymous()
+            };
+            let badge_w = 72.0;
+            let badge_rect = Rect::from_center_size(
+                Pos2::new(row_rect.right() - badge_w * 0.5 - 8.0, row_rect.center().y),
+                Vec2::new(badge_w, 22.0),
+            );
+            ui.painter().rect_filled(
+                badge_rect,
+                CornerRadius::same(11),
+                if show_in_top {
+                    colors.accent
+                } else {
+                    colors.bar_bg_over
+                },
+            );
+            if show_in_top {
+                paint_select_check(
+                    ui.painter(),
+                    Pos2::new(badge_rect.left() + 12.0, badge_rect.center().y),
+                    11.0,
+                    Color32::WHITE,
+                );
+            }
+            ui.painter().text(
+                Pos2::new(
+                    badge_rect.center().x + if show_in_top { 6.0 } else { 0.0 },
+                    badge_rect.center().y,
+                ),
+                Align2::CENTER_CENTER,
+                &badge_text,
+                FontId::proportional(10.5),
+                if show_in_top {
+                    Color32::WHITE
+                } else {
+                    colors.sub_text_fg
+                },
+            );
+
+            let lbl_clip = Rect::from_min_max(
+                Pos2::new(star_rect.right() + 8.0, row_rect.top()),
+                Pos2::new(badge_rect.left() - 6.0, row_rect.bottom()),
+            );
+            ui.painter().with_clip_rect(lbl_clip).text(
+                Pos2::new(lbl_clip.left(), row_rect.center().y),
+                Align2::LEFT_CENTER,
+                &toggle_label,
+                FontId::proportional(12.0),
+                colors.bold_fg,
+            );
+            if row_resp
+                .on_hover_text("Toggle whether your account appears in Top Senders for this post")
+                .clicked()
+            {
+                let next = if show_in_top {
+                    PaidReactionPrivacy::Anonymous
+                } else {
+                    PaidReactionPrivacy::Default
+                };
+                self.paid_privacy = Some(next);
+                action = Some(ReactionsListAction::TogglePaidPrivacy(next));
+            }
+            ui.add_space(6.0);
+        }
+
+        // Filter tabs: All + per-emoji tabs (rendered with Twemoji/star icons — zero missing glyphs)
         ScrollArea::horizontal()
             .id_salt(("tg_who_reacted_tabs", self.msg_id.0))
             .show(ui, |ui| {
@@ -163,10 +383,11 @@ impl ReactionsListWidget {
                     for (idx, counter) in self.summary.iter().enumerate() {
                         let is_active =
                             self.active_filter.as_deref() == Some(counter.emoji.as_str());
-                        if paint_filter_pill(
+                        if paint_reaction_filter_pill(
                             ui,
                             Id::unique(("tg_wr_tab", self.msg_id.0, idx)),
-                            &format!("{} {}", counter.emoji, counter.count),
+                            &counter.emoji,
+                            counter.count,
                             is_active,
                             colors,
                         ) && !is_active
@@ -195,13 +416,84 @@ impl ReactionsListWidget {
                 );
             });
         } else {
+            let can_moderate = self.can_moderate;
+            let mut toggle_menu_for: Option<PeerId> = None;
+            let active_menu_peer = self.active_row_menu;
             ScrollArea::vertical()
                 .id_salt(("tg_who_reacted_rows", self.msg_id.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (idx, entry) in self.entries.iter().enumerate() {
-                        if paint_reaction_peer_row(ui, idx, entry, colors, &ui_colors) {
-                            action = Some(ReactionsListAction::OpenPeer(entry.peer_id));
+                        let menu_open = active_menu_peer == Some(entry.peer_id);
+                        match paint_reaction_peer_row(ui, idx, entry, menu_open, colors, &ui_colors)
+                        {
+                            ReactionRowClick::OpenPeer => {
+                                action = Some(ReactionsListAction::OpenPeer(entry.peer_id));
+                            }
+                            ReactionRowClick::ToggleModerationMenu => {
+                                toggle_menu_for = Some(entry.peer_id);
+                            }
+                            ReactionRowClick::None => {}
+                        }
+                        if menu_open && !entry.is_my {
+                            Frame::NONE
+                                .fill(colors.bar_bg_over)
+                                .stroke(Stroke::new(1.0, colors.divider))
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(Margin::symmetric(10, 6))
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        let rep_lbl = tr::lng_report_reaction();
+                                        if ui
+                                            .button(
+                                                RichText::new(&rep_lbl)
+                                                    .size(11.5)
+                                                    .color(colors.active_text_fg),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(ReactionsListAction::ReportReaction(
+                                                entry.peer_id,
+                                            ));
+                                            toggle_menu_for = Some(entry.peer_id);
+                                        }
+                                        if can_moderate {
+                                            let del_one_lbl =
+                                                tr::lng_context_delete_this_reaction();
+                                            if ui
+                                                .button(
+                                                    RichText::new(&del_one_lbl)
+                                                        .size(11.5)
+                                                        .color(colors.attention_fg),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(
+                                                    ReactionsListAction::DeleteParticipantReaction(
+                                                        entry.peer_id,
+                                                    ),
+                                                );
+                                                toggle_menu_for = Some(entry.peer_id);
+                                            }
+                                            if ui
+                                                .button(
+                                                    RichText::new("Remove all from user")
+                                                        .size(11.5)
+                                                        .color(colors.attention_fg),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(
+                                                    ReactionsListAction::DeleteParticipantReactions(
+                                                        entry.peer_id,
+                                                    ),
+                                                );
+                                                toggle_menu_for = Some(entry.peer_id);
+                                            }
+                                        }
+                                    });
+                                });
+                            ui.add_space(4.0);
                         }
                     }
                     if let Some(ref cursor) = self.next_offset {
@@ -220,6 +512,13 @@ impl ReactionsListWidget {
                         });
                     }
                 });
+            if let Some(pid) = toggle_menu_for {
+                self.active_row_menu = if self.active_row_menu == Some(pid) {
+                    None
+                } else {
+                    Some(pid)
+                };
+            }
         }
 
         action
@@ -779,13 +1078,71 @@ fn paint_filter_pill(
     resp.clicked()
 }
 
+fn paint_reaction_filter_pill(
+    ui: &mut Ui,
+    id: Id,
+    emoji: &str,
+    count: u32,
+    active: bool,
+    colors: &HistoryColors,
+) -> bool {
+    let fg = if active {
+        Color32::WHITE
+    } else {
+        colors.text_fg
+    };
+    let bg = if active {
+        colors.accent
+    } else {
+        colors.bar_bg_over
+    };
+    let count_str = count.to_string();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(count_str.clone(), FontId::proportional(12.0), fg);
+    let icon_side = 15.0;
+    let size = Vec2::new((icon_side + 5.0 + galley.size().x + 18.0).max(52.0), 26.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let accessible = format!("{emoji} {count_str}");
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, active, &accessible));
+    let _ = ui.interact(rect, id, Sense::hover());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    ui.painter().rect_filled(rect, CornerRadius::same(13), bg);
+    let content_w = icon_side + 5.0 + galley.size().x;
+    let start_x = rect.center().x - content_w * 0.5;
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(start_x + icon_side * 0.5, rect.center().y),
+        Vec2::splat(icon_side),
+    );
+    paint_reaction_glyph(ui.painter(), ui.ctx(), emoji, icon_rect, fg);
+    ui.painter().galley(
+        Pos2::new(
+            icon_rect.right() + 5.0,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        fg,
+    );
+    resp.clicked()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactionRowClick {
+    None,
+    OpenPeer,
+    ToggleModerationMenu,
+}
+
 fn paint_reaction_peer_row(
     ui: &mut Ui,
     idx: usize,
     entry: &ReactionPeerEntry,
+    menu_open: bool,
     colors: &HistoryColors,
     ui_colors: &dyn tg_ui::stand_in::Colors,
-) -> bool {
+) -> ReactionRowClick {
     let width = ui.available_width().max(200.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 48.0), Sense::click());
     let _ = ui.interact(
@@ -793,7 +1150,7 @@ fn paint_reaction_peer_row(
         Id::unique(("tg_wr_row", entry.peer_id.0, idx)),
         Sense::hover(),
     );
-    if resp.hovered() {
+    if resp.hovered() || menu_open {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         ui.painter()
             .rect_filled(rect, CornerRadius::same(8), colors.bar_bg_over);
@@ -806,9 +1163,63 @@ fn paint_reaction_peer_row(
     EmptyUserpic::for_color_index(entry.color_index, &entry.name, ui_colors)
         .paint_circle(ui.painter(), av_rect);
 
+    // Optional overflow actions button (`...`) on non-self rows for reaction moderation/reporting.
+    let mut right_edge = rect.right() - 8.0;
+    let mut menu_clicked = false;
+    if !entry.is_my {
+        let more_rect = Rect::from_center_size(
+            Pos2::new(right_edge - 12.0, rect.center().y),
+            Vec2::splat(24.0),
+        );
+        let more_resp = ui.interact(
+            more_rect,
+            Id::unique(("tg_wr_row_more", entry.peer_id.0, idx)),
+            Sense::click(),
+        );
+        more_resp.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::Role::Button,
+                true,
+                format!("Reaction actions for {}", entry.name),
+            )
+        });
+        if more_resp.hovered() || menu_open {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            ui.painter()
+                .circle_filled(more_rect.center(), 11.0, colors.bar_bg);
+        }
+        if more_resp.has_focus() {
+            ui.painter()
+                .circle_stroke(more_rect.center(), 11.0, Stroke::new(1.5, colors.accent));
+        }
+        let c = more_rect.center();
+        for dx in [-4.0_f32, 0.0, 4.0] {
+            ui.painter()
+                .circle_filled(Pos2::new(c.x + dx, c.y), 1.5, colors.sub_text_fg);
+        }
+        if more_resp
+            .on_hover_text("Report or remove reaction")
+            .clicked()
+        {
+            menu_clicked = true;
+        }
+        right_edge = more_rect.left() - 6.0;
+    }
+
+    let emoji_rect = Rect::from_center_size(
+        Pos2::new(right_edge - 11.0, rect.center().y),
+        Vec2::splat(20.0),
+    );
+    paint_reaction_glyph(
+        ui.painter(),
+        ui.ctx(),
+        &entry.emoji,
+        emoji_rect,
+        colors.text_fg,
+    );
+
     let text_x = av_rect.right() + 10.0;
-    let emoji_x = rect.right() - 14.0;
-    let max_text_w = (emoji_x - text_x - 24.0).max(60.0);
+    let max_text_w = (emoji_rect.left() - text_x - 8.0).max(48.0);
 
     let name_galley = ui.painter().layout_no_wrap(
         entry.name.clone(),
@@ -827,23 +1238,27 @@ fn paint_reaction_peer_row(
         );
 
     let subtitle = format_peer_subtitle(entry.username.as_deref(), entry.date_unix);
-    ui.painter().text(
-        Pos2::new(text_x, rect.top() + 25.0),
-        Align2::LEFT_TOP,
-        subtitle,
-        FontId::proportional(11.0),
-        colors.sub_text_fg,
-    );
+    let sub_galley =
+        ui.painter()
+            .layout_no_wrap(subtitle, FontId::proportional(11.0), colors.sub_text_fg);
+    ui.painter()
+        .with_clip_rect(Rect::from_min_size(
+            Pos2::new(text_x, rect.top() + 25.0),
+            Vec2::new(max_text_w, 16.0),
+        ))
+        .galley(
+            Pos2::new(text_x, rect.top() + 25.0),
+            sub_galley,
+            colors.sub_text_fg,
+        );
 
-    ui.painter().text(
-        Pos2::new(emoji_x, rect.center().y),
-        Align2::RIGHT_CENTER,
-        &entry.emoji,
-        FontId::proportional(18.0),
-        colors.text_fg,
-    );
-
-    resp.clicked()
+    if menu_clicked || (!entry.is_my && resp.secondary_clicked()) {
+        ReactionRowClick::ToggleModerationMenu
+    } else if resp.clicked() {
+        ReactionRowClick::OpenPeer
+    } else {
+        ReactionRowClick::None
+    }
 }
 
 fn paint_voter_row(

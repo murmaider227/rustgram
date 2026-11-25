@@ -496,3 +496,85 @@ fn live_session_proxy_backend_checks_real_mtproxy_and_persists_tdata() {
 
     server_task.abort();
 }
+
+#[test]
+fn system_proxy_default_mode_is_not_counted_as_proxy_enabled() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (client, _updates_rx) = tg_mtproto::Client::with_transport(
+        ClientConfig::default(),
+        Arc::new(tg_mtproto::FakeTransportFactory::new()),
+    );
+    let rpc = MtprotoRpc::new(client.clone());
+    let runtime = Arc::new(
+        tg_app::live::start_mtproto_erased_on(
+            UserId(99),
+            rpc,
+            rt.handle().clone(),
+            no_sync_runtime_config(),
+        )
+        .expect("start SessionRuntime"),
+    );
+
+    let mut live = LiveSession::new(runtime, 99);
+    // Default SettingsProxy starts in ProxySettingsMode::System — matches tdesktop `useProxy`
+    // (`Core::App().settings().proxy().isEnabled()`), which is false unless a custom proxy is set.
+    assert_eq!(
+        live.proxy_controller().proxy_settings().settings(),
+        ProxySettingsMode::System
+    );
+    assert!(
+        !live.proxy_controller().is_proxy_enabled(),
+        "default System proxy mode must not count as enabled"
+    );
+    assert!(
+        !live.proxy_enabled(),
+        "Backend::proxy_enabled() must be false in System proxy mode"
+    );
+
+    let strings = EnglishStrings;
+    let default_ind =
+        proxy_indicator_state(ConnectionStatus::Connected, &SettingsProxy::new(), &strings);
+    assert!(
+        !default_ind.proxy_active,
+        "System proxy mode must not mark proxy_active"
+    );
+    assert!(
+        !default_ind.visible,
+        "connected direct/system-proxy session must hide the proxy pill"
+    );
+
+    // Enabling a custom proxy makes is_proxy_enabled() true.
+    let custom = CoreProxyData {
+        proxy_type: CoreProxyType::Socks5,
+        host: "127.0.0.1".to_owned(),
+        port: 1080,
+        user: String::new(),
+        password: String::new(),
+    };
+    let mut sp = SettingsProxy::new();
+    sp.add_to_list(custom.clone());
+    sp.set_selected(custom);
+    sp.set_settings(ProxySettingsMode::Enabled);
+    live.apply_proxy_settings(&sp).expect("enable custom proxy");
+    assert!(live.proxy_controller().is_proxy_enabled());
+    assert!(live.proxy_enabled());
+
+    // Switching back to System proxy disables the custom proxy indicator again.
+    sp.set_settings(ProxySettingsMode::System);
+    live.apply_proxy_settings(&sp).expect("switch to system");
+    assert!(!live.proxy_controller().is_proxy_enabled());
+    assert!(!live.proxy_enabled());
+
+    // Switching to Disabled also keeps proxy_enabled false.
+    sp.set_settings(ProxySettingsMode::Disabled);
+    live.apply_proxy_settings(&sp).expect("disable proxy");
+    assert!(!live.proxy_controller().is_proxy_enabled());
+    assert!(!live.proxy_enabled());
+
+    drop(live);
+    client.shutdown();
+}

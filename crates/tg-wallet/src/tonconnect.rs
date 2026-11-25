@@ -466,6 +466,11 @@ impl TonConnectSession {
 
         if let Some(payload) = proof_payload {
             let domain = self.manifest.host();
+            if !ton_connect_proof_domain_allowed(&domain, "") {
+                return Err(WalletError::TonConnect(format!(
+                    "TON Proof domain '{domain}' is not allowed"
+                )));
+            }
             let sig = sign_ton_proof(keypair, &addr, &domain, timestamp, payload);
             items.push(json!({
                 "name": "ton_proof",
@@ -975,7 +980,40 @@ pub fn ton_connect_proof_domain_allowed(domain: &str, ownership_domain: &str) ->
     let ownership = normalize(ownership_domain);
     !normalized.is_empty()
         && normalized != "telegram.org"
+        && !normalized.ends_with(".telegram.org")
         && (ownership.is_empty() || normalized != ownership)
+}
+
+/// Extracts a normalized lowercase hostname (without trailing dots) from a strict `https://`
+/// TON Connect manifest URL, returning `None` if the URL is invalid or non-HTTPS.
+#[must_use]
+pub fn manifest_url_host(manifest_url: &str) -> Option<String> {
+    if !valid_https_url(manifest_url) {
+        return None;
+    }
+    let parsed = Url::parse(manifest_url).ok()?;
+    let host = parsed
+        .host_str()?
+        .to_ascii_lowercase()
+        .trim_end_matches('.')
+        .to_owned();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Returns `true` when `manifest.url` resolves to the exact same normalized hostname as
+/// `manifest_url`, preventing a manifest hosted on an attacker domain from claiming another
+/// site's hostname for TON Proof or `signData`.
+#[must_use]
+pub fn ton_connect_manifest_hosts_match(manifest_url: &str, manifest: &DappManifest) -> bool {
+    let Some(url_host) = manifest_url_host(manifest_url) else {
+        return false;
+    };
+    let manifest_host = manifest
+        .host()
+        .to_ascii_lowercase()
+        .trim_end_matches('.')
+        .to_owned();
+    !manifest_host.is_empty() && manifest_host == url_host
 }
 
 // ============================================================================

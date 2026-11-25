@@ -154,16 +154,6 @@ impl FiltersMenuWidget {
                         ui.painter()
                             .rect_filled(btn_rect, CornerRadius::ZERO, sidebar_bg_active);
                     }
-                    if selected {
-                        // Active left indicator pill matching modern tdesktop.
-                        let bar = Rect::from_min_size(
-                            Pos2::new(btn_rect.left(), btn_rect.top() + 12.0),
-                            Vec2::new(3.0, btn_rect.height() - 24.0),
-                        );
-                        ui.painter()
-                            .rect_filled(bar, CornerRadius::same(2), sidebar_fg_active);
-                    }
-
                     let fg = if selected {
                         sidebar_fg_active
                     } else {
@@ -182,8 +172,10 @@ impl FiltersMenuWidget {
                         &colors,
                     );
 
-                    // Folder title (`st::windowFiltersButton.textTop`).
-                    let title = elide_sidebar_label(&folder.title, 10);
+                    // Folder title (`st::windowFiltersButton.textTop`); the id-0 folder is
+                    // always `lng_filters_all` (`FiltersMenu::prepareButton`).
+                    let display_title = sidebar_folder_title(folder);
+                    let title = elide_sidebar_label(&display_title, 10);
                     let text_y = btn_rect.top() + st::window_filters_button.text_top.0 as f32 + 5.0;
                     ui.painter().text(
                         Pos2::new(btn_rect.center().x, text_y),
@@ -197,9 +189,9 @@ impl FiltersMenuWidget {
                     let (badge_count, badge_muted) =
                         folder.unread.badge_display(self.include_muted_in_badges);
                     let folder_label = if badge_count > 0 {
-                        format!("{} ({badge_count} unread)", folder.title)
+                        format!("{display_title} ({badge_count} unread)")
                     } else {
-                        folder.title.clone()
+                        display_title.clone()
                     };
                     resp.widget_info(|| {
                         egui::WidgetInfo::selected(
@@ -300,7 +292,7 @@ impl FiltersMenuWidget {
                 paint_style_icon(
                     ui.painter(),
                     edit_icon_rect,
-                    st::folders_setup,
+                    st::filters_edit,
                     &colors,
                     Some(sidebar_fg),
                 );
@@ -397,11 +389,12 @@ pub fn show_horizontal_folder_tabs(
 
                 for folder in folders {
                     let active = folder.id == active_filter;
+                    let display_title = tabs_folder_title(folder);
                     let (badge_count, badge_muted) = folder.unread.badge_display(true);
                     let font = font_id_from_style(st::dialogs_text_font);
                     let title_w = ui
                         .painter()
-                        .layout_no_wrap(folder.title.clone(), font.clone(), Color32::WHITE)
+                        .layout_no_wrap(display_title.clone(), font.clone(), Color32::WHITE)
                         .size()
                         .x;
                     let badge_text = if badge_count > 0 {
@@ -420,9 +413,9 @@ pub fn show_horizontal_folder_tabs(
                         Sense::click(),
                     );
                     let tab_label = if badge_count > 0 {
-                        format!("{} ({badge_count} unread)", folder.title)
+                        format!("{display_title} ({badge_count} unread)")
                     } else {
-                        folder.title.clone()
+                        display_title.clone()
                     };
                     resp.widget_info(|| {
                         egui::WidgetInfo::selected(
@@ -449,7 +442,7 @@ pub fn show_horizontal_folder_tabs(
                             ui.painter(),
                             Pos2::new(text_x, tab_rect.center().y - 1.0),
                             Align2::LEFT_CENTER,
-                            &folder.title,
+                            &display_title,
                             font,
                             fg,
                         );
@@ -457,7 +450,7 @@ pub fn show_horizontal_folder_tabs(
                         ui.painter().text(
                             Pos2::new(text_x, tab_rect.center().y - 1.0),
                             Align2::LEFT_CENTER,
-                            &folder.title,
+                            &display_title,
                             font,
                             fg,
                         );
@@ -518,6 +511,26 @@ pub fn show_horizontal_folder_tabs(
     );
 
     selected_out
+}
+
+/// Title shown for `folder` in the vertical sidebar (`lng_filters_all` for the id-0 folder).
+#[must_use]
+pub fn sidebar_folder_title(folder: &ChatFolder) -> String {
+    if folder.id == FilterId::ALL {
+        tg_lang::tr::lng_filters_all()
+    } else {
+        folder.title.clone()
+    }
+}
+
+/// Title shown for `folder` in the horizontal tabs (`lng_filters_all_short` for the id-0 folder).
+#[must_use]
+pub fn tabs_folder_title(folder: &ChatFolder) -> String {
+    if folder.id == FilterId::ALL {
+        tg_lang::tr::lng_filters_all_short()
+    } else {
+        folder.title.clone()
+    }
 }
 
 /// Formats folder sidebar badge count (`> 999 -> "99+"`, matching `window_filters_menu.cpp:608-612`).

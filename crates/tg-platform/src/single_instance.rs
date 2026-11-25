@@ -290,22 +290,32 @@ mod win_ipc {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::JoinHandle;
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING,
-        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-        HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_EVENT, WAIT_OBJECT_0,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
+        ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE,
+        GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_EVENT, WAIT_OBJECT_0,
+    };
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, GetLengthSid,
+        GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR,
+        PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE,
-        FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+        FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, FlushFileBuffers, OPEN_EXISTING,
+        PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
     };
     use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+        PIPE_WAIT, WaitNamedPipeW,
     };
+    use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
     use windows::Win32::System::Threading::{
-        CreateEventW, CreateMutexW, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, ReleaseMutex,
-        ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+        CreateEventW, CreateMutexW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken,
+        PROCESS_SYNCHRONIZE, ReleaseMutex, ResetEvent, SetEvent, WaitForMultipleObjects,
+        WaitForSingleObject,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -380,18 +390,145 @@ mod win_ipc {
         format!("\\\\.\\pipe\\RustgramPipe_{}", sanitize_name(instance_name))
     }
 
-    fn create_pipe_instance(pipe_w: &[u16]) -> Result<HANDLE> {
-        // SAFETY: Valid null-terminated UTF-16 pipe path and standard overlapped named pipe flags.
+    pub(crate) fn pipe_open_mode(first_instance: bool) -> FILE_FLAGS_AND_ATTRIBUTES {
+        let base = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+        if first_instance {
+            base | FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            base
+        }
+    }
+
+    pub(crate) fn pipe_mode() -> NAMED_PIPE_MODE {
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS
+    }
+
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                // SAFETY: Closing owned Win32 kernel handle.
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    /// Owns the backing buffers for a Windows `SECURITY_DESCRIPTOR` with an explicit DACL
+    /// granting access solely to the current process user's SID.
+    pub(crate) struct CurrentUserSecurityDescriptor {
+        _token_user_buf: Vec<u8>,
+        _acl_buf: Vec<u32>,
+        sd: SECURITY_DESCRIPTOR,
+    }
+
+    impl CurrentUserSecurityDescriptor {
+        pub(crate) fn new() -> Result<Self> {
+            let mut token = HANDLE::default();
+            // SAFETY: Opening current process token with TOKEN_QUERY right.
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+                .map_err(|e| PlatformError::from_win("OpenProcessToken", e))?;
+            let _token_guard = OwnedHandle(token);
+
+            let mut needed: u32 = 0;
+            // SAFETY: Querying required buffer length for TokenUser.
+            let probe = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+            if probe.is_ok() || needed == 0 {
+                return Err(PlatformError::Ipc(
+                    "GetTokenInformation(TokenUser) returned unexpected length".into(),
+                ));
+            }
+            // SAFETY: Checking Win32 error immediately after GetTokenInformation probe.
+            let probe_err = unsafe { GetLastError() };
+            if probe_err != ERROR_INSUFFICIENT_BUFFER {
+                return Err(PlatformError::last_win32("GetTokenInformation(probe)"));
+            }
+
+            let mut token_user_buf = vec![0u8; needed as usize];
+            // SAFETY: Filling caller-allocated buffer of exact queried size with TOKEN_USER.
+            unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    Some(token_user_buf.as_mut_ptr().cast()),
+                    needed,
+                    &mut needed,
+                )
+            }
+            .map_err(|e| PlatformError::from_win("GetTokenInformation(TokenUser)", e))?;
+
+            // SAFETY: `token_user_buf` was populated by GetTokenInformation(TokenUser).
+            let user_sid: PSID =
+                unsafe { (*(token_user_buf.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+            if user_sid.0.is_null() {
+                return Err(PlatformError::Ipc(
+                    "current process token returned null user SID".into(),
+                ));
+            }
+
+            // SAFETY: `user_sid` is a valid SID returned by GetTokenInformation.
+            let sid_len = unsafe { GetLengthSid(user_sid) } as usize;
+            let raw_acl_size =
+                std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>() + sid_len
+                    - std::mem::size_of::<u32>();
+            let acl_words = raw_acl_size.div_ceil(std::mem::size_of::<u32>());
+            let acl_byte_len = (acl_words * std::mem::size_of::<u32>()) as u32;
+            let mut acl_buf = vec![0u32; acl_words];
+            let acl_ptr = acl_buf.as_mut_ptr().cast::<ACL>();
+
+            // SAFETY: `acl_buf` is 4-byte aligned and sized for ACL + single ACCESS_ALLOWED_ACE + SID.
+            unsafe { InitializeAcl(acl_ptr, acl_byte_len, ACL_REVISION) }
+                .map_err(|e| PlatformError::from_win("InitializeAcl", e))?;
+            // SAFETY: Adding single ACCESS_ALLOWED_ACE for the current user's SID only.
+            unsafe { AddAccessAllowedAce(acl_ptr, ACL_REVISION, FILE_ALL_ACCESS.0, user_sid) }
+                .map_err(|e| PlatformError::from_win("AddAccessAllowedAce", e))?;
+
+            let mut sd = SECURITY_DESCRIPTOR::default();
+            let sd_ptr = PSECURITY_DESCRIPTOR((&mut sd as *mut SECURITY_DESCRIPTOR).cast());
+            // SAFETY: Initializing stack-allocated SECURITY_DESCRIPTOR with revision 1.
+            unsafe { InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION) }
+                .map_err(|e| PlatformError::from_win("InitializeSecurityDescriptor", e))?;
+            // SAFETY: Setting explicit DACL (bDaclPresent=true, bDaclDefaulted=false) pointing to
+            // `acl_buf`, which stays pinned inside this struct for the lifetime of the descriptor.
+            unsafe { SetSecurityDescriptorDacl(sd_ptr, true, Some(acl_ptr), false) }
+                .map_err(|e| PlatformError::from_win("SetSecurityDescriptorDacl", e))?;
+
+            Ok(Self {
+                _token_user_buf: token_user_buf,
+                _acl_buf: acl_buf,
+                sd,
+            })
+        }
+
+        pub(crate) fn security_attributes(&mut self) -> SECURITY_ATTRIBUTES {
+            // Re-bind DACL pointer after struct move so it always points to our owned `_acl_buf`.
+            let acl_ptr = self._acl_buf.as_mut_ptr().cast::<ACL>();
+            let sd_ptr = PSECURITY_DESCRIPTOR((&mut self.sd as *mut SECURITY_DESCRIPTOR).cast());
+            // SAFETY: Refreshing DACL pointer inside self.sd to point to pinned heap `_acl_buf`.
+            let _ = unsafe { SetSecurityDescriptorDacl(sd_ptr, true, Some(acl_ptr), false) };
+            SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: (&mut self.sd as *mut SECURITY_DESCRIPTOR).cast(),
+                bInheritHandle: BOOL(0),
+            }
+        }
+    }
+
+    pub(crate) fn create_pipe_instance(pipe_w: &[u16], first_instance: bool) -> Result<HANDLE> {
+        let mut user_sd = CurrentUserSecurityDescriptor::new()?;
+        let sa = user_sd.security_attributes();
+        // SAFETY: Valid null-terminated UTF-16 pipe path, hardened overlapped named pipe flags
+        // (`FILE_FLAG_FIRST_PIPE_INSTANCE` on initial creation + `PIPE_REJECT_REMOTE_CLIENTS`),
+        // and explicit current-user-only DACL in `sa` valid for the duration of `CreateNamedPipeW`.
         let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(pipe_w.as_ptr()),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                pipe_open_mode(first_instance),
+                pipe_mode(),
                 PIPE_UNLIMITED_INSTANCES,
                 8192,
                 8192,
                 0,
-                None,
+                Some(&sa),
             )
         };
         if handle == INVALID_HANDLE_VALUE {
@@ -489,9 +626,10 @@ mod win_ipc {
         }
 
         // Create the initial pipe instance synchronously before returning so any secondary
-        // instance launched immediately afterwards finds the pipe listening.
+        // instance launched immediately afterwards finds the pipe listening, and enforce
+        // `FILE_FLAG_FIRST_PIPE_INSTANCE` so a pre-existing squatting pipe fails closed.
         let pipe_w = to_wide(&p_path);
-        let first_pipe = match create_pipe_instance(&pipe_w) {
+        let first_pipe = match create_pipe_instance(&pipe_w, true) {
             Ok(h) => h,
             Err(e) => {
                 // SAFETY: Cleaning up mutex on pipe creation failure.
@@ -556,21 +694,26 @@ mod win_ipc {
                         handle_client_pipe(current_pipe, io_ev, stop_ev, &on_activate);
                     }
 
-                    // SAFETY: Finished serving this client; close this pipe instance.
-                    unsafe {
-                        let _ = DisconnectNamedPipe(current_pipe);
-                        let _ = CloseHandle(current_pipe);
-                    }
+                    // Disconnect the client and reuse the exact same primary pipe instance handle
+                    // so there is never an unowned window where a squatter could recreate the pipe.
+                    // SAFETY: Disconnecting the served client from our owned pipe handle.
+                    let disconnect_ok = unsafe { DisconnectNamedPipe(current_pipe) }.is_ok();
 
                     if stop_clone.load(Ordering::SeqCst) {
+                        // SAFETY: Closing owned pipe handle on shutdown.
+                        let _ = unsafe { CloseHandle(current_pipe) };
                         break;
                     }
 
-                    match create_pipe_instance(&pipe_w_thread) {
-                        Ok(next) => current_pipe = next,
-                        Err(e) => {
-                            tracing::error!("Failed to recreate single-instance pipe: {e}");
-                            break;
+                    if !disconnect_ok {
+                        // SAFETY: Closing broken pipe handle before attempting recreation.
+                        let _ = unsafe { CloseHandle(current_pipe) };
+                        match create_pipe_instance(&pipe_w_thread, false) {
+                            Ok(next) => current_pipe = next,
+                            Err(e) => {
+                                tracing::error!("Failed to recreate single-instance pipe: {e}");
+                                break;
+                            }
                         }
                     }
                 }
@@ -934,5 +1077,194 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].urls, vec!["tg://resolve?domain=rustgram"]);
         assert_eq!(got[0].args, vec!["--demo"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d5_single_instance_pipe_enforces_first_instance_reject_remote_and_user_only_dacl() {
+        use crate::app_id::win_impl::to_wide;
+        use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError, HANDLE};
+        use windows::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            GetKernelObjectSecurity, GetSecurityDescriptorDacl, GetTokenInformation,
+            PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        };
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_FIRST_PIPE_INSTANCE;
+        use windows::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS;
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        use windows::core::BOOL;
+
+        // 1. Verify open/pipe mode flags include FILE_FLAG_FIRST_PIPE_INSTANCE and PIPE_REJECT_REMOTE_CLIENTS.
+        let open_flags = win_ipc::pipe_open_mode(true);
+        assert_ne!(
+            open_flags.0 & FILE_FLAG_FIRST_PIPE_INSTANCE.0,
+            0,
+            "first pipe instance must set FILE_FLAG_FIRST_PIPE_INSTANCE"
+        );
+        let mode_flags = win_ipc::pipe_mode();
+        assert_ne!(
+            mode_flags.0 & PIPE_REJECT_REMOTE_CLIENTS.0,
+            0,
+            "named pipe must set PIPE_REJECT_REMOTE_CLIENTS"
+        );
+
+        // 2. Create a pipe via `create_pipe_instance(..., true)` and verify:
+        //    (a) a second `create_pipe_instance(..., true)` on the same name fails (squatter protection),
+        //    (b) the live kernel object has an explicit DACL containing ONLY 1 ACE for the current user's SID.
+        let pipe_path = format!(
+            "\\\\.\\pipe\\RustgramD5SecTest_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let pipe_w = to_wide(&pipe_path);
+        let h1 = win_ipc::create_pipe_instance(&pipe_w, true).expect("create hardened pipe");
+
+        // Second first-instance creation on the same name MUST fail with ERROR_ACCESS_DENIED.
+        let dup = win_ipc::create_pipe_instance(&pipe_w, true);
+        assert!(
+            dup.is_err(),
+            "FILE_FLAG_FIRST_PIPE_INSTANCE must reject creating a duplicate instance on the same pipe name"
+        );
+        let last_err = unsafe { GetLastError() };
+        assert_eq!(
+            last_err, ERROR_ACCESS_DENIED,
+            "expected ERROR_ACCESS_DENIED when squatting an existing pipe"
+        );
+
+        // Query the live pipe handle's DACL from the Windows kernel.
+        let mut sd_needed: u32 = 0;
+        let _ = unsafe {
+            GetKernelObjectSecurity(h1, DACL_SECURITY_INFORMATION.0, None, 0, &mut sd_needed)
+        };
+        assert!(sd_needed > 0, "expected non-empty security descriptor");
+        let mut sd_buf = vec![0u8; sd_needed as usize];
+        unsafe {
+            GetKernelObjectSecurity(
+                h1,
+                DACL_SECURITY_INFORMATION.0,
+                Some(PSECURITY_DESCRIPTOR(sd_buf.as_mut_ptr().cast())),
+                sd_needed,
+                &mut sd_needed,
+            )
+        }
+        .expect("GetKernelObjectSecurity");
+
+        let mut dacl_present = BOOL(0);
+        let mut dacl_defaulted = BOOL(0);
+        let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
+        unsafe {
+            GetSecurityDescriptorDacl(
+                PSECURITY_DESCRIPTOR(sd_buf.as_mut_ptr().cast()),
+                &mut dacl_present,
+                &mut dacl_ptr,
+                &mut dacl_defaulted,
+            )
+        }
+        .expect("GetSecurityDescriptorDacl");
+        assert!(dacl_present.as_bool(), "DACL must be present on pipe");
+        assert!(
+            !dacl_defaulted.as_bool(),
+            "DACL must be explicit (not defaulted)"
+        );
+        assert!(
+            !dacl_ptr.is_null(),
+            "DACL must not be a NULL (allow-all) DACL"
+        );
+
+        let mut acl_info = ACL_SIZE_INFORMATION::default();
+        unsafe {
+            GetAclInformation(
+                dacl_ptr,
+                (&mut acl_info as *mut ACL_SIZE_INFORMATION).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        }
+        .expect("GetAclInformation");
+        assert_eq!(
+            acl_info.AceCount, 1,
+            "pipe DACL must contain exactly 1 ACE (current user only), got {}",
+            acl_info.AceCount
+        );
+
+        let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe { GetAce(dacl_ptr, 0, &mut ace_ptr) }.expect("GetAce");
+        let ace = unsafe { &*(ace_ptr.cast::<ACCESS_ALLOWED_ACE>()) };
+        let ace_sid = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+
+        // Compare ACE SID against current process user's SID.
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+            .expect("OpenProcessToken");
+        let mut tok_len: u32 = 0;
+        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut tok_len) };
+        let mut tok_buf = vec![0u8; tok_len as usize];
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(tok_buf.as_mut_ptr().cast()),
+                tok_len,
+                &mut tok_len,
+            )
+        }
+        .expect("GetTokenInformation");
+        let current_sid = unsafe { (*(tok_buf.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        assert!(
+            unsafe { EqualSid(ace_sid, current_sid) }.is_ok(),
+            "pipe DACL ACE SID must equal the current user's SID"
+        );
+
+        let _ = unsafe { CloseHandle(token) };
+        let _ = unsafe { CloseHandle(h1) };
+
+        // 3. Also verify sequential activations through the reused single-instance pipe handle.
+        let inst_name = format!("d5_seq_test_{}", std::process::id());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_cb = Arc::clone(&seen);
+        let primary =
+            acquire_single_instance(&inst_name, &InstanceActivation::default(), move |act| {
+                seen_cb.lock().unwrap().extend(act.urls);
+                InstanceResponse {
+                    process_id: std::process::id(),
+                    window_id: 0,
+                }
+            })
+            .expect("acquire primary");
+        let _guard = match primary {
+            AcquireResult::Primary(g) => g,
+            AcquireResult::Secondary { .. } => panic!("expected primary"),
+        };
+
+        for idx in 1..=2 {
+            let url = format!("tg://resolve?domain=client{idx}");
+            let res = acquire_single_instance(
+                &inst_name,
+                &InstanceActivation {
+                    urls: vec![url],
+                    ..Default::default()
+                },
+                |_| InstanceResponse {
+                    process_id: 0,
+                    window_id: 0,
+                },
+            )
+            .expect("secondary connect");
+            assert!(matches!(
+                res,
+                AcquireResult::Secondary { response: Some(_) }
+            ));
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "tg://resolve?domain=client1".to_owned(),
+                "tg://resolve?domain=client2".to_owned()
+            ]
+        );
     }
 }

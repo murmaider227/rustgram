@@ -113,7 +113,7 @@ pub fn format_proxy_label(p: &CoreProxyData) -> String {
 pub struct ProxyIndicatorState {
     /// Whether the indicator should be displayed.
     pub visible: bool,
-    /// Whether a proxy mode (`Enabled` or `System`) is currently active.
+    /// Whether a custom proxy (`ProxySettingsMode::Enabled`) is currently active.
     pub proxy_active: bool,
     /// Whether the connection is still establishing / waiting to retry.
     pub connecting: bool,
@@ -173,7 +173,7 @@ pub fn proxy_indicator_state(
     proxy: &SettingsProxy,
     strings: &dyn Strings,
 ) -> ProxyIndicatorState {
-    let proxy_active = proxy.is_enabled() || proxy.is_system();
+    let proxy_active = proxy.is_enabled();
     let connecting = !matches!(status, ConnectionStatus::Connected);
     let visible = proxy_active || connecting;
     let label = format_proxy_connection_status(status, proxy_active, strings);
@@ -181,7 +181,6 @@ pub fn proxy_indicator_state(
         ProxySettingsMode::Enabled if proxy.selected().is_valid() => {
             Some(format_proxy_label(proxy.selected()))
         }
-        ProxySettingsMode::System => Some("System proxy".to_owned()),
         _ => None,
     };
     ProxyIndicatorState {

@@ -4367,6 +4367,18 @@ impl LiveSession {
             .and_then(|c| c.call_latest_video_frame.clone())
     }
 
+    /// Returns a known active group call `(call_id, access_hash, can_manage)` registered for
+    /// `group_peer_id` via `updateGroupCall` or [`Self::register_known_group_call`], if any.
+    #[must_use]
+    pub(crate) fn known_group_call_for(&self, group_peer_id: PeerId) -> Option<(i64, u64, bool)> {
+        self.calls
+            .inner
+            .lock()
+            .ok()
+            .and_then(|c| c.known_group_calls.get(&group_peer_id).copied())
+            .map(|k| (k.call_id.0 as i64, k.access_hash as u64, k.can_manage))
+    }
+
     /// Registers a known active group call for `group_peer_id` so [`CallsBackend::join_group_call`]
     /// can join it directly without an extra `getFullChat` / `getFullChannel` round-trip.
     pub fn register_known_group_call(

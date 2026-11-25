@@ -60,10 +60,19 @@ const CONTACTS_EXTRAS_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// matching `PromoSuggestions::_contactBirthdaysLastDayRequest` in `promo_suggestions.cpp:285`).
 const SECS_PER_DAY: i32 = 86_400;
 
+/// Periodic refresh interval for `contacts.getStatuses` (5 minutes).
+pub const CONTACT_STATUSES_REFRESH_INTERVAL_MS: u64 = 5 * 60 * 1_000;
+
 #[derive(Default)]
 struct ContactsExtrasState {
     birthdays_cached_day: Option<i32>,
     birthdays: Vec<ContactBirthdayEntry>,
+    /// A background `contacts.getBirthdays` started by [`poll_contact_birthdays`] is running.
+    birthdays_fetching: bool,
+    /// Outcome of the last background fetch that failed, handed out once.
+    birthdays_fetch_error: Option<String>,
+    last_statuses_refresh_ms: Option<u64>,
+    periodic_statuses_started: bool,
 }
 
 struct StateEntry {
@@ -423,6 +432,51 @@ pub(crate) fn update_contact_note(
 // 5. Contact Birthdays (`contacts.getBirthdays`)
 // =============================================================================
 
+/// Non-blocking variant of [`contact_birthdays`] for the chat list: serves today's cache, or
+/// starts `contacts.getBirthdays` on a background thread and returns `None` until it finishes
+/// (tdesktop sends this request asynchronously; on the test servers it sometimes takes seconds).
+pub(crate) fn poll_contact_birthdays(
+    live: &LiveSession,
+) -> Option<Result<Vec<ContactBirthdayEntry>, String>> {
+    let today = now_unix_i32() / SECS_PER_DAY;
+    let start = with_state(live, |st| {
+        if st.birthdays_cached_day == Some(today) {
+            return Err(Some(Ok(st.birthdays.clone())));
+        }
+        if let Some(err) = st.birthdays_fetch_error.take() {
+            return Err(Some(Err(err)));
+        }
+        if st.birthdays_fetching {
+            return Err(None);
+        }
+        st.birthdays_fetching = true;
+        Ok(())
+    });
+    if let Err(ready) = start {
+        return ready;
+    }
+    let session = live.clone();
+    let spawned = std::thread::Builder::new()
+        .name("contact-birthdays".to_owned())
+        .spawn(move || {
+            let res = contact_birthdays(&session, false);
+            with_state(&session, |st| {
+                st.birthdays_fetching = false;
+                if let Err(err) = res {
+                    st.birthdays_fetch_error = Some(err);
+                }
+            });
+            session.bridge_state().notify_ui();
+        });
+    match spawned {
+        Ok(_) => None,
+        Err(_) => {
+            with_state(live, |st| st.birthdays_fetching = false);
+            Some(contact_birthdays(live, false))
+        }
+    }
+}
+
 /// Fetches contact birthdays via `contacts.getBirthdays`
 /// (`data/components/promo_suggestions.cpp:284-346`), caching per UTC calendar day unless `force`.
 pub(crate) fn contact_birthdays(
@@ -567,8 +621,32 @@ pub(crate) fn toggle_top_peers(live: &mut LiveSession, enabled: bool) -> Result<
 /// Refreshes online/last-seen statuses for all contacts via `contacts.getStatuses`
 /// (`apiwrap.cpp:2210-2229`) and updates every loaded user in `Session`.
 pub(crate) fn refresh_contact_statuses(
-    live: &mut LiveSession,
+    live: &LiveSession,
 ) -> Result<Vec<ContactStatusInfo>, String> {
+    let now_ms = u64::try_from(live.ch_now_ms()).unwrap_or(0);
+    maybe_refresh_contact_statuses(live, now_ms, true)
+}
+
+/// Refreshes contact statuses via `contacts.getStatuses` when `force` is `true` or when at
+/// least [`CONTACT_STATUSES_REFRESH_INTERVAL_MS`] has elapsed since the previous refresh.
+///
+/// Port of `ApiWrap::updatePrivacyLastSeens` (`apiwrap.cpp:2182-2230`) and periodic contact
+/// status refresh.
+pub(crate) fn maybe_refresh_contact_statuses(
+    live: &LiveSession,
+    now_ms: u64,
+    force: bool,
+) -> Result<Vec<ContactStatusInfo>, String> {
+    if !force {
+        let within_window = with_state(live, |st| {
+            st.last_statuses_refresh_ms.is_some_and(|prev| {
+                now_ms.saturating_sub(prev) < CONTACT_STATUSES_REFRESH_INTERVAL_MS
+            })
+        });
+        if within_window {
+            return Ok(Vec::new());
+        }
+    }
     let statuses = invoke_rpc(live, tl_fns::contacts::GetStatuses {})?;
     let now = now_unix_i32();
     let out = write_session(live, |s| {
@@ -600,8 +678,55 @@ pub(crate) fn refresh_contact_statuses(
             })
             .collect::<Vec<_>>()
     });
+    with_state(live, |st| {
+        st.last_statuses_refresh_ms = Some(now_ms);
+    });
     live.bridge_state().notify_ui();
     Ok(out)
+}
+
+/// Spawns a background periodic `contacts.getStatuses` refresher for `live` on its Tokio
+/// runtime. Starts after one full [`CONTACT_STATUSES_REFRESH_INTERVAL_MS`] interval so
+/// initial sync and short-lived unit tests are undisturbed, and exits automatically when
+/// the session's `LiveBridgeState` is dropped.
+pub(crate) fn spawn_periodic_contact_statuses_task(live: &LiveSession) {
+    let should_spawn = with_state(live, |st| {
+        if st.periodic_statuses_started {
+            false
+        } else {
+            st.periodic_statuses_started = true;
+            true
+        }
+    });
+    if !should_spawn {
+        return;
+    }
+    let rpc = live.runtime().rpc().clone();
+    let session_weak = Arc::downgrade(live.runtime().session());
+    let bridge_weak = Arc::downgrade(live.bridge_state());
+    let interval = Duration::from_millis(CONTACT_STATUSES_REFRESH_INTERVAL_MS);
+    live.runtime().tokio_handle().spawn(async move {
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let (Some(session_arc), Some(bridge)) = (session_weak.upgrade(), bridge_weak.upgrade())
+            else {
+                break;
+            };
+            if let Ok(Ok(statuses)) = tokio::time::timeout(
+                CONTACTS_EXTRAS_RPC_TIMEOUT,
+                rpc.invoke(&tl_fns::contacts::GetStatuses {}),
+            )
+            .await
+            {
+                let mut session = session_arc.write().await;
+                let _ = apply_contact_statuses(&mut session, &statuses);
+                drop(session);
+                bridge.notify_ui();
+            }
+        }
+    });
 }
 
 /// Queries sponsored search peers via `contacts.getSponsoredPeers`
@@ -672,6 +797,9 @@ pub(crate) fn delete_profile_photos(
 ) -> Result<Vec<i64>, String> {
     if photos.is_empty() {
         return Ok(Vec::new());
+    }
+    for p in photos {
+        crate::profile_info_extras::validate_profile_photo_ref(p)?;
     }
     let id: Vec<tl_enums::InputPhoto> = photos
         .iter()

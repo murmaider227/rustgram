@@ -47,7 +47,9 @@ pub use dc_options::{
 pub use error::{InvocationError, MigrateKind, RpcError};
 pub use file_loader::{DedicatedFileDownloader, DownloadProgress};
 pub use keys_destroyer::{KeyDestroyOutcome, KeysDestroyResult, KeysDestroyer};
-pub use message::RequestId;
+pub use message::{
+    MAX_RECEIVE_ALLOC_BYTES, MAX_RECEIVE_MESSAGES, MAX_RECEIVE_NESTING, ReceiveBudget, RequestId,
+};
 pub use salts::SaltManager;
 pub use session::{
     ConnectionState, HTTP_WAIT_MAX_DELAY_MS, HTTP_WAIT_MAX_WAIT_MS, HTTP_WAIT_WAIT_AFTER_MS,

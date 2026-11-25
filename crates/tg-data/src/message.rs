@@ -1453,6 +1453,98 @@ pub struct MessageReactionsSummary {
     pub min: bool,
 }
 
+impl MessageReactionsSummary {
+    /// Optimistically strips all reactions by `participant_id` from this summary,
+    /// decrementing aggregate counts and removing zeroed entries, matching
+    /// `MessageReactions::removeFromParticipant` (`data/data_message_reactions.cpp:2036-2099`).
+    ///
+    /// When `is_self` is `true`, also clears `chosen_order` for removed self reactions (and
+    /// strips chosen reactions even if `recent_reactors` did not list self).
+    pub fn remove_from_participant(
+        &mut self,
+        participant_id: PeerId,
+        known_reaction: Option<&ReactionId>,
+        is_self: bool,
+    ) -> bool {
+        let mut changed = false;
+        let mut participant_found = false;
+        let mut removed_counts: Vec<(ReactionId, i32)> = Vec::new();
+
+        self.recent_reactors.retain(|reactor| {
+            if reactor.peer_id == participant_id {
+                participant_found = true;
+                changed = true;
+                if let Some((_, count)) = removed_counts
+                    .iter_mut()
+                    .find(|(id, _)| *id == reactor.reaction)
+                {
+                    *count += 1;
+                } else {
+                    removed_counts.push((reactor.reaction.clone(), 1));
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        let decrement = |results: &mut Vec<MessageReactionCount>,
+                         id: &ReactionId,
+                         count: i32,
+                         clear_chosen: bool|
+         -> bool {
+            let Some(pos) = results.iter().position(|entry| &entry.id == id) else {
+                return false;
+            };
+            if results[pos].count <= count {
+                results.remove(pos);
+            } else {
+                results[pos].count -= count;
+                if clear_chosen {
+                    results[pos].chosen_order = None;
+                }
+            }
+            true
+        };
+
+        for (reaction_id, count) in &removed_counts {
+            decrement(&mut self.results, reaction_id, *count, is_self);
+        }
+
+        if is_self && !participant_found {
+            let chosen_ids: Vec<ReactionId> = self
+                .results
+                .iter()
+                .filter(|entry| entry.is_chosen())
+                .map(|entry| entry.id.clone())
+                .collect();
+            for id in &chosen_ids {
+                if decrement(&mut self.results, id, 1, true) {
+                    changed = true;
+                    participant_found = true;
+                }
+            }
+        }
+
+        if let Some(known) = known_reaction
+            && !known.is_empty()
+            && !participant_found
+            && decrement(&mut self.results, known, 1, is_self)
+        {
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Returns `true` when both aggregate reaction counts and recent reactors are empty.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty() && self.recent_reactors.is_empty()
+    }
+}
+
 /// Semantic button color style (`KeyboardButtonStyle` in `schema/api.tl`).
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ButtonColor {

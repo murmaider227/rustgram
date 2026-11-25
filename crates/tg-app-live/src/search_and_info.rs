@@ -796,7 +796,7 @@ pub fn prepare_search_offsets(
     (offset_id, add_offset)
 }
 
-fn message_to_search_result(
+pub(crate) fn message_to_search_result(
     session: &Session,
     msg: &tg_data::Message,
 ) -> Option<MessageSearchResult> {
@@ -815,18 +815,11 @@ fn message_to_search_result(
     let archived = session
         .history(msg.peer_id)
         .is_some_and(|h| h.folder_id() == Some(tg_data::ARCHIVE_FOLDER_ID));
-    let text = match &msg.content {
-        MessageContent::Regular { text, .. } => {
-            if text.text.is_empty() {
-                tg_session::runtime::format_message_preview(msg)
-            } else {
-                text.text.clone()
-            }
-        }
-        MessageContent::Service(_) => tg_session::runtime::format_message_preview(msg),
-        MessageContent::Empty => return None,
-    };
-    let sender_name = msg.from_id.map(|from| peer_display_title(session, from));
+    if matches!(msg.content, MessageContent::Empty) {
+        return None;
+    }
+    let text = crate::preview_text::message_preview_text(session, msg);
+    let sender_name = crate::preview_text::preview_sender(session, msg);
     Some(MessageSearchResult {
         peer_id: from_data_peer(msg.peer_id),
         kind,
@@ -879,18 +872,27 @@ fn build_global_peer_result(
     })
 }
 
-fn build_member_entry(
+/// `PeerListRow::refreshStatus` for a member row: `Data::OnlineText`, where the current account is
+/// always online while the app is open (`ApiWrap::updateOnline` marks the self user online).
+fn member_status_text(session: &Session, peer: &Peer, now: i32) -> (String, bool) {
+    if peer.id() == session.self_peer_id() && peer.as_user().is_some() {
+        return (tg_lang::tr::lng_status_online(), true);
+    }
+    peer_status_text(peer, now)
+}
+
+pub(crate) fn build_member_entry(
     session: &Session,
     pid: DataPeerId,
     role: MemberRole,
     now: i32,
 ) -> MemberEntry {
     if let Some(peer) = session.peer(pid) {
-        let (status_text, is_online) = peer_status_text(peer, now);
+        let (status_text, is_online) = member_status_text(session, peer, now);
         let is_bot = peer.as_user().is_some_and(|u| u.is_bot());
         MemberEntry {
             peer_id: from_data_peer(pid),
-            name: peer_display_title(session, pid),
+            name: crate::preview_text::peer_real_name(session, pid),
             username: peer_primary_username(peer),
             status_text,
             is_online,
@@ -3119,7 +3121,7 @@ pub(super) fn search_dialogs(
                             peer_title: item.title.clone(),
                             color_index: item.color_index,
                             msg_id: from_data_msg(msg.id),
-                            sender_name: msg.from_id.map(|from| peer_display_title(session, from)),
+                            sender_name: crate::preview_text::preview_sender(session, msg),
                             text: body.to_owned(),
                             time: unix_to_local_datetime(msg.date),
                             archived: item.archived,
@@ -3423,6 +3425,63 @@ pub(super) fn pinned_messages(live: &LiveSession, peer_id: PeerId) -> Vec<Pinned
         .collect()
 }
 
+/// Whether the first pinned-messages page of `peer`'s main chat is cached.
+pub(crate) fn pinned_loaded(live: &LiveSession, peer: tg_data::PeerId) -> bool {
+    let key = (crate::convert::from_data_peer(peer), None);
+    with_state(live, |st| st.pinned.get(&key).is_some_and(|e| e.loaded))
+}
+
+/// Loads the first pinned-messages page of `peer`'s main chat into the cache (used by
+/// [`crate::open_chat_prefetch`]).
+pub(crate) fn load_pinned_now(live: &LiveSession, peer: tg_data::PeerId) {
+    let _ = load_pinned_into_cache(live, crate::convert::from_data_peer(peer), None);
+}
+
+/// Requests the first pinned-messages page and records it (or the failure) in the cache.
+fn load_pinned_into_cache(
+    live: &LiveSession,
+    peer_id: PeerId,
+    topic_root_id: Option<MsgId>,
+) -> Option<Vec<HistoryMessage>> {
+    let key = (peer_id, topic_root_id);
+    match live.load_pinned_messages_page(
+        peer_id,
+        topic_root_id,
+        MsgId(0),
+        LoadDirection::Before,
+        SHARED_MEDIA_PER_PAGE,
+    ) {
+        Ok(page) => {
+            let ids: Vec<MsgId> = page.messages.iter().map(|m| m.id).collect();
+            with_state(live, |st| {
+                st.pinned.insert(
+                    key,
+                    PinnedCacheEntry {
+                        msg_ids: ids,
+                        loaded: true,
+                        rpc_ok: true,
+                    },
+                );
+            });
+            Some(page.messages)
+        }
+        Err(err) => {
+            debug!(peer = peer_id.0, error = %err, "messages.search (pinned) failed");
+            with_state(live, |st| {
+                st.pinned.insert(
+                    key,
+                    PinnedCacheEntry {
+                        msg_ids: Vec::new(),
+                        loaded: true,
+                        rpc_ok: false,
+                    },
+                );
+            });
+            None
+        }
+    }
+}
+
 /// Hook for [`tg_app_core::history::backend::HistoryBackend::pinned_full_messages`].
 pub(super) fn pinned_full_messages(
     live: &LiveSession,
@@ -3430,43 +3489,20 @@ pub(super) fn pinned_full_messages(
     topic_root_id: Option<MsgId>,
 ) -> Vec<HistoryMessage> {
     let key = (peer_id, topic_root_id);
-    let loaded = with_state(live, |st| st.pinned.get(&key).is_some_and(|e| e.loaded));
-    if !loaded {
-        match live.load_pinned_messages_page(
-            peer_id,
-            topic_root_id,
-            MsgId(0),
-            LoadDirection::Before,
-            SHARED_MEDIA_PER_PAGE,
-        ) {
-            Ok(page) => {
-                let ids: Vec<MsgId> = page.messages.iter().map(|m| m.id).collect();
-                with_state(live, |st| {
-                    st.pinned.insert(
-                        key,
-                        PinnedCacheEntry {
-                            msg_ids: ids,
-                            loaded: true,
-                            rpc_ok: true,
-                        },
-                    );
-                });
-                return page.messages;
-            }
-            Err(err) => {
-                debug!(peer = peer_id.0, error = %err, "messages.search (pinned) failed");
-                with_state(live, |st| {
-                    st.pinned.insert(
-                        key,
-                        PinnedCacheEntry {
-                            msg_ids: Vec::new(),
-                            loaded: true,
-                            rpc_ok: false,
-                        },
-                    );
-                });
-            }
-        }
+    let is_loaded = || with_state(live, |st| st.pinned.get(&key).is_some_and(|e| e.loaded));
+    let mut loaded = is_loaded();
+    if !loaded
+        && topic_root_id.is_none()
+        && crate::open_chat_prefetch::wait_in_flight(
+            live,
+            to_data_peer(peer_id),
+            crate::open_chat_prefetch::OpenChatRequest::Pinned,
+        )
+    {
+        loaded = is_loaded();
+    }
+    if !loaded && let Some(messages) = load_pinned_into_cache(live, peer_id, topic_root_id) {
+        return messages;
     }
 
     let cached = with_state(live, |st| {

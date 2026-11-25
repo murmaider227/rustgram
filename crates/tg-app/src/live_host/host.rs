@@ -20,7 +20,7 @@ use tg_core::domain::Environment;
 use tg_core::{CoreSettings, GlobalConfig};
 use tg_data::UserId;
 use tg_session::{
-    AccountManager, ENV_API_HASH, ENV_API_ID, SessionEvent, SessionRuntimeConfig,
+    AccountManager, ENV_API_HASH, ENV_API_ID, SessionEvent, SessionRuntime, SessionRuntimeConfig,
     StoredSessionSettings, WorkingDirOpenOptions, load_api_credentials_from_env,
     load_api_credentials_from_vars,
 };
@@ -30,6 +30,7 @@ use tracing::{info, warn};
 
 use crate::business::BusinessScreenHost;
 use crate::calls::AppCallsHost;
+use crate::core_types::erased_rpc::ErasedRpcClient;
 use crate::history::inline_media::default_hardware_audio_enabled;
 use crate::intro::{IntroAction, IntroWidget};
 use crate::live::bridge::RuntimeBridgedRpc;
@@ -185,6 +186,34 @@ pub struct LiveActiveWorkspace {
     payments_open: bool,
     platform_overlays_enabled: bool,
     web_proxy_carrier: crate::live::web_proxy_carrier::WebProxyCarrierHost,
+    /// Stories lists loading on a background thread (see [`spawn_stories_bootstrap`]).
+    pending_stories: Option<std::sync::mpsc::Receiver<StoriesStore>>,
+}
+
+/// Loads the stories lists (`stories.getAllStories` and read states) on a background thread, the
+/// way tdesktop's `Data::Stories` preloads them asynchronously: those requests take hundreds of
+/// milliseconds and used to block building the workspace before the first frame. Returns `None`
+/// when the thread cannot be spawned, and the caller then loads them in place.
+fn spawn_stories_bootstrap(
+    live_session: &LiveSession,
+    self_story_peer: tg_data::PeerId,
+    egui_ctx: Option<&egui::Context>,
+) -> Option<std::sync::mpsc::Receiver<StoriesStore>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut session = live_session.clone();
+    let ctx = egui_ctx.cloned();
+    std::thread::Builder::new()
+        .name("stories-bootstrap".to_owned())
+        .spawn(move || {
+            let mut store = StoriesStore::new(self_story_peer);
+            session.bootstrap_stories_store(&mut store, now_unix_i32());
+            let _ = tx.send(store);
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        })
+        .ok()
+        .map(|_| rx)
 }
 
 impl LiveActiveWorkspace {
@@ -230,7 +259,10 @@ impl LiveActiveWorkspace {
 
         let self_story_peer = StoriesBackend::self_peer_id(&live_session);
         let mut stories_store = StoriesStore::new(self_story_peer);
-        live_session.bootstrap_stories_store(&mut stories_store, now_unix_i32());
+        let pending_stories = spawn_stories_bootstrap(&live_session, self_story_peer, egui_ctx);
+        if pending_stories.is_none() {
+            live_session.bootstrap_stories_store(&mut stories_store, now_unix_i32());
+        }
         let stories_host =
             AppStoriesHost::with_backend(stories_store, live_session.create_stories_backend());
 
@@ -276,6 +308,7 @@ impl LiveActiveWorkspace {
             payments_open: false,
             platform_overlays_enabled: true,
             web_proxy_carrier: crate::live::web_proxy_carrier::WebProxyCarrierHost::new(),
+            pending_stories,
         }
     }
 
@@ -323,6 +356,7 @@ impl LiveActiveWorkspace {
             payments_open: false,
             platform_overlays_enabled: false,
             web_proxy_carrier: crate::live::web_proxy_carrier::WebProxyCarrierHost::new(),
+            pending_stories: None,
         }
     }
 
@@ -425,6 +459,20 @@ impl LiveActiveWorkspace {
         self.business_open
     }
 
+    fn poll_pending_stories(&mut self) {
+        let Some(rx) = self.pending_stories.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(store) => {
+                *self.stories_host.store_mut() = store;
+                self.pending_stories = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending_stories = None,
+        }
+    }
+
     /// Renders one complete frame of the live workspace, returning `true` if logout was requested.
     pub fn show(&mut self, ctx: &egui::Context, ui: &mut Ui) -> bool {
         self.live_session.set_egui_ctx(ctx.clone());
@@ -457,13 +505,19 @@ impl LiveActiveWorkspace {
             }
         }
 
-        // 2. Drain asynchronous live story updates into the StoriesStore.
-        let _ = self
-            .live_session
-            .drain_story_updates(self.stories_host.store_mut(), now_unix_i32());
+        // 2. Install the background-loaded stories lists once ready, then drain asynchronous live
+        //    story updates into the StoriesStore (they stay queued until the lists are installed).
+        self.poll_pending_stories();
+        if self.pending_stories.is_none() {
+            let _ = self
+                .live_session
+                .drain_story_updates(self.stories_host.store_mut(), now_unix_i32());
+        }
 
         // 3. Dispatch pre-queued deep-link overlays (e.g. IPC `tg://call?slug=`) and render Calls.
-        self.dispatch_deep_link_overlay_requests(ctx);
+        if !self.controller.is_passcode_locked() {
+            self.dispatch_deep_link_overlay_requests(ctx);
+        }
         self.calls_host.update_and_render(ui);
 
         // 3b. Feed freshly decoded live RTMP/HLS stream frames into the viewer before painting.
@@ -483,10 +537,23 @@ impl LiveActiveWorkspace {
                 .show_with_stories(ui, Some(&mut self.stories_host));
         });
 
-        if self.controller.take_open_recent_calls_request() {
+        let locked = self.controller.is_passcode_locked();
+        if locked {
+            self.close_for_passcode_lock(ctx);
+        } else {
+            self.webview_host.set_passcode_locked(false);
+        }
+        if self.controller.take_open_recent_calls_request() && !locked {
             self.calls_host.open_recent_calls();
         }
-        self.dispatch_deep_link_overlay_requests(ctx);
+        if let Some((peer_id, video)) = self.controller.take_start_call_request()
+            && !locked
+        {
+            self.calls_host.start_outgoing_call(peer_id, video);
+        }
+        if !locked {
+            self.dispatch_deep_link_overlay_requests(ctx);
+        }
         if self.controller.take_logout_requested() {
             request_logout = true;
         }
@@ -520,7 +587,11 @@ impl LiveActiveWorkspace {
         }
 
         // 8. Live keyboard overlays: Statistics (Ctrl+Shift+T), Business (Ctrl+Shift+B),
-        //    Payments/Passport (Ctrl+Shift+P), plus Export & Theme Studio.
+        //    Payments/Passport (Ctrl+Shift+P), plus Export & Theme Studio. None of them (nor
+        //    their shortcuts) run while the passcode lock is shown.
+        if locked {
+            return request_logout;
+        }
         self.update_and_render_live_overlays(ctx, &palette, theme_mode);
 
         // 9. Tick StoriesStore timers and render fullscreen StoryViewerOverlay when open.
@@ -557,6 +628,9 @@ impl LiveActiveWorkspace {
         if self.stories_host.take_open_premium_request() {
             self.open_live_payments_premium();
         }
+        if self.stories_host.take_update_app_request() {
+            self.controller.request_update_check();
+        }
 
         // 9b. Ensure any live video stream opened during this frame starts polling immediately
         //     (or stops immediately if the overlay was closed).
@@ -571,6 +645,34 @@ impl LiveActiveWorkspace {
         }
 
         request_logout
+    }
+
+    /// Closes every window that could show account content over the passcode lock: Mini App and
+    /// Instant View windows, the story viewer, the Business / Payments overlays and the wallet
+    /// (`Application::closeAdditionalWindows`, `application.cpp:197-203, 1432-1440`). The
+    /// controller closes its own boxes, media viewer, PiP and round video.
+    pub fn close_for_passcode_lock(&mut self, ctx: &egui::Context) {
+        self.webview_host.set_passcode_locked(true);
+        self.stories_host.close_for_passcode_lock();
+        self.business_open = false;
+        self.payments_open = false;
+        crate::wallet::AppWalletHost::close(ctx);
+        let now_ms = self.controller.elapsed_ms();
+        crate::live::video_stream_loop::sync_live_video_stream(
+            &self.live_session,
+            self.controller.media_overlay_mut(),
+            now_ms,
+        );
+    }
+
+    /// Returns `true` when any window that must not show over the lock is open (for tests).
+    #[must_use]
+    pub fn has_additional_windows_open(&self) -> bool {
+        self.webview_host.instant_view().is_some()
+            || self.webview_host.mini_app().is_some()
+            || self.stories_host.has_open_window()
+            || self.business_open
+            || self.payments_open
     }
 
     /// Flushes shell settings and shuts down auxiliary hosts cleanly on exit or logout.
@@ -809,6 +911,10 @@ impl LiveActiveWorkspace {
             crate::live::themes::ensure_live_themes_hooks(ctx, &self.live_session);
             crate::export::AppExportHost::update_and_render(ctx, palette, theme_mode);
             crate::wallet::AppWalletHost::update_and_render(ctx, palette, theme_mode);
+            crate::themes::AppThemesHost::hydrate_default_background_emojis(
+                ctx,
+                &self.live_session,
+            );
             crate::themes::AppThemesHost::update_and_render(
                 ctx,
                 palette.layer_backdrop,
@@ -876,6 +982,61 @@ fn render_modal_overlay_panel(
 }
 
 type ManagerSlot = Arc<Mutex<Option<AccountManager>>>;
+
+/// Mirrors the active workspace's passcode lock onto every account (the lock is app-wide in
+/// tdesktop, `application.cpp:1433`): locking one locks all of them and closes their additional
+/// windows; unlocking unlocks all. Returns the new app-wide lock state.
+pub fn sync_app_wide_passcode_lock(
+    host: &mut MultiAccountWorkspaceHost,
+    app_locked: bool,
+    ctx: &egui::Context,
+) -> bool {
+    let active_slot = host.active_slot();
+    let active_locked = host
+        .active_workspace()
+        .is_some_and(|ws| ws.controller().is_passcode_locked());
+    if active_locked == app_locked {
+        return app_locked;
+    }
+    for slot in host.slot_indices() {
+        if slot == active_slot {
+            continue;
+        }
+        if let Some(entry) = host.account_mut(slot) {
+            let ws = &mut entry.workspace;
+            if active_locked {
+                ws.controller_mut().lock_for_app_wide_passcode();
+                ws.close_for_passcode_lock(ctx);
+            } else {
+                ws.controller_mut().clear_passcode_lock();
+            }
+        }
+    }
+    ctx.request_repaint();
+    active_locked
+}
+
+/// Undoes an account switch (Main Menu, tray menu, cross-account notification click) or an
+/// "Add Account" request made during a frame that started locked, and reports no action.
+pub fn refuse_account_switch_while_locked(
+    host: &mut MultiAccountWorkspaceHost,
+    was_locked: bool,
+    slot_before: i32,
+    action: MultiAccountFrameAction,
+) -> MultiAccountFrameAction {
+    if !was_locked {
+        return action;
+    }
+    if host.active_slot() != slot_before {
+        host.switch_to(slot_before);
+    }
+    match action {
+        MultiAccountFrameAction::SwitchedAccount(_) | MultiAccountFrameAction::AddAccount => {
+            MultiAccountFrameAction::None
+        }
+        other => other,
+    }
+}
 
 fn with_manager<R>(slot: &ManagerSlot, f: impl FnOnce(&mut AccountManager) -> R) -> Option<R> {
     let mut guard = slot.lock().ok()?;
@@ -980,6 +1141,9 @@ struct LiveActivePhase {
     last_persisted_sessions: BTreeMap<i32, StoredSessionSettings>,
     last_notify_sync_versions: BTreeMap<i32, u64>,
     last_window_pos: WindowPosition,
+    /// App-wide passcode lock (`Core::Application::_passcodeLock`): every account is locked
+    /// together and account switching is refused while it is set.
+    app_locked: bool,
 }
 
 impl LiveActivePhase {
@@ -1033,7 +1197,21 @@ impl LiveActivePhase {
             last_persisted_sessions: stored_sessions,
             last_notify_sync_versions: notify_versions,
             last_window_pos,
+            app_locked: false,
         }
+    }
+
+    /// Renders one frame; while the app is locked an account switch (Main Menu, tray menu or a
+    /// notification click from another account) is undone and reported as no action.
+    fn show_frame(&mut self, ctx: &egui::Context, ui: &mut Ui) -> MultiAccountFrameAction {
+        let was_locked = self.app_locked;
+        let slot_before = self.host.active_slot();
+        let action = self.host.show(ctx, ui);
+        let action =
+            refuse_account_switch_while_locked(&mut self.host, was_locked, slot_before, action);
+        self.tick_settings_and_passcode(ctx);
+        self.app_locked = sync_app_wide_passcode_lock(&mut self.host, self.app_locked, ctx);
+        action
     }
 
     fn tick_settings_and_passcode(&mut self, ctx: &egui::Context) {
@@ -1409,6 +1587,8 @@ pub struct LiveAppHost {
     widget_helper_path: Option<PathBuf>,
     window_hwnd: usize,
     native_hwnd: isize,
+    /// Activations received before `tdata` was unlocked, replayed once an account is active.
+    queued_activations: Vec<crate::startup::ipc::IncomingActivation>,
 }
 
 impl LiveAppHost {
@@ -1429,6 +1609,31 @@ impl LiveAppHost {
             working_dir,
             data_name,
             creds_res,
+        )
+    }
+
+    /// Bootstraps live mode from a [`LiveBootstrapPrefetch`] started before the window was created
+    /// (falls back to [`Self::bootstrap`] if the prefetch thread died).
+    #[must_use]
+    pub fn bootstrap_prefetched(
+        egui_ctx: Option<egui::Context>,
+        settings: ShellSettings,
+        settings_path: PathBuf,
+        working_dir: PathBuf,
+        data_name: String,
+        prefetch: LiveBootstrapPrefetch,
+    ) -> Self {
+        let Some((creds_res, prepared)) = prefetch.wait() else {
+            return Self::bootstrap(egui_ctx, settings, settings_path, working_dir, data_name);
+        };
+        Self::bootstrap_with_parts(
+            egui_ctx,
+            settings,
+            settings_path,
+            working_dir,
+            data_name,
+            creds_res,
+            prepared,
         )
     }
 
@@ -1462,6 +1667,26 @@ impl LiveAppHost {
         data_name: String,
         creds_res: tg_session::Result<ApiCredentials>,
     ) -> Self {
+        Self::bootstrap_with_parts(
+            egui_ctx,
+            settings,
+            settings_path,
+            working_dir,
+            data_name,
+            creds_res,
+            None,
+        )
+    }
+
+    fn bootstrap_with_parts(
+        egui_ctx: Option<egui::Context>,
+        settings: ShellSettings,
+        settings_path: PathBuf,
+        working_dir: PathBuf,
+        data_name: String,
+        creds_res: tg_session::Result<ApiCredentials>,
+        prepared: Option<PreparedAccountManager>,
+    ) -> Self {
         let embedded = settings.resolved_embedded_type();
         let accent = settings.resolved_accent_color();
         let mut theme_manager = ThemeManager::with_embedded(embedded);
@@ -1478,14 +1703,22 @@ impl LiveAppHost {
             Err(err) => LivePhase::MissingCredentials {
                 message: format_missing_credentials_message(&err.to_string()),
             },
-            Ok(credentials) => init_account_manager_phase(
-                egui_ctx.clone(),
-                &settings,
-                settings_path.clone(),
-                working_dir.clone(),
-                data_name.clone(),
-                credentials,
-            ),
+            Ok(credentials) => match prepared {
+                Some(prepared) => finish_account_manager_phase(
+                    egui_ctx.clone(),
+                    &settings,
+                    settings_path.clone(),
+                    prepared,
+                ),
+                None => init_account_manager_phase(
+                    egui_ctx.clone(),
+                    &settings,
+                    settings_path.clone(),
+                    working_dir.clone(),
+                    data_name.clone(),
+                    credentials,
+                ),
+            },
         };
 
         Self {
@@ -1502,6 +1735,7 @@ impl LiveAppHost {
             widget_helper_path: None,
             window_hwnd: 0,
             native_hwnd: 0,
+            queued_activations: Vec::new(),
         }
     }
 
@@ -1604,6 +1838,9 @@ impl LiveAppHost {
                     ws.controller_mut()
                         .handle_incoming_activation(activation, ctx);
                 }
+            }
+            LivePhase::PasscodeRequired { .. } => {
+                self.queued_activations.push(activation);
             }
             LivePhase::Intro(intro_phase) => {
                 if let Some(url) = activation.urls.first() {
@@ -1852,11 +2089,18 @@ impl LiveAppHost {
                 }
             }
             LivePhase::Active(active) => {
+                if !self.queued_activations.is_empty()
+                    && let Some(ws) = active.host.active_workspace_mut()
+                {
+                    for activation in std::mem::take(&mut self.queued_activations) {
+                        ws.controller_mut()
+                            .handle_incoming_activation(activation, ctx);
+                    }
+                }
                 with_manager(&active.manager, |mgr| {
                     crate::live::wallet::sync_live_wallets_for_host(ctx, &active.host, mgr);
                 });
-                active_action = active.host.show(ctx, ui);
-                active.tick_settings_and_passcode(ctx);
+                active_action = active.show_frame(ctx, ui);
             }
         }
 
@@ -2058,10 +2302,9 @@ impl LiveAppHost {
                 let mut intro = IntroWidget::with_rpc_client(credentials, bridged_rpc);
                 intro.set_passkey_window_hwnd(self.window_hwnd);
                 let mut shim = IntroStatusShim::default();
-                if let Some(enabled) = with_manager(&active.manager, |mgr| {
-                    let p = mgr.proxy_settings();
-                    p.is_enabled() || p.is_system()
-                }) {
+                if let Some(enabled) =
+                    with_manager(&active.manager, |mgr| mgr.proxy_settings().is_enabled())
+                {
                     shim.set_proxy_enabled(enabled);
                 }
                 self.phase = LivePhase::Intro(Box::new(LiveIntroPhase {
@@ -2190,7 +2433,7 @@ impl LiveAppHost {
             user_id,
             rpc,
             intro_phase.rt.handle().clone(),
-            SessionRuntimeConfig::default(),
+            live_runtime_config(),
         ) {
             Ok(r) => Arc::new(r),
             Err(err) => {
@@ -2388,6 +2631,34 @@ fn init_account_manager_phase(
     data_name: String,
     credentials: ApiCredentials,
 ) -> LivePhase {
+    let prepared = prepare_account_manager(working_dir, data_name, credentials);
+    finish_account_manager_phase(egui_ctx, settings, settings_path, prepared)
+}
+
+/// Live `SessionRuntime`s started before the window exists, keyed by account slot.
+type EarlyRuntimes = BTreeMap<i32, Result<Arc<SessionRuntime<ErasedRpcClient>>, String>>;
+
+/// The part of the live bootstrap that needs neither the window nor the `egui` context: the
+/// Tokio runtime, opening and unlocking `tdata`, and starting each account's `SessionRuntime`
+/// (which opens the MTProto connection).
+enum PreparedAccountManager {
+    Failed(String),
+    PasscodeRequired {
+        rt: tokio::runtime::Runtime,
+        manager: AccountManager,
+    },
+    Unlocked {
+        rt: tokio::runtime::Runtime,
+        manager: AccountManager,
+        early_runtimes: EarlyRuntimes,
+    },
+}
+
+fn prepare_account_manager(
+    working_dir: PathBuf,
+    data_name: String,
+    credentials: ApiCredentials,
+) -> PreparedAccountManager {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -2395,46 +2666,158 @@ fn init_account_manager_phase(
     {
         Ok(rt) => rt,
         Err(err) => {
-            return LivePhase::BootstrapError {
-                message: format!("Failed to start async Tokio runtime: {err}"),
-            };
+            return PreparedAccountManager::Failed(format!(
+                "Failed to start async Tokio runtime: {err}"
+            ));
         }
     };
+    crate::startup::profiler::mark("live_tokio_rt");
 
     let opts = WorkingDirOpenOptions::new(working_dir, credentials).with_data_name(data_name);
     let mut manager = match AccountManager::open(opts) {
         Ok(m) => m,
         Err(err) => {
-            return LivePhase::BootstrapError {
-                message: format!("Failed to open tdata working directory: {err}"),
-            };
+            return PreparedAccountManager::Failed(format!(
+                "Failed to open tdata working directory: {err}"
+            ));
         }
     };
+    crate::startup::profiler::mark("live_account_manager_open");
 
-    let default_update = UpdateSnapshot::default();
     match manager.needs_passcode() {
-        Ok(true) => LivePhase::PasscodeRequired {
+        Ok(true) => PreparedAccountManager::PasscodeRequired { rt, manager },
+        Ok(false) => match manager.unlock(b"") {
+            Ok(()) => {
+                crate::startup::profiler::mark("live_account_manager_unlock");
+                let early_runtimes = start_account_runtimes(&rt, &manager);
+                PreparedAccountManager::Unlocked {
+                    rt,
+                    manager,
+                    early_runtimes,
+                }
+            }
+            Err(err) => PreparedAccountManager::Failed(format!("Failed to unlock tdata: {err}")),
+        },
+        Err(err) => {
+            PreparedAccountManager::Failed(format!("Failed to inspect tdata passcode state: {err}"))
+        }
+    }
+}
+
+fn finish_account_manager_phase(
+    egui_ctx: Option<egui::Context>,
+    settings: &ShellSettings,
+    settings_path: PathBuf,
+    prepared: PreparedAccountManager,
+) -> LivePhase {
+    match prepared {
+        PreparedAccountManager::Failed(message) => LivePhase::BootstrapError { message },
+        PreparedAccountManager::PasscodeRequired { rt, manager } => LivePhase::PasscodeRequired {
             rt,
             manager: Box::new(manager),
             passcode_input: String::new(),
             error: None,
         },
-        Ok(false) => match manager.unlock(b"") {
-            Ok(()) => build_phase_after_unlock(
-                egui_ctx,
-                settings,
-                settings_path,
-                &default_update,
-                rt,
-                manager,
-            ),
-            Err(err) => LivePhase::BootstrapError {
-                message: format!("Failed to unlock tdata: {err}"),
+        PreparedAccountManager::Unlocked {
+            rt,
+            manager,
+            early_runtimes,
+        } => build_phase_after_unlock_with(
+            egui_ctx,
+            settings,
+            settings_path,
+            &UpdateSnapshot::default(),
+            rt,
+            manager,
+            early_runtimes,
+        ),
+    }
+}
+
+/// Authenticated account slots in `tdata` order.
+fn authed_account_slots(manager: &AccountManager) -> Vec<i32> {
+    manager
+        .account_slots()
+        .into_iter()
+        .filter(|s| s.user_id.is_some())
+        .map(|s| s.index)
+        .collect()
+}
+
+/// The app's `SessionRuntime` settings. At start tdesktop sends `updates.getState` only and
+/// requests the chat list from `stateDone` (`api/api_updates.cpp:258,480-489`); with a fresh state
+/// a `getDifference` right after it has nothing to catch up, and the first chat-list page would
+/// wait for that extra round trip.
+fn live_runtime_config() -> SessionRuntimeConfig {
+    SessionRuntimeConfig {
+        run_get_difference_on_start: false,
+        ..SessionRuntimeConfig::default()
+    }
+}
+
+/// Starts a live `SessionRuntime` for every authenticated slot, so the MTProto connection, the
+/// temporary auth key and its binding are under way before the window is created.
+fn start_account_runtimes(rt: &tokio::runtime::Runtime, manager: &AccountManager) -> EarlyRuntimes {
+    let mut runtimes = EarlyRuntimes::new();
+    for slot in authed_account_slots(manager) {
+        let Some(account) = manager.account(slot) else {
+            continue;
+        };
+        let Some(user_id) = account.user_id else {
+            continue;
+        };
+        let started = start_mtproto_erased_on(
+            user_id,
+            account.rpc.clone(),
+            rt.handle().clone(),
+            SessionRuntimeConfig {
+                initial_self_user: account.self_user.clone(),
+                ..live_runtime_config()
             },
-        },
-        Err(err) => LivePhase::BootstrapError {
-            message: format!("Failed to inspect tdata passcode state: {err}"),
-        },
+        )
+        .map(Arc::new)
+        .map_err(|err| err.to_string());
+        runtimes.insert(slot, started);
+    }
+    crate::startup::profiler::mark("live_start_mtproto");
+    runtimes
+}
+
+/// Result of [`LiveBootstrapPrefetch`]: the API credentials from the environment and, when they
+/// loaded, the prepared account manager.
+type PrefetchedLive = (
+    tg_session::Result<ApiCredentials>,
+    Option<PreparedAccountManager>,
+);
+
+/// Live-mode startup work that runs on a background thread while `eframe` creates the window and
+/// the GL context (see [`PreparedAccountManager`]).
+pub struct LiveBootstrapPrefetch {
+    rx: std::sync::mpsc::Receiver<PrefetchedLive>,
+}
+
+impl LiveBootstrapPrefetch {
+    /// Starts the prefetch thread for `working_dir` / `data_name` with the API credentials from
+    /// the environment. Returns `None` if the thread cannot be spawned.
+    #[must_use]
+    pub fn spawn(working_dir: PathBuf, data_name: String) -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("live-bootstrap".to_owned())
+            .spawn(move || {
+                let creds_res = load_api_credentials_from_env();
+                let prepared = creds_res
+                    .as_ref()
+                    .ok()
+                    .map(|c| prepare_account_manager(working_dir, data_name, c.clone()));
+                let _ = tx.send((creds_res, prepared));
+            })
+            .ok()
+            .map(|_| Self { rx })
+    }
+
+    fn wait(self) -> Option<PrefetchedLive> {
+        self.rx.recv().ok()
     }
 }
 
@@ -2446,6 +2829,26 @@ fn build_phase_after_unlock(
     rt: tokio::runtime::Runtime,
     manager: AccountManager,
 ) -> LivePhase {
+    build_phase_after_unlock_with(
+        egui_ctx,
+        settings,
+        settings_path,
+        update_snapshot,
+        rt,
+        manager,
+        EarlyRuntimes::new(),
+    )
+}
+
+fn build_phase_after_unlock_with(
+    egui_ctx: Option<egui::Context>,
+    settings: &ShellSettings,
+    settings_path: PathBuf,
+    update_snapshot: &UpdateSnapshot,
+    rt: tokio::runtime::Runtime,
+    manager: AccountManager,
+    mut early_runtimes: EarlyRuntimes,
+) -> LivePhase {
     let Some(active_index) = manager.active_index() else {
         return LivePhase::BootstrapError {
             message: "No active account slot found in tdata.".to_owned(),
@@ -2454,12 +2857,7 @@ fn build_phase_after_unlock(
 
     // Start a live SessionRuntime for EVERY authenticated account slot so inactive accounts
     // remain active in the background (unread counters + notifications), matching tdesktop.
-    let authed_slots: Vec<i32> = manager
-        .account_slots()
-        .into_iter()
-        .filter(|s| s.user_id.is_some())
-        .map(|s| s.index)
-        .collect();
+    let authed_slots = authed_account_slots(&manager);
 
     if !authed_slots.is_empty() {
         let core_settings = manager.core_settings().clone();
@@ -2497,13 +2895,18 @@ fn build_phase_after_unlock(
                 active = (slot == target_active),
                 "resuming saved live session from tdata"
             );
-            let runtime = match start_mtproto_erased_on(
-                user_id,
-                account.rpc.clone(),
-                rt.handle().clone(),
-                SessionRuntimeConfig::default(),
-            ) {
-                Ok(r) => Arc::new(r),
+            let started = early_runtimes.remove(&slot).unwrap_or_else(|| {
+                start_mtproto_erased_on(
+                    user_id,
+                    account.rpc.clone(),
+                    rt.handle().clone(),
+                    live_runtime_config(),
+                )
+                .map(Arc::new)
+                .map_err(|err| err.to_string())
+            });
+            let runtime = match started {
+                Ok(r) => r,
                 Err(err) => {
                     return LivePhase::BootstrapError {
                         message: format!(
@@ -2584,6 +2987,7 @@ fn build_phase_after_unlock(
             last_persisted_sessions: stored_sessions,
             last_notify_sync_versions,
             last_window_pos,
+            app_locked: false,
         }));
     }
 
@@ -2597,8 +3001,7 @@ fn build_phase_after_unlock(
     let bridged_rpc = RuntimeBridgedRpc::new(account.rpc.clone(), rt.handle().clone());
     let intro = IntroWidget::with_rpc_client(credentials, bridged_rpc);
     let mut shim = IntroStatusShim::default();
-    let initial_proxy_enabled =
-        manager.proxy_settings().is_enabled() || manager.proxy_settings().is_system();
+    let initial_proxy_enabled = manager.proxy_settings().is_enabled();
     shim.set_proxy_enabled(initial_proxy_enabled);
     LivePhase::Intro(Box::new(LiveIntroPhase {
         rt,

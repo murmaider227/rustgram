@@ -53,6 +53,9 @@ impl Serializable for RpcResult {
 
 impl Deserializable for RpcResult {
     fn deserialize(buf: &mut Cursor<'_>) -> Result<Self, DeserializeError> {
+        let mut depth = buf.enter_depth()?;
+        let buf = &mut *depth;
+        buf.charge_elements(1)?;
         let req_msg_id = i64::deserialize(buf)?;
         let result = RawObject::deserialize(buf)?;
         Ok(Self { req_msg_id, result })
@@ -95,13 +98,18 @@ impl Serializable for CoreMessage {
 
 impl Deserializable for CoreMessage {
     fn deserialize(buf: &mut Cursor<'_>) -> Result<Self, DeserializeError> {
+        let mut depth = buf.enter_depth()?;
+        let buf = &mut *depth;
+        buf.charge_elements(1)?;
         let msg_id = i64::deserialize(buf)?;
         let seqno = i32::deserialize(buf)?;
         let bytes = i32::deserialize(buf)?;
         if bytes < 0 {
             return Err(DeserializeError::NegativeLength(bytes));
         }
-        let body = RawObject(buf.read_slice(bytes as usize)?.to_vec());
+        let slice = buf.read_slice(bytes as usize)?;
+        buf.charge_alloc(slice.len())?;
+        let body = RawObject(slice.to_vec());
         Ok(Self {
             msg_id,
             seqno,
@@ -140,6 +148,9 @@ impl Serializable for MsgContainer {
 
 impl Deserializable for MsgContainer {
     fn deserialize(buf: &mut Cursor<'_>) -> Result<Self, DeserializeError> {
+        let mut depth = buf.enter_depth()?;
+        let buf = &mut *depth;
+        buf.charge_elements(1)?;
         let messages = deserialize_bare_vec(buf)?;
         Ok(Self { messages })
     }
@@ -209,6 +220,9 @@ impl Serializable for GzipPacked {
 
 impl Deserializable for GzipPacked {
     fn deserialize(buf: &mut Cursor<'_>) -> Result<Self, DeserializeError> {
+        let mut depth = buf.enter_depth()?;
+        let buf = &mut *depth;
+        buf.charge_elements(1)?;
         let packed_data = Vec::<u8>::deserialize(buf)?;
         Ok(Self { packed_data })
     }

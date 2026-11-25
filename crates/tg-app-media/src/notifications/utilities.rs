@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tg_platform::system_info::RgbaColor;
@@ -20,6 +21,38 @@ pub const NOTIFY_DELETE_PHOTO_AFTER_MS: i64 = 60_000;
 pub const NOTIFY_USERPIC_SIZE: u32 = 64;
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_NOTIFY_USERPICS_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Configures the active account's temporary directory for native toast notification avatars
+/// (e.g. `<tdata>/temp_<dataName>/notify_userpics`) so avatar PNGs never leak into `%TEMP%`.
+pub fn set_default_userpics_dir(dir: Option<PathBuf>) {
+    if let Ok(mut guard) = ACTIVE_NOTIFY_USERPICS_DIR.lock() {
+        *guard = dir;
+    }
+}
+
+/// Returns the currently configured account notification userpics directory, if any.
+#[must_use]
+pub fn active_default_userpics_dir() -> Option<PathBuf> {
+    ACTIVE_NOTIFY_USERPICS_DIR
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+/// Removes all stale notification userpic PNGs inside `dir` (ignoring any file currently busy).
+pub fn cleanup_userpics_dir(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    let _ = fs::remove_dir(dir);
+}
 
 /// Cache key matching tdesktop's `InMemoryKey` (`(first, second)`).
 ///
@@ -127,13 +160,19 @@ struct CachedImageEntry {
 #[derive(Debug)]
 pub struct CachedUserpics {
     cache_dir: PathBuf,
+    use_default_dir: bool,
     images: BTreeMap<UserpicKey, CachedImageEntry>,
     some_saved: bool,
 }
 
 impl Default for CachedUserpics {
     fn default() -> Self {
-        Self::new(default_temp_dir())
+        Self {
+            cache_dir: default_temp_dir(),
+            use_default_dir: true,
+            images: BTreeMap::new(),
+            some_saved: false,
+        }
     }
 }
 
@@ -143,8 +182,19 @@ impl CachedUserpics {
     pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             cache_dir,
+            use_default_dir: false,
             images: BTreeMap::new(),
             some_saved: false,
+        }
+    }
+
+    fn sync_default_dir(&mut self) {
+        if self.use_default_dir
+            && let Some(active) = active_default_userpics_dir()
+            && active != self.cache_dir
+        {
+            self.clear_all();
+            self.cache_dir = active;
         }
     }
 
@@ -174,6 +224,7 @@ impl CachedUserpics {
         peer: Option<&NotifyPeerInfo>,
         now_ms: i64,
     ) -> std::io::Result<PathBuf> {
+        self.sync_default_dir();
         if let Some(existing) = self.images.get_mut(&key) {
             if existing.until_ms != 0 {
                 existing.until_ms = now_ms.saturating_add(NOTIFY_DELETE_PHOTO_AFTER_MS);
@@ -243,6 +294,7 @@ impl CachedUserpics {
             for entry in self.images.values() {
                 let _ = fs::remove_file(&entry.path);
             }
+            let _ = fs::remove_dir(&self.cache_dir);
         }
         self.images.clear();
         self.some_saved = false;
@@ -256,7 +308,9 @@ impl Drop for CachedUserpics {
 }
 
 fn default_temp_dir() -> PathBuf {
-    std::env::temp_dir().join("rustgram-notify-userpics")
+    active_default_userpics_dir().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("rustgram-notify-userpics-{}", std::process::id()))
+    })
 }
 
 fn draw_filled_circle(img: &mut RgbaImage, cx: f32, cy: f32, radius: f32, color: RgbaColor) {
@@ -428,5 +482,44 @@ fn glyph_5x7(ch: char) -> &'static [u8; 7] {
         _ => &[
             0b01110, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100,
         ],
+    }
+}
+
+#[cfg(test)]
+mod d3_tests {
+    use super::*;
+
+    #[test]
+    fn d3_notify_userpics_uses_account_temp_dir_and_cleans_up() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let acc_dir = dir.path().join("temp_data").join("notify_userpics");
+
+        let mut cache = CachedUserpics::default();
+        set_default_userpics_dir(Some(acc_dir.clone()));
+
+        let png = cache
+            .get(UserpicKey::for_peer(42, 1), None, 1_000)
+            .expect("write userpic png");
+        assert!(
+            png.starts_with(&acc_dir),
+            "notification userpic must live under account temp folder, got {}",
+            png.display()
+        );
+        assert!(png.is_file());
+
+        drop(cache);
+        assert!(
+            !png.exists(),
+            "dropping CachedUserpics must remove written avatar PNG"
+        );
+
+        // Stale files left from a crash are removed by cleanup_userpics_dir.
+        fs::create_dir_all(&acc_dir).expect("mkdir");
+        let stale = acc_dir.join("notify_stale.png");
+        fs::write(&stale, b"stale").expect("write stale");
+        cleanup_userpics_dir(&acc_dir);
+        assert!(!stale.exists());
+
+        set_default_userpics_dir(None);
     }
 }

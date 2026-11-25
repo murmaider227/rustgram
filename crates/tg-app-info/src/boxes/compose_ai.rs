@@ -550,7 +550,7 @@ impl ComposeAiBoxState {
             if let Some(ev) = about.show(ui, colors, false) {
                 match ev {
                     AboutCocoonAction::OpenLink(url) => {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        open_link_with_policy(ui.ctx(), &url);
                     }
                     AboutCocoonAction::Close => {
                         self.about_cocoon = None;
@@ -1411,4 +1411,42 @@ pub(crate) fn paint_accent_button(ui: &mut Ui, label: &str, colors: &dyn Colors)
 #[allow(dead_code)]
 pub(crate) fn badge_rect(rect: Rect) -> Rect {
     rect
+}
+
+/// Opens `url` only after the shared external URL policy accepted (and normalized) it.
+fn open_link_with_policy(ctx: &egui::Context, url: &str) -> bool {
+    match tg_platform::url_policy::validate_external_url(url) {
+        Ok(validated) => {
+            ctx.open_url(egui::OpenUrl::new_tab(validated));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests_sec2a {
+    #[test]
+    fn l7_about_cocoon_link_goes_through_url_policy() {
+        let ctx = egui::Context::default();
+        assert!(!super::open_link_with_policy(
+            &ctx,
+            "file:///C:/Windows/calc.exe"
+        ));
+        assert!(!super::open_link_with_policy(
+            &ctx,
+            "https://a.example@evil.example/"
+        ));
+        let commands = ctx.output(|o| o.commands.clone());
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, egui::OutputCommand::OpenUrl(_))),
+            "rejected links must not be opened: {commands:?}"
+        );
+        assert!(super::open_link_with_policy(
+            &ctx,
+            "https://telegram.org/faq"
+        ));
+    }
 }

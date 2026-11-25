@@ -20,13 +20,20 @@ use tg_chat::{
 use tg_text::emoji as tg_emoji_db;
 
 use crate::chat_helpers::backend::{
-    ChatHelpersBackend, GifCategory, GifItem, InlineGifQueryHook, StickerMedia,
+    CLOUD_SEARCH_PAGE_LIMIT, ChatHelpersBackend, DefaultEmojiCatalog, DefaultEmojiCatalogKind,
+    DefaultTagReaction, DefaultTagReactionsResult, EmojiGroupInfo, GifCategory, GifItem,
+    InlineGifQueryHook, OLD_FEATURED_LOAD_LIMIT, OldFeaturedStickersPage, PaidReactionPrivacy,
+    SearchStickerSetsResult, SearchStickersPage, SearchStickersRequest, StickerMedia,
 };
+use tg_app_core::stand_in::types::{MsgId, PeerId};
 
 const SET_LOTTIE_CRITTERS: StickerSetId = StickerSetId(10_001);
 const SET_GEOMETRIC_BOTS: StickerSetId = StickerSetId(10_002);
 const SET_COSMIC_PREMIUM: StickerSetId = StickerSetId(10_003);
 const SET_TRENDING_SHAPES: StickerSetId = StickerSetId(10_004);
+const SET_OLD_FEATURED_ARCHIVE_1: StickerSetId = StickerSetId(10_005);
+const SET_OLD_FEATURED_ARCHIVE_2: StickerSetId = StickerSetId(10_006);
+const SET_REMOTE_EMOJI_PACK: StickerSetId = StickerSetId(10_007);
 
 /// Default mock inline-bot GIF query hook (`@gif`).
 #[derive(Debug, Clone)]
@@ -221,6 +228,18 @@ pub struct MockChatHelpersBackend {
     bot_commands: HashMap<UserId, Vec<BotCommand>>,
     recent_inline_bots: RecentInlineBots,
     recent_hashtags: RecentHashtags,
+    old_featured_catalog: Vec<StickerSetId>,
+    remote_emoji_pack_ids: Vec<StickerSetId>,
+    paid_reaction_privacy_default: PaidReactionPrivacy,
+    message_paid_privacy: HashMap<(PeerId, MsgId), PaidReactionPrivacy>,
+    reported_reactions: std::sync::Mutex<Vec<(PeerId, MsgId, PeerId)>>,
+    deleted_participant_reactions: Vec<(PeerId, Option<MsgId>, PeerId)>,
+    clear_recent_calls: usize,
+    default_emoji_catalog_calls: std::sync::Mutex<Vec<DefaultEmojiCatalogKind>>,
+    default_tag_reactions_calls: std::sync::Mutex<usize>,
+    custom_default_tag_reactions: Vec<DefaultTagReaction>,
+    emoji_groups: Result<Vec<EmojiGroupInfo>, String>,
+    emoji_groups_calls: std::sync::Mutex<usize>,
 }
 
 impl Default for MockChatHelpersBackend {
@@ -590,6 +609,136 @@ impl MockChatHelpersBackend {
         );
         stickers.feed_set_stickers(SET_TRENDING_SHAPES, pack4_docs, &pack4_emoji);
 
+        // Older featured archive packs (`messages.getOldFeaturedStickers`) & remote custom-emoji pack
+        // (`messages.searchEmojiStickerSets`).
+        type OldFeaturedPackDef = (
+            StickerSetId,
+            &'static str,
+            &'static str,
+            &'static [StaticStickerDef],
+        );
+        let old_featured_defs: &[OldFeaturedPackDef] = &[
+            (
+                SET_OLD_FEATURED_ARCHIVE_1,
+                "Retro Signals",
+                "retro_signals",
+                &[
+                    (4101, "📡", [0x2E, 0x9B, 0xD7], [0x1C, 0x5D, 0x99], 0),
+                    (4102, "⚡", [0xFF, 0xB3, 0x00], [0xF5, 0x7C, 0x00], 1),
+                    (4103, "🎯", [0xE5, 0x39, 0x35], [0xB7, 0x1C, 0x1C], 2),
+                    (4104, "🧭", [0x43, 0xA0, 0x47], [0x1B, 0x5E, 0x20], 3),
+                    (4105, "🛰️", [0x5E, 0x35, 0xB1], [0x31, 0x1B, 0x92], 4),
+                ],
+            ),
+            (
+                SET_OLD_FEATURED_ARCHIVE_2,
+                "Studio Badges",
+                "studio_badges",
+                &[
+                    (4201, "🎨", [0xEC, 0x40, 0x7A], [0xAD, 0x14, 0x57], 1),
+                    (4202, "📐", [0x26, 0xA6, 0x9A], [0x00, 0x69, 0x5C], 2),
+                    (4203, "✨", [0xAB, 0x47, 0xBC], [0x6A, 0x1B, 0x9A], 0),
+                    (4204, "🚀", [0x42, 0xA5, 0xF5], [0x15, 0x65, 0xC0], 3),
+                    (4205, "⭐", [0xFF, 0xCA, 0x28], [0xFF, 0x8F, 0x00], 4),
+                ],
+            ),
+        ];
+        let mut old_featured_catalog = Vec::new();
+        for &(set_id, title, short_name, defs) in old_featured_defs {
+            let mut docs = Vec::new();
+            let mut emoji_map = Vec::new();
+            for &(doc_raw, alt, c1, c2, shape) in defs {
+                let doc_id = DocumentId(doc_raw);
+                docs.push(doc_id);
+                emoji_map.push((alt.to_owned(), vec![doc_id]));
+                stickers.insert_document(StickerDocument {
+                    id: doc_id,
+                    set_id: Some(set_id),
+                    sticker_type: StickerType::Webp,
+                    alt_emoji: alt.to_owned(),
+                    dimensions: Size::new(512, 512),
+                    thumbnail_size: Some(Size::new(128, 128)),
+                    is_premium_sticker: false,
+                    is_premium_emoji: false,
+                    is_gifv: false,
+                });
+                sticker_media.insert(
+                    doc_id,
+                    StickerMedia::StaticRgba {
+                        width: 96,
+                        height: 96,
+                        rgba: render_static_sticker_rgba(96, c1, c2, shape),
+                    },
+                );
+            }
+            stickers.feed_set(
+                StickerSetUpdate {
+                    id: set_id,
+                    access_hash: set_id.0 * 37,
+                    hash: set_id.0,
+                    title: title.to_owned(),
+                    short_name: short_name.to_owned(),
+                    count: docs.len() as i32,
+                    flags: StickersSetFlags::FEATURED | StickersSetFlags::OFFICIAL,
+                    install_date: None,
+                    thumbnail_document_id: docs.first().copied(),
+                },
+                now,
+            );
+            stickers.feed_set_stickers(set_id, docs, &emoji_map);
+            old_featured_catalog.push(set_id);
+        }
+
+        // Custom-emoji search pack (`messages.searchEmojiStickerSets`).
+        let mut emoji_pack_docs = Vec::new();
+        let mut emoji_pack_map = Vec::new();
+        for &(doc_raw, alt, c1, c2, shape) in &[
+            (4301u64, "⭐", [0xFF, 0xD5, 0x4F], [0xFF, 0x8F, 0x00], 0u8),
+            (4302u64, "🔥", [0xFF, 0x70, 0x43], [0xD8, 0x43, 0x15], 1u8),
+            (4303u64, "🚀", [0x29, 0xB6, 0xF6], [0x02, 0x77, 0xBD], 2u8),
+            (4304u64, "✨", [0xBA, 0x68, 0xC8], [0x6A, 0x1B, 0x9A], 3u8),
+            (4305u64, "❤️", [0xF0, 0x62, 0x92], [0xC2, 0x18, 0x5B], 4u8),
+        ] {
+            let doc_id = DocumentId(doc_raw);
+            emoji_pack_docs.push(doc_id);
+            emoji_pack_map.push((alt.to_owned(), vec![doc_id]));
+            stickers.insert_document(StickerDocument {
+                id: doc_id,
+                set_id: Some(SET_REMOTE_EMOJI_PACK),
+                sticker_type: StickerType::Webp,
+                alt_emoji: alt.to_owned(),
+                dimensions: Size::new(512, 512),
+                thumbnail_size: Some(Size::new(128, 128)),
+                is_premium_sticker: false,
+                is_premium_emoji: true,
+                is_gifv: false,
+            });
+            sticker_media.insert(
+                doc_id,
+                StickerMedia::StaticRgba {
+                    width: 96,
+                    height: 96,
+                    rgba: render_static_sticker_rgba(96, c1, c2, shape),
+                },
+            );
+        }
+        stickers.feed_set(
+            StickerSetUpdate {
+                id: SET_REMOTE_EMOJI_PACK,
+                access_hash: 777_777,
+                hash: 77,
+                title: "Spark Emoji Pack".into(),
+                short_name: "spark_emoji_pack".into(),
+                count: emoji_pack_docs.len() as i32,
+                flags: StickersSetFlags::EMOJI,
+                install_date: None,
+                thumbnail_document_id: emoji_pack_docs.first().copied(),
+            },
+            now,
+        );
+        stickers.feed_set_stickers(SET_REMOTE_EMOJI_PACK, emoji_pack_docs, &emoji_pack_map);
+        let remote_emoji_pack_ids = vec![SET_REMOTE_EMOJI_PACK];
+
         // Seed Favorites (including one Premium-locked sticker so lock badges are immediately visible)
         // and Recent stickers.
         stickers.set_faved(DocumentId(3001), true, None, false);
@@ -717,12 +866,98 @@ impl MockChatHelpersBackend {
             bot_commands,
             recent_inline_bots,
             recent_hashtags,
+            old_featured_catalog,
+            remote_emoji_pack_ids,
+            paid_reaction_privacy_default: PaidReactionPrivacy::Default,
+            message_paid_privacy: HashMap::new(),
+            reported_reactions: std::sync::Mutex::new(Vec::new()),
+            deleted_participant_reactions: Vec::new(),
+            clear_recent_calls: 0,
+            default_emoji_catalog_calls: std::sync::Mutex::new(Vec::new()),
+            default_tag_reactions_calls: std::sync::Mutex::new(0),
+            custom_default_tag_reactions: vec![
+                DefaultTagReaction::Emoji("⭐".to_owned()),
+                DefaultTagReaction::Emoji("📌".to_owned()),
+                DefaultTagReaction::Emoji("❤️".to_owned()),
+                DefaultTagReaction::Emoji("🔥".to_owned()),
+                DefaultTagReaction::Emoji("👍".to_owned()),
+                DefaultTagReaction::Emoji("🎉".to_owned()),
+                DefaultTagReaction::Emoji("💡".to_owned()),
+                DefaultTagReaction::Emoji("🎯".to_owned()),
+            ],
+            emoji_groups: Ok(Vec::new()),
+            emoji_groups_calls: std::sync::Mutex::new(0),
         }
+    }
+
+    /// Overrides the mock `messages.getEmojiGroups` reply (for tests).
+    pub fn set_emoji_groups(&mut self, groups: Result<Vec<EmojiGroupInfo>, String>) {
+        self.emoji_groups = groups;
+    }
+
+    /// Returns how many times `emoji_groups` was invoked (for tests).
+    #[must_use]
+    pub fn recorded_emoji_groups_calls(&self) -> usize {
+        self.emoji_groups_calls.lock().map(|g| *g).unwrap_or(0)
+    }
+
+    /// Returns all [`DefaultEmojiCatalogKind`] values requested via `default_emoji_catalog`.
+    #[must_use]
+    pub fn recorded_default_emoji_catalog_calls(&self) -> Vec<DefaultEmojiCatalogKind> {
+        self.default_emoji_catalog_calls
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns how many times `default_tag_reactions` was invoked (for tests).
+    #[must_use]
+    pub fn recorded_default_tag_reactions_calls(&self) -> usize {
+        self.default_tag_reactions_calls
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(0)
+    }
+
+    /// Overrides the mock `messages.getDefaultTagReactions` list (for tests).
+    pub fn set_default_tag_reactions(&mut self, reactions: Vec<DefaultTagReaction>) {
+        self.custom_default_tag_reactions = reactions;
     }
 
     /// Replaces the inline-bot GIF query hook (e.g. for custom providers or tests).
     pub fn set_inline_gif_hook(&mut self, hook: Box<dyn InlineGifQueryHook + Send + Sync>) {
         self.gif_hook = hook;
+    }
+
+    /// Returns how many times `clear_recent_stickers` was invoked (for tests).
+    #[must_use]
+    pub const fn clear_recent_calls(&self) -> usize {
+        self.clear_recent_calls
+    }
+
+    /// Returns all `(peer_id, msg_id, reaction_peer_id)` calls recorded by `report_reaction`.
+    #[must_use]
+    pub fn recorded_reported_reactions(&self) -> Vec<(PeerId, MsgId, PeerId)> {
+        self.reported_reactions
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns all `(peer_id, opt_msg_id, participant_id)` calls recorded by reaction deletion.
+    #[must_use]
+    pub fn recorded_deleted_participant_reactions(&self) -> &[(PeerId, Option<MsgId>, PeerId)] {
+        &self.deleted_participant_reactions
+    }
+
+    /// Returns the stored paid-reaction privacy override for `(peer_id, msg_id)`, if any.
+    #[must_use]
+    pub fn message_paid_reaction_privacy(
+        &self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+    ) -> Option<PaidReactionPrivacy> {
+        self.message_paid_privacy.get(&(peer_id, msg_id)).copied()
     }
 }
 
@@ -766,6 +1001,13 @@ impl ChatHelpersBackend for MockChatHelpersBackend {
             .query_mine(query, false, &recent, &self.emoji_variants, |e| {
                 tg_emoji_db::find_emoji(e, 0).is_some_and(|(er, _)| er.has_variants())
             })
+    }
+
+    fn emoji_groups(&self) -> Result<Vec<EmojiGroupInfo>, String> {
+        if let Ok(mut calls) = self.emoji_groups_calls.lock() {
+            *calls += 1;
+        }
+        self.emoji_groups.clone()
     }
 
     fn is_premium(&self) -> bool {
@@ -883,6 +1125,22 @@ impl ChatHelpersBackend for MockChatHelpersBackend {
             .sets
             .get(&set_id)
             .is_some_and(tg_chat::stickers::StickersSet::is_in_my_list)
+    }
+
+    fn sticker_set_section(&self, set_id: StickerSetId) -> Option<StickerPanelSection> {
+        let set = self.stickers.sets.get(&set_id)?;
+        Some(StickerPanelSection {
+            id: set.id,
+            flags: set.flags,
+            title: set.title.clone(),
+            short_name: set.short_name.clone(),
+            count: set.count,
+            external_layout: !set.is_in_my_list(),
+            stickers: set.stickers.clone(),
+            thumbnail_document_id: set
+                .thumbnail_document_id
+                .or_else(|| set.stickers.first().copied()),
+        })
     }
 
     fn saved_gifs(&self) -> Vec<GifItem> {
@@ -1023,6 +1281,231 @@ impl ChatHelpersBackend for MockChatHelpersBackend {
                 premiums_to_end_for_free: 2,
             },
         )
+    }
+
+    fn search_stickers_remote(
+        &self,
+        req: &SearchStickersRequest,
+    ) -> Result<SearchStickersPage, String> {
+        let q = req.query.trim().to_lowercase();
+        let emo = req.emoticon.trim();
+        if q.is_empty() && emo.is_empty() {
+            return Ok(SearchStickersPage::default());
+        }
+        let mut all = self.search_stickers(if !q.is_empty() { &q } else { emo });
+        // Also include older archive stickers whose alt emoji or owning set title matches.
+        for &set_id in &self.old_featured_catalog {
+            if let Some(set) = self.stickers.sets.get(&set_id)
+                && (set.title.to_lowercase().contains(&q)
+                    || set.short_name.to_lowercase().contains(&q)
+                    || q.contains("star")
+                    || q.contains("fire")
+                    || q.contains("rocket")
+                    || q.contains("spark"))
+            {
+                for &doc_id in &set.stickers {
+                    if !all.contains(&doc_id) {
+                        all.push(doc_id);
+                    }
+                }
+            }
+        }
+        let offset = req.offset.max(0) as usize;
+        let limit = if req.limit > 0 {
+            req.limit as usize
+        } else {
+            CLOUD_SEARCH_PAGE_LIMIT as usize
+        };
+        let end = (offset + limit).min(all.len());
+        let page = if offset < all.len() {
+            all[offset..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        let next_offset = if end < all.len() {
+            Some(end as i32)
+        } else {
+            None
+        };
+        Ok(SearchStickersPage {
+            stickers: page,
+            next_offset,
+            hash: all.len() as i64,
+            not_modified: false,
+        })
+    }
+
+    fn search_emoji_sticker_sets(
+        &self,
+        query: &str,
+        _exclude_featured: bool,
+    ) -> Result<SearchStickerSetsResult, String> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Ok(SearchStickerSetsResult::default());
+        }
+        let set_ids: Vec<StickerSetId> = self
+            .remote_emoji_pack_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.stickers.sets.get(id).is_some_and(|s| {
+                    s.title.to_lowercase().contains(&q)
+                        || s.short_name.to_lowercase().contains(&q)
+                        || s.stickers.iter().any(|d| {
+                            self.stickers
+                                .documents
+                                .get(d)
+                                .is_some_and(|doc| doc.alt_emoji.contains(&q))
+                        })
+                        || q.contains("star")
+                        || q.contains("fire")
+                        || q.contains("emoji")
+                        || q.contains("spark")
+                })
+            })
+            .collect();
+        Ok(SearchStickerSetsResult {
+            hash: set_ids.len() as i64,
+            set_ids,
+            not_modified: false,
+        })
+    }
+
+    fn load_old_featured_stickers(
+        &self,
+        offset: i32,
+        limit: i32,
+    ) -> Result<OldFeaturedStickersPage, String> {
+        let start = offset.max(0) as usize;
+        let lim = if limit > 0 {
+            limit as usize
+        } else {
+            OLD_FEATURED_LOAD_LIMIT as usize
+        };
+        let end = (start + lim).min(self.old_featured_catalog.len());
+        let set_ids = if start < self.old_featured_catalog.len() {
+            self.old_featured_catalog[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(OldFeaturedStickersPage {
+            set_ids,
+            unread_ids: Vec::new(),
+            total_count: self.old_featured_catalog.len() as i32,
+            next_offset: end as i32,
+            premium: false,
+            hash: self.old_featured_catalog.len() as i64,
+            not_modified: false,
+        })
+    }
+
+    fn clear_recent_stickers(&mut self, attached: bool) -> Result<bool, String> {
+        self.clear_recent_calls += 1;
+        if attached {
+            self.stickers
+                .sets
+                .remove(&tg_chat::stickers::CLOUD_RECENT_ATTACHED_SET_ID);
+        } else {
+            self.stickers
+                .sets
+                .remove(&tg_chat::stickers::CLOUD_RECENT_SET_ID);
+            self.stickers.sets.remove(&tg_chat::stickers::CUSTOM_SET_ID);
+            self.stickers.old_recent_pack.clear();
+        }
+        Ok(true)
+    }
+
+    fn default_emoji_catalog(
+        &self,
+        kind: DefaultEmojiCatalogKind,
+        _force: bool,
+    ) -> Result<DefaultEmojiCatalog, String> {
+        if let Ok(mut g) = self.default_emoji_catalog_calls.lock() {
+            g.push(kind);
+        }
+        let ids: Vec<DocumentId> = self.stickers.documents.keys().copied().take(8).collect();
+        let mut document_ids: Vec<DocumentId> = if ids.is_empty() {
+            (90_001..=90_006).map(DocumentId).collect()
+        } else {
+            ids
+        };
+        // Each catalog kind is a separate server list (`account.getDefault*Emojis`): give each
+        // kind a different order so callers can tell which catalog they received.
+        let shift = match kind {
+            DefaultEmojiCatalogKind::ProfilePhoto => 0,
+            DefaultEmojiCatalogKind::GroupPhoto => 1,
+            DefaultEmojiCatalogKind::Background => 2,
+            DefaultEmojiCatalogKind::ChannelRestrictedStatus => 3,
+        };
+        if !document_ids.is_empty() {
+            let n = shift % document_ids.len();
+            document_ids.rotate_left(n);
+        }
+        Ok(DefaultEmojiCatalog {
+            hash: document_ids.len() as i64,
+            document_ids,
+            not_modified: false,
+        })
+    }
+
+    fn default_tag_reactions(&self, _force: bool) -> Result<DefaultTagReactionsResult, String> {
+        if let Ok(mut g) = self.default_tag_reactions_calls.lock() {
+            *g += 1;
+        }
+        Ok(DefaultTagReactionsResult {
+            hash: self.custom_default_tag_reactions.len() as i64,
+            reactions: self.custom_default_tag_reactions.clone(),
+            not_modified: false,
+        })
+    }
+
+    fn paid_reaction_privacy(&self, _force: bool) -> Result<PaidReactionPrivacy, String> {
+        Ok(self.paid_reaction_privacy_default)
+    }
+
+    fn toggle_paid_reaction_privacy(
+        &mut self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+        privacy: PaidReactionPrivacy,
+    ) -> Result<bool, String> {
+        self.paid_reaction_privacy_default = privacy;
+        self.message_paid_privacy.insert((peer_id, msg_id), privacy);
+        Ok(true)
+    }
+
+    fn report_reaction(
+        &self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+        reaction_peer_id: PeerId,
+    ) -> Result<bool, String> {
+        if let Ok(mut g) = self.reported_reactions.lock() {
+            g.push((peer_id, msg_id, reaction_peer_id));
+        }
+        Ok(true)
+    }
+
+    fn delete_participant_reaction(
+        &mut self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+        participant_id: PeerId,
+    ) -> Result<(), String> {
+        self.deleted_participant_reactions
+            .push((peer_id, Some(msg_id), participant_id));
+        Ok(())
+    }
+
+    fn delete_participant_reactions(
+        &mut self,
+        peer_id: PeerId,
+        participant_id: PeerId,
+    ) -> Result<bool, String> {
+        self.deleted_participant_reactions
+            .push((peer_id, None, participant_id));
+        Ok(true)
     }
 }
 

@@ -1480,11 +1480,58 @@ fn dispatch_parsed_deep_link(
                 }
             }
         }
-        DeepLink::ContactToken { token, .. } => {
+        DeepLink::ContactToken {
+            token,
+            no_paid_token,
+        } => {
             if token.is_empty() {
-                DeepLinkOutcome::Toast("This contact link is invalid.".to_owned())
+                DeepLinkOutcome::Toast(tg_lang::tr::lng_contact_link_invalid())
             } else {
-                DeepLinkOutcome::show_box(BoxKind::AddContact(AddContactBoxState::new()))
+                match InfoBackend::import_contact_token(backend, &token) {
+                    Ok(peer_id) => {
+                        let mut fee_toast = None;
+                        if let Some(ref free_token) = no_paid_token
+                            && !free_token.is_empty()
+                        {
+                            match InfoBackend::import_no_paid_messages_token(
+                                backend, peer_id, free_token,
+                            ) {
+                                Ok(res) if res.price_removed => {
+                                    fee_toast = Some(
+                                        "Paid message fee waived for this contact.".to_owned(),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    fee_toast =
+                                        Some(if err.to_ascii_uppercase().contains("FLOOD") {
+                                            tg_lang::tr::lng_flood_error()
+                                        } else {
+                                            format!("Could not apply fee-waiver token: {err}")
+                                        });
+                                }
+                            }
+                        }
+                        session.show_peer_history(
+                            peer_id,
+                            SectionShow::forward(),
+                            MsgId::SHOW_AT_UNREAD,
+                        );
+                        if let Some(msg) = fee_toast {
+                            DeepLinkOutcome::Toast(msg)
+                        } else {
+                            DeepLinkOutcome::Handled
+                        }
+                    }
+                    Err(err) => {
+                        let msg = if err.to_ascii_uppercase().contains("FLOOD") {
+                            tg_lang::tr::lng_flood_error()
+                        } else {
+                            tg_lang::tr::lng_contact_link_invalid()
+                        };
+                        DeepLinkOutcome::Toast(msg)
+                    }
+                }
             }
         }
         DeepLink::TestChatTheme { .. } => DeepLinkOutcome::OpenSettingsSection {
@@ -3478,18 +3525,25 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
+    let head = s.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        s.get(prefix.len()..)
     } else {
         None
     }
 }
 
 fn strip_http_scheme(url: &str) -> (&str, &str) {
-    if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
-        (&url[..8], &url[8..])
-    } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
-        (&url[..7], &url[7..])
+    if let Some(head) = url.get(..8)
+        && head.eq_ignore_ascii_case("https://")
+        && let Some(rest) = url.get(8..)
+    {
+        (head, rest)
+    } else if let Some(head) = url.get(..7)
+        && head.eq_ignore_ascii_case("http://")
+        && let Some(rest) = url.get(7..)
+    {
+        (head, rest)
     } else {
         ("", url)
     }

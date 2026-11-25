@@ -362,27 +362,15 @@ impl WalletContract {
         Ok(signing)
     }
 
-    /// Signs a transfer with `keypair` and wraps it into an external-in BOC message.
+    /// Wraps a wallet signing payload and 64-byte signature buffer into an external-in BOC message.
     ///
     /// Automatically attaches `StateInit` when `seqno == 0` (initial wallet deployment).
-    pub fn create_signed_transfer(
+    fn wrap_external_transfer(
         &self,
-        keypair: &TonKeypair,
         seqno: u32,
-        valid_until: u32,
-        messages: &[TransferMessage],
+        signing: CellBuilder,
+        sig_bytes: [u8; 64],
     ) -> Result<SignedTransfer, WalletError> {
-        if keypair.public_key_bytes() != self.public_key {
-            return Err(WalletError::Contract(
-                "signing keypair does not match wallet public key".to_owned(),
-            ));
-        }
-
-        let signing = self.build_signing_payload(seqno, valid_until, messages)?;
-        let signing_hash = signing.clone().end_cell()?.hash();
-        let sig = keypair.signing_key().sign(&signing_hash);
-        let sig_bytes = sig.to_bytes();
-
         // V3R2 and V4R2 pack signature at the front; V5R1 packs signature at the tail.
         let mut body_builder = CellBuilder::new();
         match self.version {
@@ -436,6 +424,43 @@ impl WalletContract {
             message_hash,
             boc_base64,
         })
+    }
+
+    /// Builds an unsigned external-in BOC with an all-zero dummy signature (`[0u8; 64]`) for
+    /// `ignore_chksig = true` fee estimation and pre-approval transaction emulation ONLY.
+    ///
+    /// Never accesses or uses any real wallet private key, so the returned BOC cannot verify
+    /// under `self.public_key` and is strictly unbroadcastable on-chain.
+    pub fn create_unsigned_emulation_transfer(
+        &self,
+        seqno: u32,
+        valid_until: u32,
+        messages: &[TransferMessage],
+    ) -> Result<SignedTransfer, WalletError> {
+        let signing = self.build_signing_payload(seqno, valid_until, messages)?;
+        self.wrap_external_transfer(seqno, signing, [0_u8; 64])
+    }
+
+    /// Signs a transfer with `keypair` and wraps it into an external-in BOC message.
+    ///
+    /// Automatically attaches `StateInit` when `seqno == 0` (initial wallet deployment).
+    pub fn create_signed_transfer(
+        &self,
+        keypair: &TonKeypair,
+        seqno: u32,
+        valid_until: u32,
+        messages: &[TransferMessage],
+    ) -> Result<SignedTransfer, WalletError> {
+        if keypair.public_key_bytes() != self.public_key {
+            return Err(WalletError::Contract(
+                "signing keypair does not match wallet public key".to_owned(),
+            ));
+        }
+
+        let signing = self.build_signing_payload(seqno, valid_until, messages)?;
+        let signing_hash = signing.clone().end_cell()?.hash();
+        let sig = keypair.signing_key().sign(&signing_hash);
+        self.wrap_external_transfer(seqno, signing, sig.to_bytes())
     }
 
     /// Verifies that a [`SignedTransfer`]'s Ed25519 signature matches `self.public_key` and

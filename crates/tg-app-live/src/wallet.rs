@@ -12,6 +12,7 @@
 //! Endpoints always come from [`WalletAppConfig`] (or environment configuration). Tests run
 //! exclusively against local in-process fake Toncenter and TON Connect bridge servers.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,8 +45,9 @@ use tg_wallet::toncenter::{
 use tg_wallet::tonconnect::{
     DappManifest, HttpTonConnectBridge, SignDataResult, TonConnectAppRequest, TonConnectBridge,
     TonConnectBridgeConfig, TonConnectErrorCode, TonConnectKeypair, TonConnectLinkKind,
-    TonConnectSendTxRequest, TonConnectSession, TonConnectSessionStatus, parse_ton_connect_link,
-    sign_ton_connect_data,
+    TonConnectSendTxRequest, TonConnectSession, TonConnectSessionStatus, manifest_url_host,
+    parse_ton_connect_link, sign_ton_connect_data, ton_connect_manifest_hosts_match,
+    ton_connect_proof_domain_allowed,
 };
 use tg_wallet::vault::{LocalKeyVault, PasscodeKdf};
 use tg_wallet::{
@@ -602,8 +604,8 @@ pub struct LiveWalletBackend {
     sessions: Vec<LiveTonConnectSession>,
     next_session_id: u64,
     pending_connect: Option<PendingConnectApproval>,
-    pending_tx: Option<PendingTxApproval>,
-    pending_sign_data: Option<PendingSignDataApproval>,
+    pending_tx_queue: VecDeque<PendingTxApproval>,
+    pending_sign_data_queue: VecDeque<PendingSignDataApproval>,
     collectibles: Vec<NftItem>,
     jettons: Vec<JettonWalletBalance>,
     onramp_providers: Vec<OnrampProviderCard>,
@@ -693,8 +695,8 @@ impl LiveWalletBackend {
             sessions: Vec::new(),
             next_session_id: 1,
             pending_connect: None,
-            pending_tx: None,
-            pending_sign_data: None,
+            pending_tx_queue: VecDeque::new(),
+            pending_sign_data_queue: VecDeque::new(),
             collectibles: Vec::new(),
             jettons: Vec::new(),
             onramp_providers: Vec::new(),
@@ -956,8 +958,72 @@ impl LiveWalletBackend {
         Ok(msgs)
     }
 
+    /// Validates a TON Connect `sendTransaction` request against the active wallet's network,
+    /// address (`from`), message count, and expiration (`valid_until`), returning the verified
+    /// `valid_until` timestamp (`u32`).
+    fn validate_ton_connect_tx_request(
+        &self,
+        tx_req: &TonConnectSendTxRequest,
+        now: u64,
+    ) -> Result<u32, String> {
+        let contract = self
+            .contract
+            .as_ref()
+            .ok_or_else(|| "No wallet configured".to_owned())?;
+        let expected_network = if contract.testnet { "-3" } else { "-239" };
+        if let Some(ref net) = tx_req.network
+            && net.trim() != expected_network
+        {
+            return Err(format!(
+                "Transaction network '{}' does not match active wallet network '{}'",
+                net.trim(),
+                expected_network
+            ));
+        }
+        let valid_until = match tx_req.valid_until {
+            Some(vu) => {
+                if vu <= now {
+                    return Err("Transaction request has expired (valid_until <= now)".to_owned());
+                }
+                u32::try_from(vu).map_err(|_| {
+                    "Transaction valid_until exceeds 32-bit TON timestamp range".to_owned()
+                })?
+            }
+            None => now.saturating_add(300).min(u64::from(u32::MAX)) as u32,
+        };
+        if let Some(ref from_str) = tx_req.from {
+            let trimmed = from_str.trim();
+            if trimmed.is_empty() {
+                return Err("Transaction 'from' address is empty".to_owned());
+            }
+            let parsed_from = TonAddress::parse(trimmed)
+                .map_err(|e| format!("Invalid transaction 'from' address: {e}"))?;
+            let wallet_addr = contract.address().map_err(|e| e.to_string())?;
+            if parsed_from.address.to_raw() != wallet_addr.to_raw() {
+                return Err("Transaction 'from' address does not match active wallet".to_owned());
+            }
+        }
+        if tx_req.messages.is_empty() {
+            return Err("Transaction contains no messages".to_owned());
+        }
+        let max_msgs = contract.version.max_messages();
+        if tx_req.messages.len() > max_msgs {
+            return Err(format!(
+                "Transaction has {} messages, exceeding wallet limit of {}",
+                tx_req.messages.len(),
+                max_msgs
+            ));
+        }
+        Ok(valid_until)
+    }
+
     /// Runs `ToncenterApi::emulate_message` with `ignore_chksig = true` for a TON Connect
     /// transaction preview, returning `(estimated_fee_nano, emulation, ton_connect_emulation)`.
+    ///
+    /// Security invariant (B7): NEVER calls `load_keypair()` and NEVER signs with the real
+    /// wallet private key before user approval. Builds an unsigned dummy-signature BOC via
+    /// [`WalletContract::create_unsigned_emulation_transfer`] which cannot verify under the
+    /// wallet's real public key and cannot be broadcast on-chain.
     fn emulate_ton_connect_tx(
         &self,
         tx_req: &TonConnectSendTxRequest,
@@ -969,19 +1035,18 @@ impl LiveWalletBackend {
         let Ok(msgs) = Self::build_ton_connect_messages(tx_req) else {
             return (DEFAULT_ESTIMATED_FEE_NANO, None, None);
         };
-        // Pre-sign emulation uses `ignore_chksig = true`, so we do not require unlocking the
-        // vault just to preview balance deltas, fees, and warnings.
-        let emul_kp = self
-            .load_keypair()
-            .unwrap_or_else(|_| TonKeypair::from_seed([0u8; 32]));
         let now = now_unix_u64();
-        let valid_until = tx_req.valid_until.unwrap_or(now.saturating_add(300)) as u32;
-        let Ok(signed) = contract.create_signed_transfer(&emul_kp, self.seqno, valid_until, &msgs)
+        let valid_until = tx_req
+            .valid_until
+            .unwrap_or(now.saturating_add(300))
+            .min(u64::from(u32::MAX)) as u32;
+        let Ok(unsigned) =
+            contract.create_unsigned_emulation_transfer(self.seqno, valid_until, &msgs)
         else {
             return (DEFAULT_ESTIMATED_FEE_NANO, None, None);
         };
 
-        let req = EmulateMessageRequest::new(signed.boc_base64).with_metadata(true);
+        let req = EmulateMessageRequest::new(unsigned.boc_base64).with_metadata(true);
         let api = Arc::clone(toncenter);
         match block_on_runtime(
             &self.rt_handle,
@@ -1021,12 +1086,12 @@ impl LiveWalletBackend {
         let mut sessions_dirty = false;
         let mut disconnected_ids: Vec<u64> = Vec::new();
         let mut replies_to_send: Vec<(String, String, String)> = Vec::new();
-        let mut incoming_txs: Vec<(u64, String, String, TonConnectSendTxRequest)> = Vec::new();
-        let mut incoming_sign_data: Vec<PendingSignDataApproval> = Vec::new();
+        const MAX_PENDING_TON_CONNECT_QUEUE: usize = 16;
+        let now = now_unix_u64();
 
-        for stored in &mut self.sessions {
-            let wallet_cid = stored.session.wallet_client_id();
-            let last_id = stored.session.last_event_id.clone();
+        for idx in 0..self.sessions.len() {
+            let wallet_cid = self.sessions[idx].session.wallet_client_id();
+            let last_id = self.sessions[idx].session.last_event_id.clone();
             let bridge_ref = Arc::clone(&bridge);
             let events = block_on_runtime(&self.rt_handle, async move {
                 bridge_ref
@@ -1036,61 +1101,149 @@ impl LiveWalletBackend {
             .map_err(|e| e.to_string())?;
 
             for ev in events {
+                // Persist `last_event_id` BEFORE decrypting/parsing/emulating this event so a
+                // poison payload that crashes or aborts processing is never re-delivered forever.
                 if let Some(id) = ev.id {
-                    stored.session.last_event_id = Some(id);
-                    sessions_dirty = true;
+                    self.sessions[idx].session.last_event_id = Some(id);
+                    if self.vault.is_unlocked() {
+                        let _ = self.persist_ton_connect_sessions();
+                    }
                 }
-                if !ev.from.eq_ignore_ascii_case(&stored.card.dapp_client_id) {
+                if !ev
+                    .from
+                    .eq_ignore_ascii_case(&self.sessions[idx].card.dapp_client_id)
+                {
                     continue;
                 }
                 total_processed += 1;
-                match stored.session.decrypt_app_request(&ev.message) {
+                let session_id = self.sessions[idx].card.session_id;
+                let dapp_name = self.sessions[idx].card.manifest.name.clone();
+                let dapp_domain = self.sessions[idx].card.manifest.host();
+                let req = self.sessions[idx].session.decrypt_app_request(&ev.message);
+                match req {
                     Ok(TonConnectAppRequest::SendTransaction(tx_req)) => {
-                        let domain = stored.card.manifest.host();
-                        incoming_txs.push((
-                            stored.card.session_id,
-                            stored.card.manifest.name.clone(),
-                            domain,
-                            tx_req,
-                        ));
+                        if let Err(reason) = self.validate_ton_connect_tx_request(&tx_req, now) {
+                            if let Ok(enc) = self.sessions[idx].session.build_error_response(
+                                &tx_req.request_id,
+                                TonConnectErrorCode::BadRequest,
+                                &reason,
+                            ) {
+                                replies_to_send.push((
+                                    self.sessions[idx].session.wallet_client_id(),
+                                    self.sessions[idx].session.dapp_client_id(),
+                                    enc,
+                                ));
+                            }
+                            continue;
+                        }
+                        let duplicate = self.pending_tx_queue.iter().any(|p| {
+                            p.session_id == session_id && p.request.request_id == tx_req.request_id
+                        });
+                        if duplicate || self.pending_tx_queue.len() >= MAX_PENDING_TON_CONNECT_QUEUE
+                        {
+                            let msg = if duplicate {
+                                "Duplicate pending sendTransaction request id"
+                            } else {
+                                "Too many pending transaction requests"
+                            };
+                            if let Ok(enc) = self.sessions[idx].session.build_error_response(
+                                &tx_req.request_id,
+                                TonConnectErrorCode::BadRequest,
+                                msg,
+                            ) {
+                                replies_to_send.push((
+                                    self.sessions[idx].session.wallet_client_id(),
+                                    self.sessions[idx].session.dapp_client_id(),
+                                    enc,
+                                ));
+                            }
+                            continue;
+                        }
+                        let (estimated_fee_nano, emulation, ton_connect_emulation) =
+                            self.emulate_ton_connect_tx(&tx_req);
+                        self.pending_tx_queue.push_back(PendingTxApproval {
+                            session_id,
+                            dapp_name,
+                            dapp_domain,
+                            request: tx_req,
+                            estimated_fee_nano,
+                            emulation,
+                            ton_connect_emulation,
+                        });
                     }
                     Ok(TonConnectAppRequest::Disconnect { .. }) => {
-                        disconnected_ids.push(stored.card.session_id);
+                        disconnected_ids.push(session_id);
                         sessions_dirty = true;
                     }
                     Ok(TonConnectAppRequest::SignData(sd)) => {
-                        // Validate payload shape early; never sign until user confirms in UI.
-                        if let Err(err) = sd.to_sign_data_payload() {
-                            if let Ok(enc) = stored.session.build_error_response(
+                        if !ton_connect_proof_domain_allowed(&dapp_domain, "") {
+                            if let Ok(enc) = self.sessions[idx].session.build_error_response(
+                                &sd.request_id,
+                                TonConnectErrorCode::BadRequest,
+                                "dApp domain is not allowed for signData",
+                            ) {
+                                replies_to_send.push((
+                                    self.sessions[idx].session.wallet_client_id(),
+                                    self.sessions[idx].session.dapp_client_id(),
+                                    enc,
+                                ));
+                            }
+                        } else if let Err(err) = sd.to_sign_data_payload() {
+                            if let Ok(enc) = self.sessions[idx].session.build_error_response(
                                 &sd.request_id,
                                 TonConnectErrorCode::BadRequest,
                                 &err.to_string(),
                             ) {
                                 replies_to_send.push((
-                                    stored.session.wallet_client_id(),
-                                    stored.session.dapp_client_id(),
+                                    self.sessions[idx].session.wallet_client_id(),
+                                    self.sessions[idx].session.dapp_client_id(),
                                     enc,
                                 ));
                             }
                         } else {
-                            let domain = stored.card.manifest.host();
-                            incoming_sign_data.push(PendingSignDataApproval {
-                                session_id: stored.card.session_id,
-                                dapp_name: stored.card.manifest.name.clone(),
-                                dapp_domain: domain,
-                                request: sd,
+                            let duplicate = self.pending_sign_data_queue.iter().any(|p| {
+                                p.session_id == session_id && p.request.request_id == sd.request_id
                             });
+                            if duplicate
+                                || self.pending_sign_data_queue.len()
+                                    >= MAX_PENDING_TON_CONNECT_QUEUE
+                            {
+                                let msg = if duplicate {
+                                    "Duplicate pending signData request id"
+                                } else {
+                                    "Too many pending signData requests"
+                                };
+                                if let Ok(enc) = self.sessions[idx].session.build_error_response(
+                                    &sd.request_id,
+                                    TonConnectErrorCode::BadRequest,
+                                    msg,
+                                ) {
+                                    replies_to_send.push((
+                                        self.sessions[idx].session.wallet_client_id(),
+                                        self.sessions[idx].session.dapp_client_id(),
+                                        enc,
+                                    ));
+                                }
+                                continue;
+                            }
+                            self.pending_sign_data_queue
+                                .push_back(PendingSignDataApproval {
+                                    session_id,
+                                    dapp_name,
+                                    dapp_domain,
+                                    request: sd,
+                                });
                         }
                     }
                     Ok(TonConnectAppRequest::Unsupported { request_id, method }) => {
-                        if let Ok(enc) = stored.session.build_error_response(
+                        if let Ok(enc) = self.sessions[idx].session.build_error_response(
                             &request_id,
                             TonConnectErrorCode::MethodNotSupported,
                             &format!("Unsupported method: {method}"),
                         ) {
                             replies_to_send.push((
-                                stored.session.wallet_client_id(),
-                                stored.session.dapp_client_id(),
+                                self.sessions[idx].session.wallet_client_id(),
+                                self.sessions[idx].session.dapp_client_id(),
                                 enc,
                             ));
                         }
@@ -1100,24 +1253,6 @@ impl LiveWalletBackend {
                     }
                 }
             }
-        }
-
-        for (session_id, dapp_name, dapp_domain, tx_req) in incoming_txs {
-            let (estimated_fee_nano, emulation, ton_connect_emulation) =
-                self.emulate_ton_connect_tx(&tx_req);
-            self.pending_tx = Some(PendingTxApproval {
-                session_id,
-                dapp_name,
-                dapp_domain,
-                request: tx_req,
-                estimated_fee_nano,
-                emulation,
-                ton_connect_emulation,
-            });
-        }
-
-        for sd in incoming_sign_data {
-            self.pending_sign_data = Some(sd);
         }
 
         for (from_cid, to_cid, enc) in replies_to_send {
@@ -1132,20 +1267,10 @@ impl LiveWalletBackend {
         if !disconnected_ids.is_empty() {
             self.sessions
                 .retain(|s| !disconnected_ids.contains(&s.card.session_id));
-            if self
-                .pending_tx
-                .as_ref()
-                .is_some_and(|p| disconnected_ids.contains(&p.session_id))
-            {
-                self.pending_tx = None;
-            }
-            if self
-                .pending_sign_data
-                .as_ref()
-                .is_some_and(|p| disconnected_ids.contains(&p.session_id))
-            {
-                self.pending_sign_data = None;
-            }
+            self.pending_tx_queue
+                .retain(|p| !disconnected_ids.contains(&p.session_id));
+            self.pending_sign_data_queue
+                .retain(|p| !disconnected_ids.contains(&p.session_id));
         }
 
         if sessions_dirty && self.vault.is_unlocked() {
@@ -1309,15 +1434,16 @@ impl LiveWalletBackend {
         else {
             return DEFAULT_ESTIMATED_FEE_NANO;
         };
-        let Ok(kp) = self.load_keypair() else {
-            return DEFAULT_ESTIMATED_FEE_NANO;
-        };
-        let valid_until = now_unix_u64().saturating_add(300) as u32;
-        let Ok(signed) = contract.create_signed_transfer(&kp, self.seqno, valid_until, msgs) else {
+        // Security invariant (B7): `emulate_trace` uses `ignore_chksig = true`; NEVER call
+        // `load_keypair()` or sign with the real wallet key before the user confirms sending.
+        let valid_until = now_unix_u64().saturating_add(300).min(u64::from(u32::MAX)) as u32;
+        let Ok(unsigned) =
+            contract.create_unsigned_emulation_transfer(self.seqno, valid_until, msgs)
+        else {
             return DEFAULT_ESTIMATED_FEE_NANO;
         };
         let api = Arc::clone(toncenter);
-        let boc = signed.boc_base64;
+        let boc = unsigned.boc_base64;
         match block_on_runtime(
             &self.rt_handle,
             async move { api.emulate_trace(&boc).await },
@@ -1364,7 +1490,8 @@ impl LiveWalletBackend {
         self.history.clear();
         self.sessions.clear();
         self.pending_connect = None;
-        self.pending_tx = None;
+        self.pending_tx_queue.clear();
+        self.pending_sign_data_queue.clear();
 
         self.persist_vault_and_meta()?;
         if self.toncenter.is_some() {
@@ -1767,7 +1894,7 @@ impl WalletBackend for LiveWalletBackend {
     }
 
     fn pending_tx_approval(&self) -> Option<PendingTxApproval> {
-        self.pending_tx.clone()
+        self.pending_tx_queue.front().cloned()
     }
 
     fn handle_ton_connect_link(&mut self, raw_link: &str) -> Result<(), String> {
@@ -1813,6 +1940,28 @@ impl WalletBackend for LiveWalletBackend {
             .bridge
             .as_ref()
             .ok_or_else(|| "TON Connect bridge endpoint is not configured".to_owned())?;
+
+        // Security invariant (B8): bind the dApp identity and any ton_proof domain to the
+        // fetched manifest URL's host, and enforce `ton_connect_proof_domain_allowed` (blocking
+        // telegram.org / *.telegram.org spoofing).
+        let manifest_host = manifest_url_host(&pending.link.manifest_url)
+            .ok_or_else(|| "TON Connect manifestUrl must be a valid HTTPS URL".to_owned())?;
+        if !ton_connect_manifest_hosts_match(&pending.link.manifest_url, &pending.manifest) {
+            return Err(format!(
+                "TON Connect manifest host '{}' does not match manifestUrl host '{}'",
+                pending.manifest.host(),
+                manifest_host
+            ));
+        }
+        if pending.link.proof_payload.is_some()
+            && !ton_connect_proof_domain_allowed(&manifest_host, "")
+        {
+            return Err(format!(
+                "TON Proof domain '{}' is not allowed",
+                manifest_host
+            ));
+        }
+
         let kp = self.load_keypair()?;
 
         let wallet_tc_kp = TonConnectKeypair::generate();
@@ -1868,11 +2017,50 @@ impl WalletBackend for LiveWalletBackend {
         self.pending_connect = None;
     }
 
-    fn approve_ton_connect_tx(&mut self) -> Result<SendReceipt, String> {
+    fn approve_ton_connect_tx(
+        &mut self,
+        request_id: &str,
+        content_hash: &str,
+    ) -> Result<SendReceipt, String> {
         let pending = self
-            .pending_tx
-            .clone()
+            .pending_tx_queue
+            .front()
+            .cloned()
             .ok_or_else(|| "No pending TON Connect transaction".to_owned())?;
+        if pending.request.request_id != request_id || pending.content_hash() != content_hash {
+            return Err(
+                "Pending TON Connect transaction changed before approval; review the current request"
+                    .to_owned(),
+            );
+        }
+        let now = now_unix_u64();
+        let valid_until = match self.validate_ton_connect_tx_request(&pending.request, now) {
+            Ok(vu) => vu,
+            Err(reason) => {
+                self.pending_tx_queue.pop_front();
+                if let Some(bridge) = self.bridge.as_ref()
+                    && let Some(stored) = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.card.session_id == pending.session_id)
+                    && let Ok(enc) = stored.session.build_error_response(
+                        &pending.request.request_id,
+                        TonConnectErrorCode::BadRequest,
+                        &reason,
+                    )
+                {
+                    let from_cid = stored.session.wallet_client_id();
+                    let to_cid = stored.session.dapp_client_id();
+                    let bridge_ref = Arc::clone(bridge);
+                    let _ = block_on_runtime(&self.rt_handle, async move {
+                        bridge_ref
+                            .send_message(&from_cid, &to_cid, TON_CONNECT_TTL_SECS, &enc)
+                            .await
+                    });
+                }
+                return Err(reason);
+            }
+        };
         let contract = self
             .contract
             .as_ref()
@@ -1889,11 +2077,6 @@ impl WalletBackend for LiveWalletBackend {
 
         let msgs = Self::build_ton_connect_messages(&pending.request)?;
 
-        let now = now_unix_u64();
-        let valid_until = pending
-            .request
-            .valid_until
-            .unwrap_or(now.saturating_add(300)) as u32;
         let signed = contract
             .create_signed_transfer(&kp, self.seqno, valid_until, &msgs)
             .map_err(|e| e.to_string())?;
@@ -1970,7 +2153,7 @@ impl WalletBackend for LiveWalletBackend {
                 status: WalletTxStatus::Pending,
             },
         );
-        self.pending_tx = None;
+        self.pending_tx_queue.pop_front();
 
         Ok(SendReceipt {
             message_hash_hex: hash_hex,
@@ -1979,7 +2162,7 @@ impl WalletBackend for LiveWalletBackend {
     }
 
     fn decline_ton_connect_tx(&mut self) {
-        let Some(pending) = self.pending_tx.take() else {
+        let Some(pending) = self.pending_tx_queue.pop_front() else {
             return;
         };
         let Some(bridge) = self.bridge.as_ref() else {
@@ -2007,14 +2190,41 @@ impl WalletBackend for LiveWalletBackend {
     }
 
     fn pending_sign_data(&self) -> Option<PendingSignDataApproval> {
-        self.pending_sign_data.clone()
+        self.pending_sign_data_queue.front().cloned()
     }
 
-    fn approve_ton_connect_sign_data(&mut self) -> Result<SignDataResult, String> {
+    fn approve_ton_connect_sign_data(
+        &mut self,
+        request_id: &str,
+        content_hash: &str,
+    ) -> Result<SignDataResult, String> {
         let pending = self
-            .pending_sign_data
-            .clone()
+            .pending_sign_data_queue
+            .front()
+            .cloned()
             .ok_or_else(|| "No pending TON Connect signData request".to_owned())?;
+        if pending.request.request_id != request_id || pending.content_hash() != content_hash {
+            return Err(
+                "Pending TON Connect signData request changed before approval; review the current request"
+                    .to_owned(),
+            );
+        }
+        if !ton_connect_proof_domain_allowed(&pending.dapp_domain, "") {
+            self.pending_sign_data_queue.pop_front();
+            return Err(format!(
+                "TON Connect signData domain '{}' is not allowed",
+                pending.dapp_domain
+            ));
+        }
+        let session_host = self
+            .sessions
+            .iter()
+            .find(|s| s.card.session_id == pending.session_id)
+            .map(|s| s.card.manifest.host())
+            .unwrap_or_default();
+        if !session_host.is_empty() && !session_host.eq_ignore_ascii_case(&pending.dapp_domain) {
+            return Err("signData domain does not match connected dApp manifest host".to_owned());
+        }
         let contract = self
             .contract
             .as_ref()
@@ -2053,12 +2263,12 @@ impl WalletBackend for LiveWalletBackend {
             .map_err(|e| e.to_string())?;
         }
 
-        self.pending_sign_data = None;
+        self.pending_sign_data_queue.pop_front();
         Ok(signed)
     }
 
     fn decline_ton_connect_sign_data(&mut self) {
-        let Some(pending) = self.pending_sign_data.take() else {
+        let Some(pending) = self.pending_sign_data_queue.pop_front() else {
             return;
         };
         let Some(bridge) = self.bridge.as_ref() else {
@@ -2094,32 +2304,62 @@ impl WalletBackend for LiveWalletBackend {
             return Err("Session not found".to_owned());
         };
         let stored = self.sessions.remove(pos);
-        if let Some(bridge) = self.bridge.as_ref()
-            && let Ok(enc) = stored.session.build_disconnect_event(session_id)
-        {
-            let from_cid = stored.session.wallet_client_id();
-            let to_cid = stored.session.dapp_client_id();
-            let bridge_ref = Arc::clone(bridge);
-            let _ = block_on_runtime(&self.rt_handle, async move {
-                bridge_ref
-                    .send_message(&from_cid, &to_cid, TON_CONNECT_TTL_SECS, &enc)
-                    .await
-            });
+        if let Some(bridge) = self.bridge.as_ref() {
+            // Answer any pending queued requests for this session with an error before disconnecting.
+            for req in self
+                .pending_tx_queue
+                .iter()
+                .filter(|p| p.session_id == session_id)
+            {
+                if let Ok(enc) = stored.session.build_error_response(
+                    &req.request.request_id,
+                    TonConnectErrorCode::UserDeclined,
+                    "Session disconnected",
+                ) {
+                    let from_cid = stored.session.wallet_client_id();
+                    let to_cid = stored.session.dapp_client_id();
+                    let bridge_ref = Arc::clone(bridge);
+                    let _ = block_on_runtime(&self.rt_handle, async move {
+                        bridge_ref
+                            .send_message(&from_cid, &to_cid, TON_CONNECT_TTL_SECS, &enc)
+                            .await
+                    });
+                }
+            }
+            for req in self
+                .pending_sign_data_queue
+                .iter()
+                .filter(|p| p.session_id == session_id)
+            {
+                if let Ok(enc) = stored.session.build_error_response(
+                    &req.request.request_id,
+                    TonConnectErrorCode::UserDeclined,
+                    "Session disconnected",
+                ) {
+                    let from_cid = stored.session.wallet_client_id();
+                    let to_cid = stored.session.dapp_client_id();
+                    let bridge_ref = Arc::clone(bridge);
+                    let _ = block_on_runtime(&self.rt_handle, async move {
+                        bridge_ref
+                            .send_message(&from_cid, &to_cid, TON_CONNECT_TTL_SECS, &enc)
+                            .await
+                    });
+                }
+            }
+            if let Ok(enc) = stored.session.build_disconnect_event(session_id) {
+                let from_cid = stored.session.wallet_client_id();
+                let to_cid = stored.session.dapp_client_id();
+                let bridge_ref = Arc::clone(bridge);
+                let _ = block_on_runtime(&self.rt_handle, async move {
+                    bridge_ref
+                        .send_message(&from_cid, &to_cid, TON_CONNECT_TTL_SECS, &enc)
+                        .await
+                });
+            }
         }
-        if self
-            .pending_tx
-            .as_ref()
-            .is_some_and(|p| p.session_id == session_id)
-        {
-            self.pending_tx = None;
-        }
-        if self
-            .pending_sign_data
-            .as_ref()
-            .is_some_and(|p| p.session_id == session_id)
-        {
-            self.pending_sign_data = None;
-        }
+        self.pending_tx_queue.retain(|p| p.session_id != session_id);
+        self.pending_sign_data_queue
+            .retain(|p| p.session_id != session_id);
         if self.vault.is_unlocked() {
             let _ = self.persist_ton_connect_sessions();
         }
@@ -2845,4 +3085,272 @@ fn validate_handoff_url(raw: &str) -> Result<String, String> {
         return Err("Handoff URL is missing host".to_owned());
     }
     Ok(parsed.to_string())
+}
+
+#[cfg(test)]
+mod sec2c_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tg_platform::wallet_protection::FakeWalletKeyProtector;
+    use tg_wallet::WalletError;
+    use tg_wallet::toncenter::{
+        AddressInfo, BoxFuture, EmulatedTrace, GetMethodResult, SendBocResult, TonTransaction,
+    };
+    use tg_wallet::tonconnect::BridgeEvent;
+
+    struct InspectVaultToncenter {
+        wallet_dir: PathBuf,
+        passcode: String,
+        seen_on_disk_last_event_id: Mutex<Option<Option<String>>>,
+    }
+
+    impl ToncenterApi for InspectVaultToncenter {
+        fn get_address_information<'a>(
+            &'a self,
+            _address: &'a str,
+        ) -> BoxFuture<'a, Result<AddressInfo, WalletError>> {
+            Box::pin(async {
+                Ok(AddressInfo {
+                    balance_nano: 10_000_000_000,
+                    state: AccountState::Active,
+                    last_tx_lt: 1,
+                    last_tx_hash: "00".repeat(32),
+                    never_used: false,
+                })
+            })
+        }
+
+        fn get_transactions<'a>(
+            &'a self,
+            _address: &'a str,
+            _limit: usize,
+            _lt: Option<u64>,
+            _hash: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Vec<TonTransaction>, WalletError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn send_boc<'a>(
+            &'a self,
+            _boc_base64: &'a str,
+        ) -> BoxFuture<'a, Result<SendBocResult, WalletError>> {
+            Box::pin(async {
+                Ok(SendBocResult {
+                    ok: true,
+                    hash: Some("aa".repeat(32)),
+                })
+            })
+        }
+
+        fn run_get_method<'a>(
+            &'a self,
+            _address: &'a str,
+            _method: &'a str,
+            _stack: &'a [Value],
+        ) -> BoxFuture<'a, Result<GetMethodResult, WalletError>> {
+            Box::pin(async {
+                Ok(GetMethodResult {
+                    exit_code: 0,
+                    stack: vec![json!(["num", "0x1"])],
+                })
+            })
+        }
+
+        fn emulate_trace<'a>(
+            &'a self,
+            _boc_base64: &'a str,
+        ) -> BoxFuture<'a, Result<EmulatedTrace, WalletError>> {
+            Box::pin(async {
+                Ok(EmulatedTrace {
+                    fee_nano: 5_000_000,
+                    account: format!("0:{}", "11".repeat(32)),
+                })
+            })
+        }
+
+        fn emulate_message<'a>(
+            &'a self,
+            _request: &'a EmulateMessageRequest,
+        ) -> BoxFuture<'a, Result<EmulationResult, WalletError>> {
+            Box::pin(async move {
+                // Inspect the persisted encrypted vault on disk WHILE processing the event.
+                // On the old code, `persist_ton_connect_sessions` was only called at the end of
+                // `poll_ton_connect_events`, so `last_event_id` on disk was still `None` here.
+                let mut disk_vault =
+                    LocalKeyVault::load_from_dir(1, &self.wallet_dir).expect("load vault");
+                disk_vault.unlock(&self.passcode).expect("unlock vault");
+                let raw = disk_vault
+                    .read_secret(VAULT_SECRET_TON_CONNECT)
+                    .expect("read persisted tonconnect sessions");
+                let bundle: PersistedTonConnectBundle =
+                    serde_json::from_slice(raw.as_slice()).expect("decode bundle");
+                let persisted_id = bundle
+                    .sessions
+                    .first()
+                    .and_then(|s| s.last_event_id.clone());
+                *self.seen_on_disk_last_event_id.lock().unwrap() = Some(persisted_id);
+                Ok(EmulationResult {
+                    mc_block_seqno: Some(1),
+                    root_tx_hash: "root".to_owned(),
+                    root_account: format!("0:{}", "11".repeat(32)),
+                    total_fees_nano: 5_000_000,
+                    root_fee_nano: 5_000_000,
+                    total_gas_fees_nano: 3_000_000,
+                    total_storage_fees_nano: 100_000,
+                    total_fwd_fees_nano: 1_900_000,
+                    is_incomplete: false,
+                    trace_succeeded: true,
+                    transactions: Vec::new(),
+                    account_deltas: Vec::new(),
+                    warnings: Vec::new(),
+                    raw_actions: Vec::new(),
+                })
+            })
+        }
+    }
+
+    struct RecordingFakeBridge {
+        manifest: DappManifest,
+        inbox: Mutex<Vec<BridgeEvent>>,
+        polled_last_ids: Mutex<Vec<Option<String>>>,
+    }
+
+    impl TonConnectBridge for RecordingFakeBridge {
+        fn fetch_manifest<'a>(
+            &'a self,
+            _manifest_url: &'a str,
+        ) -> BoxFuture<'a, Result<DappManifest, WalletError>> {
+            let m = self.manifest.clone();
+            Box::pin(async move { Ok(m) })
+        }
+
+        fn send_message<'a>(
+            &'a self,
+            _from_client_id: &'a str,
+            _to_client_id: &'a str,
+            _ttl_secs: u32,
+            _encrypted_base64: &'a str,
+        ) -> BoxFuture<'a, Result<(), WalletError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn poll_events<'a>(
+            &'a self,
+            _client_id: &'a str,
+            last_event_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Vec<BridgeEvent>, WalletError>> {
+            let recorded = last_event_id.map(str::to_owned);
+            Box::pin(async move {
+                self.polled_last_ids.lock().unwrap().push(recorded);
+                Ok(std::mem::take(&mut *self.inbox.lock().unwrap()))
+            })
+        }
+    }
+
+    #[test]
+    fn sec2c_w1_ton_connect_persists_last_event_id_before_processing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wallet_dir = tmp.path().to_path_buf();
+        let passcode = "test-passcode-123";
+
+        let toncenter = Arc::new(InspectVaultToncenter {
+            wallet_dir: wallet_dir.clone(),
+            passcode: passcode.to_owned(),
+            seen_on_disk_last_event_id: Mutex::new(None),
+        });
+        let manifest = DappManifest {
+            url: "https://demoswap.example".to_owned(),
+            name: "Demo Swap".to_owned(),
+            icon_url: String::new(),
+        };
+        let bridge = Arc::new(RecordingFakeBridge {
+            manifest: manifest.clone(),
+            inbox: Mutex::new(Vec::new()),
+            polled_last_ids: Mutex::new(Vec::new()),
+        });
+        let protector: Arc<dyn WalletKeyProtector> = Arc::new(FakeWalletKeyProtector::new());
+
+        let mut backend = LiveWalletBackend::with_dependencies(
+            1,
+            wallet_dir.clone(),
+            rt.handle().clone(),
+            WalletAppConfig::default(),
+            Some(Arc::clone(&toncenter) as Arc<dyn ToncenterApi>),
+            Some(Arc::clone(&bridge) as Arc<dyn TonConnectBridge>),
+            Arc::clone(&protector),
+            PasscodeKdf::fast_test_kdf(),
+        );
+        let words = generate_mnemonic("").expect("synthetic test mnemonic");
+        backend
+            .create_wallet(&words, WalletVersion::V5R1, passcode)
+            .expect("create synthetic wallet");
+
+        // Pair a synthetic TON Connect dApp session without touching any network.
+        let dapp_kp = TonConnectKeypair::generate();
+        let connect_url = format!(
+            "tc://?v=2&id={}&r=%7B%22manifestUrl%22%3A%22https%3A%2F%2Fdemoswap.example%2Ftonconnect-manifest.json%22%2C%22items%22%3A%5B%7B%22name%22%3A%22ton_addr%22%7D%5D%7D",
+            dapp_kp.client_id()
+        );
+        backend
+            .handle_ton_connect_link(&connect_url)
+            .expect("begin connect");
+        backend
+            .approve_ton_connect()
+            .expect("approve synthetic connect");
+
+        let wallet_cid = backend.sessions[0].session.wallet_client_id();
+        let dapp_session = TonConnectSession::new(dapp_kp, &wallet_cid, manifest).unwrap();
+        let dest = TonAddress::new(0, [0x33_u8; 32]).to_friendly(true, false);
+        let tx_req = json!({
+            "id": "w1-poison-tx",
+            "method": "sendTransaction",
+            "params": [json!({
+                "valid_until": now_unix_u64() + 600,
+                "network": "-239",
+                "messages": [{
+                    "address": dest,
+                    "amount": "100000000"
+                }]
+            }).to_string()]
+        })
+        .to_string();
+        bridge.inbox.lock().unwrap().push(BridgeEvent {
+            id: Some("ev-w1-poison-42".to_owned()),
+            from: dapp_session.wallet_client_id(),
+            message: dapp_session.encrypt_message(tx_req.as_bytes()).unwrap(),
+        });
+
+        assert_eq!(backend.poll_ton_connect_events().unwrap(), 1);
+        assert_eq!(
+            *toncenter.seen_on_disk_last_event_id.lock().unwrap(),
+            Some(Some("ev-w1-poison-42".to_owned())),
+            "last_event_id must be persisted to disk BEFORE processing/emulating the event"
+        );
+
+        // Reloading from disk after a simulated crash must resume AFTER `ev-w1-poison-42`.
+        let mut reloaded = LiveWalletBackend::with_dependencies(
+            1,
+            wallet_dir,
+            rt.handle().clone(),
+            WalletAppConfig::default(),
+            Some(Arc::clone(&toncenter) as Arc<dyn ToncenterApi>),
+            Some(Arc::clone(&bridge) as Arc<dyn TonConnectBridge>),
+            protector,
+            PasscodeKdf::fast_test_kdf(),
+        );
+        reloaded
+            .unlock_vault(passcode)
+            .expect("unlock reloaded wallet");
+        assert_eq!(reloaded.poll_ton_connect_events().unwrap(), 0);
+        let polled = bridge.polled_last_ids.lock().unwrap();
+        assert_eq!(
+            polled.last().cloned().flatten().as_deref(),
+            Some("ev-w1-poison-42"),
+            "reloaded session must poll with persisted last_event_id so poison event is not re-delivered"
+        );
+    }
 }

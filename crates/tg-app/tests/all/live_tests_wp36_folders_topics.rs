@@ -690,6 +690,7 @@ fn wp36_peer_rank_tag_sanitization_and_rpc() {
         bot_reads_all_messages: false,
         has_mini_app: false,
         media_counts: SharedMediaCounts::default(),
+        group_call: Default::default(),
     };
     let member = MemberEntry {
         peer_id: h.bob_peer,

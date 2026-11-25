@@ -271,6 +271,16 @@ pub trait AppSession:
     /// Takes any queued Mini App / HTML5 Game launch URL for `bot_id`.
     fn take_pending_mini_app_url(&mut self, bot_id: PeerId) -> Option<String>;
 
+    /// Returns `true` if `bot_id` has already been confirmed by the user for opening Mini Apps
+    /// without showing the consent box again (`Storage::Account::isPeerTrustedOpenWebView`).
+    fn is_mini_app_bot_trusted(&self, _bot_id: PeerId) -> bool {
+        false
+    }
+
+    /// Marks `bot_id` as trusted for opening Mini Apps and schedules encrypted persistence in
+    /// per-account `StoredSessionSettings` (`Storage::Account::markPeerTrustedOpenWebView`).
+    fn trust_mini_app_bot(&mut self, _bot_id: PeerId) {}
+
     /// Drains any pending chat navigation requests emitted by notifications or the media viewer.
     fn take_pending_chat_opens(&self) -> Vec<PendingChatOpen>;
 
@@ -450,6 +460,11 @@ pub trait AppSession:
     fn is_live_session(&self) -> bool {
         false
     }
+
+    /// Called once when `peer_id` becomes the chat shown in the history column, before the
+    /// history view asks for its data, so a live session can send the chat's requests together
+    /// (tdesktop sends them asynchronously from `HistoryWidget::showHistory`).
+    fn prepare_open_chat(&self, _peer_id: PeerId) {}
 
     /// Resolves a username (`@handle` or `handle`), hitting `contacts.resolveUsername` in live mode
     /// when not yet present in the local cache.

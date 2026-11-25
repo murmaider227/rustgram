@@ -5,7 +5,7 @@
 
 use tg_data::{
     AllowedReactions, AllowedReactionsType, Birthday, BlockStatus, BotCommand, BotInfo,
-    BotVerifyDetails, CallsStatus, Channel, ChannelFlags, ChannelId, ChannelLocation, Chat,
+    BotVerifyDetails, CallId, CallsStatus, Channel, ChannelFlags, ChannelId, ChannelLocation, Chat,
     ChatAdminRights, ChatBannedRights, ChatFlags, ChatId, ChatRestrictionsInfo, CollectibleId,
     ContactStatus, DialogKey, DocumentId, EmojiStatus, LastseenStatus, LoadedStatus, MsgId,
     PeerBarSettings, PeerCommon, PeerId, PeerNotifySettings, PeerUpdateFlags, PhotoId, ProfileTab,
@@ -14,7 +14,7 @@ use tg_data::{
 };
 use tg_tl::{enums as tl_enums, types as tl_types};
 
-use crate::convert::media::{geo_point_from_tl, photo_id_from_tl, reaction_from_tl};
+use crate::convert::media::{geo_point_from_tl, photo_from_tl, photo_id_from_tl, reaction_from_tl};
 use crate::convert::messages::text_with_entities_from_tl;
 
 /// Converts a TL `Peer` into a `tg_data::PeerId`.
@@ -1028,6 +1028,33 @@ pub fn apply_tl_user_full(session: &mut Session, tl_full: &tl_enums::UserFull) -
         }
     }
 
+    // Cache full profile/personal/fallback `PhotoData` (including `access_hash` and
+    // `file_reference`) and resolve the active `userpic_photo_id` with tdesktop priority:
+    // personal > profile > fallback (`data/data_session.cpp` / `api/api_peer_photo.cpp`).
+    let mut active_photo_id: Option<PhotoId> = None;
+    let mut explicitly_empty = false;
+    for photo in [&f.fallback_photo, &f.profile_photo, &f.personal_photo]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(data) = photo_from_tl(photo) {
+            active_photo_id = Some(data.id);
+            session.cache_photo(data);
+        } else {
+            explicitly_empty = true;
+        }
+    }
+    if let Some(pid) = active_photo_id {
+        user.common.userpic_photo_id = pid;
+    } else if explicitly_empty
+        || (f.personal_photo.is_none()
+            && f.profile_photo.is_none()
+            && f.fallback_photo.is_none()
+            && user.common.userpic_photo_id == tg_data::UNKNOWN_PHOTO_ID)
+    {
+        user.common.userpic_photo_id = PhotoId::ZERO;
+    }
+
     user.common.loaded_status = LoadedStatus::Full;
     session.upsert_user(
         user,
@@ -1294,10 +1321,14 @@ pub fn apply_tl_chat(session: &mut Session, tl_chat: &tl_enums::Chat) -> Option<
             flags.set(ChannelFlags::FORUM_TABS, d.forum_tabs);
             flags.set(ChannelFlags::AUTO_TRANSLATION, d.autotranslation);
             flags.set(ChannelFlags::MONOFORUM, d.monoforum);
-            flags.set(
-                ChannelFlags::MONOFORUM_DISABLED,
-                !d.broadcast_messages_allowed,
-            );
+            // Match `Data::Session::processChat` + `ChannelData::setMonoforumLink`
+            // (`data/data_session.cpp:1219,1240-1242`, `data/data_channel.cpp:369-390`):
+            // `MONOFORUM_DISABLED` applies only to monoforums when unlinked from their broadcast
+            // channel, never from a regular channel's `!broadcast_messages_allowed`.
+            if !d.monoforum {
+                flags.remove(ChannelFlags::MONOFORUM_DISABLED);
+            }
+            ch.broadcast_messages_allowed = d.broadcast_messages_allowed;
 
             if !is_min {
                 // `date`, `creator`, `left`, `admin_rights`, `banned_rights`, `stories_hidden`
@@ -1354,8 +1385,18 @@ pub fn apply_tl_chat(session: &mut Session, tl_chat: &tl_enums::Chat) -> Option<
                 ch.stars_per_message = 0;
                 flags.remove(ChannelFlags::HAS_STARS_PER_MESSAGE);
             }
-            if let Some(mono) = d.linked_monoforum_id {
-                ch.monoforum_link = Some(ChannelId::from_tl(mono));
+            let prev_monoforum_link = ch.monoforum_link;
+            let linked_monoforum_id = d
+                .linked_monoforum_id
+                .filter(|&id| id != 0)
+                .map(ChannelId::from_tl);
+            if let Some(mono) = linked_monoforum_id {
+                ch.monoforum_link = Some(mono);
+                if d.monoforum {
+                    flags.remove(ChannelFlags::MONOFORUM_DISABLED);
+                }
+            } else if d.monoforum && prev_monoforum_link.is_some() {
+                flags.insert(ChannelFlags::MONOFORUM_DISABLED);
             }
             if let Some(comm) = d.linked_community_id {
                 ch.linked_community_id = Some(ChannelId::from_tl(comm));
@@ -1396,6 +1437,33 @@ pub fn apply_tl_chat(session: &mut Session, tl_chat: &tl_enums::Chat) -> Option<
                     | PeerUpdateFlags::MEMBERS
                     | PeerUpdateFlags::RIGHTS,
             );
+            // Mirror `ChannelData::setMonoforumLink` (`data/data_channel.cpp:369-390`):
+            // linking/unlinking a broadcast channel updates `MONOFORUM_DISABLED` on the linked
+            // monoforum channel only.
+            if d.broadcast {
+                if let Some(mono_id) = linked_monoforum_id {
+                    if let Some(tg_data::Peer::Channel(mono)) =
+                        session.peer_mut(PeerId::from_channel(mono_id))
+                        && mono.is_monoforum()
+                    {
+                        mono.monoforum_link = Some(chid);
+                        mono.flags.remove(ChannelFlags::MONOFORUM_DISABLED);
+                    }
+                } else if let Some(old_mono_id) = prev_monoforum_link
+                    && let Some(tg_data::Peer::Channel(mono)) =
+                        session.peer_mut(PeerId::from_channel(old_mono_id))
+                    && mono.is_monoforum()
+                {
+                    mono.flags.insert(ChannelFlags::MONOFORUM_DISABLED);
+                }
+            } else if d.monoforum
+                && let Some(bc_id) = linked_monoforum_id
+                && let Some(tg_data::Peer::Channel(bc)) =
+                    session.peer_mut(PeerId::from_channel(bc_id))
+                && bc.is_broadcast()
+            {
+                bc.monoforum_link = Some(chid);
+            }
             Some(peer_id)
         }
         tl_enums::Chat::Community(c) => {
@@ -1515,6 +1583,17 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
             {
                 chat.invite_link = inv.link.clone();
             }
+            match &f.call {
+                Some(tl_enums::InputGroupCall::InputGroupCall(gc)) => {
+                    chat.group_call = Some((CallId::from_tl(gc.id), gc.access_hash as u64));
+                    chat.flags.insert(ChatFlags::CALL_ACTIVE);
+                }
+                _ => {
+                    chat.group_call = None;
+                    chat.flags
+                        .remove(ChatFlags::CALL_ACTIVE | ChatFlags::CALL_NOT_EMPTY);
+                }
+            }
 
             match &f.participants {
                 tl_enums::ChatParticipants::ChatParticipants(ps) => {
@@ -1554,10 +1633,13 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
                 tl_enums::ChatParticipants::Forbidden(_) => {}
             }
 
-            if let Some(photo) = &f.chat_photo
-                && let Some(pid) = photo_id_from_tl(photo)
-            {
-                chat.common.userpic_photo_id = pid;
+            if let Some(photo) = &f.chat_photo {
+                if let Some(data) = photo_from_tl(photo) {
+                    chat.common.userpic_photo_id = data.id;
+                    session.cache_photo(data);
+                } else {
+                    chat.common.userpic_photo_id = PhotoId::ZERO;
+                }
             }
             chat.common.loaded_status = LoadedStatus::Full;
             session.upsert_chat(
@@ -1618,6 +1700,16 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
                 ch.stars_per_message = stars as i32;
                 flags.set(ChannelFlags::HAS_STARS_PER_MESSAGE, stars > 0);
             }
+            match &f.call {
+                Some(tl_enums::InputGroupCall::InputGroupCall(gc)) => {
+                    ch.group_call = Some((CallId::from_tl(gc.id), gc.access_hash as u64));
+                    flags.insert(ChannelFlags::CALL_ACTIVE);
+                }
+                _ => {
+                    ch.group_call = None;
+                    flags.remove(ChannelFlags::CALL_ACTIVE | ChannelFlags::CALL_NOT_EMPTY);
+                }
+            }
             ch.set_flags(flags);
 
             if let Some(count) = f.participants_count {
@@ -1655,8 +1747,11 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
             {
                 ch.invite_link = inv.link.clone();
             }
-            if let Some(pid) = photo_id_from_tl(&f.chat_photo) {
-                ch.common.userpic_photo_id = pid;
+            if let Some(data) = photo_from_tl(&f.chat_photo) {
+                ch.common.userpic_photo_id = data.id;
+                session.cache_photo(data);
+            } else {
+                ch.common.userpic_photo_id = PhotoId::ZERO;
             }
 
             let migrated_from = f.migrated_from_chat_id.map(ChatId::from_tl);
@@ -1718,8 +1813,11 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
             if let Some(kicked) = f.kicked_count {
                 ch.kicked_count = kicked;
             }
-            if let Some(pid) = photo_id_from_tl(&f.chat_photo) {
-                ch.common.userpic_photo_id = pid;
+            if let Some(data) = photo_from_tl(&f.chat_photo) {
+                ch.common.userpic_photo_id = data.id;
+                session.cache_photo(data);
+            } else {
+                ch.common.userpic_photo_id = PhotoId::ZERO;
             }
             ch.common.loaded_status = LoadedStatus::Full;
             session.upsert_channel(ch, PeerUpdateFlags::FULL_INFO | PeerUpdateFlags::ABOUT);

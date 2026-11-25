@@ -114,6 +114,10 @@ struct DefaultTagReactionsCache {
     received_ms: u64,
 }
 
+/// Minimum polling interval for `messages.getMessagesReactions` on visible group/channel
+/// messages (`kPollEach = 20 * 1000` in `data/data_message_reactions.cpp:49`).
+pub const REACTIONS_POLL_INTERVAL_MS: u64 = 20_000;
+
 #[derive(Debug, Default)]
 struct StickersReactionsExtrasState {
     updates_listener_started: bool,
@@ -126,6 +130,7 @@ struct StickersReactionsExtrasState {
     paid_reaction_privacy_loaded: bool,
     paid_reaction_privacy: PaidReactionPrivacy,
     message_paid_reaction_privacy: HashMap<(PeerId, MsgId), PaidReactionPrivacy>,
+    reactions_last_polled_ms: HashMap<(PeerId, MsgId), u64>,
 }
 
 struct RegistryEntry {
@@ -228,6 +233,18 @@ fn read_session<R: Send>(live: &LiveSession, f: impl FnOnce(&Session) -> R + Sen
     block_on_runtime(live.runtime().tokio_handle(), async move {
         let guard = arc.read().await;
         f(&guard)
+    })
+}
+
+fn write_session<R: Send>(live: &LiveSession, f: impl FnOnce(&mut Session) -> R + Send) -> R {
+    let lock = live.runtime().session();
+    if let Ok(mut guard) = lock.try_write() {
+        return f(&mut guard);
+    }
+    let arc = Arc::clone(lock);
+    block_on_runtime(live.runtime().tokio_handle(), async move {
+        let mut guard = arc.write().await;
+        f(&mut guard)
     })
 }
 
@@ -426,28 +443,44 @@ fn resolve_input_stickered_media(
             id,
             access_hash,
             file_reference,
-        } => Ok(tl_enums::InputStickeredMedia::Photo(
-            tl_types::InputStickeredMediaPhoto {
-                id: tl_enums::InputPhoto::InputPhoto(tl_types::InputPhoto {
-                    id: *id,
-                    access_hash: *access_hash,
-                    file_reference: file_reference.clone(),
-                }),
-            },
-        )),
+        } => {
+            if *id == 0 || *access_hash == 0 {
+                return Err(
+                    "Attached stickers photo reference is missing a valid server ID or access_hash."
+                        .to_owned(),
+                );
+            }
+            Ok(tl_enums::InputStickeredMedia::Photo(
+                tl_types::InputStickeredMediaPhoto {
+                    id: tl_enums::InputPhoto::InputPhoto(tl_types::InputPhoto {
+                        id: *id,
+                        access_hash: *access_hash,
+                        file_reference: file_reference.clone(),
+                    }),
+                },
+            ))
+        }
         AttachedStickersMedia::Document {
             id,
             access_hash,
             file_reference,
-        } => Ok(tl_enums::InputStickeredMedia::Document(
-            tl_types::InputStickeredMediaDocument {
-                id: tl_enums::InputDocument::InputDocument(tl_types::InputDocument {
-                    id: *id,
-                    access_hash: *access_hash,
-                    file_reference: file_reference.clone(),
-                }),
-            },
-        )),
+        } => {
+            if *id == 0 || *access_hash == 0 {
+                return Err(
+                    "Attached stickers document reference is missing a valid server ID or access_hash."
+                        .to_owned(),
+                );
+            }
+            Ok(tl_enums::InputStickeredMedia::Document(
+                tl_types::InputStickeredMediaDocument {
+                    id: tl_enums::InputDocument::InputDocument(tl_types::InputDocument {
+                        id: *id,
+                        access_hash: *access_hash,
+                        file_reference: file_reference.clone(),
+                    }),
+                },
+            ))
+        }
         AttachedStickersMedia::Message { peer_id, msg_id } => {
             let full_id = DataFullMsgId::new(to_data_peer(*peer_id), to_data_msg(*msg_id));
             read_session(live, |session| {
@@ -875,6 +908,44 @@ impl LiveSession {
         Ok(remote_codes)
     }
 
+    /// Best-effort emoji-keyword language refresh triggered by live emoji-keyword lookup
+    /// (`EmojiKeywords::refresh` -> `refreshRemoteList`, `chat_helpers/emoji_keywords.cpp:552-560, 692-717`).
+    ///
+    /// Respects [`EMOJI_KEYWORDS_REFRESH_MS`] (1 hour) per active language list; on RPC failure
+    /// caches the failed timestamp for that list so repeated keystrokes do not flood RPCs.
+    pub(crate) fn ensure_emoji_keywords_languages_refreshed(&self) {
+        let active_lang = {
+            let code = self.langpack().active_language_code();
+            if code.trim().is_empty() {
+                "en".to_owned()
+            } else {
+                code
+            }
+        };
+        let mut lang_codes = vec![active_lang];
+        if !lang_codes.iter().any(|c| c.eq_ignore_ascii_case("en")) {
+            lang_codes.push("en".to_owned());
+        }
+        if let Err(err) = self.emoji_keywords_languages_live(&lang_codes, false) {
+            debug!(error = %err, "auto messages.getEmojiKeywordsLanguages refresh failed");
+            let state = state_for_live(self);
+            let now_ms = now_ms_u64(self);
+            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+            if g.emoji_keywords_languages
+                .as_ref()
+                .is_none_or(|c| c.requested_codes != lang_codes)
+            {
+                g.emoji_keywords_languages = Some(EmojiKeywordsLanguagesCache {
+                    requested_codes: lang_codes,
+                    remote_codes: Vec::new(),
+                    received_ms: now_ms,
+                });
+            } else if let Some(cache) = g.emoji_keywords_languages.as_mut() {
+                cache.received_ms = now_ms;
+            }
+        }
+    }
+
     /// `account.getDefaultProfilePhotoEmojis`, `account.getDefaultGroupPhotoEmojis`,
     /// `account.getDefaultBackgroundEmojis`, and `account.getChannelRestrictedStatusEmojis` —
     /// hash-cached default custom-emoji catalogs (`api/api_peer_photo.cpp:854-899`).
@@ -982,8 +1053,79 @@ impl LiveSession {
         self.runtime()
             .apply_updates_blocking(updates)
             .map_err(|e| format!("failed to apply messages.getMessagesReactions updates: {e}"))?;
+        let state = state_for_live(self);
+        let now_ms = now_ms_u64(self);
+        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+        for &mid in msg_ids {
+            g.reactions_last_polled_ms.insert((peer_id, mid), now_ms);
+        }
+        drop(g);
         self.bridge_state().notify_ui();
         Ok(())
+    }
+
+    /// Polls visible messages in a group/channel that already carry reactions via
+    /// `messages.getMessagesReactions`, respecting tdesktop's 20-second `kPollEach` interval
+    /// and skipping 1:1 user peers (`Data::Reactions::poll` & `pollCollected`,
+    /// `data/data_message_reactions.cpp:1512-1535, 1696-1729`).
+    ///
+    /// Returns the subset of `msg_ids` that were actually polled on this call.
+    pub fn poll_visible_messages_reactions_live(
+        &self,
+        peer_id: PeerId,
+        msg_ids: &[MsgId],
+    ) -> Result<Vec<MsgId>, String> {
+        let data_peer = to_data_peer(peer_id);
+        if data_peer.is_user() || msg_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now_ms = now_ms_u64(self);
+        let state = state_for_live(self);
+        let due_candidates: Vec<MsgId> = {
+            let g = state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = Vec::with_capacity(msg_ids.len());
+            for &mid in msg_ids {
+                if mid.0 <= 0 || seen.contains(&mid) {
+                    continue;
+                }
+                let due = g
+                    .reactions_last_polled_ms
+                    .get(&(peer_id, mid))
+                    .is_none_or(|&last| now_ms.saturating_sub(last) >= REACTIONS_POLL_INTERVAL_MS);
+                if due {
+                    seen.push(mid);
+                }
+            }
+            seen
+        };
+        if due_candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let with_reactions: Vec<MsgId> = read_session(self, |session| {
+            due_candidates
+                .into_iter()
+                .filter(|&mid| {
+                    let full_id = DataFullMsgId::new(data_peer, to_data_msg(mid));
+                    session
+                        .message(full_id)
+                        .and_then(|m| m.reactions.as_ref())
+                        .is_some_and(|r| !r.is_empty())
+                })
+                .collect()
+        });
+        if with_reactions.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Record poll attempt timestamp before invoking so transient errors also respect
+        // `kPollEach` instead of re-polling on every frame.
+        {
+            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+            for &mid in &with_reactions {
+                g.reactions_last_polled_ms.insert((peer_id, mid), now_ms);
+            }
+        }
+        self.refresh_messages_reactions_live(peer_id, &with_reactions)?;
+        Ok(with_reactions)
     }
 
     /// `messages.getDefaultTagReactions` — hash-cached default Saved Messages tag reactions
@@ -1167,7 +1309,9 @@ impl LiveSession {
     }
 
     /// `messages.deleteParticipantReactions` — removes all reactions by `participant_id`
-    /// across `peer_id` (`apiwrap.cpp:1566-1582`).
+    /// across `peer_id` (`apiwrap.cpp:1566-1582`) and optimistically strips `participant_id`'s
+    /// reactions across cached messages in `peer_id`, matching
+    /// `Session::removeReactionsFromParticipant` (`data/data_session.cpp:3518-3544`).
     pub fn delete_participant_reactions_live(
         &mut self,
         peer_id: PeerId,
@@ -1178,6 +1322,11 @@ impl LiveSession {
         let ok =
             self.ch_invoke_rpc(tl_fns::messages::DeleteParticipantReactions { peer, participant })?;
         if ok {
+            let data_peer = to_data_peer(peer_id);
+            let data_participant = to_data_peer(participant_id);
+            write_session(self, |s| {
+                s.remove_reactions_from_participant(data_peer, None, data_participant, None);
+            });
             self.bridge_state().notify_ui();
         }
         Ok(ok)

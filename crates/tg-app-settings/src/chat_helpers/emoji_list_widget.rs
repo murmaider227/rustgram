@@ -3,18 +3,20 @@
 //! Port origin: `Telegram/SourceFiles/chat_helpers/emoji_list_widget.h`,
 //! `Telegram/SourceFiles/chat_helpers/emoji_list_widget.cpp`, and `chat_helpers.style`.
 
+use std::collections::HashMap;
+
 use egui::{
-    Align2, Area, Color32, CornerRadius, Frame, Id, Key, Margin, Order, Pos2, Rect, ScrollArea,
-    Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    Align2, Area, Color32, CornerRadius, FontId, Frame, Id, Key, Margin, Order, Pos2, Rect,
+    ScrollArea, Sense, Stroke, StrokeKind, TextEdit, TextureHandle, TextureOptions, Ui, Vec2,
 };
-use tg_chat::emoji::{SkinTone, strip_skin_tone};
-use tg_emoji::EmojiTextureCache;
+use tg_chat::emoji::SkinTone;
+use tg_emoji::{EmojiAtlas, EmojiTextureCache};
 use tg_lang::tr;
 use tg_text::emoji::{self, EmojiRef, Section};
 use tg_ui::fonts::font_id_from_style;
-use tg_ui::tg_style::st;
+use tg_ui::tg_style::{Icon, st};
 
-use crate::chat_helpers::backend::ChatHelpersBackend;
+use crate::chat_helpers::backend::{ChatHelpersBackend, EmojiGroupInfo};
 use crate::chat_helpers::paint_helper_icon;
 use tg_app_core::stand_in::theme::Palette;
 
@@ -73,6 +75,33 @@ pub const fn section_footer_glyph(section: Section) -> &'static str {
     }
 }
 
+/// Footer icon pair (normal, active) for a Unicode emoji category (`defaultComposeIcons`).
+fn footer_icons_for(section: Section) -> (Icon, Icon) {
+    let icons = &st::default_compose_icons;
+    match section {
+        Section::Recent => (icons.recent, icons.recent_active),
+        Section::People => (icons.people, icons.people_active),
+        Section::Nature => (icons.nature, icons.nature_active),
+        Section::Food => (icons.food, icons.food_active),
+        Section::Activity => (icons.activity, icons.activity_active),
+        Section::Travel => (icons.travel, icons.travel_active),
+        Section::Objects => (icons.objects, icons.objects_active),
+        Section::Symbols => (icons.symbols, icons.symbols_active),
+    }
+}
+
+/// Inner margin of the scrolling emoji / sticker lists: `defaultEmojiPan.margin` plus
+/// `defaultEmojiPan.padding` (left 7 + 7, right 7 + 4, bottom 7).
+pub(crate) fn emoji_list_margin() -> Margin {
+    let pan = &st::default_emoji_pan;
+    Margin {
+        left: (pan.margin.left.0 + pan.padding.left.0) as i8,
+        right: (pan.margin.right.0 + pan.padding.right.0) as i8,
+        top: 0,
+        bottom: pan.padding.bottom.0 as i8,
+    }
+}
+
 /// Active skin-tone variant popup state (`EmojiColorPicker` in `emoji_list_widget.cpp`).
 #[derive(Debug, Clone)]
 pub struct SkinTonePopup {
@@ -104,6 +133,10 @@ pub struct EmojiListWidget {
     press_hold: Option<(EmojiRef, Rect, f64)>,
     color_picker: Option<SkinTonePopup>,
     section_cache: Vec<(Section, Vec<EmojiRef>)>,
+    active_group: Option<usize>,
+    mood_icons: MoodIconCache,
+    mood_groups_polled_at: Option<f64>,
+    columns: usize,
 }
 
 impl Default for EmojiListWidget {
@@ -128,6 +161,10 @@ impl EmojiListWidget {
             press_hold: None,
             color_picker: None,
             section_cache,
+            active_group: None,
+            mood_icons: MoodIconCache::default(),
+            mood_groups_polled_at: None,
+            columns: EMOJI_COLUMNS,
         }
     }
 
@@ -141,6 +178,67 @@ impl EmojiListWidget {
     pub fn set_search_query(&mut self, query: impl Into<String>) {
         self.search_query = query.into();
         self.focused_index = None;
+        self.active_group = None;
+    }
+
+    /// Returns the selected emoji group of the search row, if any.
+    #[must_use]
+    pub const fn active_group(&self) -> Option<usize> {
+        self.active_group
+    }
+
+    /// Selects (or clears) an emoji group of the search row ([`Self::mood_groups`]).
+    pub fn set_active_group(&mut self, group: Option<usize>) {
+        self.active_group = group.filter(|&g| g < self.mood_icons.groups().len());
+        self.search_query.clear();
+        self.focused_index = None;
+    }
+
+    /// Emoji groups shown right of the search field (`TabbedSearch::_groups`).
+    #[must_use]
+    pub fn mood_groups(&self) -> &[MoodGroup] {
+        self.mood_icons.groups()
+    }
+
+    /// Replaces the search-row emoji groups with the server's `messages.getEmojiGroups` list.
+    /// An empty list restores the built-in [`EMOJI_MOOD_GROUPS`] fallback.
+    pub fn set_mood_groups(&mut self, groups: Vec<MoodGroup>) {
+        if self.mood_icons.set_groups(groups) {
+            self.active_group = None;
+        }
+    }
+
+    /// Pulls the search-row groups from `backend.emoji_groups()` (`messages.getEmojiGroups`,
+    /// `EmojiStatuses::emojiGroupsValue` in `tabbed_selector.cpp` `MakeSearch`) when the panel is
+    /// first shown and then every [`MOOD_GROUPS_POLL_SECS`]. An empty list or an error keeps
+    /// the groups already shown (the built-in [`EMOJI_MOOD_GROUPS`] until the server answers),
+    /// as tdesktop keeps its last `messages.emojiGroups` on a failed request.
+    pub fn refresh_mood_groups(&mut self, backend: &dyn ChatHelpersBackend, now: f64) {
+        if self
+            .mood_groups_polled_at
+            .is_some_and(|at| now >= at && now - at < MOOD_GROUPS_POLL_SECS)
+        {
+            return;
+        }
+        self.mood_groups_polled_at = Some(now);
+        let groups = backend
+            .emoji_groups()
+            .map(|list| mood_groups_from_server(&list))
+            .unwrap_or_default();
+        if !groups.is_empty() {
+            self.set_mood_groups(groups);
+        }
+    }
+
+    fn group_emojis(&self) -> Option<Vec<EmojiRef>> {
+        let group = self.mood_icons.groups().get(self.active_group?)?;
+        Some(
+            group
+                .emoticons
+                .iter()
+                .filter_map(|e| emoji::find_emoji(e, 0).map(|(r, _)| r))
+                .collect(),
+        )
     }
 
     /// Returns whether the skin-tone popup is currently open (used to prevent auto-hiding panel).
@@ -178,6 +276,7 @@ impl EmojiListWidget {
     /// Jumps to a specific emoji section in the scroll list.
     pub fn jump_to_section(&mut self, section: Section) {
         self.search_query.clear();
+        self.active_group = None;
         self.active_section = section;
         self.scroll_to_section = Some(section);
         self.color_picker = None;
@@ -197,8 +296,9 @@ impl EmojiListWidget {
                 self.close_skin_tone_popup();
                 return (true, None);
             }
-            if !self.search_query.is_empty() {
+            if !self.search_query.is_empty() || self.active_group.is_some() {
                 self.search_query.clear();
+                self.active_group = None;
                 self.focused_index = None;
                 return (true, None);
             }
@@ -260,9 +360,9 @@ impl EmojiListWidget {
         } else if left {
             cur.saturating_sub(1)
         } else if down {
-            (cur + EMOJI_COLUMNS).min(max_idx)
+            (cur + self.columns).min(max_idx)
         } else if up {
-            cur.saturating_sub(EMOJI_COLUMNS)
+            cur.saturating_sub(self.columns)
         } else {
             cur
         };
@@ -271,6 +371,11 @@ impl EmojiListWidget {
     }
 
     fn collect_visible_emojis(&mut self, backend: &mut dyn ChatHelpersBackend) -> Vec<EmojiRef> {
+        if self.search_query.trim().is_empty()
+            && let Some(refs) = self.group_emojis()
+        {
+            return refs;
+        }
         if !self.search_query.trim().is_empty() {
             return backend
                 .search_emoji(self.search_query.trim())
@@ -339,6 +444,8 @@ impl EmojiListWidget {
     ) -> Option<EmojiListEvent> {
         let mut event = None;
         let full_rect = ui.available_rect_before_wrap();
+        let now = ui.input(|i| i.time);
+        self.refresh_mood_groups(backend, now);
 
         // Reserve bottom footer strip (`EMOJI_FOOTER_HEIGHT`).
         let footer_rect = Rect::from_min_max(
@@ -351,33 +458,53 @@ impl EmojiListWidget {
         );
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
-            // 1. Search bar (`TabbedSearch` style, 33px height).
-            let search_ph = tr::lng_dlg_filter();
-            Frame::NONE
-                .inner_margin(Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    render_search_bar(
-                        ui,
-                        "tg_emoji_search_field",
-                        &mut self.search_query,
-                        &search_ph,
-                        None,
-                        palette,
-                    );
-                });
+            // 1. Search row (`TabbedSearch`, emoji groups on the right).
+            let search = render_tabbed_search(
+                ui,
+                "tg_emoji_search_field",
+                &mut self.search_query,
+                self.active_group,
+                &mut self.mood_icons,
+                palette,
+            );
+            if search.changed {
+                self.active_group = None;
+                self.focused_index = None;
+            }
+            if let Some(g) = search.group_clicked {
+                let next = (self.active_group != Some(g)).then_some(g);
+                self.set_active_group(next);
+            }
 
             // 2. Scrollable emoji grid body.
             let scroll_avail = ui.available_rect_before_wrap();
             ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_avail), |ui| {
+                // tdesktop scroll bars overlay the list (`emojiScroll`), they take no width.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
                 ScrollArea::vertical()
                     .id_salt("tg_emoji_list_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         Frame::NONE
-                            .inner_margin(Margin::symmetric(8, 2))
+                            .inner_margin(emoji_list_margin())
                             .show(ui, |ui| {
                                 let now = ui.input(|i| i.time);
-                                if !self.search_query.trim().is_empty() {
+                                if self.search_query.trim().is_empty()
+                                    && let Some(refs) = self.group_emojis()
+                                {
+                                    let mut global_idx = 0usize;
+                                    if let Some(ev) = self.paint_emoji_grid(
+                                        ui,
+                                        &refs,
+                                        &mut global_idx,
+                                        now,
+                                        backend,
+                                        emoji_cache,
+                                        palette,
+                                    ) {
+                                        event = Some(ev);
+                                    }
+                                } else if !self.search_query.trim().is_empty() {
                                     let hits = backend.search_emoji(self.search_query.trim());
                                     if hits.is_empty() {
                                         ui.add_space(36.0);
@@ -417,17 +544,19 @@ impl EmojiListWidget {
                                         .filter_map(|s| emoji::find_emoji(s, 0).map(|(e, _)| e))
                                         .collect();
                                     if !recent_refs.is_empty() {
-                                        let hdr_rect = self.paint_section_header(
-                                            ui,
-                                            Section::Recent,
-                                            false,
-                                            palette,
-                                            emoji_cache,
-                                            backend,
-                                        );
+                                        // The recent section has no title (`EmojiListWidget::paint`
+                                        // skips the header of section 0).
+                                        let top = ui.cursor().top();
                                         if self.scroll_to_section == Some(Section::Recent) {
-                                            ui.scroll_to_rect(hdr_rect, Some(egui::Align::TOP));
+                                            let r = Rect::from_min_size(
+                                                Pos2::new(ui.cursor().left(), top),
+                                                Vec2::new(1.0, 1.0),
+                                            );
+                                            ui.scroll_to_rect(r, Some(egui::Align::TOP));
                                             self.scroll_to_section = None;
+                                        }
+                                        if top >= scroll_avail.top() - 1.0 {
+                                            self.active_section = Section::Recent;
                                         }
                                         if let Some(ev) = self.paint_emoji_grid(
                                             ui,
@@ -450,17 +579,13 @@ impl EmojiListWidget {
                                             sec,
                                             sec == Section::People,
                                             palette,
-                                            emoji_cache,
-                                            backend,
                                         );
                                         if self.scroll_to_section == Some(sec) {
                                             ui.scroll_to_rect(hdr_rect, Some(egui::Align::TOP));
                                             self.scroll_to_section = None;
                                         }
                                         // Update active section indicator as user scrolls.
-                                        if hdr_rect.top() <= scroll_avail.top() + 40.0
-                                            && hdr_rect.bottom() >= scroll_avail.top() - 600.0
-                                        {
+                                        if hdr_rect.top() <= scroll_avail.top() + 1.0 {
                                             self.active_section = sec;
                                         }
                                         if let Some(ev) = self.paint_emoji_grid(
@@ -482,7 +607,7 @@ impl EmojiListWidget {
         });
 
         // 3. Bottom category footer (`36px`).
-        self.paint_footer(ui, footer_rect, emoji_cache, palette);
+        self.paint_footer(ui, footer_rect, palette);
 
         // 4. Long-press check for skin-tone popup.
         if let Some((er, rect, pressed_at)) = self.press_hold {
@@ -517,47 +642,52 @@ impl EmojiListWidget {
         section: Section,
         show_skin_all_button: bool,
         palette: &Palette,
-        emoji_cache: &mut EmojiTextureCache,
-        backend: &dyn ChatHelpersBackend,
     ) -> Rect {
         let width = ui.available_width().max(120.0);
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(width, EMOJI_HEADER_HEIGHT), Sense::hover());
+        let pan = &st::default_emoji_pan;
+        // `headerLeft` is measured from the panel edge; the list already has `margin.left`.
+        let left = (pan.header_left.0 - pan.margin.left.0 - pan.padding.left.0) as f32;
+        let font = font_id_from_style(st::emoji_pan_header_font);
         ui.painter().text(
-            Pos2::new(rect.left() + 6.0, rect.center().y),
-            Align2::LEFT_CENTER,
+            Pos2::new(
+                rect.left() + left.max(0.0),
+                rect.top() + pan.header_top.0 as f32,
+            ),
+            Align2::LEFT_TOP,
             section_title(section),
-            font_id_from_style(st::emoji_pan_header_font),
-            palette.window_sub_text_fg,
+            font,
+            theme_color(ui.ctx(), "emojiPanHeaderFg", palette.window_sub_text_fg),
         );
 
-        // "Choose default skin tone" hand button in Smileys & People header (`emojiPanColorAll`).
+        // "Choose default skin tone" button in the Smileys & People header (`emojiPanColorAll`).
         if show_skin_all_button {
+            let btn = &st::emoji_pan_color_all;
+            let side = btn.width.0 as f32;
             let btn_rect = Rect::from_min_size(
-                Pos2::new(rect.right() - 28.0, rect.center().y - 12.0),
-                Vec2::new(24.0, 24.0),
+                Pos2::new(
+                    rect.right() - side,
+                    rect.top() + pan.header_top.0 as f32 - 4.0,
+                ),
+                Vec2::splat(side),
             );
             let resp = ui.interact(
                 btn_rect,
                 ui.make_persistent_id("tg_emoji_color_all_btn"),
                 Sense::click(),
             );
-            if resp.hovered() {
-                ui.painter()
-                    .rect_filled(btn_rect, CornerRadius::same(6), palette.window_bg_over);
-            }
-            let global_tone = backend
-                .emoji_variants()
-                .lookup_tone("")
-                .unwrap_or(SkinTone::Default);
-            if let Some((hand, _)) = emoji::find_emoji("✋", 0) {
-                let toned = hand.variant(global_tone.index() as usize);
-                emoji_cache.paint_emoji(
-                    ui.painter(),
-                    ui.ctx(),
-                    toned,
-                    btn_rect.shrink(3.0),
-                    Color32::WHITE,
+            let dark = ui.ctx().global_style().visuals.dark_mode;
+            let icon = if resp.hovered() {
+                btn.icon_over
+            } else {
+                btn.icon
+            };
+            if !paint_helper_icon(ui.painter(), btn_rect, icon, dark, None) {
+                ui.painter().circle_stroke(
+                    btn_rect.center(),
+                    6.0,
+                    Stroke::new(1.4, palette.window_sub_text_fg),
                 );
             }
             if resp.on_hover_text(tr::lng_emoji_color_all()).clicked() {
@@ -580,8 +710,9 @@ impl EmojiListWidget {
     ) -> Option<EmojiListEvent> {
         let mut chosen = None;
         let avail_w = ui.available_width().max(EMOJI_CELL_SIZE);
-        let cols = EMOJI_COLUMNS.min(((avail_w / 34.0).floor() as usize).max(1));
-        let cell_w = (avail_w / cols as f32).min(42.0);
+        let cols = ((avail_w / EMOJI_CELL_SIZE).floor() as usize).max(1);
+        self.columns = cols;
+        let cell_w = avail_w / cols as f32;
         let cell_h = EMOJI_CELL_SIZE;
         let rows = items.len().div_ceil(cols);
         let total_h = rows as f32 * cell_h;
@@ -659,15 +790,6 @@ impl EmojiListWidget {
                     Color32::WHITE,
                 );
 
-                // Subtle corner dot on colorizable emoji so users know long-press/right-click works.
-                if base_ref.has_variants() && resp.hovered() {
-                    ui.painter().circle_filled(
-                        Pos2::new(cell_rect.right() - 5.0, cell_rect.bottom() - 5.0),
-                        2.0,
-                        palette.window_sub_text_fg,
-                    );
-                }
-
                 // Track long-press start for skin-tone popup.
                 if resp.is_pointer_button_down_on()
                     && base_ref.has_variants()
@@ -699,77 +821,49 @@ impl EmojiListWidget {
         chosen
     }
 
-    fn paint_footer(
-        &mut self,
-        ui: &mut Ui,
-        footer_rect: Rect,
-        emoji_cache: &mut EmojiTextureCache,
-        palette: &Palette,
-    ) {
-        ui.painter().rect_filled(
-            footer_rect,
-            CornerRadius {
-                nw: 0,
-                ne: 0,
-                sw: 8,
-                se: 8,
-            },
-            palette.window_bg,
-        );
-        ui.painter().line_segment(
-            [
-                Pos2::new(footer_rect.left(), footer_rect.top()),
-                Pos2::new(footer_rect.right(), footer_rect.top()),
-            ],
-            Stroke::new(1.0, palette.divider),
-        );
+    fn paint_footer(&mut self, ui: &mut Ui, footer_rect: Rect, palette: &Palette) {
+        // `StickersListFooter` in emoji mode: Recent, then the Unicode categories as one
+        // group icon that expands into all seven category icons while one of them is active.
+        paint_footer_background(ui, footer_rect, palette);
+        let icons = &st::default_compose_icons;
+        let searching = !self.search_query.is_empty() || self.active_group.is_some();
+        let expanded = !searching && self.active_section != Section::Recent;
+        let categories = &EMOJI_SECTIONS[1..];
 
-        let count = EMOJI_SECTIONS.len();
-        let slot_w = footer_rect.width() / count as f32;
-        for (idx, &sec) in EMOJI_SECTIONS.iter().enumerate() {
-            let slot_rect = Rect::from_min_size(
-                Pos2::new(footer_rect.left() + idx as f32 * slot_w, footer_rect.top()),
-                Vec2::new(slot_w, footer_rect.height()),
-            );
+        let mut slots: Vec<(Section, Icon, Icon)> =
+            vec![(Section::Recent, icons.recent, icons.recent_active)];
+        if expanded {
+            for &sec in categories {
+                let (icon, active) = footer_icons_for(sec);
+                slots.push((sec, icon, active));
+            }
+        } else {
+            slots.push((Section::People, icons.people, icons.people_active));
+        }
+
+        if !searching {
+            if expanded {
+                paint_footer_selection(ui, footer_rect, 1, categories.len());
+            } else {
+                paint_footer_selection(ui, footer_rect, 0, 0);
+            }
+        }
+        for (idx, (sec, icon, icon_active)) in slots.into_iter().enumerate() {
+            let slot_rect = footer_slot_rect(footer_rect, idx);
             let resp = ui.interact(
                 slot_rect,
                 ui.make_persistent_id(("tg_emoji_footer", idx)),
                 Sense::click(),
             );
-            let active = self.search_query.is_empty() && self.active_section == sec;
-
-            if resp.hovered() {
-                ui.painter().rect_filled(
-                    slot_rect.shrink(3.0),
-                    CornerRadius::same(6),
-                    palette.window_bg_over,
+            let active = !searching && self.active_section == sec;
+            let icon = if active { icon_active } else { icon };
+            if !paint_footer_icon(ui, slot_rect, icon) {
+                ui.painter().circle_stroke(
+                    slot_rect.center(),
+                    8.0,
+                    Stroke::new(1.5, palette.window_sub_text_fg),
                 );
             }
-            if active {
-                ui.painter().rect_filled(
-                    Rect::from_min_size(
-                        Pos2::new(slot_rect.left() + 6.0, slot_rect.bottom() - 2.5),
-                        Vec2::new(slot_rect.width() - 12.0, 2.5),
-                    ),
-                    CornerRadius::same(1),
-                    palette.window_bg_active,
-                );
-            }
-
-            let tint = if active {
-                Color32::WHITE
-            } else {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 190)
-            };
-            let icon_rect = Rect::from_center_size(slot_rect.center(), Vec2::splat(19.0));
-            emoji_cache.paint_emoji_str(
-                ui.painter(),
-                ui.ctx(),
-                section_footer_glyph(sec),
-                icon_rect,
-                tint,
-            );
-
             if resp.on_hover_text(section_title(sec)).clicked() {
                 self.jump_to_section(sec);
             }
@@ -890,100 +984,605 @@ impl EmojiListWidget {
     }
 }
 
-/// Shared tdesktop-styled pill search bar (`defaultTabbedSearch`, 33px height) used across
-/// Emoji, Stickers, and GIFs tabs.
-pub(crate) fn render_search_bar(
+// ---------------------------------------------------------------------------------------------
+// Shared 7.4.6 pieces used by the Emoji, Stickers and GIFs tabs: the `TabbedSearch` row with
+// emoji-group ("mood") buttons and the bottom `StickersListFooter` icon strip.
+// ---------------------------------------------------------------------------------------------
+
+/// egui temp-data key set by [`super::tabbed_panel::TabbedPanel`] while it paints in docked
+/// (third column) mode, so footers paint square bottom corners.
+pub(crate) const DOCKED_PANEL_FLAG: &str = "tg_tabbed_panel_docked";
+
+/// Whether the panel is being painted as a docked column this frame.
+pub(crate) fn is_docked_panel(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(Id::unique(DOCKED_PANEL_FLAG)))
+        .unwrap_or(false)
+}
+
+/// Resolves a `tg-theme` palette color by its tdesktop name for the current Day/Night mode.
+pub(crate) fn theme_color(ctx: &egui::Context, name: &str, fallback: Color32) -> Color32 {
+    let dark = ctx.global_style().visuals.dark_mode;
+    crate::chat_helpers::theme_palette_for_dark(dark)
+        .color_by_name(name)
+        .map_or(fallback, |c| {
+            Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+        })
+}
+
+/// One emoji group ("mood") button of the search row (`Data::EmojiGroup`). tdesktop receives
+/// these from `messages.getEmojiGroups`; the list below mirrors the server's default groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmojiMoodGroup {
+    /// Emoji whose silhouette is drawn as the group icon.
+    pub icon: &'static str,
+    /// Group title (tooltip / accessible name).
+    pub title: &'static str,
+    /// Emoticons the group filters by.
+    pub emoticons: &'static [&'static str],
+}
+
+/// Default emoji groups shown right of the search field (`TabbedSearch::_groups`).
+pub const EMOJI_MOOD_GROUPS: [EmojiMoodGroup; 11] = [
+    EmojiMoodGroup {
+        icon: "❤️",
+        title: "Love",
+        emoticons: &["❤️", "😍", "🥰", "😘", "💕", "💖", "💘", "😻"],
+    },
+    EmojiMoodGroup {
+        icon: "👍",
+        title: "Approval",
+        emoticons: &["👍", "👌", "👏", "🙌", "✅", "💯", "🤝"],
+    },
+    EmojiMoodGroup {
+        icon: "👎",
+        title: "Disapproval",
+        emoticons: &["👎", "🙅", "❌", "🚫", "🙄"],
+    },
+    EmojiMoodGroup {
+        icon: "🎉",
+        title: "Cheers",
+        emoticons: &["🎉", "🥳", "🎊", "🥂", "🍻", "🍾"],
+    },
+    EmojiMoodGroup {
+        icon: "😂",
+        title: "Laughter",
+        emoticons: &["😂", "🤣", "😆", "😁", "😹"],
+    },
+    EmojiMoodGroup {
+        icon: "😮",
+        title: "Astonishment",
+        emoticons: &["😮", "😲", "😱", "🤯", "😯"],
+    },
+    EmojiMoodGroup {
+        icon: "😢",
+        title: "Sadness",
+        emoticons: &["😢", "😭", "😞", "😔", "🥺"],
+    },
+    EmojiMoodGroup {
+        icon: "😡",
+        title: "Anger",
+        emoticons: &["😡", "😠", "🤬", "👿", "💢"],
+    },
+    EmojiMoodGroup {
+        icon: "😐",
+        title: "Neutral",
+        emoticons: &["😐", "😑", "😶", "🫤"],
+    },
+    EmojiMoodGroup {
+        icon: "🤔",
+        title: "Doubt",
+        emoticons: &["🤔", "🤨", "🧐", "😕"],
+    },
+    EmojiMoodGroup {
+        icon: "🤪",
+        title: "Silly",
+        emoticons: &["🤪", "😜", "😝", "😛"],
+    },
+];
+
+/// One emoji group of the search row as shown: either a server `Data::EmojiGroup`
+/// (`messages.getEmojiGroups`) or an entry of the built-in [`EMOJI_MOOD_GROUPS`] fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoodGroup {
+    /// Group title (tooltip / accessible name).
+    pub title: String,
+    /// Emoji whose silhouette is drawn as the group icon.
+    pub icon: String,
+    /// Emoticons the group filters by.
+    pub emoticons: Vec<String>,
+}
+
+impl MoodGroup {
+    /// Builds a group from server data. tdesktop draws the group's `icon_emoji_id` custom
+    /// emoji; until that document is available the first emoticon stands in as the icon.
+    #[must_use]
+    pub fn new(title: impl Into<String>, emoticons: Vec<String>) -> Self {
+        let icon = emoticons.first().cloned().unwrap_or_default();
+        Self {
+            title: title.into(),
+            icon,
+            emoticons,
+        }
+    }
+}
+
+impl From<&EmojiMoodGroup> for MoodGroup {
+    fn from(group: &EmojiMoodGroup) -> Self {
+        Self {
+            title: group.title.to_owned(),
+            icon: group.icon.to_owned(),
+            emoticons: group.emoticons.iter().map(|e| (*e).to_owned()).collect(),
+        }
+    }
+}
+
+/// Seconds between `backend.emoji_groups()` polls while the emoji tab is shown; the live
+/// backend answers from its hash-checked cache in between server refreshes.
+pub const MOOD_GROUPS_POLL_SECS: f64 = 60.0;
+
+/// Converts `messages.getEmojiGroups` entries into search-row groups (`GroupsFromTL` in
+/// `data_emoji_statuses.cpp`). The `emojiGroupPremium` entry is dropped: its `*premium` query
+/// lists premium custom emoji, which this emoji tab does not render.
+#[must_use]
+pub fn mood_groups_from_server(groups: &[EmojiGroupInfo]) -> Vec<MoodGroup> {
+    groups
+        .iter()
+        .filter(|g| !g.is_premium && !g.emoticons.is_empty())
+        .map(|g| MoodGroup::new(g.title.clone(), g.emoticons.clone()))
+        .collect()
+}
+
+/// The built-in [`EMOJI_MOOD_GROUPS`] as owned [`MoodGroup`]s.
+#[must_use]
+pub fn default_mood_groups() -> Vec<MoodGroup> {
+    EMOJI_MOOD_GROUPS.iter().map(MoodGroup::from).collect()
+}
+
+/// The search-row emoji groups plus their single-color icons: tdesktop paints the server's
+/// group icons as text-colored custom emoji. Each icon is an outline alpha mask made from the
+/// emoji sprite, tinted at paint time.
+pub struct MoodIconCache {
+    groups: Vec<MoodGroup>,
+    textures: HashMap<usize, Option<TextureHandle>>,
+}
+
+impl Default for MoodIconCache {
+    fn default() -> Self {
+        Self {
+            groups: default_mood_groups(),
+            textures: HashMap::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for MoodIconCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MoodIconCache")
+            .field("groups", &self.groups.len())
+            .field("count", &self.textures.len())
+            .finish()
+    }
+}
+
+impl MoodIconCache {
+    /// Groups currently shown in the search row.
+    #[must_use]
+    pub fn groups(&self) -> &[MoodGroup] {
+        &self.groups
+    }
+
+    /// Replaces the groups (an empty list restores the defaults). Returns `true` if they changed.
+    pub fn set_groups(&mut self, groups: Vec<MoodGroup>) -> bool {
+        let groups = if groups.is_empty() {
+            default_mood_groups()
+        } else {
+            groups
+        };
+        if groups == self.groups {
+            return false;
+        }
+        self.groups = groups;
+        self.textures.clear();
+        true
+    }
+
+    fn texture(&mut self, ctx: &egui::Context, index: usize) -> Option<egui::TextureId> {
+        let group = self.groups.get(index)?;
+        let name = format!("tg_emoji_mood_{index}_{}", group.icon);
+        let icon = group.icon.clone();
+        self.textures
+            .entry(index)
+            .or_insert_with(|| {
+                let image = mood_icon_mask(&icon)?;
+                Some(ctx.load_texture(name, image, TextureOptions::LINEAR))
+            })
+            .as_ref()
+            .map(TextureHandle::id)
+    }
+}
+
+fn mood_icon_mask(seq: &str) -> Option<egui::ColorImage> {
+    let (er, _) = emoji::find_emoji(seq, 0)?;
+    let atlas = EmojiAtlas::global();
+    let sprite = atlas.sprite(er)?;
+    let rgba = atlas.emoji_rgba(er).ok()??;
+    let [_, _, w, h] = sprite.pixel_rect;
+    let (w, h) = (w as usize, h as usize);
+    if rgba.len() != w * h * 4 {
+        return None;
+    }
+    let alpha: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|px| px[3]).collect();
+    let mut out = Vec::with_capacity(rgba.len());
+    for a in outline_alpha(&alpha, w, h) {
+        out.extend_from_slice(&[255, 255, 255, a]);
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &out))
+}
+
+/// The server's emoji-group icons are thin line drawings painted in the text colour. Without
+/// them the built-in groups use the emoji's silhouette as an outline: the shape minus its
+/// erosion, a stroke of about 1/12 of the sprite (1.5 px at the 18 px icon size).
+fn outline_alpha(alpha: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let radius = (w.min(h) / 12).max(1);
+    let eroded = erode(alpha, w, h, radius);
+    alpha
+        .iter()
+        .zip(&eroded)
+        .map(|(&a, &e)| a.saturating_sub(e))
+        .collect()
+}
+
+/// Separable min filter (box erosion) of `radius` pixels; outside the image counts as empty.
+fn erode(alpha: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+    let mut rows = vec![0_u8; alpha.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let from = x.saturating_sub(radius);
+            let to = x + radius;
+            rows[y * w + x] = if x < radius || to >= w {
+                0
+            } else {
+                alpha[y * w + from..=y * w + to]
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap_or(0)
+            };
+        }
+    }
+    let mut out = vec![0_u8; alpha.len()];
+    for y in 0..h {
+        for x in 0..w {
+            out[y * w + x] = if y < radius || y + radius >= h {
+                0
+            } else {
+                (y - radius..=y + radius)
+                    .map(|yy| rows[yy * w + x])
+                    .min()
+                    .unwrap_or(0)
+            };
+        }
+    }
+    out
+}
+
+/// Result of [`render_tabbed_search`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TabbedSearchResponse {
+    /// The typed query changed this frame.
+    pub changed: bool,
+    /// An emoji-group button was clicked (index into [`MoodIconCache::groups`]).
+    pub group_clicked: Option<usize>,
+}
+
+/// Paints tdesktop's `TabbedSearch` row (`defaultTabbedSearch`): a rounded `windowBgOver` pill
+/// with the search icon, a `Search` field of `defaultFieldWidth` and the emoji-group buttons.
+/// Margins follow `defaultEmojiPan.margin` + `searchMargin`.
+pub(crate) fn render_tabbed_search(
     ui: &mut Ui,
     id_salt: &str,
     query: &mut String,
-    placeholder: &str,
-    prefix_badge: Option<&str>,
+    active_group: Option<usize>,
+    icons: &mut MoodIconCache,
     palette: &Palette,
-) -> bool {
-    let mut changed = false;
-    let bar_w = ui.available_width().max(120.0);
-    let bar_h = 33.0;
-    let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(bar_w, bar_h), Sense::hover());
+) -> TabbedSearchResponse {
+    let ts = &st::default_tabbed_search;
+    let pan = &st::default_emoji_pan;
+    let height = ts.height.0 as f32;
+    let outer = ui.available_rect_before_wrap();
+    let margin_left = (pan.margin.left.0 + pan.search_margin.left.0) as f32;
+    let margin_right = (pan.margin.right.0 + pan.search_margin.right.0) as f32;
+    let margin_top = pan.search_margin.top.0 as f32;
+    let margin_bottom = pan.search_margin.bottom.0 as f32;
+    let bar = Rect::from_min_max(
+        Pos2::new(outer.left() + margin_left, outer.top() + margin_top),
+        Pos2::new(
+            (outer.right() - margin_right).max(outer.left() + margin_left + 120.0),
+            outer.top() + margin_top + height,
+        ),
+    );
+    ui.allocate_rect(
+        Rect::from_min_max(
+            outer.min,
+            Pos2::new(outer.right(), bar.bottom() + margin_bottom),
+        ),
+        Sense::hover(),
+    );
 
+    let ctx = ui.ctx().clone();
+    let dark = ctx.global_style().visuals.dark_mode;
+    let bg = theme_color(&ctx, "windowBgOver", palette.window_bg_over);
+    let bg_active = theme_color(&ctx, "windowBgRipple", palette.window_bg_over);
+    let fg = theme_color(&ctx, "emojiIconFg", palette.window_sub_text_fg);
+    let fg_active = theme_color(&ctx, "emojiSubIconFgActive", palette.window_fg);
+    let placeholder_fg = theme_color(&ctx, "placeholderFg", palette.window_sub_text_fg);
+    let text_fg = theme_color(&ctx, "windowFg", palette.window_fg);
     ui.painter()
-        .rect_filled(bar_rect, CornerRadius::same(16), palette.input_bg);
+        .rect_filled(bar, CornerRadius::same((height / 2.0) as u8), bg);
 
-    let inner_rect = bar_rect.shrink2(Vec2::new(10.0, 4.0));
-    let dark = ui.ctx().global_style().visuals.dark_mode;
-    ui.scope_builder(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            // Search icon (`st::box_field_search_icon`).
-            let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-            if !paint_helper_icon(
-                ui.painter(),
-                icon_r,
-                st::box_field_search_icon,
-                dark,
-                Some(palette.window_sub_text_fg),
-            ) {
-                let c = Pos2::new(icon_r.left() + 6.0, icon_r.top() + 6.0);
-                ui.painter()
-                    .circle_stroke(c, 4.2, Stroke::new(1.4, palette.window_sub_text_fg));
-                ui.painter().line_segment(
-                    [c + Vec2::new(3.1, 3.1), c + Vec2::new(6.2, 6.2)],
-                    Stroke::new(1.5, palette.window_sub_text_fg),
-                );
+    let mut out = TabbedSearchResponse::default();
+
+    // Search icon button (`defaultTabbedSearchButton`, icon at x = 7, centered vertically).
+    let search_btn = Rect::from_min_size(bar.min, Vec2::new(ts.search.width.0 as f32, height));
+    let icon_rect = Rect::from_min_size(
+        Pos2::new(
+            search_btn.left() + ts.search.icon_position.x.0 as f32,
+            search_btn.center().y - 12.0,
+        ),
+        Vec2::splat(24.0),
+    );
+    if !paint_helper_icon(ui.painter(), icon_rect, ts.search.icon, dark, Some(fg)) {
+        let c = icon_rect.center() - Vec2::new(1.5, 1.5);
+        ui.painter().circle_stroke(c, 5.0, Stroke::new(1.5, fg));
+        ui.painter().line_segment(
+            [c + Vec2::new(3.6, 3.6), c + Vec2::new(7.0, 7.0)],
+            Stroke::new(1.6, fg),
+        );
+    }
+
+    let edit_id = ui.make_persistent_id(("tg_tabbed_search_field", id_salt));
+    let focused = ui.memory(|m| m.has_focus(edit_id));
+    let show_groups = query.is_empty() && !focused;
+    let cancel_w = if query.is_empty() {
+        0.0
+    } else {
+        ts.cancel.width.0 as f32
+    };
+    let field_left = search_btn.right();
+    let field_right = if show_groups {
+        (field_left + ts.default_field_width.0 as f32).min(bar.right() - 4.0)
+    } else {
+        bar.right() - cancel_w - 4.0
+    };
+    let field_rect = Rect::from_min_max(
+        Pos2::new(field_left, bar.top()),
+        Pos2::new(field_right.max(field_left + 20.0), bar.bottom()),
+    );
+    let font = FontId::proportional(ts.field.style.font.size.0 as f32);
+    let edit_resp = ui.put(
+        field_rect.shrink2(Vec2::new(2.0, 5.0)),
+        TextEdit::singleline(query)
+            .id(edit_id)
+            .frame(Frame::NONE)
+            .font(font.clone())
+            .text_color(text_fg)
+            .align(Align2::LEFT_CENTER)
+            .hint_text(
+                egui::RichText::new(tr::lng_dlg_filter())
+                    .font(font)
+                    .color(placeholder_fg),
+            ),
+    );
+    if edit_resp.changed() {
+        out.changed = true;
+    }
+
+    if show_groups {
+        let groups_rect = Rect::from_min_max(
+            Pos2::new(field_rect.right(), bar.top()),
+            Pos2::new(bar.right() - 4.0, bar.bottom()),
+        );
+        let painter = ui.painter_at(groups_rect);
+        let group_w = ts.group_width.0 as f32;
+        let skip = ts.group_skip.0 as f32;
+        let group_titles: Vec<String> = icons.groups().iter().map(|g| g.title.clone()).collect();
+        for (idx, title) in group_titles.iter().enumerate() {
+            let x = groups_rect.left() + idx as f32 * (group_w + skip);
+            if x >= groups_rect.right() {
+                break;
             }
-
-            if let Some(badge) = prefix_badge {
-                ui.label(
-                    egui::RichText::new(badge)
-                        .size(12.5)
-                        .strong()
-                        .color(palette.window_active_text_fg),
-                );
-            }
-
-            let clear_w = if query.is_empty() { 0.0 } else { 20.0 };
-            let edit_w = (ui.available_width() - clear_w).max(60.0);
-            let resp = ui.add_sized(
-                Vec2::new(edit_w, 22.0),
-                TextEdit::singleline(query)
-                    .id_source(id_salt)
-                    .frame(Frame::NONE)
-                    .hint_text(placeholder),
+            let slot = Rect::from_min_size(
+                Pos2::new(x, groups_rect.top()),
+                Vec2::new(group_w, groups_rect.height()),
             );
-            if resp.changed() {
-                changed = true;
+            let resp = ui.interact(
+                slot.intersect(groups_rect),
+                ui.make_persistent_id(("tg_tabbed_search_group", id_salt, idx)),
+                Sense::click(),
+            );
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::Role::Button,
+                    true,
+                    active_group == Some(idx),
+                    title,
+                )
+            });
+            let active = active_group == Some(idx);
+            if active {
+                painter.rect_filled(
+                    Rect::from_center_size(slot.center(), Vec2::new(group_w, group_w - 4.0)),
+                    CornerRadius::same(((group_w - 4.0) / 2.0) as u8),
+                    bg_active,
+                );
             }
+            if let Some(tex) = icons.texture(&ctx, idx) {
+                painter.image(
+                    tex,
+                    Rect::from_center_size(slot.center(), Vec2::splat(18.0)),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    if active { fg_active } else { fg },
+                );
+            }
+            if resp.clicked() {
+                out.group_clicked = Some(idx);
+            }
+        }
+        // Right-edge fade (`TabbedSearch::fadeRight`) over the clipped group strip.
+        let fade_w = 12.0;
+        let fade = Rect::from_min_max(
+            Pos2::new(groups_rect.right() - fade_w, groups_rect.top()),
+            groups_rect.max,
+        );
+        let mut mesh = egui::Mesh::default();
+        let transparent = Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 0);
+        mesh.colored_vertex(fade.left_top(), transparent);
+        mesh.colored_vertex(fade.right_top(), bg);
+        mesh.colored_vertex(fade.right_bottom(), bg);
+        mesh.colored_vertex(fade.left_bottom(), transparent);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        ui.painter().add(egui::Shape::mesh(mesh));
+    }
 
-            if !query.is_empty() {
-                let (clr_r, clr_resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                let fg = if clr_resp.hovered() {
-                    palette.window_fg
-                } else {
-                    palette.window_sub_text_fg
-                };
-                if !paint_helper_icon(
-                    ui.painter(),
-                    clr_r.shrink(2.0),
-                    st::small_close_icon,
-                    dark,
-                    Some(fg),
-                ) {
-                    let cc = clr_r.center();
-                    ui.painter().line_segment(
-                        [cc + Vec2::new(-3.5, -3.5), cc + Vec2::new(3.5, 3.5)],
-                        Stroke::new(1.4, fg),
-                    );
-                    ui.painter().line_segment(
-                        [cc + Vec2::new(3.5, -3.5), cc + Vec2::new(-3.5, 3.5)],
-                        Stroke::new(1.4, fg),
-                    );
-                }
-                if clr_resp.clicked() {
-                    query.clear();
-                    changed = true;
-                }
+    if !query.is_empty() {
+        let cancel = Rect::from_min_max(Pos2::new(bar.right() - cancel_w, bar.top()), bar.max);
+        let resp = ui.interact(
+            cancel,
+            ui.make_persistent_id(("tg_tabbed_search_cancel", id_salt)),
+            Sense::click(),
+        );
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tr::lng_cancel()));
+        let cross_fg = theme_color(&ctx, "menuIconFg", palette.window_sub_text_fg);
+        if !paint_helper_icon(
+            ui.painter(),
+            Rect::from_center_size(cancel.center(), Vec2::splat(12.0)),
+            st::small_close_icon,
+            dark,
+            Some(cross_fg),
+        ) {
+            let cc = cancel.center();
+            ui.painter().line_segment(
+                [cc + Vec2::new(-4.0, -4.0), cc + Vec2::new(4.0, 4.0)],
+                Stroke::new(1.5, cross_fg),
+            );
+            ui.painter().line_segment(
+                [cc + Vec2::new(4.0, -4.0), cc + Vec2::new(-4.0, 4.0)],
+                Stroke::new(1.5, cross_fg),
+            );
+        }
+        if resp.clicked() {
+            query.clear();
+            out.changed = true;
+        }
+    }
+    out
+}
+
+/// Footer icon slot width (`defaultEmojiPan.iconWidth`).
+pub(crate) const FOOTER_ICON_WIDTH: f32 = st::default_emoji_pan.icon_width.0 as f32;
+/// Footer selection square (`defaultEmojiPan.iconArea`).
+pub(crate) const FOOTER_ICON_AREA: f32 = st::default_emoji_pan.icon_area.0 as f32;
+/// Left / right inset of the footer icons (`defaultEmojiPan.iconSkip`).
+pub(crate) const FOOTER_ICON_SKIP: f32 = st::default_emoji_pan.icon_skip.0 as f32;
+
+/// Paints the footer strip background (`categoriesBg`) with its top shadow line.
+pub(crate) fn paint_footer_background(ui: &Ui, rect: Rect, palette: &Palette) {
+    let ctx = ui.ctx();
+    let bg = theme_color(ctx, "emojiPanCategories", palette.window_bg);
+    let r = if is_docked_panel(ctx) {
+        0
+    } else {
+        st::emoji_pan_radius.0 as u8
+    };
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: r,
+            se: r,
+        },
+        bg,
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left(), rect.top()),
+            Pos2::new(rect.right(), rect.top()),
+        ],
+        Stroke::new(1.0, theme_color(ctx, "shadowFg", palette.divider)),
+    );
+}
+
+/// Rect of footer icon slot `index` (left aligned, `iconSkip` inset, `iconWidth` each).
+pub(crate) fn footer_slot_rect(footer: Rect, index: usize) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            footer.left() + FOOTER_ICON_SKIP + index as f32 * FOOTER_ICON_WIDTH,
+            footer.top(),
+        ),
+        Vec2::new(FOOTER_ICON_WIDTH, footer.height()),
+    )
+}
+
+/// Paints the rounded `categoriesBgOver` selection behind footer slots `from..=to`.
+pub(crate) fn paint_footer_selection(ui: &Ui, footer: Rect, from: usize, to: usize) {
+    let first = footer_slot_rect(footer, from);
+    let last = footer_slot_rect(footer, to.max(from));
+    let inset = (FOOTER_ICON_WIDTH - FOOTER_ICON_AREA) / 2.0;
+    let rect = Rect::from_min_max(
+        Pos2::new(
+            first.left() + inset,
+            first.center().y - FOOTER_ICON_AREA / 2.0,
+        ),
+        Pos2::new(
+            last.right() - inset,
+            first.center().y + FOOTER_ICON_AREA / 2.0,
+        ),
+    );
+    let radius = if to > from {
+        FOOTER_ICON_AREA / 2.0
+    } else {
+        st::emoji_pan_radius.0 as f32
+    };
+    let ctx = ui.ctx();
+    let fallback = ui.visuals().widgets.hovered.bg_fill;
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(radius as u8),
+        theme_color(ctx, "windowBgRipple", fallback),
+    );
+}
+
+/// Paints a 24 px footer category icon (`defaultComposeIcons`) centered in `slot`.
+pub(crate) fn paint_footer_icon(ui: &Ui, slot: Rect, icon: Icon) -> bool {
+    let dark = ui.ctx().global_style().visuals.dark_mode;
+    paint_helper_icon(
+        ui.painter(),
+        Rect::from_center_size(slot.center(), Vec2::splat(24.0)),
+        icon,
+        dark,
+        None,
+    )
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::outline_alpha;
+
+    #[test]
+    fn mood_icon_outline_keeps_the_edge_and_hollows_the_inside() {
+        let (w, h) = (24, 24);
+        let mut alpha = vec![0_u8; w * h];
+        for y in 4..20 {
+            for x in 4..20 {
+                alpha[y * w + x] = 255;
             }
-        });
-    });
-    let _ = strip_skin_tone("");
-    changed
+        }
+        let out = outline_alpha(&alpha, w, h);
+        assert_eq!(out[12 * w + 12], 0, "centre is hollow");
+        assert_eq!(out[12 * w + 4], 255, "left edge stays");
+        assert_eq!(out[4 * w + 12], 255, "top edge stays");
+        assert_eq!(out[0], 0, "outside stays empty");
+    }
 }

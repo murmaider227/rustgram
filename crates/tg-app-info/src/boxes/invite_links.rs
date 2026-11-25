@@ -21,7 +21,9 @@ use tg_ui::widgets::checkbox::{Radio, Toggle};
 use tg_ui::widgets::input_field::InputField;
 use tg_ui::widgets::labels::{FlatLabel, divider_bar};
 
-use crate::info::backend::{InfoBackend, InviteImporterInfo, InviteLinkInfo, InviteLinkRequest};
+use crate::info::backend::{
+    AdminWithInvitesEntry, InfoBackend, InviteImporterInfo, InviteLinkInfo, InviteLinkRequest,
+};
 use tg_app_core::stand_in::types::PeerId;
 
 /// Maximum invite link label length (`kMaxLabelLength = 32` in `ui/boxes/edit_invite_link.cpp`).
@@ -33,6 +35,10 @@ pub const SECS_HOUR: i32 = 3_600;
 pub const SECS_DAY: i32 = 86_400;
 /// Seconds in one week.
 pub const SECS_WEEK: i32 = 86_400 * 7;
+
+/// Right-hand gutter inside the modal `TgScrollArea` so pills, cards, and row actions
+/// stay clear of the overlay scrollbar track even at narrow 390 px viewports.
+pub const INVITE_LINKS_SCROLLBAR_GUTTER: f32 = 14.0;
 
 /// Visual state category for an invite link (`Color` enum in `edit_peer_invite_links.cpp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +361,8 @@ pub struct EditInviteLinksBoxState {
     pub active_links: Vec<InviteLinkInfo>,
     /// Revoked invite links.
     pub revoked_links: Vec<InviteLinkInfo>,
+    /// Other administrators who have created invite links (`messages.getAdminsWithInvites`).
+    pub admins_with_invites: Vec<AdminWithInvitesEntry>,
     /// Whether initial data has been fetched from the backend.
     pub loaded: bool,
     /// Current sub-view.
@@ -377,6 +385,7 @@ impl EditInviteLinksBoxState {
             peer_title: peer_title.into(),
             active_links: Vec::new(),
             revoked_links: Vec::new(),
+            admins_with_invites: Vec::new(),
             loaded: false,
             view: InviteLinksView::List,
             error: None,
@@ -384,7 +393,7 @@ impl EditInviteLinksBoxState {
         }
     }
 
-    /// Loads active and revoked invite links from `backend`.
+    /// Loads active links, revoked links, and other admins with invites from `backend`.
     pub fn reload(&mut self, backend: &dyn InfoBackend) {
         match backend.exported_chat_invites(self.peer_id, false) {
             Ok(active) => {
@@ -397,6 +406,9 @@ impl EditInviteLinksBoxState {
         }
         if let Ok(revoked) = backend.exported_chat_invites(self.peer_id, true) {
             self.revoked_links = revoked.links;
+        }
+        if let Ok(admins) = backend.admins_with_invites(self.peer_id) {
+            self.admins_with_invites = admins.into_iter().filter(|a| !a.is_self).collect();
         }
         self.loaded = true;
     }
@@ -516,9 +528,13 @@ impl EditInviteLinksBoxState {
     #[must_use]
     pub fn to_modal(&self, id: &str) -> BoxModal {
         match &self.view {
-            InviteLinksView::List => BoxModal::new(id, tr::lng_manage_peer_invite_links())
-                .width(st::box_wide_width.0 as f32 + 32.0)
-                .add_button(BoxButton::default_btn("close", tr::lng_close())),
+            InviteLinksView::List => {
+                let mut modal = BoxModal::new(id, tr::lng_manage_peer_invite_links())
+                    .width(st::box_wide_width.0 as f32 + 32.0)
+                    .add_button(BoxButton::default_btn("close", tr::lng_close()));
+                modal.max_content_height = 500.0;
+                modal
+            }
             InviteLinksView::Editor(form) => {
                 let title = if form.editing_link.is_some() {
                     tr::lng_group_invite_edit_title()
@@ -608,14 +624,18 @@ impl EditInviteLinksBoxState {
         ui.add_space(6.0);
 
         if let Some(prim) = primary {
-            let box_w = ui.available_width().max(220.0);
+            let box_w = (ui.available_width() - INVITE_LINKS_SCROLLBAR_GUTTER).max(200.0);
             let (card_rect, _) = ui.allocate_exact_size(Vec2::new(box_w, 42.0), Sense::hover());
             ui.painter().rect_filled(
                 card_rect,
                 CornerRadius::same(8),
                 colors.color("windowBgOver"),
             );
-            ui.painter().text(
+            let link_clip = Rect::from_min_max(
+                Pos2::new(card_rect.min.x + 12.0, card_rect.min.y),
+                Pos2::new(card_rect.max.x - 12.0, card_rect.max.y),
+            );
+            ui.painter().with_clip_rect(link_clip).text(
                 Pos2::new(card_rect.min.x + 12.0, card_rect.center().y),
                 Align2::LEFT_CENTER,
                 &prim.link,
@@ -678,6 +698,7 @@ impl EditInviteLinksBoxState {
                 .id_salt("inv_extra_hdr")
                 .show(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(INVITE_LINKS_SCROLLBAR_GUTTER);
                 if inline_action_pill(
                     ui,
                     "inv_create_new",
@@ -728,6 +749,7 @@ impl EditInviteLinksBoxState {
                 .id_salt("inv_revoked_hdr")
                 .show(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(INVITE_LINKS_SCROLLBAR_GUTTER);
                     if inline_action_pill(
                         ui,
                         "inv_delete_all_revoked",
@@ -745,6 +767,29 @@ impl EditInviteLinksBoxState {
             let revoked_snapshot = self.revoked_links.clone();
             for link in &revoked_snapshot {
                 if let Some(ev) = self.render_invite_row(ui, link, true, backend, colors) {
+                    action = Some(ev);
+                }
+            }
+        }
+
+        // 4. Other Admins with Invite Links (`messages.getAdminsWithInvites`,
+        //    `edit_peer_invite_links.cpp:760-843`)
+        if !self.admins_with_invites.is_empty() {
+            ui.add_space(10.0);
+            divider_bar(ui, 6.0, colors);
+            ui.add_space(8.0);
+
+            FlatLabel::plain(
+                &format!("Other Admins ({})", self.admins_with_invites.len()),
+                FlatLabelStyle::subsection_title(colors),
+            )
+            .id_salt("inv_other_admins_hdr")
+            .show(ui);
+            ui.add_space(4.0);
+
+            let admins_snapshot = self.admins_with_invites.clone();
+            for admin in &admins_snapshot {
+                if let Some(ev) = render_admin_with_invites_row(ui, admin, colors) {
                     action = Some(ev);
                 }
             }
@@ -792,7 +837,7 @@ impl EditInviteLinksBoxState {
             );
         }
 
-        let right_x = rect.max.x - 4.0;
+        let right_x = rect.max.x - INVITE_LINKS_SCROLLBAR_GUTTER;
         let btn1_rect = Rect::from_center_size(
             Pos2::new(right_x - 28.0, rect.center().y),
             Vec2::new(52.0, 26.0),
@@ -915,7 +960,7 @@ impl EditInviteLinksBoxState {
         ui.painter().line_segment(
             [
                 Pos2::new(text_x, rect.max.y),
-                Pos2::new(rect.max.x - 4.0, rect.max.y),
+                Pos2::new(rect.max.x - INVITE_LINKS_SCROLLBAR_GUTTER, rect.max.y),
             ],
             Stroke::new(0.5, colors.color("shadowFg")),
         );
@@ -1046,14 +1091,18 @@ impl EditInviteLinksBoxState {
     ) -> Option<InviteLinksBoxAction> {
         let mut action = None;
 
-        let box_w = ui.available_width().max(220.0);
+        let box_w = (ui.available_width() - INVITE_LINKS_SCROLLBAR_GUTTER).max(200.0);
         let (card_rect, _) = ui.allocate_exact_size(Vec2::new(box_w, 40.0), Sense::hover());
         ui.painter().rect_filled(
             card_rect,
             CornerRadius::same(8),
             colors.color("windowBgOver"),
         );
-        ui.painter().text(
+        let stats_clip = Rect::from_min_max(
+            Pos2::new(card_rect.min.x + 12.0, card_rect.min.y),
+            Pos2::new(card_rect.max.x - 12.0, card_rect.max.y),
+        );
+        ui.painter().with_clip_rect(stats_clip).text(
             Pos2::new(card_rect.min.x + 12.0, card_rect.center().y),
             Align2::LEFT_CENTER,
             &link.link,
@@ -1193,7 +1242,10 @@ fn render_importer_row(
 
     if show_request_buttons {
         let rej_rect = Rect::from_center_size(
-            Pos2::new(rect.max.x - 30.0, rect.center().y),
+            Pos2::new(
+                rect.max.x - INVITE_LINKS_SCROLLBAR_GUTTER - 27.0,
+                rect.center().y,
+            ),
             Vec2::new(54.0, 24.0),
         );
         let acc_rect = Rect::from_center_size(
@@ -1250,6 +1302,91 @@ fn render_importer_row(
     }
 
     decision
+}
+
+fn render_admin_with_invites_row(
+    ui: &mut Ui,
+    admin: &AdminWithInvitesEntry,
+    colors: &dyn Colors,
+) -> Option<InviteLinksBoxAction> {
+    let width = ui.available_width().max(220.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::click());
+    let links_summary = if admin.revoked_invites_count > 0 {
+        format!(
+            "{} active link(s) · {} revoked",
+            admin.invites_count, admin.revoked_invites_count
+        )
+    } else if admin.invites_count == 1 {
+        "1 invite link".to_owned()
+    } else {
+        format!("{} invite links", admin.invites_count)
+    };
+    let acc_label = format!("{}: {}", admin.name, links_summary);
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &acc_label));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), colors.color("windowBgOver"));
+    }
+
+    let av_rect = Rect::from_center_size(
+        Pos2::new(rect.min.x + 18.0, rect.center().y),
+        Vec2::splat(34.0),
+    );
+    EmptyUserpic::for_color_index((admin.admin_id.bare() % 7) as u8, &admin.name, colors)
+        .paint_circle(ui.painter(), av_rect);
+
+    let text_x = av_rect.max.x + 10.0;
+    let right_badge_w = 30.0;
+    let clip_rect = Rect::from_min_max(
+        Pos2::new(text_x, rect.min.y + 4.0),
+        Pos2::new(
+            (rect.max.x - right_badge_w).max(text_x + 40.0),
+            rect.max.y - 4.0,
+        ),
+    );
+    let clip = ui.painter().with_clip_rect(clip_rect);
+    let title = match admin.username {
+        Some(ref u) if !u.is_empty() => format!("{} (@{u})", admin.name),
+        _ => admin.name.clone(),
+    };
+    clip.text(
+        Pos2::new(text_x, rect.min.y + 7.0),
+        Align2::LEFT_TOP,
+        title,
+        font_id_from_style(st::semibold_font),
+        colors.color("windowBoldFg"),
+    );
+    clip.text(
+        Pos2::new(text_x, rect.min.y + 26.0),
+        Align2::LEFT_TOP,
+        &links_summary,
+        FontId::new(11.5, family_regular()),
+        colors.color("windowSubTextFg"),
+    );
+    ui.painter().text(
+        Pos2::new(rect.max.x - 18.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        "›",
+        FontId::new(15.0, family_regular()),
+        colors.color("windowSubTextFg"),
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(text_x, rect.max.y),
+            Pos2::new(rect.max.x - 14.0, rect.max.y),
+        ],
+        Stroke::new(0.5, colors.color("shadowFg")),
+    );
+
+    if resp.clicked() {
+        Some(InviteLinksBoxAction::Toast(format!(
+            "{} created {}",
+            admin.name, links_summary
+        )))
+    } else {
+        None
+    }
 }
 
 fn inline_action_pill(ui: &mut Ui, id_salt: &str, label: &str, bg: Color32, fg: Color32) -> bool {

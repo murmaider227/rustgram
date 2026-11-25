@@ -16,14 +16,13 @@ use tg_ui::widgets::buttons::RoundButton;
 use tg_ui::widgets::sliders::MediaSlider;
 
 use super::backend::{
-    DEFAULT_RINGTONE_MAX_SIZE, MAX_NOTIFICATIONS_COUNT, NotifyException, NotifyScope,
-    ReactionsNotifyFrom, SettingsBackend, format_bytes,
+    ActiveSession, DEFAULT_RINGTONE_MAX_SIZE, MAX_NOTIFICATIONS_COUNT, NotifyException,
+    NotifyScope, ReactionsNotifyFrom, ScopeNotifySettings, SettingsBackend, format_bytes,
 };
 use super::strings;
 use super::widgets::{
-    SettingsIconKind, settings_card, settings_checkbox_row, settings_divider, settings_radio_row,
-    settings_row, settings_row_pad_x, settings_split_toggle_row, settings_toggle_row,
-    subsection_title,
+    SettingsIconKind, settings_card, settings_checkbox_row, settings_divider, settings_row_pad_x,
+    settings_split_toggle_row, settings_toggle_row, subsection_title,
 };
 
 /// Persistent UI state for the Notifications & Sounds section.
@@ -52,11 +51,29 @@ pub fn render_notifications_section(
 ) -> NotificationsOutput {
     let mut out = NotificationsOutput::default();
     let toast = &mut out.toast;
-    let pad_x = settings_row_pad_x();
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.add_space(SECTION_SKIP);
 
-    // 1. Global desktop notification toggles.
+    // 1. Multi-account (`BuildMultiAccountSection`): only with more than one account.
+    if core.accounts_order.len() > 1 {
+        subsection_title(ui, &tr::lng_settings_show_from(), colors);
+        let all_accounts_lbl = tr::lng_settings_notify_all();
+        settings_toggle_row(
+            ui,
+            &all_accounts_lbl,
+            None,
+            None,
+            &mut core.notify_from_all,
+            true,
+            colors,
+        );
+        ui.add_space(SECTION_SKIP);
+        settings_divider(ui, Some(&tr::lng_settings_notify_all_about()), colors);
+        ui.add_space(SECTION_SKIP);
+    }
+
+    // 2. Global settings (`BuildGlobalNotificationsSection`).
     subsection_title(ui, &tr::lng_settings_notify_global(), colors);
-
     let desktop_notify_lbl = tr::lng_settings_desktop_notify();
     settings_toggle_row(
         ui,
@@ -67,180 +84,177 @@ pub fn render_notifications_section(
         true,
         colors,
     );
-
-    let mut native = core.native_notifications.unwrap_or(true);
-    if settings_toggle_row(
+    settings_toggle_row(
         ui,
-        strings::NATIVE_NOTIFICATIONS_LABEL,
-        Some(strings::NATIVE_NOTIFICATIONS_SUBTITLE),
+        &tr::lng_settings_alert_windows(),
         None,
-        &mut native,
-        core.desktop_notify,
+        Some(SettingsIconKind::DockBounce),
+        &mut core.flash_bounce_notify,
+        true,
         colors,
-    ) {
-        core.native_notifications = Some(native);
-    }
-
+    );
     let allow_sound_lbl = tr::lng_settings_sound_allowed();
     settings_toggle_row(
         ui,
         &allow_sound_lbl,
         None,
-        Some(SettingsIconKind::Speaker),
+        Some(SettingsIconKind::Mic),
         &mut core.sound_notify,
         true,
         colors,
     );
 
-    // Notification volume slider (`0..=100%`).
-    if core.sound_notify {
-        let mut vol = f64::from(core.notifications_volume.min(100)) / 100.0;
-        ui.horizontal(|ui| {
-            ui.add_space(pad_x);
-            ui.label(
-                egui::RichText::new(strings::NOTIFICATION_VOLUME_LABEL)
-                    .font(font_id_from_style(st::normal_font))
-                    .color(colors.color("windowFg")),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(pad_x);
-                ui.label(
-                    egui::RichText::new(format!("{}%", core.notifications_volume))
-                        .font(font_id_from_style(st::semibold_font))
-                        .color(colors.color("windowActiveTextFg")),
-                );
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.add_space(pad_x);
-            let avail = (ui.available_width() - pad_x).max(140.0);
-            if MediaSlider::new(&mut vol, MediaSliderStyle::default_media_slider(colors))
-                .always_display_marker(true)
-                .width(avail)
-                .show(ui)
-                .changed()
-            {
-                core.notifications_volume = (vol * 100.0).round().clamp(0.0, 100.0) as u16;
-            }
-        });
-        ui.add_space(6.0);
+    // Volume (`Ui::AddRingtonesVolumeSlider`): subsection title, slider, value label.
+    subsection_title(ui, &tr::lng_settings_master_volume_notifications(), colors);
+    let volume = if core.notifications_volume == 0 {
+        100
+    } else {
+        core.notifications_volume.min(100)
+    };
+    let mut vol = f64::from(volume) / 100.0;
+    if labeled_slider_row(
+        ui,
+        &mut vol,
+        &format!("{volume}%"),
+        !core.sound_notify,
+        colors,
+    ) {
+        core.notifications_volume = (vol * 100.0).round().clamp(1.0, 100.0) as u16;
+    }
+    ui.add_space(SECTION_SKIP);
+
+    // 3. Notification view preview (`SetupNotifyViewOptions`): sample toast on the chat
+    // wallpaper with the "Name" / "Text" pills; a plain divider when notifications are off.
+    if core.desktop_notify {
+        render_notify_preview(ui, &mut core.notify_view, colors);
+    } else {
+        settings_divider(ui, None, colors);
     }
 
-    settings_toggle_row(
-        ui,
-        strings::FLASH_TASKBAR_LABEL,
-        None,
-        None,
-        &mut core.flash_bounce_notify,
-        true,
-        colors,
-    );
-
-    settings_toggle_row(
-        ui,
-        strings::SKIP_TOASTS_FOCUS_LABEL,
-        None,
-        None,
-        &mut core.skip_toasts_in_focus,
-        core.desktop_notify,
-        colors,
-    );
-
-    let all_accounts_lbl = tr::lng_settings_notify_all();
-    let all_accounts_sub = tr::lng_settings_notify_all_about();
-    settings_toggle_row(
-        ui,
-        &all_accounts_lbl,
-        Some(&all_accounts_sub),
-        None,
-        &mut core.notify_from_all,
-        true,
-        colors,
-    );
-
-    settings_divider(ui, None, colors);
-
-    // 2. Notification content / preview text (`CoreSettings::notify_view`).
-    subsection_title(ui, strings::NOTIFY_PREVIEW_TITLE, colors);
-    let preview_enabled = core.desktop_notify;
-    settings_radio_row(
-        ui,
-        &mut core.notify_view,
-        NotifyView::ShowPreview,
-        strings::NOTIFY_SHOW_PREVIEW,
-        preview_enabled,
-        colors,
-    );
-    settings_radio_row(
-        ui,
-        &mut core.notify_view,
-        NotifyView::ShowName,
-        strings::NOTIFY_SHOW_NAME,
-        preview_enabled,
-        colors,
-    );
-    settings_radio_row(
-        ui,
-        &mut core.notify_view,
-        NotifyView::ShowNothing,
-        strings::NOTIFY_SHOW_NOTHING,
-        preview_enabled,
-        colors,
-    );
-
-    settings_divider(ui, None, colors);
-
-    // 3. Notification Position Corner Picker & Count (`NotificationsCount` in `settings_notifications.cpp`).
-    subsection_title(ui, &tr::lng_settings_notifications_position(), colors);
-    render_corner_picker(
-        ui,
-        &mut core.notifications_corner,
-        core.desktop_notify,
-        colors,
-    );
-
-    ui.add_space(10.0);
-    let clamped_count = core.notifications_count.clamp(1, MAX_NOTIFICATIONS_COUNT);
-    core.notifications_count = clamped_count;
-    let mut count_norm = f64::from(clamped_count - 1) / f64::from(MAX_NOTIFICATIONS_COUNT - 1);
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
-        ui.label(
-            egui::RichText::new(tr::lng_settings_notifications_count())
-                .font(font_id_from_style(st::normal_font))
-                .color(colors.color("windowFg")),
+    // 4. Notifications for chats (`BuildNotifyTypeSection`).
+    ui.add_space(SECTION_SKIP);
+    subsection_title(ui, &tr::lng_settings_notify_title(), colors);
+    for scope in NotifyScope::ALL {
+        let mut scope_cfg = backend.scope_notifications(scope);
+        let subtitle = scope_status(&scope_cfg);
+        let icon = match scope {
+            NotifyScope::PrivateChats => SettingsIconKind::Account,
+            NotifyScope::Groups => SettingsIconKind::Groups,
+            NotifyScope::Channels => SettingsIconKind::Channel,
+        };
+        let scope_title = scope.localized_title();
+        let (clicked, toggled) = settings_split_toggle_row(
+            ui,
+            &scope_title,
+            &subtitle,
+            Some(icon),
+            &mut scope_cfg.enabled,
+            colors,
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(pad_x);
-            ui.label(
-                egui::RichText::new(clamped_count.to_string())
-                    .font(font_id_from_style(st::semibold_font))
-                    .color(colors.color("windowActiveTextFg")),
-            );
-        });
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
-        let avail = (ui.available_width() - pad_x).max(140.0);
-        if MediaSlider::new(
-            &mut count_norm,
-            MediaSliderStyle::default_media_slider(colors),
-        )
-        .always_display_marker(true)
-        .disabled(!core.desktop_notify)
-        .width(avail)
-        .show(ui)
-        .changed()
-        {
-            core.notifications_count =
-                1 + (count_norm * f64::from(MAX_NOTIFICATIONS_COUNT - 1)).round() as i32;
+        if toggled {
+            backend.set_scope_notifications(scope, scope_cfg);
         }
-    });
-    ui.add_space(4.0);
+        if clicked {
+            if state.editing_scope == Some(scope) {
+                state.editing_scope = None;
+            } else {
+                state.editing_scope = Some(scope);
+            }
+        }
+    }
 
+    // Reactions split toggle (`AddReactionsButton`) -> `settings_notifications_reactions.cpp`.
+    let mut events = backend.notification_events();
+    let mut events_changed = false;
+    let react_title = tr::lng_notification_reactions();
+    let react_subtitle = if events.reactions_enabled() {
+        events.reactions_summary()
+    } else {
+        tr::lng_notification_click_to_change()
+    };
+    let mut react_enabled = events.reactions_enabled();
+    let (react_clicked, react_toggled) = settings_split_toggle_row(
+        ui,
+        &react_title,
+        &react_subtitle,
+        Some(SettingsIconKind::Reactions),
+        &mut react_enabled,
+        colors,
+    );
+    if react_toggled {
+        events.set_all_reactions_from(if react_enabled {
+            ReactionsNotifyFrom::All
+        } else {
+            ReactionsNotifyFrom::None
+        });
+        events_changed = true;
+    } else if react_clicked {
+        out.open_reactions = true;
+    }
+
+    if let Some(scope) = state.editing_scope {
+        ui.add_space(6.0);
+        render_scope_editor(ui, scope, backend, colors, toast);
+    }
+
+    // 5. Events (`BuildEventNotificationsSection`).
+    ui.add_space(SECTION_SKIP);
     settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
+    subsection_title(ui, &tr::lng_settings_events_title(), colors);
+    let joined_lbl = tr::lng_settings_events_joined();
+    if settings_toggle_row(
+        ui,
+        &joined_lbl,
+        None,
+        Some(SettingsIconKind::Invite),
+        &mut events.contact_joined,
+        true,
+        colors,
+    ) {
+        events_changed = true;
+    }
+    let pinned_lbl = tr::lng_settings_events_pinned();
+    settings_toggle_row(
+        ui,
+        &pinned_lbl,
+        None,
+        Some(SettingsIconKind::Pin),
+        &mut core.notify_about_pinned,
+        true,
+        colors,
+    );
+    if events_changed {
+        backend.set_notification_events(events);
+    }
 
-    // 4. Badge Counter options (`CoreSettings::include_muted_counter*`, `count_unread_messages`).
+    // 6. Calls (`BuildCallNotificationsSection`): `callsDisabledHere` of the current session.
+    ui.add_space(SECTION_SKIP);
+    settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
+    subsection_title(ui, &tr::lng_settings_notifications_calls_title(), colors);
+    let current = backend
+        .active_sessions()
+        .into_iter()
+        .find(ActiveSession::is_current);
+    let mut accept_calls = current.as_ref().is_none_or(|s| s.accept_calls);
+    if settings_toggle_row(
+        ui,
+        &tr::lng_settings_call_accept_calls(),
+        None,
+        Some(SettingsIconKind::Calls),
+        &mut accept_calls,
+        true,
+        colors,
+    ) {
+        let accept_secret = current.as_ref().is_none_or(|s| s.accept_secret_chats);
+        backend.update_session_permissions(0, accept_calls, accept_secret);
+    }
+
+    // 7. Badge counter (`BuildBadgeCounterSection`).
+    ui.add_space(SECTION_SKIP);
+    settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
     subsection_title(ui, &tr::lng_settings_badge_title(), colors);
     settings_checkbox_row(
         ui,
@@ -264,129 +278,307 @@ pub fn render_notifications_section(
         colors,
     );
 
+    // 8. System integration (`BuildSystemIntegrationAndAdvancedSection`): the native toggle;
+    // with native notifications off, focus mode, corner and count.
+    ui.add_space(SECTION_SKIP);
     settings_divider(ui, None, colors);
-
-    // 5. Notifications for chats (per-scope split toggles).
-    subsection_title(ui, &tr::lng_settings_notify_title(), colors);
-    for scope in NotifyScope::ALL {
-        let mut scope_cfg = backend.scope_notifications(scope);
-        let subtitle = scope_cfg.subtitle();
-        let icon = match scope {
-            NotifyScope::PrivateChats => SettingsIconKind::Account,
-            NotifyScope::Groups => SettingsIconKind::Folders,
-            NotifyScope::Channels => SettingsIconKind::Notifications,
-        };
-        let scope_title = scope.localized_title();
-        let (clicked, toggled) = settings_split_toggle_row(
-            ui,
-            &scope_title,
-            &subtitle,
-            Some(icon),
-            &mut scope_cfg.enabled,
-            colors,
-        );
-        if toggled {
-            backend.set_scope_notifications(scope, scope_cfg);
-        }
-        if clicked {
-            if state.editing_scope == Some(scope) {
-                state.editing_scope = None;
-            } else {
-                state.editing_scope = Some(scope);
-            }
-        }
-    }
-
-    if let Some(scope) = state.editing_scope {
-        ui.add_space(6.0);
-        render_scope_editor(ui, scope, backend, colors, toast);
-    }
-
-    settings_divider(ui, None, colors);
-
-    // 6. Events (contact joined, pinned messages, reactions).
-    subsection_title(ui, &tr::lng_settings_events_title(), colors);
-    let mut events = backend.notification_events();
-    let mut events_changed = false;
-
-    let joined_lbl = tr::lng_settings_events_joined();
+    ui.add_space(SECTION_SKIP);
+    subsection_title(ui, &tr::lng_settings_native_title(), colors);
+    let mut native = core.native_notifications.unwrap_or(true);
     if settings_toggle_row(
         ui,
-        &joined_lbl,
+        &tr::lng_settings_use_windows(),
         None,
         None,
-        &mut events.contact_joined,
+        &mut native,
         true,
         colors,
     ) {
-        events_changed = true;
+        core.native_notifications = Some(native);
     }
-
-    let pinned_lbl = tr::lng_settings_events_pinned();
-    settings_toggle_row(
-        ui,
-        &pinned_lbl,
-        None,
-        None,
-        &mut core.notify_about_pinned,
-        true,
-        colors,
-    );
-
-    // Split-toggle entry to `Settings -> Notifications -> Reactions` (`settings_notifications_reactions.cpp`).
-    let react_title = tr::lng_notification_reactions();
-    let react_subtitle = events.reactions_summary();
-    let mut react_enabled = events.reactions_enabled();
-    let (react_clicked, react_toggled) = settings_split_toggle_row(
-        ui,
-        &react_title,
-        &react_subtitle,
-        Some(SettingsIconKind::Notifications),
-        &mut react_enabled,
-        colors,
-    );
-    if react_toggled {
-        events.set_all_reactions_from(if react_enabled {
-            ReactionsNotifyFrom::All
-        } else {
-            ReactionsNotifyFrom::None
-        });
-        events_changed = true;
-    } else if react_clicked {
-        out.open_reactions = true;
-    }
-
-    if events_changed {
-        backend.set_notification_events(events);
-    }
-
-    settings_divider(ui, None, colors);
-
-    // 7. Custom Ringtones (`boxes/ringtones_box.cpp`: getSavedRingtones / saveRingtone / uploadRingtone).
-    subsection_title(ui, &tr::lng_ringtones_box_title(), colors);
-    render_ringtones_subsection(ui, backend, colors, toast);
-
-    settings_divider(ui, None, colors);
-
-    if settings_row(
-        ui,
-        strings::RESET_ALL_NOTIFICATIONS_TITLE,
-        Some(strings::RESET_ALL_NOTIFICATIONS_SUBTITLE),
-        None,
-        None,
-        true,
-        false,
-        colors,
-    )
-    .clicked()
-    {
-        backend.reset_all_notifications();
-        state.editing_scope = None;
-        *toast = Some(strings::RESET_ALL_NOTIFICATIONS_TOAST.to_owned());
+    if !native {
+        settings_toggle_row(
+            ui,
+            &tr::lng_settings_skip_in_focus(),
+            None,
+            None,
+            &mut core.skip_toasts_in_focus,
+            true,
+            colors,
+        );
+        ui.add_space(SECTION_SKIP);
+        settings_divider(ui, None, colors);
+        ui.add_space(SECTION_SKIP);
+        subsection_title(ui, &tr::lng_settings_notifications_position(), colors);
+        render_corner_picker(
+            ui,
+            &mut core.notifications_corner,
+            core.desktop_notify,
+            colors,
+        );
+        ui.add_space(SECTION_SKIP);
+        subsection_title(ui, &tr::lng_settings_notifications_count(), colors);
+        let clamped_count = core.notifications_count.clamp(1, MAX_NOTIFICATIONS_COUNT);
+        core.notifications_count = clamped_count;
+        let mut count_norm = f64::from(clamped_count - 1) / f64::from(MAX_NOTIFICATIONS_COUNT - 1);
+        if labeled_slider_row(
+            ui,
+            &mut count_norm,
+            &clamped_count.to_string(),
+            !core.desktop_notify,
+            colors,
+        ) {
+            core.notifications_count =
+                1 + (count_norm * f64::from(MAX_NOTIFICATIONS_COUNT - 1)).round() as i32;
+        }
     }
 
     ui.add_space(16.0);
     out
+}
+
+/// Vertical skip around dividers and titles (`st::settings_checkboxes_skip`).
+const SECTION_SKIP: f32 = 8.0;
+
+/// Status line under a per-chat-type split toggle (`AddTypeButton`): "Click here to change"
+/// without exceptions, otherwise "On, 2 exceptions" / "Off, 2 exceptions".
+fn scope_status(cfg: &ScopeNotifySettings) -> String {
+    let count = cfg.exceptions.len();
+    if count == 0 {
+        return tr::lng_notification_click_to_change();
+    }
+    let exc = tr::lng_notification_exceptions(count as i64);
+    if cfg.enabled {
+        tr::lng_notification_on(&exc)
+    } else {
+        tr::lng_notification_off(&exc)
+    }
+}
+
+/// Full-width slider row: slider from the row padding, value label right-aligned
+/// (`Ui::AddRingtonesVolumeSlider`, `NotificationsCount`). Returns `true` when changed.
+fn labeled_slider_row(
+    ui: &mut Ui,
+    value: &mut f64,
+    label: &str,
+    disabled: bool,
+    colors: &dyn Colors,
+) -> bool {
+    let pad_x = settings_row_pad_x();
+    let label_font = egui::FontId::new(12.0, tg_ui::fonts::family_regular());
+    let label_fg = colors.color("windowActiveTextFg");
+    let label_w = ui
+        .painter()
+        .layout_no_wrap("100%".to_owned(), label_font.clone(), label_fg)
+        .size()
+        .x;
+    let full_w = ui.available_width();
+    let (row_rect, _) = ui.allocate_exact_size(Vec2::new(full_w, 30.0), Sense::hover());
+    let slider_w = (full_w - pad_x * 2.0 - label_w - 10.0).max(120.0);
+    let slider_rect = Rect::from_min_size(
+        Pos2::new(row_rect.left() + pad_x, row_rect.top()),
+        Vec2::new(slider_w, row_rect.height()),
+    );
+    let changed = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(slider_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                MediaSlider::new(value, MediaSliderStyle::default_media_slider(colors))
+                    .always_display_marker(true)
+                    .disabled(disabled)
+                    .width(slider_w)
+                    .show(ui)
+                    .changed()
+            },
+        )
+        .inner;
+    ui.painter().text(
+        Pos2::new(row_rect.right() - pad_x, row_rect.center().y),
+        Align2::RIGHT_CENTER,
+        label,
+        label_font,
+        label_fg,
+    );
+    changed
+}
+
+/// tdesktop's sample-notification userpic (`icons/settings/dino.svg`, GPL-3.0).
+const DINO_SVG: &[u8] = include_bytes!("assets/dino.svg");
+
+/// Rasterizes (once per context) the Dino Rex userpic used by the notification preview.
+fn dino_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let id = egui::Id::unique("tg_settings_notify_preview_dino");
+    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(tex);
+    }
+    let size = 96_u32;
+    let tree = resvg::usvg::Tree::from_data(DINO_SVG, &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)?;
+    let tree_size = tree.size();
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(
+            size as f32 / tree_size.width().max(1.0),
+            size as f32 / tree_size.height().max(1.0),
+        ),
+        &mut pixmap.as_mut(),
+    );
+    let image =
+        egui::ColorImage::from_rgba_premultiplied([size as usize, size as usize], pixmap.data());
+    let tex = ctx.load_texture(
+        "tg_settings_notify_dino",
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    Some(tex)
+}
+
+/// Notification preview card (`NotifyPreview` + `SetupNotifyViewOptions`): the chat wallpaper,
+/// a `msgInBg` sample toast ("Dino Rex" / "It's morning in Tokyo"), and the "Name" / "Text"
+/// service pills that set [`NotifyView`].
+fn render_notify_preview(ui: &mut Ui, view: &mut NotifyView, colors: &dyn Colors) {
+    // `st::notify_preview_margins` (40, 20, 40, 58), userpic 36 px at (14, 13), text at 64.
+    let (m_left, m_top, m_right, m_bottom) = (40.0_f32, 20.0_f32, 40.0_f32, 58.0_f32);
+    let card_h = 58.0_f32;
+    let width = ui.available_width();
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(width, m_top + card_h + m_bottom), Sense::hover());
+    {
+        let bg = crate::themes::active_chat_background(ui.ctx());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        if let Ok(mut bg) = bg.lock() {
+            // `SectionWidget::PaintBackground` with `QSize(width, window height)`: the strip
+            // shows the top of a window-tall wallpaper, so the pattern keeps its chat scale.
+            let window_h = ui.ctx().content_rect().height().max(rect.height());
+            let area = Rect::from_min_size(rect.min, Vec2::new(rect.width(), window_h));
+            bg.paint(&mut child, area, None);
+        };
+    }
+
+    let card = Rect::from_min_size(
+        Pos2::new(rect.left() + m_left, rect.top() + m_top),
+        Vec2::new((width - m_left - m_right).max(120.0), card_h),
+    );
+    let radius = st::box_radius.scaled().clamp(2, 16) as u8;
+    ui.painter()
+        .rect_filled(card, CornerRadius::same(radius), colors.color("msgInBg"));
+
+    let name_shown = *view != NotifyView::ShowNothing;
+    let text_shown = *view == NotifyView::ShowPreview;
+    let userpic = Rect::from_min_size(card.min + Vec2::new(14.0, 11.0), Vec2::splat(36.0));
+    if let Some(tex) = name_shown.then(|| dino_texture(ui.ctx())).flatten() {
+        ui.painter().image(
+            tex.id(),
+            userpic,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        ui.painter()
+            .circle_filled(userpic.center(), 18.0, colors.color("windowBgActive"));
+    }
+    let text_fg = colors.color("historyTextInFg");
+    let painter = ui.painter().with_clip_rect(card.shrink(4.0));
+    let title = if name_shown {
+        tr::lng_notification_preview_title()
+    } else {
+        "Rustgram".to_owned()
+    };
+    painter.text(
+        Pos2::new(card.left() + 64.0, card.top() + 9.0),
+        Align2::LEFT_TOP,
+        title,
+        font_id_from_style(st::semibold_font),
+        text_fg,
+    );
+    let body = if text_shown {
+        tr::lng_notification_preview_text()
+    } else {
+        tr::lng_notification_preview()
+    };
+    painter.text(
+        Pos2::new(card.left() + 64.0, card.top() + 30.0),
+        Align2::LEFT_TOP,
+        body,
+        font_id_from_style(st::normal_font),
+        text_fg,
+    );
+
+    // "Name" / "Text" pills (`Ui::MakeChatServiceCheckbox`, `st::background_checkbox`).
+    let pill_font = font_id_from_style(st::semibold_font);
+    let labels = [
+        tr::lng_notification_show_name(),
+        tr::lng_notification_show_text(),
+    ];
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|l| {
+            ui.painter()
+                .layout_no_wrap(l.clone(), pill_font.clone(), Color32::WHITE)
+                .size()
+                .x
+                + 52.0
+        })
+        .collect();
+    let skip = 12.0_f32;
+    let total = widths.iter().sum::<f32>() + skip;
+    let pill_h = 30.0_f32;
+    let pill_top = card.bottom() + (m_bottom - pill_h) * 0.5;
+    let mut x = rect.center().x - total * 0.5;
+    let service_bg = colors.color("msgServiceBg");
+    let service_fg = colors.color("msgServiceFg");
+    for (i, label) in labels.iter().enumerate() {
+        let pill = Rect::from_min_size(Pos2::new(x, pill_top), Vec2::new(widths[i], pill_h));
+        x += widths[i] + skip;
+        let resp = ui.interact(
+            pill,
+            ui.scope_id().with(("notify_view_pill", i)),
+            Sense::click(),
+        );
+        let checked = if i == 0 { name_shown } else { text_shown };
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::CheckBox, true, checked, label.clone())
+        });
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            *view = match (i, checked) {
+                (0, true) => NotifyView::ShowNothing,
+                (0, false) => NotifyView::ShowName,
+                (_, true) => NotifyView::ShowName,
+                (_, false) => NotifyView::ShowPreview,
+            };
+        }
+        ui.painter()
+            .rect_filled(pill, CornerRadius::same((pill_h * 0.5) as u8), service_bg);
+        let check_c = Pos2::new(pill.left() + 18.0, pill.center().y);
+        if checked {
+            ui.painter().circle_filled(check_c, 9.0, service_fg);
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    Pos2::new(check_c.x - 4.0, check_c.y + 0.5),
+                    Pos2::new(check_c.x - 1.0, check_c.y + 3.5),
+                    Pos2::new(check_c.x + 4.5, check_c.y - 3.0),
+                ],
+                Stroke::new(1.8, service_bg),
+            ));
+        } else {
+            ui.painter()
+                .circle_stroke(check_c, 8.0, Stroke::new(1.6, service_fg));
+        }
+        ui.painter().text(
+            Pos2::new(pill.left() + 36.0, pill.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            pill_font.clone(),
+            service_fg,
+        );
+    }
 }
 
 /// Interactive mini-monitor 4-corner notification position picker (`settings_notifications.cpp`).
@@ -618,6 +810,24 @@ fn render_scope_editor(
             cfg.exceptions.remove(idx);
             changed = true;
         }
+        // `lng_notification_exceptions_clear` (`settings_notifications_type.cpp`).
+        if !cfg.exceptions.is_empty() {
+            ui.add_space(4.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(tr::lng_notification_exceptions_clear())
+                            .font(font_id_from_style(st::normal_font))
+                            .color(colors.color("attentionButtonFg")),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                cfg.exceptions.clear();
+                changed = true;
+            }
+        }
 
         // Quick-add exception from known contacts matching scope.
         if let Some(candidate) = contacts.into_iter().find(|c| {
@@ -651,6 +861,11 @@ fn render_scope_editor(
     if changed {
         backend.set_scope_notifications(scope, cfg);
     }
+
+    // `lng_notification_tone` opens `RingtonesBox`: saved cloud tones + upload.
+    ui.add_space(6.0);
+    subsection_title(ui, &tr::lng_notification_tone(), colors);
+    render_ringtones_subsection(ui, backend, colors, toast);
 }
 
 fn render_ringtones_subsection(

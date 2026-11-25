@@ -20,7 +20,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tg_api::{DcId, InvocationError, RpcClient, RpcError};
 use tg_data::{PeerUpdateFlags, User, UserId as DataUserId};
@@ -920,7 +920,13 @@ fn wp28_round_video_capture_headless_safe_and_square_crop_export() {
     );
 
     let mut session = RoundVideoWebcamCapture::start_with_source(Box::new(synth), false);
-    std::thread::sleep(Duration::from_millis(60));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if session.frame_count() >= 1 && session.latest_preview().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(session.frame_count() >= 1);
     assert!(session.latest_preview().is_some());
 

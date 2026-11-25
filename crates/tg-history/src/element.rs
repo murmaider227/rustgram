@@ -896,12 +896,18 @@ pub fn layout_message(
     let reactions_in_bubble = has_reactions && input.reactions_in_bubble && draw_bubble;
 
     // 1. Optimal size (performCountOptimalSize, history_view_message.cpp:1514-1733).
+    // Text skip block reserved for the bottom info on the last line (`Ui::Text::String`
+    // `updateSkipBlock`), when the time is drawn inside the text block.
+    let info_skip = if has_visible_text
+        && !input.hides_bottom_info
+        && !has_reactions
+        && probe_media.is_none()
+    {
+        MSG_DATE_SPACE + bottom_info_opt.optimal_size.width
+    } else {
+        0
+    };
     let textual_max_width = if has_visible_text {
-        let info_skip = if !input.hides_bottom_info && !has_reactions && probe_media.is_none() {
-            MSG_DATE_SPACE + bottom_info_opt.optimal_size.width
-        } else {
-            0
-        };
         MSG_PADDING.left + input.text_max_width + info_skip + MSG_PADDING.right
     } else {
         MSG_PADDING.horizontal()
@@ -1064,8 +1070,15 @@ pub fn layout_message(
             }
         }
     } else if draw_bubble && has_visible_text && input.text_real_width > 0 {
-        let shrunk = (input.text_real_width + MSG_PADDING.horizontal()).max(non_text_max);
-        content_width = content_width.min(shrunk);
+        // Keep the skip block when the time fits after the text, so a short one-line message
+        // never draws its time over the text.
+        let with_info = input.text_real_width + info_skip + MSG_PADDING.horizontal();
+        let text_only = if with_info <= content_width {
+            with_info
+        } else {
+            input.text_real_width + MSG_PADDING.horizontal()
+        };
+        content_width = content_width.min(text_only.max(non_text_max));
     }
 
     if content_width < available_width && !matches!(input.chat_mode, ElementChatMode::Wide) {

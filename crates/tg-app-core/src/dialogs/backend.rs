@@ -129,6 +129,61 @@ pub struct FolderTagBadge {
     pub color_index: u8,
 }
 
+/// Classification of media/service preview attached to a dialog's latest message,
+/// used by `dialogs/layout.rs` to draw leading mini thumbnails/icons and tdesktop's
+/// blue `dialogsTextFgService` tint (`dialogs_layout.cpp` / `data_media_types.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DialogMediaPreviewKind {
+    /// Photo attachment (with optional stripped/mini thumbnail).
+    Photo,
+    /// Video attachment (with optional mini thumbnail).
+    Video,
+    /// Round video message.
+    RoundVideo,
+    /// Animated GIF.
+    Gif,
+    /// Voice message.
+    Voice,
+    /// Music / audio track.
+    Audio,
+    /// Generic document / file attachment.
+    File,
+    /// Sticker (static, animated, or video).
+    Sticker,
+    /// Location, live location, or venue.
+    Location,
+    /// Shared contact card.
+    Contact,
+    /// Poll or quiz.
+    Poll,
+    /// Checklist / to-do list.
+    TodoList,
+    /// Animated dice / dart / slot.
+    Dice,
+    /// HTML5 bot game.
+    Game,
+    /// Payment invoice.
+    Invoice,
+    /// Forwarded story.
+    Story,
+    /// Service message (e.g. `"Channel created"`, `"You allowed this bot..."`).
+    Service,
+}
+
+/// Structured preview metadata for a dialog's latest message (`HistoryItem::toPreview`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogMediaPreview {
+    /// Kind of media or service action for leading icon selection.
+    pub kind: DialogMediaPreviewKind,
+    /// Optional stripped JPEG thumbnail bytes (`PhotoStrippedSize`) for mini-image previews.
+    pub stripped_thumb: Option<Vec<u8>>,
+    /// Whether the preview text should be tinted with tdesktop's blue `dialogsTextFgService`
+    /// color (service actions and media-only previews without a caption).
+    pub use_service_color: bool,
+    /// Whether the message carries a non-empty text caption in addition to the media item.
+    pub has_caption: bool,
+}
+
 /// Complete view model for a single row in the dialogs list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogItem {
@@ -182,6 +237,12 @@ pub struct DialogItem {
     pub badges: DialogBadgesState,
     /// Whether this bot offers an inline "Open" right action button.
     pub has_bot_app_button: bool,
+    /// Whether this peer is in the current user's contacts (`User::isContact`, never `true` for
+    /// Saved Messages / groups / channels). Used by the dialog context menu (`"Block user"`).
+    pub is_contact: bool,
+    /// Optional structured media/service preview metadata for chat-list thumbnails, leading
+    /// media icons, and blue service/media preview tinting.
+    pub media_preview: Option<DialogMediaPreview>,
 }
 
 impl DialogItem {
@@ -719,8 +780,21 @@ pub trait DialogsBackend: Send {
     /// Returns a paginated slice of dialogs for `list` (`Filter(id)` or `Archive`).
     fn dialog_slice(&self, list: DialogListQuery, offset: usize, limit: usize) -> DialogSlice;
 
+    /// `false` while the first page of the main chat list is still being requested, so an
+    /// empty list draws tdesktop's "Loading..." state (`InnerWidget::refreshEmpty`,
+    /// `EmptyState::Loading`) instead of "no chats".
+    fn chats_list_loaded(&self) -> bool {
+        true
+    }
+
     /// Looks up a single dialog item by `peer_id`.
     fn dialog_by_peer(&self, peer_id: PeerId) -> Option<DialogItem>;
+
+    /// Whether the user `peer_id` is blocked (`UserData::isBlocked`); picks "Block" vs
+    /// "Unblock" / "Restart bot" in the chat-list menu (`Filler::addBlockUser`).
+    fn is_peer_blocked(&self, _peer_id: PeerId) -> bool {
+        false
+    }
 
     /// Returns all configured chat folders (always including `FilterId::ALL`).
     fn chat_folders(&self) -> Vec<ChatFolder>;
@@ -851,6 +925,16 @@ pub trait DialogsBackend: Send {
         Ok(Vec::new())
     }
 
+    /// Today's contact birthdays for the chat-list suggestion bar without blocking the frame:
+    /// `None` while `contacts.getBirthdays` is still on its way (ask again on a later frame), like
+    /// tdesktop's asynchronous request in `PromoSuggestions`. Defaults to [`Self::contact_birthdays`].
+    fn poll_contact_birthdays(
+        &self,
+    ) -> Option<Result<Vec<crate::core_types::dto::contacts_extras::ContactBirthdayEntry>, String>>
+    {
+        Some(self.contact_birthdays(false))
+    }
+
     /// Enables or disables top-peers suggestions (`contacts.toggleTopPeers`,
     /// `data/components/top_peers.cpp:195-216`).
     fn toggle_top_peers(&mut self, _enabled: bool) -> Result<bool, String> {
@@ -883,5 +967,88 @@ pub trait DialogsBackend: Send {
     /// `window/window_peer_menu.cpp:525-530`).
     fn hide_promo_data(&mut self, _peer_id: PeerId) -> Result<bool, String> {
         Err("Hiding promo data is not supported by this backend.".to_owned())
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-77: Mute Submenu Actions (Timed Mute, Sound On/Off, Per-Chat Tone),
+    //        Block Confirmation (Report Spam + Block + Delete Chat), & Bot Restart
+    // -----------------------------------------------------------------------
+
+    /// Mutes or unmutes notifications for `peer_id` for `seconds` (`account.updateNotifySettings`,
+    /// `menu/menu_mute.cpp:238-247`):
+    /// - `seconds <= 0`: unmutes immediately (`mute_until = 0`)
+    /// - `seconds == i32::MAX`: mutes forever (`mute_until = i32::MAX`)
+    /// - `0 < seconds < i32::MAX`: mutes until `now_unix + seconds` (clamped to `i32::MAX`).
+    ///
+    /// Returns `Ok(true)` if the dialog is now muted, `Ok(false)` if unmuted.
+    fn mute_dialog_for(&mut self, _peer_id: PeerId, _seconds: i32) -> Result<bool, String> {
+        Err("Timed dialog mute is not supported by this backend.".to_owned())
+    }
+
+    /// Returns the active mute expiration Unix timestamp for `peer_id` (`Some(ts)` where `ts > 0`,
+    /// `Some(i32::MAX)` when muted forever, or `None` when unmuted).
+    fn dialog_mute_until(&self, _peer_id: PeerId) -> Option<i32> {
+        None
+    }
+
+    /// Returns the effective per-chat notification sound for `peer_id`
+    /// (`menu/menu_mute.cpp:229-234`, `NotifySettings::sound`).
+    fn dialog_notify_sound(&self, _peer_id: PeerId) -> crate::notifications::settings::NotifySound {
+        crate::notifications::settings::NotifySound::default_sound()
+    }
+
+    /// Enables (`enabled = true`) or disables (`enabled = false`, silent `NotificationSound::None`)
+    /// notification sound for `peer_id` (`account.updateNotifySettings`,
+    /// `menu/menu_mute.cpp:325-339`). Returns `Ok(enabled)` on success.
+    fn set_dialog_sound_enabled(
+        &mut self,
+        _peer_id: PeerId,
+        _enabled: bool,
+    ) -> Result<bool, String> {
+        Err("Toggling per-chat notification sound is not supported by this backend.".to_owned())
+    }
+
+    /// Sets a per-chat notification tone (`Default`, `Silent`, local sound, or uploaded cloud
+    /// ringtone document ID) for `peer_id` (`account.updateNotifySettings`,
+    /// `menu/menu_mute.cpp:235-237`).
+    fn set_dialog_notify_sound(
+        &mut self,
+        _peer_id: PeerId,
+        _sound: crate::notifications::settings::NotifySound,
+    ) -> Result<(), String> {
+        Err("Setting per-chat notification tone is not supported by this backend.".to_owned())
+    }
+
+    /// Returns `true` when `peer_id` carries `PeerBarSettings::REPORT_SPAM`, so the block
+    /// confirmation box should offer the "Report spam" checkbox
+    /// (`window/window_peer_menu.cpp:2770-2773`).
+    fn dialog_suggests_report_spam(&self, _peer_id: PeerId) -> bool {
+        false
+    }
+
+    /// Blocks `peer_id` (`contacts.block`) and optionally reports spam (`messages.reportSpam`)
+    /// and/or deletes the chat (`delete_chat`) — matching `Window::PeerMenuBlockUserBox`
+    /// (`window/window_peer_menu.cpp:2855-2868`).
+    fn report_spam_and_block(
+        &mut self,
+        _peer_id: PeerId,
+        _report_spam: bool,
+        _delete_chat: bool,
+    ) -> Result<(), String> {
+        Err("Blocking with report/delete options is not supported by this backend.".to_owned())
+    }
+
+    /// Deletes/leaves a conversation (`messages.deleteHistory` for DMs, `messages.deleteChatUser`
+    /// and `messages.deleteHistory` for basic groups, or `channels.leaveChannel` for supergroups /
+    /// channels), draining `AffectedHistory` pagination and removing the dialog locally
+    /// (`ApiWrap::deleteConversation`, `window/window_peer_menu.cpp:2864`).
+    fn delete_chat(&mut self, _peer_id: PeerId, _revoke: bool) -> Result<(), String> {
+        Err("Deleting chat is not supported by this backend.".to_owned())
+    }
+
+    /// Unblocks `peer_id` (`contacts.unblock`) and, when `peer_id` is a non-support bot, sends
+    /// `/start` (`PeerMenuUnblockUserWithBotRestart`, `window/window_peer_menu.cpp:2879-2887`).
+    fn unblock_and_restart_bot(&mut self, _peer_id: PeerId) -> Result<(), String> {
+        Err("Unblocking and restarting bot is not supported by this backend.".to_owned())
     }
 }

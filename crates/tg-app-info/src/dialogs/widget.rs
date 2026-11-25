@@ -21,13 +21,14 @@ use crate::dialogs::inner::{DialogsInnerWidget, InnerAction};
 use crate::dialogs::layout::{DialogColors, paint_semibold_text};
 use crate::dialogs::search::{
     DialogsSearchState, HashOrCashtag, SearchKeyboardItem, SearchViewAction,
-    collect_search_keyboard_items, fix_hashtag_search_query, is_hash_or_cashtag_search_query,
-    paint_search_scope_chip, show_search_body, show_search_header_tabs,
+    collect_search_keyboard_items_with_sponsored, fix_hashtag_search_query,
+    is_hash_or_cashtag_search_query, paint_search_scope_chip, show_search_body,
+    show_search_header_tabs,
 };
 use crate::dialogs::strings;
 use crate::dialogs::suggestions::{
-    PromoDataSnapshot, PromoSuggestion, PromoSuggestionsState, SuggestionAction,
-    render_top_bar_suggestion,
+    KEY_BIRTHDAY_CONTACTS_TODAY, PromoDataSnapshot, PromoSuggestion, PromoSuggestionsState,
+    SuggestionAction, render_top_bar_suggestion,
 };
 use tg_app_core::stand_in::strings::Strings;
 use tg_app_core::stand_in::theme::Palette;
@@ -57,6 +58,14 @@ pub enum DialogsPanelAction {
     ActivateSuggestion(PromoSuggestion),
     /// Informational toast message.
     Toast(String),
+    /// Open a conversation in a separate window (`"Open in new window"`).
+    OpenInNewWindow(PeerId),
+    /// Block or unblock a user / bot from the chat-list menu (`Filler::addBlockUser`).
+    ToggleBlock(PeerId),
+    /// Mute submenu "Mute for..." (`PickMuteBox`).
+    OpenMuteFor(PeerId),
+    /// Mute submenu "Select tone" (`RingtonesBox`).
+    OpenSelectTone(PeerId),
 }
 
 /// Keyboard command mapped from tdesktop's `Shortcuts::Command` (`dialogs_inner_widget.cpp:6484-6620`).
@@ -210,6 +219,7 @@ pub struct DialogsPanel {
     /// Reduced-motion flag (`PowerSavingFlags::ANIMATIONS`).
     pub reduced_motion: bool,
     last_promo_snapshot: Option<PromoDataSnapshot>,
+    last_birthdays_date: Option<(i32, u8, u8)>,
     request_search_focus: bool,
 }
 
@@ -236,8 +246,14 @@ impl DialogsPanel {
             quick_dialog_action: tg_core::settings::QuickDialogAction::Disabled,
             reduced_motion: false,
             last_promo_snapshot: None,
+            last_birthdays_date: None,
             request_search_focus: false,
         }
+    }
+
+    /// Forces a fresh `DialogsBackend::contact_birthdays` query on the next render frame.
+    pub fn invalidate_contact_birthdays_cache(&mut self) {
+        self.last_birthdays_date = None;
     }
 
     /// Applies relevant [`tg_core::settings::CoreSettings`] fields (quick dialog action and
@@ -356,7 +372,12 @@ impl DialogsPanel {
         let req = self.search_state.build_request(&self.search_query);
         let results = backend.search_dialogs(&req);
         let recent = backend.recent_search_peers();
-        let items = collect_search_keyboard_items(&self.search_query, &results, &recent);
+        let items = collect_search_keyboard_items_with_sponsored(
+            &self.search_query,
+            &results,
+            &self.search_state.sponsored_peers,
+            &recent,
+        );
 
         match shortcut {
             DialogsShortcut::MoveDown => {
@@ -397,6 +418,7 @@ impl DialogsPanel {
                         None
                     }
                     SearchKeyboardItem::LocalChat(pid)
+                    | SearchKeyboardItem::SponsoredPeer(pid)
                     | SearchKeyboardItem::GlobalPeer(pid)
                     | SearchKeyboardItem::RecentPeer(pid) => {
                         backend.add_recent_search_peer(pid);
@@ -593,6 +615,8 @@ impl DialogsPanel {
 
             let req = self.search_state.build_request(&self.search_query);
             let results = backend.search_dialogs(&req);
+            self.search_state
+                .sync_sponsored_peers(&self.search_query, backend);
             let now = backend.current_time();
             egui::ScrollArea::vertical()
                 .id_salt("tg_dialogs_search_scroll")
@@ -620,6 +644,20 @@ impl DialogsPanel {
                     self.promo_suggestions.apply_snapshot(snap.clone());
                     self.last_promo_snapshot = Some(snap);
                 }
+                let today_date = backend.current_time().date;
+                let today_key = (today_date.year, today_date.month, today_date.day);
+                if self.last_birthdays_date != Some(today_key)
+                    && let Some(result) = backend.poll_contact_birthdays()
+                {
+                    if let Ok(entries) = result {
+                        self.promo_suggestions.sync_contact_birthdays(
+                            today_date.month,
+                            today_date.day,
+                            entries,
+                        );
+                    }
+                    self.last_birthdays_date = Some(today_key);
+                }
                 if let Some(sug_act) =
                     render_top_bar_suggestion(ui, &mut self.promo_suggestions, palette)
                 {
@@ -628,8 +666,17 @@ impl DialogsPanel {
                             action = Some(DialogsPanelAction::ActivateSuggestion(s));
                         }
                         SuggestionAction::Dismiss { key, peer_id } => {
-                            if let Err(err) = backend.dismiss_promo_suggestion(peer_id, &key) {
-                                action = Some(DialogsPanelAction::Toast(err));
+                            match backend.dismiss_promo_suggestion(peer_id, &key) {
+                                Ok(_) if key == KEY_BIRTHDAY_CONTACTS_TODAY => {
+                                    action = Some(DialogsPanelAction::Toast(
+                                        tg_lang::tr::lng_dialogs_suggestions_birthday_contact_dismiss(
+                                        ),
+                                    ));
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    action = Some(DialogsPanelAction::Toast(err));
+                                }
                             }
                         }
                     }
@@ -662,6 +709,18 @@ impl DialogsPanel {
                     }
                     InnerAction::Toast(msg) => {
                         action = Some(DialogsPanelAction::Toast(msg));
+                    }
+                    InnerAction::OpenInNewWindow(pid) => {
+                        action = Some(DialogsPanelAction::OpenInNewWindow(pid));
+                    }
+                    InnerAction::ToggleBlock(pid) => {
+                        action = Some(DialogsPanelAction::ToggleBlock(pid));
+                    }
+                    InnerAction::OpenMuteFor(pid) => {
+                        action = Some(DialogsPanelAction::OpenMuteFor(pid));
+                    }
+                    InnerAction::OpenSelectTone(pid) => {
+                        action = Some(DialogsPanelAction::OpenSelectTone(pid));
                     }
                 }
             }
@@ -767,6 +826,13 @@ impl DialogsPanel {
             SearchViewAction::LoadMoreMessages => {
                 self.search_state.messages_limit =
                     self.search_state.messages_limit.saturating_add(40);
+            }
+            SearchViewAction::ToggleSponsoredInfo(pid) => {
+                if self.search_state.sponsored_info_open == Some(pid) {
+                    self.search_state.sponsored_info_open = None;
+                } else {
+                    self.search_state.sponsored_info_open = Some(pid);
+                }
             }
         }
     }
@@ -919,31 +985,9 @@ impl DialogsPanel {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    if self.search_active {
-                        let (rect, resp) =
-                            ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
-                        if resp.hovered() {
-                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                            ui.painter().circle_filled(
-                                rect.center(),
-                                16.0,
-                                colors.color("windowBgOver"),
-                            );
-                        }
-                        paint_style_icon(
-                            ui.painter(),
-                            rect,
-                            st::back_button_icon,
-                            &colors,
-                            Some(colors.sub_text_fg()),
-                        );
-                        if resp
-                            .on_hover_text(tg_lang::tr::lng_sr_cancel_search())
-                            .clicked()
-                        {
-                            self.cancel_search();
-                        }
-                    } else if show_hamburger && hamburger_button(ui, palette) {
+                    // 7.4.6 keeps the main menu button while searching and cancels with the ×
+                    // inside the field (`_cancelSearch`); there is no extra back arrow.
+                    if show_hamburger && hamburger_button(ui, palette) {
                         action = Some(DialogsPanelAction::OpenMainMenu);
                     }
 
@@ -961,10 +1005,11 @@ impl DialogsPanel {
                         },
                     );
                     if focused {
+                        // `st::dialogsFilter`: borderActive 2px / denominator 2 in `windowBgRipple`.
                         ui.painter().rect_stroke(
                             pill_rect,
                             CornerRadius::same(17),
-                            Stroke::new(1.5, colors.color("filterInputBorderFg")),
+                            Stroke::new(1.0, colors.color("windowBgRipple")),
                             egui::StrokeKind::Inside,
                         );
                     }

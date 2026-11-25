@@ -1202,6 +1202,97 @@ pub(crate) fn read_unread_reactions(
     Ok(result)
 }
 
+/// Marks unread reactions on currently visible `msg_ids` in `peer_id` as read like tdesktop
+/// (`history_inner_widget.cpp:1572`, `apiwrap.cpp:1478-1508`):
+/// - Clears `HAS_UNREAD_REACTION` / unread recent reactors and decrements local unread-reaction
+///   counts in `tg_data::Session` (and `LiveEngagementState`'s cached counts) so both the floating
+///   "♥ N" jump button and the chat-row heart badge clear immediately.
+/// - Sends `channels.readMessageContents` for supergroups/channels or `messages.readMessageContents`
+///   for DMs/basic groups (feeding `AffectedMessages` PTS into `SessionRuntime`).
+/// - Returns the subset of `msg_ids` that actually had unread reactions (empty -> zero RPCs).
+pub(crate) fn mark_visible_reactions_read(
+    live: &LiveSession,
+    peer_id: PeerId,
+    msg_ids: &[MsgId],
+) -> Result<Vec<MsgId>, String> {
+    let data_ids: Vec<DataMsgId> = msg_ids
+        .iter()
+        .copied()
+        .filter(|id| id.0 > 0)
+        .map(to_data_msg)
+        .collect();
+    if data_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let data_peer = to_data_peer(peer_id);
+    let marked_data =
+        live.write_session(|session| session.mark_messages_reactions_read(data_peer, &data_ids));
+    if marked_data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marked_ui: Vec<MsgId> = marked_data.iter().copied().map(from_data_msg).collect();
+
+    // Synchronize `LiveEngagementState`'s cached unread_reactions counters / loaded_ids so
+    // `unread_things_counts(scope)` immediately reflects the newly read reactions.
+    {
+        let state = state_for_live(live);
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        let matching_scopes: Vec<UnreadThingsScope> = guard
+            .unread_reactions
+            .keys()
+            .copied()
+            .filter(|s| s.peer_id == peer_id)
+            .collect();
+        for scope in matching_scopes {
+            let new_session_count = live.read_session(|session| {
+                if let Some(top_id) = scope.top_msg_id {
+                    session
+                        .forum(data_peer)
+                        .and_then(|f| f.topic(to_data_msg(top_id)))
+                        .map_or(0, |t| t.unread_reactions_count)
+                } else if let Some(saved_peer) = scope.saved_peer_id {
+                    let saved_data = to_data_peer(saved_peer);
+                    if let Some(ch_id) = data_peer.to_channel() {
+                        session
+                            .monoforum(ch_id)
+                            .and_then(|m| m.sublist(saved_data))
+                            .map_or(0, |s| s.unread_reactions_count)
+                    } else {
+                        session
+                            .saved_messages()
+                            .sublist(saved_data)
+                            .map_or(0, |s| s.unread_reactions_count)
+                    }
+                } else {
+                    session
+                        .history(data_peer)
+                        .map_or(0, |h| h.unread_reactions_count)
+                }
+            });
+            if let Some(entry) = guard.unread_reactions.get_mut(&scope) {
+                for id in &marked_ui {
+                    entry.loaded_ids.remove(id);
+                }
+                if entry.count.is_some() {
+                    entry.count = Some(new_session_count.max(0));
+                }
+            }
+        }
+    }
+    live.bridge_state().notify_ui();
+
+    if let Some(channel) = live.input_channel(peer_id) {
+        let req = tg_api::channels::build_read_channel_message_contents(channel, &marked_data);
+        let _ = invoke_rpc(live, req)?;
+    } else {
+        let req = tg_api::channels::build_read_common_message_contents(&marked_data);
+        let tl_enums::messages::AffectedMessages::AffectedMessages(aff) = invoke_rpc(live, req)?;
+        let _ = live.apply_affected_history(None, aff.pts, aff.pts_count);
+    }
+
+    Ok(marked_ui)
+}
+
 /// Marks all unread poll votes read via `messages.readPollVotes`, looping while
 /// `messages.AffectedHistory.offset > 0` (`menu/menu_send.cpp:1070-1085`).
 pub(crate) fn read_unread_poll_votes(

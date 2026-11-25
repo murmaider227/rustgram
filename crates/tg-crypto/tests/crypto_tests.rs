@@ -616,17 +616,48 @@ fn pq_factorization_known_vectors_and_big() {
     assert!(pq_hi > (1u64 << 63));
     assert_eq!(factorize(pq_hi), (p_hi, q_hi));
 
-    // factorize_bytes for both 64-bit and >64-bit (72-bit) semiprime
+    // factorize_bytes for 64-bit semiprime
     let (pb, qb) = factorize_bytes(&pq.to_be_bytes()).unwrap();
     assert_eq!(BigUint::from_bytes_be(&pb), BigUint::from(0x494C_553Bu64));
     assert_eq!(BigUint::from_bytes_be(&qb), BigUint::from(0x5391_1073u64));
 
+    // >8-byte pq must be rejected before factorizing (SEC-C4)
     let big_p = BigUint::from(1_000_000_007u64);
-    let big_q = BigUint::from(1_000_000_000_039u64); // product ~ 10^21 > 2^64
+    let big_q = BigUint::from(1_000_000_000_039u64); // product ~ 10^21 > 2^64 (9 bytes)
     let big_pq = &big_p * &big_q;
-    let (bp, bq) = factorize_bytes(&big_pq.to_bytes_be()).unwrap();
-    assert_eq!(BigUint::from_bytes_be(&bp), big_p);
-    assert_eq!(BigUint::from_bytes_be(&bq), big_q);
+    assert!(big_pq.to_bytes_be().len() > 8);
+    assert!(matches!(
+        factorize_bytes(&big_pq.to_bytes_be()),
+        Err(CryptoError::InvalidLength(_))
+    ));
+}
+
+#[test]
+fn factorize_bytes_rejects_oversized_16_byte_pq_quickly() {
+    // 16-byte odd value with no small prime factors (would spin in BigUint Pollard-rho
+    // for a very long time if not rejected upfront by the 8-byte cap).
+    let pq_16: [u8; 16] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x61, // 2^128 - 159 (prime)
+    ];
+    let start = std::time::Instant::now();
+    let res = factorize_bytes(&pq_16);
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(res, Err(CryptoError::InvalidLength(_))),
+        "expected InvalidLength for 16-byte pq, got {res:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "16-byte pq rejection took too long: {elapsed:?}"
+    );
+
+    // Even a 9-byte buffer with leading zero padding must be rejected by byte length.
+    let padded_9 = [0x00, 0x17, 0xed, 0x48, 0x94, 0x1a, 0x08, 0xf9, 0x81];
+    assert!(matches!(
+        factorize_bytes(&padded_9),
+        Err(CryptoError::InvalidLength(_))
+    ));
 }
 
 #[test]

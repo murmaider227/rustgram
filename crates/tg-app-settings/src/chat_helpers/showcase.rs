@@ -395,6 +395,9 @@ impl ChatHelpersShowcase {
                 ChatHelpersEvent::StickerSetRemoved(id) => {
                     self.status_note = format!("Removed pack #{}", id.0);
                 }
+                ChatHelpersEvent::RecentStickersCleared => {
+                    self.status_note = "Cleared recent stickers".to_owned();
+                }
                 ChatHelpersEvent::CloseRequested => {}
             }
         }

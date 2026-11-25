@@ -16,7 +16,9 @@ use tg_ui::stand_in::Colors;
 use tg_ui::tg_style::{Icon, st};
 use tg_ui::theme::{ColorsResolver, resolve_color_ref};
 
-use crate::info::backend::{InfoBackend, MediaItem, ProfileMainTab, SharedMediaTab};
+use crate::info::backend::{
+    InfoBackend, MediaItem, ProfileMainTab, SharedMediaTab, SharedMediaThumb,
+};
 use crate::info::profile_controls::shared_media_to_profile_main_tab;
 use crate::info::strings;
 use crate::info::values::{format_duration, format_file_size};
@@ -244,6 +246,27 @@ impl MediaListWidget {
         selected_ids: &HashSet<i32>,
         colors: &dyn Colors,
     ) -> Option<MediaListAction> {
+        self.show_items_with_thumbs(
+            ui,
+            tab,
+            items,
+            selected_ids,
+            &|_| SharedMediaThumb::Unavailable,
+            colors,
+        )
+    }
+
+    /// [`Self::show_items`] with real photo / video thumbnails from `thumb_for(msg_id)`
+    /// (`InfoBackend::shared_media_thumb`).
+    pub fn show_items_with_thumbs(
+        &mut self,
+        ui: &mut Ui,
+        tab: SharedMediaTab,
+        items: &[MediaItem],
+        selected_ids: &HashSet<i32>,
+        thumb_for: &dyn Fn(i32) -> SharedMediaThumb,
+        colors: &dyn Colors,
+    ) -> Option<MediaListAction> {
         let width = ui.available_width().max(200.0);
         if items.is_empty() {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 96.0), Sense::hover());
@@ -283,7 +306,7 @@ impl MediaListWidget {
             match tab {
                 SharedMediaTab::PhotosVideos => {
                     if let Some(a) =
-                        render_photo_video_grid(ui, &section.items, selected_ids, colors)
+                        render_photo_video_grid(ui, &section.items, selected_ids, thumb_for, colors)
                     {
                         action = Some(a);
                     }
@@ -519,6 +542,7 @@ fn render_photo_video_grid(
     ui: &mut Ui,
     items: &[&MediaItem],
     selected_ids: &HashSet<i32>,
+    thumb_for: &dyn Fn(i32) -> SharedMediaThumb,
     colors: &dyn Colors,
 ) -> Option<MediaListAction> {
     let mut action = None;
@@ -573,6 +597,14 @@ fn render_photo_video_grid(
                 tile_rect.max,
             );
             ui.painter().rect_filled(lower, CornerRadius::same(4), dark);
+            // `Overview::Layout::Photo` / `Video`: the thumbnail cropped to the square tile, the
+            // blurred stripped preview while the full thumbnail downloads.
+            if let Some((texture, uv)) = shared_media_thumb_texture(ui.ctx(), id, &thumb_for(id)) {
+                ui.painter().add(
+                    egui::epaint::RectShape::filled(tile_rect, CornerRadius::ZERO, Color32::WHITE)
+                        .with_texture(texture, uv),
+                );
+            }
 
             if let Some(secs) = duration {
                 let badge_rect = Rect::from_min_size(
@@ -898,4 +930,71 @@ fn paint_play_or_pause(
     };
     let rect = Rect::from_center_size(center, Vec2::splat(16.0));
     paint_style_icon(painter, rect, *icon, &ColorsResolver(colors), Some(color));
+}
+
+#[derive(Clone, Default)]
+struct SharedMediaThumbCache(
+    std::collections::HashMap<(i32, u64), Option<(egui::TextureHandle, Rect)>>,
+);
+
+/// Decodes (once per context) the thumbnail of shared-media item `msg_id` into a texture plus the
+/// UV rect of its centred square. Full bytes go through `image`; stripped previews (`0x01 ...`)
+/// through `tg_media::image::inline`.
+fn shared_media_thumb_texture(
+    ctx: &egui::Context,
+    msg_id: i32,
+    thumb: &SharedMediaThumb,
+) -> Option<(egui::TextureId, Rect)> {
+    use std::hash::{Hash, Hasher};
+    let (bytes, stripped) = match thumb {
+        SharedMediaThumb::Ready { bytes } => (bytes.as_slice(), false),
+        SharedMediaThumb::Loading {
+            stripped_thumb: Some(bytes),
+        } => (bytes.as_slice(), true),
+        _ => return None,
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let key = (msg_id, hasher.finish());
+    let cache_id = egui::Id::unique("tg_info_shared_media_thumbs");
+    if let Some(hit) = ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<SharedMediaThumbCache>(cache_id)
+            .0
+            .get(&key)
+            .cloned()
+    }) {
+        return hit.map(|(tex, uv)| (tex.id(), uv));
+    }
+    let decoded = if stripped {
+        tg_media::image::inline::from_inline_bytes(bytes).ok()
+    } else {
+        image::load_from_memory(bytes)
+            .ok()
+            .map(|img| img.to_rgba8())
+    };
+    let entry = decoded
+        .filter(|img| img.width() > 0 && img.height() > 0)
+        .map(|img| {
+            let (w, h) = img.dimensions();
+            let (wf, hf) = (w as f32, h as f32);
+            let side = wf.min(hf);
+            let uv = Rect::from_min_size(
+                Pos2::new((wf - side) * 0.5 / wf, (hf - side) * 0.5 / hf),
+                Vec2::new(side / wf, side / hf),
+            );
+            let image =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+            let tex = ctx.load_texture(
+                format!("tg_info_shared_media_thumb_{}_{}", key.0, key.1),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            (tex, uv)
+        });
+    ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<SharedMediaThumbCache>(cache_id)
+            .0
+            .insert(key, entry.clone());
+    });
+    entry.map(|(tex, uv)| (tex.id(), uv))
 }

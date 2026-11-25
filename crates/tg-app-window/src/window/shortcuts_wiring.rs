@@ -1122,7 +1122,7 @@ pub fn drive_intro_proxy_modal(
     let Some(IntroProxyAction::Apply(next)) = modal.show(ctx, palette, colors) else {
         return None;
     };
-    let enabled = next.is_enabled() || next.is_system();
+    let enabled = next.is_enabled();
     if let Err(err) = apply(next) {
         tracing::warn!(error = %err, "failed to apply pre-login proxy settings");
     }

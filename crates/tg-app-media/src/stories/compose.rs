@@ -237,6 +237,8 @@ pub enum PrivacyPeerListKind {
     SelectedContacts,
     /// Account-wide Close Friends list (`contacts.editCloseFriends`).
     CloseFriends,
+    /// Account-wide hidden-stories blocklist (`contacts.setBlocked(my_stories_from=true)`).
+    StoriesBlocklist,
 }
 
 /// Outcome returned by [`StoryPrivacyBox::show`] / [`StoryPrivacyBox::show_modal`].
@@ -250,6 +252,8 @@ pub enum StoryPrivacyOutcome {
     Apply(StoryPrivacyInput),
     /// Save updated Close Friends list (`contacts.editCloseFriends`).
     UpdateCloseFriends(Vec<PeerId>),
+    /// Bulk-replace the hidden-stories blocklist (`contacts.setBlocked(my_stories_from=true)`).
+    SaveStoriesBlocklist(Vec<PeerId>),
 }
 
 /// Interactive story audience & exceptions selector (`boxes/story_privacy_box.cpp`).
@@ -265,6 +269,10 @@ pub struct StoryPrivacyBox {
     pub selected_peers: BTreeSet<PeerId>,
     /// Current Close Friends peer IDs.
     pub close_friends: BTreeSet<PeerId>,
+    /// Contacts bulk-blocked from viewing our stories (`contacts.setBlocked(my_stories_from=true)`).
+    pub blocked_peers: BTreeSet<PeerId>,
+    /// Whether [`Self::blocked_peers`] has been synced from `backend.is_viewer_stories_blocked`.
+    blocklist_synced: bool,
     /// Active peer-list exception picker sub-view, if any.
     pub editing_list: Option<PrivacyPeerListKind>,
     /// Search filter inside the peer picker.
@@ -280,6 +288,8 @@ impl Default for StoryPrivacyBox {
             excluded_contacts: BTreeSet::new(),
             selected_peers: BTreeSet::new(),
             close_friends: BTreeSet::new(),
+            blocked_peers: BTreeSet::new(),
+            blocklist_synced: false,
             editing_list: None,
             search: String::new(),
             just_opened: true,
@@ -382,6 +392,15 @@ impl StoryPrivacyBox {
     /// Renders the privacy box content inside `ui`.
     pub fn show(&mut self, ui: &mut Ui, backend: &dyn StoriesBackend) -> StoryPrivacyOutcome {
         let mut outcome = StoryPrivacyOutcome::None;
+        if !self.blocklist_synced {
+            self.blocked_peers = backend
+                .contacts_for_privacy()
+                .into_iter()
+                .filter(|p| backend.is_viewer_stories_blocked(p.peer_id))
+                .map(|p| p.peer_id)
+                .collect();
+            self.blocklist_synced = true;
+        }
 
         if let Some(list_kind) = self.editing_list {
             return self.show_peer_list_editor(ui, list_kind, backend);
@@ -526,6 +545,68 @@ impl StoryPrivacyBox {
             ui.add_space(6.0);
         }
 
+        // Bulk hidden-stories blocklist row (`contacts.setBlocked(my_stories_from=true)`).
+        let blocklist_subtitle = if self.blocked_peers.is_empty() {
+            "No contacts blocked from stories".to_owned()
+        } else if self.blocked_peers.len() == 1 {
+            let only = *self.blocked_peers.iter().next().unwrap_or(&PeerId::ZERO);
+            format!("Hidden from {}", backend.peer_profile(only).name)
+        } else {
+            format!("Hidden from {} contacts", self.blocked_peers.len())
+        };
+        Frame::NONE
+            .fill(Color32::from_rgb(0x1B, 0x22, 0x2B))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(0x2D, 0x38, 0x45)))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                    ui.painter().circle_filled(
+                        dot_rect.center(),
+                        12.0,
+                        Color32::from_rgb(0xD9, 0x53, 0x4F),
+                    );
+                    ui.painter().text(
+                        dot_rect.center(),
+                        Align2::CENTER_CENTER,
+                        "H",
+                        FontId::proportional(11.5),
+                        Color32::WHITE,
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Hide My Stories From")
+                                .size(13.5)
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.label(
+                            RichText::new(&blocklist_subtitle)
+                                .size(11.5)
+                                .color(Color32::from_rgb(0x8D, 0x9F, 0xB0)),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Manage Blocklist...")
+                                        .size(11.5)
+                                        .color(Color32::from_rgb(0xFF, 0x8A, 0x80)),
+                                )
+                                .fill(Color32::from_rgb(0x2B, 0x21, 0x26))
+                                .corner_radius(CornerRadius::same(6)),
+                            )
+                            .clicked()
+                        {
+                            self.editing_list = Some(PrivacyPeerListKind::StoriesBlocklist);
+                            self.search.clear();
+                        }
+                    });
+                });
+            });
+
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
@@ -561,6 +642,7 @@ impl StoryPrivacyBox {
             PrivacyPeerListKind::ExcludedContacts => "Exclude from My Contacts",
             PrivacyPeerListKind::SelectedContacts => "Choose Selected Contacts",
             PrivacyPeerListKind::CloseFriends => "Edit Close Friends",
+            PrivacyPeerListKind::StoriesBlocklist => "Hide My Stories From",
         };
 
         ui.horizontal(|ui| {
@@ -604,6 +686,7 @@ impl StoryPrivacyBox {
             PrivacyPeerListKind::ExcludedContacts => &mut self.excluded_contacts,
             PrivacyPeerListKind::SelectedContacts => &mut self.selected_peers,
             PrivacyPeerListKind::CloseFriends => &mut self.close_friends,
+            PrivacyPeerListKind::StoriesBlocklist => &mut self.blocked_peers,
         };
 
         ScrollArea::vertical()
@@ -654,8 +737,13 @@ impl StoryPrivacyBox {
                     .color(Color32::from_rgb(0x8D, 0x9F, 0xB0)),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let done_label = if list_kind == PrivacyPeerListKind::StoriesBlocklist {
+                    "Save Blocklist"
+                } else {
+                    "Done"
+                };
                 let done_btn = egui::Button::new(
-                    RichText::new("Done")
+                    RichText::new(done_label)
                         .size(12.5)
                         .strong()
                         .color(Color32::WHITE),
@@ -666,6 +754,10 @@ impl StoryPrivacyBox {
                     if list_kind == PrivacyPeerListKind::CloseFriends {
                         outcome = StoryPrivacyOutcome::UpdateCloseFriends(
                             self.close_friends.iter().copied().collect(),
+                        );
+                    } else if list_kind == PrivacyPeerListKind::StoriesBlocklist {
+                        outcome = StoryPrivacyOutcome::SaveStoriesBlocklist(
+                            self.blocked_peers.iter().copied().collect(),
                         );
                     }
                     self.editing_list = None;
@@ -1043,6 +1135,8 @@ pub enum SendStoryOutcome {
     SubmitEdit(EditStoryRequest),
     /// Save updated Close Friends list from the embedded privacy editor.
     UpdateCloseFriends(Vec<PeerId>),
+    /// Bulk-replace the hidden-stories blocklist (`contacts.setBlocked(my_stories_from=true)`).
+    SaveStoriesBlocklist(Vec<PeerId>),
 }
 
 /// Story composer & editor modal (`boxes/send_story_box.cpp` + `media_stories_post.cpp`).
@@ -1346,6 +1440,9 @@ impl SendStoryBox {
                 }
                 StoryPrivacyOutcome::UpdateCloseFriends(peers) => {
                     return SendStoryOutcome::UpdateCloseFriends(peers);
+                }
+                StoryPrivacyOutcome::SaveStoriesBlocklist(peers) => {
+                    return SendStoryOutcome::SaveStoriesBlocklist(peers);
                 }
             }
         }

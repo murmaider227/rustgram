@@ -1100,17 +1100,24 @@ pub struct PinnedMessageSummary {
 /// Optional contact status action banner below the top bar (`history_view_contact_status.cpp`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContactStatusBanner {
-    /// Non-contact direct message: offers Add to Contacts and Block User.
+    /// Non-contact direct message: offers Add to Contacts, Block User, and Report Spam.
     AddOrBlock {
         /// Peer display name.
         peer_name: String,
     },
     /// User blocked banner: offers Unblock.
     Blocked,
-    /// Request to share phone number.
+    /// Request to share phone number (`contacts.acceptContact`).
     SharePhoneNumber {
         /// Peer display name.
         peer_name: String,
+    },
+    /// Unverified user/group/channel spam banner (`messages.reportSpam`).
+    ReportSpam {
+        /// Peer display name.
+        peer_name: String,
+        /// `true` for broadcast channels, `false` for groups/users.
+        is_channel: bool,
     },
 }
 
@@ -1200,6 +1207,36 @@ pub struct HistorySlice {
     pub first_unread_id: Option<MsgId>,
     /// Current unread message counter (for the scroll-to-bottom FAB badge).
     pub unread_count: u32,
+}
+
+/// Incremental live change event pushed from a session backend to an already-open history view.
+///
+/// Port origin: `History::addNewMessage` / `HistoryWidget::newItemAdded`,
+/// `HistoryWidget::itemEdited`, `HistoryWidget::itemRemoved`, and `Data::HistoryUpdate`
+/// (`OUTBOX_READ` / `UNREAD_VIEW`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryLiveUpdate {
+    /// A new message arrived in this peer's history.
+    MessageAdded(Box<HistoryMessage>),
+    /// An existing message in this peer's history was edited or updated in place
+    /// (text/caption edit, reactions, views, pinned flag, or sent-message promotion).
+    MessageEdited(Box<HistoryMessage>),
+    /// One or more messages were deleted from this peer's history.
+    MessagesDeleted(Vec<MsgId>),
+    /// Outgoing messages up to `max_id` were read by the recipient (double checkmarks).
+    OutboxRead {
+        /// Highest outgoing message id read by the recipient.
+        max_id: MsgId,
+    },
+    /// Unread counter or inbox read watermark changed for this peer.
+    UnreadChanged {
+        /// Updated unread message count.
+        unread_count: u32,
+        /// Updated inbox read watermark (`inboxReadTillId`).
+        inbox_read_till: MsgId,
+    },
+    /// The underlying live change stream lagged or overflowed; reload the open slice.
+    ReloadRequired,
 }
 
 /// Extended peer metadata consumed by the history top bar and status banners.
@@ -1300,6 +1337,14 @@ pub trait HistoryBackend: Send {
 
     /// Loads up to `limit` messages strictly newer than `after_id`.
     fn load_slice_after(&self, peer_id: PeerId, after_id: MsgId, limit: usize) -> HistorySlice;
+
+    /// Drains any pending live history updates for `peer_id` since the previous frame
+    /// (incoming/outgoing messages, edits, deletions, outbox/inbox read updates).
+    ///
+    /// Default implementation returns an empty list for static/mock backends.
+    fn drain_history_updates(&mut self, _peer_id: PeerId) -> Vec<HistoryLiveUpdate> {
+        Vec::new()
+    }
 
     /// Sends a new outgoing message to `peer_id`.
     fn send_message(
@@ -1819,6 +1864,45 @@ pub trait HistoryBackend: Send {
         .collect()
     }
 
+    /// Returns the user's top reaction emojis from `messages.getTopReactions` (cached with 64-bit
+    /// hash, matching tdesktop's `Data::Reactions::list(Type::Top)`).
+    fn top_reactions(&self) -> Vec<String> {
+        self.available_reactions()
+            .into_iter()
+            .filter(|r| !r.inactive && !r.is_premium)
+            .map(|r| r.emoji)
+            .collect()
+    }
+
+    /// Returns the ordered emoji list for the message context-menu reaction strip, following
+    /// tdesktop's `Data::LookupPossibleReactions` (`data_message_reactions.cpp:180-351`):
+    /// default/favorite reaction rotated to front, followed by `messages.getTopReactions`,
+    /// followed by remaining active `messages.getAvailableReactions`, filtered by `peer_id`'s
+    /// allowed reactions policy and account Premium status.
+    fn reaction_strip_emojis(&self, _peer_id: Option<PeerId>) -> Vec<String> {
+        let mut ordered = Vec::new();
+        let fav = self.default_reaction();
+        let top = self.top_reactions();
+        let avail: Vec<String> = self
+            .available_reactions()
+            .into_iter()
+            .filter(|r| !r.inactive && !r.is_premium)
+            .map(|r| r.emoji)
+            .collect();
+        for emoji in top.into_iter().chain(avail) {
+            if !emoji.is_empty() && !ordered.contains(&emoji) {
+                ordered.push(emoji);
+            }
+        }
+        if let Some(pos) = ordered.iter().position(|e| e == &fav)
+            && pos > 0
+        {
+            let item = ordered.remove(pos);
+            ordered.insert(0, item);
+        }
+        ordered
+    }
+
     /// Returns the available message effects catalog (`messages.getAvailableEffects`).
     fn available_effects(&self) -> Vec<AvailableMessageEffect> {
         crate::history::sections_model::MESSAGE_EFFECTS
@@ -1977,6 +2061,24 @@ pub trait HistoryBackend: Send {
     /// Returns optional mutable access to a [`crate::bots::backend::BotsBackend`] for bot
     /// interactions (callback queries, URL auth, inline queries, attach menu toggles).
     fn as_bots_backend_mut(&mut self) -> Option<&mut dyn crate::bots::backend::BotsBackend> {
+        None
+    }
+
+    /// Returns optional read-only access to [`crate::chat_helpers::backend::ChatHelpersBackend`]
+    /// for paid-reaction privacy and reaction moderation RPCs.
+    fn as_chat_helpers_backend(
+        &self,
+    ) -> Option<&dyn crate::chat_helpers::backend::ChatHelpersBackend> {
+        None
+    }
+
+    /// Returns optional mutable access to [`crate::chat_helpers::backend::ChatHelpersBackend`]
+    /// for paid-reaction privacy and reaction moderation RPCs
+    /// (`messages.{get,toggle}PaidReactionPrivacy`, `messages.reportReaction`,
+    /// `messages.deleteParticipantReaction{,s}`).
+    fn as_chat_helpers_backend_mut(
+        &mut self,
+    ) -> Option<&mut dyn crate::chat_helpers::backend::ChatHelpersBackend> {
         None
     }
 
@@ -2509,6 +2611,19 @@ pub trait HistoryBackend: Send {
         Ok(Vec::new())
     }
 
+    /// Polls visible group/channel messages that already carry reactions via
+    /// `messages.getMessagesReactions`, honoring tdesktop's 20-second `kPollEach` interval
+    /// (`data/data_message_reactions.cpp:1512-1535, 1696-1729`).
+    ///
+    /// Returns the subset of `msg_ids` that were actually polled on this call.
+    fn poll_messages_reactions(
+        &self,
+        _peer_id: PeerId,
+        _msg_ids: &[MsgId],
+    ) -> Result<Vec<MsgId>, String> {
+        Ok(Vec::new())
+    }
+
     /// Loads the next page of unread mentions, reactions, or poll votes for `scope` via
     /// `messages.getUnread{Mentions,Reactions,PollVotes}` (`Api::UnreadThings`).
     fn load_unread_things_page(
@@ -2544,6 +2659,21 @@ pub trait HistoryBackend: Send {
         _saved_peer_id: Option<PeerId>,
     ) -> Result<UnreadThingsReadResult, String> {
         Ok(UnreadThingsReadResult::default())
+    }
+
+    /// Marks unread reactions on currently visible `msg_ids` in `peer_id` as read like tdesktop
+    /// (`history_inner_widget.cpp:1572`, `apiwrap.cpp:1478-1508`: `messages.readMessageContents`
+    /// for DMs/basic groups or `channels.readMessageContents` for supergroups/channels) and
+    /// clears local unread-reaction state so the floating "♥ N" button and chat-row badge clear.
+    ///
+    /// Only regular server messages that currently have unread reactions are sent; returns the
+    /// subset of `msg_ids` that were marked read (empty when none had unread reactions).
+    fn mark_visible_reactions_read(
+        &mut self,
+        _peer_id: PeerId,
+        _msg_ids: &[MsgId],
+    ) -> Result<Vec<MsgId>, String> {
+        Ok(Vec::new())
     }
 
     /// Marks all unread poll votes in `peer_id` (or forum topic `top_msg_id`) as read via

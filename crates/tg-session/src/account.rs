@@ -4,10 +4,10 @@
 //! Port origin: `Telegram/SourceFiles/main/main_account.cpp`, `main/main_domain.cpp`,
 //! and `storage/storage_domain.cpp`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tg_api::{ApiCredentials, DcId, LoginStateMachine, LoginStep, RpcClient};
@@ -26,14 +26,17 @@ use tg_lang::{Instance as LangInstance, default_language_id};
 use tg_mtproto::{
     Client as MtprotoClient, KeysDestroyResult, KeysDestroyer, TgTransportFactory, TransportFactory,
 };
+use tg_storage::cache::media_cache::{
+    derive_media_cache_key, rekey_or_purge_cache_dir, unregister_cache_key,
+};
 use tg_storage::peer_id::PeerId as StoragePeerId;
 use tg_storage::serialize::peer::{
     SerializedPeer, SerializedPeerKind, SerializedUser, deserialize_self_user, serialize_self_user,
 };
 use tg_storage::tdf::{clear_key, compose_data_string, compute_data_name_key, to_file_part};
 use tg_storage::{
-    LocalStorage, MtpAuthKeyEntry, MtpAuthorization, PasscodeKdf, StorageError,
-    StoredSessionSettings,
+    LocalStorage, MtpAuthKeyEntry, MtpAuthorization, PasscodeKdf, StorageEncryptionKey,
+    StorageError, StoredSessionSettings,
 };
 use tg_tl::types as tl_types;
 use tracing::{debug, info, warn};
@@ -58,6 +61,215 @@ pub const DEFAULT_LOGOUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default per-key timeout for [`KeysDestroyer`] during logout or pending key cleanup.
 pub const DEFAULT_DESTROY_KEYS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Relative-path queue inside `tdata/` recording account directories/files that could not be
+/// removed immediately during logout (e.g. held open by WebView2 or an external viewer) so they
+/// are retried on subsequent startups and shutdowns.
+pub const PENDING_CLEANUP_FILENAME: &str = ".pending_cleanup";
+
+static UNLOCKED_DOMAIN_KEYS: OnceLock<Mutex<HashMap<PathBuf, (String, AuthKey)>>> = OnceLock::new();
+
+fn domain_key_registry() -> &'static Mutex<HashMap<PathBuf, (String, AuthKey)>> {
+    UNLOCKED_DOMAIN_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_tdata_path(tdata_dir: &Path) -> PathBuf {
+    fs::canonicalize(tdata_dir).unwrap_or_else(|_| tdata_dir.to_path_buf())
+}
+
+fn register_unlocked_domain_key(tdata_dir: &Path, data_name: &str, local_key: AuthKey) {
+    let norm = normalize_tdata_path(tdata_dir);
+    if let Ok(mut guard) = domain_key_registry().lock() {
+        guard.insert(norm, (data_name.to_owned(), local_key));
+    }
+}
+
+fn unregister_unlocked_domain_key(tdata_dir: &Path) {
+    let norm = normalize_tdata_path(tdata_dir);
+    if let Ok(mut guard) = domain_key_registry().lock() {
+        guard.remove(&norm);
+        guard.remove(tdata_dir);
+    }
+}
+
+/// Looks up the unlocked `(data_name, local_key)` registered in memory for `tdata_dir` after
+/// [`AccountManager::unlock`], so account media caches can derive per-account encryption keys
+/// without touching `tdata` passcodes again.
+#[must_use]
+pub fn unlocked_domain_key_for_tdata(tdata_dir: &Path) -> Option<(String, AuthKey)> {
+    let norm = normalize_tdata_path(tdata_dir);
+    let guard = domain_key_registry().lock().ok()?;
+    guard.get(&norm).or_else(|| guard.get(tdata_dir)).cloned()
+}
+
+/// Computes the 16-hex-char tdesktop account key folder name
+/// (`ToFilePart(compute_data_name_key(compose_data_string(data_name, slot_index)))`).
+#[must_use]
+pub fn account_data_key_file_part(data_name: &str, slot_index: i32) -> String {
+    let acc_data_name = compose_data_string(data_name, slot_index);
+    to_file_part(compute_data_name_key(&acc_data_name))
+}
+
+/// Computes the per-account temporary folder name inside `tdata` (`temp_<acc_data_name>`).
+#[must_use]
+pub fn account_temp_dir_name(data_name: &str, slot_index: i32) -> String {
+    let acc_data_name = compose_data_string(data_name, slot_index);
+    format!("temp_{acc_data_name}")
+}
+
+/// Resolves the per-account [`StorageEncryptionKey`] for `slot_index` under `tdata_dir` from the
+/// unlocked in-memory domain key (supporting passcode-locked `tdata`) or by opening an open
+/// (no-passcode) `tdata` domain directly.
+#[must_use]
+pub fn resolve_account_cache_key_for_tdata(
+    tdata_dir: &Path,
+    data_name: &str,
+    slot_index: i32,
+) -> Option<StorageEncryptionKey> {
+    if let Some((unlocked_name, local_key)) = unlocked_domain_key_for_tdata(tdata_dir) {
+        let acc_data_name = compose_data_string(&unlocked_name, slot_index);
+        return Some(derive_media_cache_key(&local_key, &acc_data_name));
+    }
+    if let Ok(domain) = tg_storage::domain::DomainStorage::open(tdata_dir, data_name, b"") {
+        let acc_data_name = compose_data_string(data_name, slot_index);
+        return Some(derive_media_cache_key(domain.local_key(), &acc_data_name));
+    }
+    None
+}
+
+fn is_safe_relative_tdata_subpath(rel: &Path) -> bool {
+    let mut saw_normal = false;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(_) => saw_normal = true,
+            _ => return false,
+        }
+    }
+    saw_normal
+}
+
+fn try_remove_path_with_retries(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    for attempt in 0..3u32 {
+        let res = if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        if res.is_ok() || !path.exists() {
+            return true;
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(20 * u64::from(attempt + 1)));
+        }
+    }
+    // Best-effort partial cleanup inside a busy directory so unlocked files are still purged
+    // immediately while locked handles stay queued in `.pending_cleanup`.
+    if path.is_dir() {
+        best_effort_prune_dir_contents(path);
+        let _ = fs::remove_dir(path);
+    }
+    !path.exists()
+}
+
+fn best_effort_prune_dir_contents(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            best_effort_prune_dir_contents(&p);
+            let _ = fs::remove_dir(&p);
+        } else {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+/// Records `target` (which must live strictly inside `tdata_dir`) in `tdata/.pending_cleanup`
+/// so future startups and shutdowns retry removing it once external locks release.
+pub fn record_pending_cleanup(tdata_dir: &Path, target: &Path) {
+    let Ok(rel) = target.strip_prefix(tdata_dir) else {
+        return;
+    };
+    if !is_safe_relative_tdata_subpath(rel) {
+        return;
+    }
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    if rel_str.is_empty() || rel_str.contains('\n') || rel_str.contains('\r') {
+        return;
+    }
+
+    let queue_path = tdata_dir.join(PENDING_CLEANUP_FILENAME);
+    let mut entries: Vec<String> = fs::read_to_string(&queue_path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if !entries.iter().any(|existing| existing == &rel_str) {
+        entries.push(rel_str);
+    }
+    if let Err(err) = fs::write(&queue_path, format!("{}\n", entries.join("\n"))) {
+        warn!(path = %queue_path.display(), error = %err, "failed to write pending cleanup queue");
+    }
+}
+
+/// Retries deleting all paths recorded in `tdata/.pending_cleanup`, removing entries that now
+/// succeed and retaining entries still held open by external processes.
+///
+/// Returns the number of previously pending targets successfully deleted.
+pub fn process_pending_cleanups(tdata_dir: &Path) -> usize {
+    let queue_path = tdata_dir.join(PENDING_CLEANUP_FILENAME);
+    let Ok(raw) = fs::read_to_string(&queue_path) else {
+        return 0;
+    };
+    let mut cleaned = 0usize;
+    let mut remaining = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let rel = Path::new(line);
+        if !is_safe_relative_tdata_subpath(rel) {
+            continue;
+        }
+        let target = tdata_dir.join(rel);
+        if try_remove_path_with_retries(&target) {
+            cleaned += 1;
+        } else {
+            remaining.push(line.to_owned());
+        }
+    }
+    if remaining.is_empty() {
+        let _ = fs::remove_file(&queue_path);
+    } else {
+        let _ = fs::write(&queue_path, format!("{}\n", remaining.join("\n")));
+    }
+    cleaned
+}
+
+/// Removes stale unlocked temporary files inside `tdata/temp_*` directories (skipping any files
+/// currently held open by an external viewer app).
+pub fn cleanup_stale_temp_dirs(tdata_dir: &Path) {
+    let Ok(entries) = fs::read_dir(tdata_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with("temp_") {
+            best_effort_prune_dir_contents(&path);
+            let _ = fs::remove_dir(&path);
+        }
+    }
+}
 
 /// Options controlling how [`AccountManager`] opens a working directory.
 #[derive(Clone)]
@@ -352,6 +564,8 @@ impl AccountManager {
     pub fn open(options: WorkingDirOpenOptions) -> Result<Self> {
         ensure_working_dir(&options.working_dir)?;
         let tdata = options.working_dir.join("tdata");
+        process_pending_cleanups(&tdata);
+        cleanup_stale_temp_dirs(&tdata);
 
         let mut local_storage = LocalStorage::open_or_init(&tdata)?;
         let mut global_config = GlobalConfig::default();
@@ -607,6 +821,40 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Loads the persisted set of bot peer IDs trusted to open Mini Apps for account `index`
+    /// (`Storage::Account::isPeerTrustedOpenWebView`).
+    pub fn trusted_mini_app_bots(&self, index: i32) -> Result<BTreeSet<i64>> {
+        Ok(self.load_session_settings(index)?.trusted_mini_app_bots)
+    }
+
+    /// Returns `true` if `bot_peer_id` is persisted as trusted to open Mini Apps for account
+    /// `index`.
+    pub fn is_mini_app_bot_trusted(&self, index: i32, bot_peer_id: i64) -> Result<bool> {
+        Ok(self
+            .load_session_settings(index)?
+            .trusted_mini_app_bots
+            .contains(&bot_peer_id))
+    }
+
+    /// Marks `bot_peer_id` as trusted to open Mini Apps for account `index` and persists the
+    /// updated encrypted `StoredSessionSettings` to `tdata`.
+    pub fn trust_mini_app_bot(&mut self, index: i32, bot_peer_id: i64) -> Result<()> {
+        let mut settings = self.load_session_settings(index)?;
+        if settings.trusted_mini_app_bots.insert(bot_peer_id) {
+            self.save_session_settings(index, &settings)?;
+        }
+        Ok(())
+    }
+
+    /// Removes `bot_peer_id` from the persisted trusted Mini App bots set for account `index`.
+    pub fn untrust_mini_app_bot(&mut self, index: i32, bot_peer_id: i64) -> Result<()> {
+        let mut settings = self.load_session_settings(index)?;
+        if settings.trusted_mini_app_bots.remove(&bot_peer_id) {
+            self.save_session_settings(index, &settings)?;
+        }
+        Ok(())
+    }
+
     /// Returns `true` if the unlocked domain currently has a local passcode configured
     /// (`Storage::Domain::hasPasscode`).
     #[must_use]
@@ -654,6 +902,7 @@ impl AccountManager {
         new_passcode: &[u8],
         kdf: PasscodeKdf,
     ) -> Result<()> {
+        let old_local_key = self.domain.storage().local_key().cloned();
         let domain_storage = self
             .domain
             .storage_mut()
@@ -680,6 +929,8 @@ impl AccountManager {
                 StorageError::IncorrectPasscode => SessionError::IncorrectPasscode,
                 other => SessionError::Storage(other),
             })?;
+
+        self.sync_media_cache_keys(old_local_key.as_ref());
 
         if new_passcode.is_empty() && self.core_settings.system_unlock_enabled {
             self.core_settings.system_unlock_enabled = false;
@@ -732,6 +983,8 @@ impl AccountManager {
             .iter()
             .map(|a| (a.index, a.environment))
             .collect();
+
+        self.sync_media_cache_keys(None);
 
         self.live_accounts.clear();
         for (index, env) in slot_defs {
@@ -880,9 +1133,61 @@ impl AccountManager {
     /// Returns the 16-char uppercase hex `tdata` key/directory stem for account slot `index`
     /// (`ToFilePart(ComputeDataNameKey(ComposeDataString(data_name, index)))`).
     #[must_use]
+    /// Returns the account's 16-hex-character `ToFilePart(compute_data_name_key)` folder name.
     pub fn account_key_file_part(&self, index: i32) -> String {
         let name = self.account_data_name(index);
         to_file_part(compute_data_name_key(&name))
+    }
+
+    /// Returns the unlocked domain 256-byte local key, if unlocked.
+    #[must_use]
+    pub fn local_key(&self) -> Option<&AuthKey> {
+        self.domain.storage().local_key()
+    }
+
+    /// Derives the per-account [`StorageEncryptionKey`] for `index` from the unlocked local key.
+    #[must_use]
+    pub fn account_cache_key(&self, index: i32) -> Option<StorageEncryptionKey> {
+        let local_key = self.local_key()?;
+        let acc_data_name = self.account_data_name(index);
+        Some(derive_media_cache_key(local_key, &acc_data_name))
+    }
+
+    /// Synchronizes the in-memory domain/cache key registries and re-keys (or purges unreadable
+    /// entries in) every account's on-disk `tdata/media_cache/<key_part>` directory.
+    ///
+    /// Pass `old_local_key = Some(prev)` when the domain local key may have rotated so
+    /// `file_locations` are re-encrypted under the new derived key while one-way-keyed blobs are
+    /// purged cleanly.
+    pub fn sync_media_cache_keys(&self, old_local_key: Option<&AuthKey>) {
+        let Some(local_key) = self.domain.storage().local_key().cloned() else {
+            return;
+        };
+        let tdata = self.domain.storage().tdata_path();
+        let data_name = self.domain.storage().data_name();
+        register_unlocked_domain_key(tdata, data_name, local_key.clone());
+        for acc in self.domain.accounts() {
+            let acc_data_name = compose_data_string(data_name, acc.index);
+            let key_part = to_file_part(compute_data_name_key(&acc_data_name));
+            let cache_dir = tdata.join("media_cache").join(&key_part);
+            let new_enc_key = derive_media_cache_key(&local_key, &acc_data_name);
+            let old_enc_key = old_local_key.map(|old| derive_media_cache_key(old, &acc_data_name));
+            if let Err(err) =
+                rekey_or_purge_cache_dir(&cache_dir, old_enc_key.as_ref(), new_enc_key)
+            {
+                warn!(
+                    index = acc.index,
+                    path = %cache_dir.display(),
+                    error = %err,
+                    "failed to synchronize account media cache encryption key"
+                );
+            }
+        }
+    }
+
+    /// Retries any pending account file cleanups queued under `tdata/.pending_cleanup`.
+    pub fn retry_pending_cleanups(&self) -> usize {
+        process_pending_cleanups(self.domain.storage().tdata_path())
     }
 
     /// Persists all loaded account slots to `tdata`.
@@ -1162,7 +1467,7 @@ impl AccountManager {
     ///    account, resets slot `index` to a fresh unauthenticated client and removes any local
     ///    passcode per tdesktop's `passcodeRemovalAuthorized` rule.
     pub async fn logout_account(&mut self, index: i32) -> Result<KeysDestroyResult> {
-        let (client, env, existing_to_destroy, main_dc_id) = {
+        let (client, env, existing_to_destroy, main_dc_id, logged_out_user_id) = {
             let live = self
                 .live_accounts
                 .get(&index)
@@ -1172,6 +1477,7 @@ impl AccountManager {
                 live.environment,
                 live.keys_to_destroy.clone(),
                 live.client.main_dc_id(),
+                live.user_id,
             )
         };
 
@@ -1245,9 +1551,11 @@ impl AccountManager {
             .collect();
 
         if self.domain.accounts().len() > 1 {
-            // Multi-account: remove this slot completely and drop its live client.
+            // Multi-account: remove this slot completely, wipe its cache/webview/wallet/temp
+            // folders, and drop its live client.
             self.live_accounts.remove(&index);
             let _ = self.domain.remove(index)?;
+            self.wipe_account_files_for(index, logged_out_user_id, false);
 
             // Hand any unconfirmed keys to the surviving active account so they are retried later.
             if !destroy_result.remaining.is_empty()
@@ -1261,9 +1569,10 @@ impl AccountManager {
                 let _ = self.save_account(active_idx);
             }
         } else {
-            // Last remaining account: wipe account files, reopen empty AccountStorage,
-            // and create a fresh unauthenticated client with no old auth keys.
-            self.wipe_account_files(index);
+            // Last remaining account: wipe account files (including media cache, WebView2
+            // profiles, wallet folder, and temp copies), reopen empty AccountStorage, and
+            // create a fresh unauthenticated client with no old auth keys.
+            self.wipe_account_files_for(index, logged_out_user_id, true);
             self.domain
                 .storage_mut()
                 .start_added(index, env)
@@ -1284,6 +1593,7 @@ impl AccountManager {
             let _ = self.domain.remove_redundant_accounts()?;
             let fresh = self.create_live_account_from_storage(index, env)?;
             self.live_accounts.insert(index, fresh);
+            self.sync_media_cache_keys(None);
         }
 
         info!(
@@ -1302,6 +1612,7 @@ impl AccountManager {
             self.live_accounts.insert(index, live);
         }
         self.prune_removed_live_accounts();
+        self.sync_media_cache_keys(None);
         Ok(index)
     }
 
@@ -1337,17 +1648,22 @@ impl AccountManager {
         if let Some(live) = self.live_accounts.remove(&index) {
             live.shutdown();
         }
+        self.wipe_account_files_for(index, None, false);
         self.prune_removed_live_accounts();
         Ok(None)
     }
 
     /// Shuts down all live MTProto clients cleanly.
     pub fn shutdown(&mut self) {
+        let tdata = self.domain.storage().tdata_path().to_path_buf();
         for live in self.live_accounts.values() {
             live.shutdown();
         }
         self.live_accounts.clear();
         self.domain.finish();
+        cleanup_stale_temp_dirs(&tdata);
+        process_pending_cleanups(&tdata);
+        unregister_unlocked_domain_key(&tdata);
     }
 
     // -------------------------------------------------------------------------
@@ -1472,15 +1788,53 @@ impl AccountManager {
         })
     }
 
-    fn wipe_account_files(&self, index: i32) {
+    fn wipe_account_files_for(&self, index: i32, user_id: Option<UserId>, is_last_account: bool) {
         let tdata = self.domain.storage().tdata_path();
         let data_name = self.domain.storage().data_name();
         let acc_data_name = compose_data_string(data_name, index);
         let key = compute_data_name_key(&acc_data_name);
+        let file_part = to_file_part(key);
         clear_key(key, tdata);
-        let base_dir = tdata.join(to_file_part(key));
-        if base_dir.exists() {
-            let _ = fs::remove_dir_all(&base_dir);
+
+        let keyed_media_cache = tdata.join("media_cache").join(&file_part);
+        let legacy_slot_media_cache = tdata.join("media_cache").join(format!("account_{index}"));
+        unregister_cache_key(&keyed_media_cache);
+        unregister_cache_key(&legacy_slot_media_cache);
+
+        let base_dir = tdata.join(&file_part);
+        let mut targets = vec![
+            base_dir.join("wallet"),
+            base_dir,
+            keyed_media_cache,
+            legacy_slot_media_cache,
+            tdata.join(format!("user_{acc_data_name}")),
+            tdata.join(format!("temp_{acc_data_name}")),
+            tdata.join("bot_storage").join(&file_part),
+            tdata.join("bot_storage").join(format!("account_{index}")),
+            tdata.join("webview_profiles").join(&file_part),
+            tdata.join(format!("wallet_{file_part}")),
+        ];
+        if let Some(uid) = user_id
+            && uid.0 != 0
+        {
+            targets.push(tdata.join("bot_storage").join(format!("user_{}", uid.0)));
+        }
+        if is_last_account {
+            targets.push(tdata.join("webview_profiles"));
+        }
+
+        for target in targets {
+            if !target.exists() {
+                continue;
+            }
+            if !try_remove_path_with_retries(&target) {
+                warn!(
+                    index,
+                    path = %target.display(),
+                    "account cleanup target busy during logout; recording pending cleanup"
+                );
+                record_pending_cleanup(tdata, &target);
+            }
         }
     }
 
@@ -1502,9 +1856,13 @@ impl AccountManager {
 
 impl Drop for AccountManager {
     fn drop(&mut self) {
+        let tdata = self.domain.storage().tdata_path().to_path_buf();
         for live in self.live_accounts.values() {
             live.shutdown();
         }
+        cleanup_stale_temp_dirs(&tdata);
+        process_pending_cleanups(&tdata);
+        unregister_unlocked_domain_key(&tdata);
     }
 }
 
@@ -1953,6 +2311,269 @@ mod passcode_and_settings_tests {
                 .auto_download
                 .bytes_limit(AutoDownloadSource::User, AutoDownloadType::Photo),
             16 * 1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn d2_logout_wipes_media_cache_webview_wallet_and_temp() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let opts = WorkingDirOpenOptions::new(tmp.path(), test_creds())
+            .with_pfs(false)
+            .with_logout_timeout(Duration::from_millis(50))
+            .with_destroy_keys_timeout(Duration::from_millis(50));
+
+        let mut mgr = AccountManager::open_and_unlock(opts, b"").expect("open");
+        let slot0 = mgr.active_index().expect("slot 0");
+        let uid0 = UserId(777_001);
+        if let Some(live) = mgr.live_accounts.get_mut(&slot0) {
+            live.user_id = Some(uid0);
+        }
+
+        let tdata = tmp.path().join("tdata");
+        let key_part = mgr.account_key_file_part(slot0);
+        let keyed_cache = tdata.join("media_cache").join(&key_part);
+        let legacy_cache = tdata.join("media_cache").join(format!("account_{slot0}"));
+        let webview_profile = tdata
+            .join("bot_storage")
+            .join(format!("user_{}", uid0.0))
+            .join("webview")
+            .join("bot_99");
+        let wallet_dir = tdata.join(&key_part).join("wallet");
+        let temp_dir = tdata.join("temp_data");
+        let user_db_dir = tdata.join("user_data").join("wvbots");
+
+        for d in [
+            &keyed_cache,
+            &legacy_cache,
+            &webview_profile,
+            &wallet_dir,
+            &temp_dir,
+            &user_db_dir,
+        ] {
+            fs::create_dir_all(d).expect("mkdir");
+            fs::write(d.join("secret.dat"), b"sensitive-account-data").expect("seed file");
+        }
+
+        let _ = mgr.logout_account(slot0).await.expect("logout");
+
+        assert!(
+            !keyed_cache.exists(),
+            "logout must remove data-keyed media cache folder"
+        );
+        assert!(
+            !legacy_cache.exists(),
+            "logout must remove legacy slot media cache folder"
+        );
+        assert!(
+            !tdata
+                .join("bot_storage")
+                .join(format!("user_{}", uid0.0))
+                .exists(),
+            "logout must remove account WebView2 profile & bot storage folder"
+        );
+        assert!(
+            !wallet_dir.exists(),
+            "logout must remove account wallet folder"
+        );
+        assert!(!temp_dir.exists(), "logout must remove account temp folder");
+        assert!(
+            !tdata.join("user_data").exists(),
+            "logout must remove account user_data database folder"
+        );
+
+        // Multi-account isolation: adding slot 1 and logging out slot 1 wipes slot 1's cache
+        // while keeping slot 0's cache intact.
+        let slot0_cache = tdata.join("media_cache").join(&key_part);
+        fs::create_dir_all(&slot0_cache).expect("recreate slot0 cache");
+        fs::write(slot0_cache.join("keep.tdef"), b"slot0").expect("seed slot0");
+
+        let slot1 = mgr
+            .add_account(Environment::Production)
+            .expect("add slot 1");
+        let key_part1 = mgr.account_key_file_part(slot1);
+        let slot1_cache = tdata.join("media_cache").join(&key_part1);
+        fs::create_dir_all(&slot1_cache).expect("mkdir slot1 cache");
+        fs::write(slot1_cache.join("wipe.tdef"), b"slot1").expect("seed slot1");
+
+        let _ = mgr.logout_account(slot1).await.expect("logout slot 1");
+        assert!(
+            !slot1_cache.exists(),
+            "multi-account logout must remove logged-out slot's media cache folder"
+        );
+        assert!(
+            slot0_cache.join("keep.tdef").is_file(),
+            "logging out slot 1 must not delete slot 0's media cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn d2_busy_file_records_pending_cleanup_and_retries_later() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let opts = WorkingDirOpenOptions::new(tmp.path(), test_creds())
+            .with_pfs(false)
+            .with_logout_timeout(Duration::from_millis(50))
+            .with_destroy_keys_timeout(Duration::from_millis(50));
+
+        let mut mgr = AccountManager::open_and_unlock(opts.clone(), b"").expect("open");
+        let slot0 = mgr.active_index().expect("slot 0");
+        let tdata = tmp.path().join("tdata");
+        let key_part = mgr.account_key_file_part(slot0);
+        let busy_cache = tdata.join("media_cache").join(&key_part);
+        fs::create_dir_all(&busy_cache).expect("mkdir");
+        let locked_file = busy_cache.join("locked.bin");
+        let unlocked_file = busy_cache.join("unlocked.bin");
+        fs::write(&locked_file, b"busy").expect("write locked");
+        fs::write(&unlocked_file, b"free").expect("write unlocked");
+
+        // Hold an exclusive Windows file handle (share_mode = 0) so remove_dir_all fails during logout.
+        #[cfg(windows)]
+        let lock_guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&locked_file)
+                .expect("open exclusively")
+        };
+
+        let _ = mgr.logout_account(slot0).await.expect("logout");
+
+        #[cfg(windows)]
+        {
+            assert!(
+                !unlocked_file.exists(),
+                "unlocked files in a busy folder should still be purged immediately"
+            );
+            assert!(
+                tdata.join(PENDING_CLEANUP_FILENAME).is_file(),
+                "failed removal during logout must record a pending cleanup entry"
+            );
+            drop(lock_guard);
+
+            let cleaned = mgr.retry_pending_cleanups();
+            assert!(
+                cleaned >= 1,
+                "pending cleanup retry must remove unlocked folder"
+            );
+            assert!(!busy_cache.exists());
+            assert!(!tdata.join(PENDING_CLEANUP_FILENAME).exists());
+        }
+    }
+
+    #[test]
+    fn passcode_change_and_key_rotation_sync_media_cache_keys() {
+        use tg_storage::cache::media_cache::{
+            LocalFileRecord, MediaCacheIndex, MediaCacheTag, lookup_cache_key_for_path,
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let opts = WorkingDirOpenOptions::new(tmp.path(), test_creds());
+        let mut mgr = AccountManager::open_and_unlock(opts, b"").expect("open");
+        mgr.complete_login(0, &synthetic_user()).expect("login");
+
+        let tdata = tmp.path().join("tdata");
+        let key_part0 = mgr.account_key_file_part(0);
+        let cache_dir0 = tdata.join("media_cache").join(&key_part0);
+        let key0 = mgr.account_cache_key(0).expect("slot 0 cache key");
+        let dl_path = tmp.path().join("downloaded_video.mp4");
+
+        {
+            let cache = MediaCacheIndex::open_with_key(&cache_dir0, key0.clone()).expect("open");
+            cache
+                .put_blob("photo:2:100:m", MediaCacheTag::Photo, b"cached-photo")
+                .expect("put");
+            cache
+                .upsert_file_location(&LocalFileRecord {
+                    key_high: 7,
+                    key_low: 8,
+                    path: dl_path.clone(),
+                    size: 512,
+                    modified_ms: 1_700_000_000_000,
+                })
+                .expect("upsert loc");
+        }
+
+        // Changing local passcode keeps cache key registry synchronized and existing cache readable.
+        mgr.set_local_passcode_with_kdf(None, b"pass-one", fast_kdf())
+            .expect("set pass");
+        mgr.set_local_passcode_with_kdf(Some(b"pass-one"), b"pass-two", fast_kdf())
+            .expect("change pass");
+        let current_key0 = mgr.account_cache_key(0).expect("key0 after change");
+        assert_eq!(
+            lookup_cache_key_for_path(&cache_dir0)
+                .as_ref()
+                .map(|k| k.as_bytes()),
+            Some(current_key0.as_bytes())
+        );
+        {
+            let cache = MediaCacheIndex::open_with_key(&cache_dir0, current_key0.clone())
+                .expect("reopen after passcode change");
+            assert_eq!(
+                cache.get_blob("photo:2:100:m").expect("get").as_deref(),
+                Some(&b"cached-photo"[..])
+            );
+        }
+
+        // Adding a second account registers its media cache key immediately.
+        let slot1 = mgr
+            .add_account(Environment::Production)
+            .expect("add slot 1");
+        let cache_dir1 = tdata
+            .join("media_cache")
+            .join(mgr.account_key_file_part(slot1));
+        let key1 = mgr.account_cache_key(slot1).expect("key1");
+        assert_eq!(
+            lookup_cache_key_for_path(&cache_dir1)
+                .as_ref()
+                .map(|k| k.as_bytes()),
+            Some(key1.as_bytes())
+        );
+
+        // When a cache directory was encrypted with a previous local key, `sync_media_cache_keys`
+        // re-encrypts `file_locations` under the active derived key and purges unreadable blobs.
+        let stale_local_key = AuthKey::new([0x9Au8; 256]);
+        let stale_cache_key = derive_media_cache_key(&stale_local_key, &mgr.account_data_name(0));
+        let stale_blob_path;
+        {
+            let stale_cache =
+                MediaCacheIndex::open_with_key(&cache_dir0, stale_cache_key).expect("open stale");
+            let entry = stale_cache
+                .put_blob("doc:2:777", MediaCacheTag::Document, b"stale-secret")
+                .expect("put stale");
+            stale_blob_path = cache_dir0.join(&entry.rel_path);
+            stale_cache
+                .upsert_file_location(&LocalFileRecord {
+                    key_high: 9,
+                    key_low: 10,
+                    path: dl_path.clone(),
+                    size: 1024,
+                    modified_ms: 1_700_000_002_000,
+                })
+                .expect("upsert stale loc");
+        }
+        assert!(stale_blob_path.is_file());
+
+        mgr.sync_media_cache_keys(Some(&stale_local_key));
+        assert_eq!(
+            lookup_cache_key_for_path(&cache_dir0)
+                .as_ref()
+                .map(|k| k.as_bytes()),
+            Some(current_key0.as_bytes())
+        );
+        assert!(
+            !stale_blob_path.exists(),
+            "stale-key blob must be purged after key rotation"
+        );
+        let synced =
+            MediaCacheIndex::open_with_key(&cache_dir0, current_key0).expect("open synced");
+        assert_eq!(synced.stats().expect("stats").entry_count, 0);
+        assert_eq!(
+            synced
+                .get_file_location(9, 10)
+                .expect("loc")
+                .map(|r| r.path),
+            Some(dl_path)
         );
     }
 }

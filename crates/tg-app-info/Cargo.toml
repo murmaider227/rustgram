@@ -18,9 +18,12 @@ tg-core = { path = "../tg-core" }
 tg-crypto = { path = "../tg-crypto" }
 tg-data = { path = "../tg-data" }
 tg-editor = { path = "../tg-editor" }
+tg-emoji = { path = "../tg-emoji" }
 tg-history = { path = "../tg-history" }
 tg-lang = { path = "../tg-lang" }
+tg-media = { path = "../tg-media" }
 tg-passport = { path = "../tg-passport" }
+tg-platform = { path = "../tg-platform" }
 tg-payments = { path = "../tg-payments" }
 tg-stats = { path = "../tg-stats" }
 tg-text = { path = "../tg-text" }

@@ -11,9 +11,13 @@ use std::time::Duration;
 
 use tg_api::RpcClient;
 use tg_api::convert::{
-    apply_tl_user_full, apply_tl_users_and_chats, input_peer_for, input_user_for,
+    apply_tl_chat_full, apply_tl_user_full, apply_tl_users_and_chats, input_channel_for,
+    input_peer_for, input_user_for, photo_from_tl,
 };
-use tg_data::{ChannelFlags, ChannelId, PeerId as DataPeerId, Session};
+use tg_data::{
+    ChannelFlags, ChannelId, LoadedStatus, PeerId as DataPeerId, PhotoData, PhotoId, Session,
+    UNKNOWN_PHOTO_ID,
+};
 use tg_payments::credits::{build_get_stars_status, stars_status_from_tl};
 use tg_tl::{RemoteCall, enums as tl_enums, functions as tl_fns, types as tl_types};
 
@@ -24,7 +28,7 @@ use crate::payments::{
     cached_self_profile_balance, record_self_stars_balance, record_self_ton_balance,
 };
 use crate::session::LiveSession;
-use tg_app_core::info::backend::{PersonalChannelOption, ProfileBalanceInfo};
+use tg_app_core::info::backend::{PersonalChannelOption, ProfileBalanceInfo, ProfilePhotoRef};
 use tg_app_core::stand_in::types::PeerId;
 
 const PROFILE_INFO_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,6 +36,8 @@ const PROFILE_INFO_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct ProfileInfoExtrasState {
     fetched_full_users: HashSet<PeerId>,
+    fetched_photo_full_peers: HashSet<(PeerId, PhotoId)>,
+    fetched_user_photos: HashSet<(PeerId, PhotoId)>,
     candidates_loaded: bool,
     candidates: Vec<PersonalChannelOption>,
     balance_attempted: HashSet<PeerId>,
@@ -358,4 +364,183 @@ pub(crate) fn peer_profile_balance(
         st.peer_balances.insert(peer_id, info);
     });
     (info.ton_nanos > 0 || info.stars_balance > 0).then_some(info)
+}
+
+/// Validates that a [`ProfilePhotoRef`] carries a real non-zero server photo ID and
+/// access hash (never a bogus placeholder fabricated from `peer_id` with `access_hash == 0`).
+pub(crate) fn validate_profile_photo_ref(photo: &ProfilePhotoRef) -> Result<(), String> {
+    if photo.id == 0 {
+        return Err("Profile photo ID cannot be zero.".to_owned());
+    }
+    if photo.access_hash == 0 {
+        return Err(
+            "Profile photo reference is missing a valid server access_hash (cannot send placeholder InputPhoto)."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn photo_data_to_profile_ref(photo: &PhotoData) -> Option<ProfilePhotoRef> {
+    let id = photo.id.to_tl();
+    let access_hash = photo.access_hash as i64;
+    if id == 0 || access_hash == 0 {
+        return None;
+    }
+    Some(ProfilePhotoRef {
+        id,
+        access_hash,
+        file_reference: photo.file_reference.clone(),
+    })
+}
+
+/// Resolves the real server [`ProfilePhotoRef`] (`id`, `access_hash`, `file_reference`) for
+/// `peer_id`'s currently active profile photo, matching `api/api_peer_photo.cpp`.
+///
+/// Resolution order:
+/// 1. Cached `PhotoData` in `Session` (populated from `UserFull`, `ChatFull`, `ChannelFull`,
+///    `photos.getUserPhotos`, or `photos.uploadContactProfilePhoto`).
+/// 2. Full-peer hydration (`users.getFullUser`, `messages.getFullChat`, or
+///    `channels.getFullChannel`) when full info has not yet been fetched for this photo ID.
+/// 3. For users, fallback to `photos.getUserPhotos(offset = 0, max_id = 0, limit = 1)` if a
+///    user photo exists or full-user metadata did not yield a cached `PhotoData`.
+///
+/// Returns `None` when the peer has no active profile photo or no valid server reference is
+/// available; never fabricates an `InputPhoto` from `peer_id.bare()`.
+pub(crate) fn active_profile_photo_ref(
+    live: &LiveSession,
+    peer_id: PeerId,
+) -> Option<ProfilePhotoRef> {
+    let data_peer = to_data_peer(peer_id);
+    if data_peer.is_zero() || data_peer.is_fake() {
+        return None;
+    }
+
+    let (cached, loaded_status, photo_id) = read_session(live, |s| {
+        let cached = s
+            .peer_active_photo(data_peer)
+            .and_then(photo_data_to_profile_ref);
+        let (status, pid) = s
+            .peer(data_peer)
+            .map(|p| (p.common().loaded_status, p.common().userpic_photo_id))
+            .unwrap_or((LoadedStatus::Not, UNKNOWN_PHOTO_ID));
+        (cached, status, pid)
+    });
+
+    if cached.is_some() {
+        return cached;
+    }
+    if loaded_status >= LoadedStatus::Full && photo_id == PhotoId::ZERO {
+        return None;
+    }
+
+    // Hydrate full peer info once per `(peer_id, photo_id)` if full info is not yet loaded.
+    if loaded_status < LoadedStatus::Full
+        && with_state(live, |st| {
+            st.fetched_photo_full_peers.insert((peer_id, photo_id))
+        })
+    {
+        if let Some(uid) = data_peer.to_user() {
+            let input_user = read_session(live, |s| input_user_for(s, uid));
+            if !matches!(input_user, tl_enums::InputUser::Empty)
+                && let Ok(tl_enums::users::UserFull::UserFull(uf)) =
+                    invoke_rpc(live, tl_fns::users::GetFullUser { id: input_user })
+            {
+                write_session(live, |s| {
+                    apply_tl_users_and_chats(s, &uf.users, &uf.chats);
+                    apply_tl_user_full(s, &uf.full_user);
+                });
+            }
+        } else if let Some(cid) = data_peer.to_chat() {
+            if let Ok(tl_enums::messages::ChatFull::ChatFull(cf)) = invoke_rpc(
+                live,
+                tl_fns::messages::GetFullChat {
+                    chat_id: cid.to_tl(),
+                },
+            ) {
+                write_session(live, |s| {
+                    apply_tl_users_and_chats(s, &cf.users, &cf.chats);
+                    apply_tl_chat_full(s, &cf.full_chat);
+                });
+            }
+        } else if let Some(chid) = data_peer.to_channel() {
+            let channel = read_session(live, |s| input_channel_for(s, chid));
+            if !matches!(channel, tl_enums::InputChannel::Empty)
+                && let Ok(tl_enums::messages::ChatFull::ChatFull(cf)) =
+                    invoke_rpc(live, tl_fns::channels::GetFullChannel { channel })
+            {
+                write_session(live, |s| {
+                    apply_tl_users_and_chats(s, &cf.users, &cf.chats);
+                    apply_tl_chat_full(s, &cf.full_chat);
+                });
+            }
+        }
+    }
+
+    let (after_full, after_status, after_photo_id) = read_session(live, |s| {
+        let cached = s
+            .peer_active_photo(data_peer)
+            .and_then(photo_data_to_profile_ref);
+        let (status, pid) = s
+            .peer(data_peer)
+            .map(|p| (p.common().loaded_status, p.common().userpic_photo_id))
+            .unwrap_or((LoadedStatus::Not, UNKNOWN_PHOTO_ID));
+        (cached, status, pid)
+    });
+    if after_full.is_some() {
+        return after_full;
+    }
+    if after_status >= LoadedStatus::Full && after_photo_id == PhotoId::ZERO {
+        return None;
+    }
+
+    // Fallback for users: fetch the active profile photo via `photos.getUserPhotos`
+    // (`offset = 0, max_id = 0, limit = 1`).
+    if let Some(uid) = data_peer.to_user()
+        && with_state(live, |st| {
+            st.fetched_user_photos.insert((peer_id, after_photo_id))
+        })
+    {
+        let input_user = read_session(live, |s| input_user_for(s, uid));
+        if !matches!(input_user, tl_enums::InputUser::Empty)
+            && let Ok(resp) = invoke_rpc(
+                live,
+                tl_fns::photos::GetUserPhotos {
+                    user_id: input_user,
+                    offset: 0,
+                    max_id: 0,
+                    limit: 1,
+                },
+            )
+        {
+            let (photos, users) = match resp {
+                tl_enums::photos::Photos::Photos(p) => (p.photos, p.users),
+                tl_enums::photos::Photos::Slice(p) => (p.photos, p.users),
+            };
+            write_session(live, |s| {
+                apply_tl_users_and_chats(s, &users, &[]);
+                let mut first_valid: Option<PhotoId> = None;
+                for tl_photo in &photos {
+                    if let Some(data) = photo_from_tl(tl_photo) {
+                        if first_valid.is_none() {
+                            first_valid = Some(data.id);
+                        }
+                        s.cache_photo(data);
+                    }
+                }
+                if let Some(pid) = first_valid
+                    && let Some(user) = s.user_mut(uid)
+                    && (user.common.userpic_photo_id == UNKNOWN_PHOTO_ID
+                        || user.common.userpic_photo_id == PhotoId::ZERO)
+                {
+                    user.common.userpic_photo_id = pid;
+                }
+            });
+        }
+    }
+
+    read_session(live, |s| {
+        s.peer_active_photo(data_peer)
+            .and_then(photo_data_to_profile_ref)
+    })
 }

@@ -498,8 +498,7 @@ impl WalletPanel {
                                 self.toast = Some(msg);
                             }
                             OnrampOutcome::OpenExternalUrl(url) => {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
-                                self.toast = Some(format!("Opened read-only handoff: {url}"));
+                                self.toast = Some(open_onramp_url(ui.ctx(), &url));
                             }
                         }
                     }
@@ -599,6 +598,18 @@ fn apply_wallet_visuals(ui: &mut Ui, palette: &Palette) {
     visuals.selection.bg_fill = palette.window_bg_active;
     visuals.selection.stroke = Stroke::new(1.0, palette.window_fg_active);
     ui.style_mut().visuals = visuals;
+}
+
+/// Opens an on-ramp hand-off URL only after the shared external URL policy accepted (and
+/// normalized) it, and returns the toast text to show.
+fn open_onramp_url(ctx: &Context, url: &str) -> String {
+    match tg_platform::url_policy::validate_external_url(url) {
+        Ok(validated) => {
+            ctx.open_url(egui::OpenUrl::new_tab(validated.clone()));
+            format!("Opened read-only handoff: {validated}")
+        }
+        Err(_) => tg_lang::tr::lng_open_link_unsupported(),
+    }
 }
 
 /// Self-contained overlay host for `app.rs`, `live/host.rs`, `window/main_menu.rs`, and
@@ -745,6 +756,14 @@ impl AppWalletHost {
     pub fn is_open(ctx: &Context) -> bool {
         let arc = Self::state_arc(ctx);
         arc.lock().map(|g| g.open).unwrap_or(false)
+    }
+
+    /// Closes the Wallet overlay (on passcode lock, `Application::closeAdditionalWindows`).
+    pub fn close(ctx: &Context) {
+        let arc = Self::state_arc(ctx);
+        if let Ok(mut guard) = arc.lock() {
+            guard.open = false;
+        }
     }
 
     /// Opens the Wallet overlay panel if allowed by [`WalletAppConfig::is_available`].
@@ -945,6 +964,25 @@ impl AppWalletHost {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sec2a_l7_onramp_url_goes_through_url_policy() {
+        let ctx = egui::Context::default();
+        let toast = super::open_onramp_url(&ctx, "ms-msdt:/id PCWDiagnostic");
+        assert_eq!(toast, tg_lang::tr::lng_open_link_unsupported());
+        let opened = ctx.output(|o| o.commands.clone());
+        assert!(
+            !opened
+                .iter()
+                .any(|c| matches!(c, egui::OutputCommand::OpenUrl(_))),
+            "rejected URL must not reach the shell: {opened:?}"
+        );
+        let toast = super::open_onramp_url(&ctx, "https://onramp.example/buy?a=1 2");
+        assert!(
+            toast.ends_with("https://onramp.example/buy?a=1%202"),
+            "{toast}"
+        );
+    }
+
     use egui::{RawInput, Rect, Vec2};
     use tg_wallet::address::TonAddress;
     use tg_wallet::contract::WalletVersion;
@@ -1035,7 +1073,14 @@ mod tests {
         }
 
         // Approve pending TON Connect tx in demo wallet.
-        let receipt = panel.backend_mut().approve_ton_connect_tx().unwrap();
+        let pending_tx = panel
+            .backend_mut()
+            .pending_tx_approval()
+            .expect("demo pending tx");
+        let receipt = panel
+            .backend_mut()
+            .approve_ton_connect_tx(&pending_tx.request.request_id, &pending_tx.content_hash())
+            .unwrap();
         assert!(!receipt.signed_boc_base64.is_empty());
 
         // Lock & unlock with DEMO_WALLET_PASSCODE.
@@ -1094,5 +1139,54 @@ mod tests {
             qr_ok = receive::paint_qr_code(ui, &uri, 180.0, Palette::day().divider);
         });
         assert!(qr_ok);
+    }
+
+    #[test]
+    fn b3_mock_wallet_and_ui_bind_approval_to_shown_request_id_and_hash() {
+        let mut backend = MockWalletBackend::with_demo_wallet();
+        let pending_tx = backend.pending_tx_approval().expect("demo pending tx");
+        let tx_id = pending_tx.request.request_id.clone();
+        let tx_hash = pending_tx.content_hash();
+
+        // Wrong request_id or wrong content_hash must be refused without changing balance/seqno.
+        let seqno_before = backend.overview().seqno;
+        assert!(
+            backend
+                .approve_ton_connect_tx("other-id", &tx_hash)
+                .is_err()
+        );
+        assert!(
+            backend
+                .approve_ton_connect_tx(&tx_id, "tampered-hash")
+                .is_err()
+        );
+        assert_eq!(backend.overview().seqno, seqno_before);
+        assert!(backend.pending_tx_approval().is_some());
+
+        // Same check for pending signData.
+        let pending_sd = backend.pending_sign_data().expect("demo pending signData");
+        let sd_id = pending_sd.request.request_id.clone();
+        let sd_hash = pending_sd.content_hash();
+        assert!(
+            backend
+                .approve_ton_connect_sign_data("other-sd", &sd_hash)
+                .is_err()
+        );
+        assert!(
+            backend
+                .approve_ton_connect_sign_data(&sd_id, "tampered-hash")
+                .is_err()
+        );
+        assert!(backend.pending_sign_data().is_some());
+
+        // Matching (request_id, content_hash) succeeds.
+        backend
+            .approve_ton_connect_tx(&tx_id, &tx_hash)
+            .expect("matching tx target must approve");
+        assert!(backend.pending_tx_approval().is_none());
+        backend
+            .approve_ton_connect_sign_data(&sd_id, &sd_hash)
+            .expect("matching signData target must approve");
+        assert!(backend.pending_sign_data().is_none());
     }
 }

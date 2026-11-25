@@ -11,10 +11,11 @@ use std::sync::OnceLock;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use tg_history::datetime::format_time_short;
 use tg_history::{
     AvatarCornerBadge, DialogChatTypeIcon, DialogRowInput, DialogRowLayout, DialogRowMode,
-    DialogRowStyle, DialogSendState, FontMetrics, LocalDateTime, elide_text_right,
-    format_unread_counter, layout_dialog_row,
+    DialogRowStyle, DialogSendState, DialogsDateKind, FontMetrics, LocalDateTime,
+    classify_dialogs_date, elide_text_right, format_unread_counter, layout_dialog_row,
 };
 use tg_lang::keys::{SimpleDate, day_of_month, day_of_week};
 use tg_ui::fonts::{family_regular, family_semibold, font_id_from_style};
@@ -30,11 +31,13 @@ use tg_ui::userpic::{
 };
 
 use crate::dialogs::backend::{
-    ArchiveSummary, DialogItem, FolderTagBadge, GlobalPeerResult, MessageSearchResult,
-    SpecialRowKind,
+    ArchiveSummary, DialogItem, DialogPeerKind, FolderTagBadge, GlobalPeerResult,
+    MessageSearchResult, SpecialRowKind,
 };
+use crate::dialogs::mini_preview::{PreviewLineColors, paint_preview_line};
 use crate::dialogs::strings;
 use tg_app_core::stand_in::theme::Palette;
+use tg_ui::widgets::media_marker::{paint_media_marker, split_media_marker};
 
 /// Height of the collapsed Archive bar (`st::dialogsImportantBarHeight = 37px`).
 pub const COLLAPSED_ARCHIVE_HEIGHT: f32 = st::dialogs_important_bar_height.0 as f32;
@@ -228,22 +231,18 @@ impl ColorResolver for DialogColors<'_> {
     }
 }
 
-/// Formats a dialog timestamp using `tg-lang`'s localized weekday/month helpers (`langDayOfWeek`,
-/// `langDayOfMonth`) matching `Dialogs::Ui::RowPainter::PaintRowDate` in `dialogs_layout.cpp`.
+/// Formats a dialog timestamp like `Ui::FormatDialogsDate` (`ui/text/format_values.cpp:724-740`):
+/// the time (`"H:mm"`, `QLocale::ShortFormat`) for the same day or the last 20 hours, the localized
+/// weekday (`langDayOfWeek`) within a week, otherwise the localized date (`langDayOfMonth`).
 #[must_use]
 pub fn format_localized_dialogs_date(
     dt: LocalDateTime,
     now: LocalDateTime,
     use_24h: bool,
 ) -> String {
-    let dt_days = dt.to_local_epoch_secs().div_euclid(86_400);
-    let now_days = now.to_local_epoch_secs().div_euclid(86_400);
-    let diff = now_days - dt_days;
-
-    if diff == 0 {
-        if use_24h {
-            format!("{:02}:{:02}", dt.hour, dt.minute)
-        } else {
+    match classify_dialogs_date(dt, now) {
+        DialogsDateKind::Time if use_24h => format_time_short(dt),
+        DialogsDateKind::Time => {
             let suffix = if dt.hour < 12 { "AM" } else { "PM" };
             let h12 = match dt.hour % 12 {
                 0 => 12,
@@ -251,23 +250,28 @@ pub fn format_localized_dialogs_date(
             };
             format!("{h12}:{:02} {suffix}", dt.minute)
         }
-    } else if (1..=6).contains(&diff) {
-        // 1970-01-01 (day 0) was Thursday (ISO weekday 4); map to 1 = Mon .. 7 = Sun.
-        let wd = (dt_days + 3).rem_euclid(7) as u8 + 1;
-        tg_lang::with_current(|inst| day_of_week(inst, wd))
-    } else {
-        let d = SimpleDate {
-            year: dt.date.year,
-            month: dt.date.month,
-            day: dt.date.day,
-        };
-        let t = SimpleDate {
-            year: now.date.year,
-            month: now.date.month,
-            day: now.date.day,
-        };
-        tg_lang::with_current(|inst| day_of_month(inst, d, t))
+        DialogsDateKind::Weekday => {
+            // 1970-01-01 (day 0) was Thursday (ISO weekday 4); map to 1 = Mon .. 7 = Sun.
+            let dt_days = dt.to_local_epoch_secs().div_euclid(86_400);
+            let wd = (dt_days + 3).rem_euclid(7) as u8 + 1;
+            tg_lang::with_current(|inst| day_of_week(inst, wd))
+        }
+        DialogsDateKind::Date => localized_short_date(dt, now),
     }
+}
+
+fn localized_short_date(dt: LocalDateTime, now: LocalDateTime) -> String {
+    let d = SimpleDate {
+        year: dt.date.year,
+        month: dt.date.month,
+        day: dt.date.day,
+    };
+    let t = SimpleDate {
+        year: now.date.year,
+        month: now.date.month,
+        day: now.date.day,
+    };
+    tg_lang::with_current(|inst| day_of_month(inst, d, t))
 }
 
 fn pick_three_state(icon: ThreeStateIcon, active: bool, selected: bool) -> Icon {
@@ -648,38 +652,19 @@ pub fn paint_dialog_row(
                 preview_font,
                 sub_fg,
             );
-        } else if let Some(sender) = &item.last_sender
-            && !item.last_message.is_empty()
-        {
-            let prefix = format!("{} ", tg_lang::tr::lng_dialogs_text_from_wrapped(sender));
-            let prefix_g = clipped.layout_no_wrap(prefix, preview_font.clone(), service_fg);
-            let prefix_w = prefix_g.size().x;
-            clipped.galley(
-                Pos2::new(r.left(), r.center().y - prefix_g.size().y * 0.5),
-                prefix_g,
-                service_fg,
-            );
-            let avail = (r.width() - prefix_w).max(0.0) as i32;
-            let body = elide_text_right(&item.last_message, avail, |s| {
-                measure_text_i32(painter, s, preview_font.clone())
-            });
-            clipped.text(
-                Pos2::new(r.left() + prefix_w, r.center().y),
-                Align2::LEFT_CENTER,
-                body,
-                preview_font,
-                sub_fg,
-            );
         } else if !item.last_message.is_empty() {
-            let body = elide_text_right(&item.last_message, r.width() as i32, |s| {
-                measure_text_i32(painter, s, preview_font.clone())
-            });
-            clipped.text(
-                Pos2::new(r.left(), r.center().y),
-                Align2::LEFT_CENTER,
-                body,
-                preview_font,
-                sub_fg,
+            // Sender, 16 px mini image or type icon, blue media/service text
+            // (`MessageView::paint`).
+            paint_preview_line(
+                &clipped,
+                r,
+                item,
+                &preview_font,
+                PreviewLineColors {
+                    text: sub_fg,
+                    service: service_fg,
+                },
+                colors,
             );
         } else {
             clipped.text(
@@ -999,6 +984,170 @@ pub fn paint_global_peer_row(
     );
 }
 
+/// Paints a sponsored search peer hit (`contacts.getSponsoredPeers`, `dialogs_inner_widget.cpp:1641-1670`)
+/// with a right-aligned `"Ad"` badge pill (`lng_search_sponsored_button`), returning the badge rect.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_sponsored_peer_row(
+    painter: &Painter,
+    rect: Rect,
+    peer: &tg_app_core::core_types::dto::contacts_extras::SponsoredPeerInfo,
+    active: bool,
+    selected: bool,
+    badge_hovered: bool,
+    palette: &Palette,
+    colors: &DialogColors<'_>,
+) -> Rect {
+    let _ = palette;
+    let bg = if active {
+        colors.color("dialogsBgActive")
+    } else if selected {
+        colors.color("dialogsBgOver")
+    } else {
+        colors.color("dialogsBg")
+    };
+    painter.rect_filled(rect, CornerRadius::ZERO, bg);
+
+    let photo_rect = Rect::from_min_size(
+        Pos2::new(
+            rect.left() + st::default_dialog_row.padding.left.0 as f32,
+            rect.top() + st::default_dialog_row.padding.top.0 as f32,
+        ),
+        Vec2::splat(st::default_dialog_row.photo_size.0 as f32),
+    );
+    paint_peer_avatar(
+        painter,
+        photo_rect,
+        SpecialRowKind::None,
+        peer.color_index,
+        &peer.title,
+        colors,
+    );
+
+    let name_fg = colors.color(if active {
+        "dialogsNameFgActive"
+    } else {
+        "dialogsNameFg"
+    });
+    let sub_fg = colors.color(if active {
+        "dialogsTextFgActive"
+    } else {
+        "dialogsTextFg"
+    });
+
+    let right_edge = rect.right() - st::default_dialog_row.padding.right.0 as f32;
+    let raw_ad_label = tg_lang::tr::lng_search_sponsored_button();
+    let ad_label = raw_ad_label
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '⋮' | '⋯' | '…' | '.'));
+    let ad_label = if ad_label.is_empty() { "Ad" } else { ad_label };
+    let ad_font = FontId::new(11.0, family_semibold());
+    let ad_text_w = measure_text_i32(painter, ad_label, ad_font.clone()) as f32;
+    let ad_w = (ad_text_w + 22.0).max(40.0);
+    let ad_h = 20.0;
+    let ad_rect = Rect::from_min_size(
+        Pos2::new(right_edge - ad_w, rect.top() + 9.0),
+        Vec2::new(ad_w, ad_h),
+    );
+    let accent = colors.color("windowBgActive");
+    let ad_fill = if active {
+        Color32::from_rgba_unmultiplied(255, 255, 255, if badge_hovered { 68 } else { 44 })
+    } else {
+        Color32::from_rgba_unmultiplied(
+            accent.r(),
+            accent.g(),
+            accent.b(),
+            if badge_hovered { 52 } else { 30 },
+        )
+    };
+    let ad_fg = if active {
+        Color32::WHITE
+    } else {
+        colors.active_text_fg()
+    };
+    painter.rect_filled(ad_rect, CornerRadius::same(10), ad_fill);
+    painter.text(
+        Pos2::new(ad_rect.left() + 8.0, ad_rect.center().y),
+        Align2::LEFT_CENTER,
+        ad_label,
+        ad_font,
+        ad_fg,
+    );
+    // Crisp 3-dot disclosure glyph painted as vectors (never depends on U+22EE font coverage).
+    let dots_x = ad_rect.right() - 8.0;
+    let dots_cy = ad_rect.center().y;
+    for dy in [-3.4_f32, 0.0, 3.4] {
+        painter.circle_filled(Pos2::new(dots_x, dots_cy + dy), 1.15, ad_fg);
+    }
+
+    let name_left = rect.left() + st::default_dialog_row.name_left.0 as f32;
+    let badge_w = if peer.verified || peer.premium {
+        18.0
+    } else {
+        0.0
+    };
+    let name_max_w = (ad_rect.left() - 8.0 - name_left - badge_w).max(16.0) as i32;
+    let name_font = font_id_from_style(st::semibold_font);
+    let elided_title = elide_text_right(&peer.title, name_max_w, |s| {
+        measure_text_i32(painter, s, name_font.clone())
+    });
+    let actual_w = measure_text_i32(painter, &elided_title, name_font.clone()) as f32;
+    paint_semibold_text(
+        painter,
+        Pos2::new(name_left, rect.top() + 19.0),
+        Align2::LEFT_CENTER,
+        &elided_title,
+        name_font,
+        name_fg,
+    );
+
+    if peer.verified {
+        paint_verified_badge(
+            painter,
+            Rect::from_min_size(
+                Pos2::new(name_left + actual_w + 3.0, rect.top() + 10.0),
+                Vec2::new(16.0, 18.0),
+            ),
+            active,
+            selected,
+            colors,
+        );
+    } else if peer.premium {
+        paint_premium_star(
+            painter,
+            Rect::from_min_size(
+                Pos2::new(name_left + actual_w + 3.0, rect.top() + 10.0),
+                Vec2::new(16.0, 18.0),
+            ),
+            active,
+            selected,
+            colors,
+        );
+    }
+
+    let subtitle = match (&peer.username, &peer.sponsor_info) {
+        (Some(u), Some(info)) if !u.is_empty() && !info.is_empty() => format!("@{u} · {info}"),
+        (Some(u), _) if !u.is_empty() => format!("@{u}"),
+        (_, Some(info)) if !info.is_empty() => info.clone(),
+        (_, _) => peer
+            .additional_info
+            .clone()
+            .unwrap_or_else(|| "Sponsored".to_owned()),
+    };
+    let sub_font = font_id_from_style(st::dialogs_text_font);
+    let sub_max_w = (right_edge - name_left).max(16.0) as i32;
+    let elided_sub = elide_text_right(&subtitle, sub_max_w, |s| {
+        measure_text_i32(painter, s, sub_font.clone())
+    });
+    painter.text(
+        Pos2::new(name_left, rect.top() + 43.0),
+        Align2::LEFT_CENTER,
+        elided_sub,
+        sub_font,
+        sub_fg,
+    );
+
+    ad_rect
+}
+
 /// Paints a message search result row with query occurrences highlighted (`RowPainter::Paint(FakeRow)`).
 #[allow(clippy::too_many_arguments)]
 pub fn paint_message_search_row(
@@ -1114,7 +1263,10 @@ pub fn paint_message_search_row(
     let clipped = painter.with_clip_rect(painter.clip_rect().intersect(clip_rect));
     let preview_font = font_id_from_style(st::dialogs_text_font);
     let mut x = text_left;
-    if let Some(sender) = &msg.sender_name {
+    // `MessageView::prepare`: only group chats show the sender before the text.
+    let show_sender = matches!(msg.kind, DialogPeerKind::Group | DialogPeerKind::Forum)
+        && msg.special == SpecialRowKind::None;
+    if let Some(sender) = msg.sender_name.as_ref().filter(|_| show_sender) {
         let prefix = format!("{} ", tg_lang::tr::lng_dialogs_text_from_wrapped(sender));
         let g = clipped.layout_no_wrap(prefix, preview_font.clone(), service_fg);
         let w = g.size().x;
@@ -1126,26 +1278,54 @@ pub fn paint_message_search_row(
         x += w;
     }
 
-    let highlight_fg = if active {
-        colors.color("dialogsNameFgActive")
-    } else {
-        colors.active_text_fg()
+    // Poll / checklist results start with tdesktop's icon emoji instead of the "📊 " marker.
+    let (marker, msg_text) = match split_media_marker(&msg.text) {
+        Some((icon, rest)) => (Some(icon), rest),
+        None => (None, msg.text.as_str()),
     };
-    let highlight_bg = colors.search_highlight_bg(active);
-    let job = build_highlighted_snippet_job(
-        &msg.text,
-        query,
-        preview_font,
-        sub_fg,
-        highlight_fg,
-        highlight_bg,
-    );
+    if let Some(icon) = marker {
+        let line_h = clipped
+            .layout_no_wrap("Ag".to_owned(), preview_font.clone(), sub_fg)
+            .size()
+            .y;
+        x += paint_media_marker(
+            &clipped,
+            Pos2::new(x, clip_rect.center().y - line_h * 0.5),
+            icon,
+            service_fg,
+            colors,
+        );
+    }
+    let snippet = search_snippet_from_first_match(msg_text, query);
+    let job = search_snippet_job(&snippet, query, preview_font, sub_fg, service_fg);
     let galley = clipped.layout_job(job);
     clipped.galley(
         Pos2::new(x, clip_rect.center().y - galley.size().y * 0.5),
         galley,
         sub_fg,
     );
+}
+
+/// Cuts `text` so the first query word match starts near the left edge, prefixed with `…`
+/// (`kLeftShift = 15` in `dialogs_message_view.cpp`).
+#[must_use]
+pub fn search_snippet_from_first_match(text: &str, query: &str) -> String {
+    const LEFT_SHIFT: usize = 15;
+    let text = text.trim();
+    let first = query
+        .split_whitespace()
+        .filter_map(|word| find_highlight_ranges(text, word).first().map(|r| r.start))
+        .min();
+    let Some(byte_from) = first else {
+        return text.to_owned();
+    };
+    let char_from = text[..byte_from].chars().count();
+    if char_from < LEFT_SHIFT {
+        return text.to_owned();
+    }
+    let skip = char_from - LEFT_SHIFT;
+    let rest: String = text.chars().skip(skip).collect();
+    format!("\u{2026}{rest}")
 }
 
 /// Finds all case-insensitive non-overlapping UTF-8 byte ranges of `query` inside `text`.
@@ -1189,6 +1369,27 @@ pub fn find_highlight_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
         }
     }
     ranges
+}
+
+/// Search-result snippet: matches are `EntityType::Colorized` (`MessageView::prepare` with
+/// `searchLowerText`), drawn in the dialogs text palette's `linkFg` (`dialogsTextFgService`,
+/// `...Active` on the selected row) with no background.
+#[must_use]
+pub fn search_snippet_job(
+    snippet: &str,
+    query: &str,
+    font_id: FontId,
+    text_fg: Color32,
+    service_fg: Color32,
+) -> LayoutJob {
+    build_highlighted_snippet_job(
+        snippet,
+        query,
+        font_id,
+        text_fg,
+        service_fg,
+        Color32::TRANSPARENT,
+    )
 }
 
 /// Builds a single-line [`LayoutJob`] with all occurrences of `query` highlighted.

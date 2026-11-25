@@ -50,6 +50,44 @@ enum DragTarget {
     CoverHead,
 }
 
+static ACTIVE_VIDEO_EDITOR_TEMP_DIR: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+static NEXT_VIDEO_EDIT_EXPORT_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Configures the active account's temporary directory for video editor FFmpeg exports
+/// (e.g. `<tdata>/temp_<dataName>/video_edit`) so exported temp MP4s never land in `%TEMP%`.
+pub fn set_active_video_editor_temp_dir(dir: Option<PathBuf>) {
+    if let Ok(mut guard) = ACTIVE_VIDEO_EDITOR_TEMP_DIR.lock() {
+        *guard = dir;
+    }
+}
+
+/// Returns the currently configured account video-editor temp directory, if any.
+#[must_use]
+pub fn active_video_editor_temp_dir() -> Option<PathBuf> {
+    ACTIVE_VIDEO_EDITOR_TEMP_DIR
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+/// Deletes stale temporary video editor exports inside `dir` (skipping any file held open).
+pub fn cleanup_video_editor_temp_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let _ = std::fs::remove_file(&path);
+        } else if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 /// Interactive Video Editor modal state hosted alongside `PhotoEditorModalState` in the
 /// Send Files box (`crates/tg-app/src/history/compose_boxes.rs`).
 pub struct VideoEditorModalState {
@@ -73,6 +111,8 @@ pub struct VideoEditorModalState {
     pub saved_draft: Option<SceneDraft>,
     /// Optional disk path for reading/writing versioned binary [`SceneDraft`] files.
     pub draft_path: Option<PathBuf>,
+    /// Optional explicit temp export directory under the active account folder.
+    export_temp_dir: Option<PathBuf>,
     /// Editable trim range text (synced when editing timestamps directly).
     pub range_input: String,
     /// Active drag handle on the trim timeline.
@@ -196,6 +236,7 @@ impl VideoEditorModalState {
             selected_overlay_id: None,
             saved_draft: None,
             draft_path: None,
+            export_temp_dir: None,
             range_input,
             drag_target: DragTarget::None,
             last_frame_time: None,
@@ -566,17 +607,43 @@ impl VideoEditorModalState {
         ));
     }
 
-    /// Runs an FFmpeg export to a temporary MP4 file if a real source file is attached;
-    /// otherwise returns the collected [`VideoModifications`] immediately.
+    /// Configures an explicit per-account temp directory for exported video files.
+    pub fn set_export_temp_dir(&mut self, dir: PathBuf) {
+        self.export_temp_dir = Some(dir);
+    }
+
+    /// Resolves the temporary output directory for exported video files: explicit override,
+    /// then the active account's temp folder, then the draft directory's `tmp_exports`, and only
+    /// as a last resort a PID-scoped fallback.
+    #[must_use]
+    pub fn resolve_export_temp_dir(&self) -> PathBuf {
+        if let Some(ref dir) = self.export_temp_dir {
+            return dir.clone();
+        }
+        if let Some(dir) = active_video_editor_temp_dir() {
+            return dir;
+        }
+        if let Some(parent) = self.draft_path.as_ref().and_then(|p| p.parent()) {
+            return parent.join("tmp_exports");
+        }
+        std::env::temp_dir().join(format!("rustgram_video_edit_pid_{}", std::process::id()))
+    }
+
+    /// Runs an FFmpeg export to a temporary MP4 file under the account temp directory if a real
+    /// source file is attached; otherwise returns the collected [`VideoModifications`] immediately.
     pub fn finalize_outcome(&mut self) -> VideoEditorOutcome {
         let mods = self.model.collect();
         let mut exported_path = None;
         let mut cover_jpeg = None;
         if self.model.source_path.is_some() && tg_editor::video::is_ffmpeg_available() {
-            let out_path = std::env::temp_dir().join(format!(
-                "rustgram_video_edit_{}_{}.mp4",
+            let out_dir = self.resolve_export_temp_dir();
+            let _ = std::fs::create_dir_all(&out_dir);
+            let seq = NEXT_VIDEO_EDIT_EXPORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let out_path = out_dir.join(format!(
+                "video_edit_{}_{}_{}.mp4",
                 self.file_index,
-                mods.from_ms.max(0)
+                mods.from_ms.max(0),
+                seq
             ));
             match self.model.export_to(&out_path, true) {
                 Ok(res) => {
@@ -1672,5 +1739,31 @@ mod tests {
         ));
         let areas = collect_story_areas(&modal.overlay_scene, modal.model.source_info.dimensions);
         assert_eq!(areas.weather.len(), 1);
+    }
+
+    #[test]
+    fn d3_video_editor_export_uses_account_temp_dir_and_cleans_up() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let acc_edit_dir = dir.path().join("temp_data").join("video_edit");
+
+        set_active_video_editor_temp_dir(Some(acc_edit_dir.clone()));
+        let modal =
+            VideoEditorModalState::open_for_file(0, "clip.mp4", 1280, 720, 5_000, 500_000, None, 1);
+        assert_eq!(
+            modal.resolve_export_temp_dir(),
+            acc_edit_dir,
+            "video editor temp export must use account temp folder, not %TEMP%"
+        );
+
+        std::fs::create_dir_all(&acc_edit_dir).expect("mkdir");
+        let stale = acc_edit_dir.join("video_edit_0_0_1.mp4");
+        std::fs::write(&stale, b"stale export").expect("write");
+        cleanup_video_editor_temp_dir(&acc_edit_dir);
+        assert!(
+            !stale.exists(),
+            "cleanup must delete stale video editor temp MP4s"
+        );
+
+        set_active_video_editor_temp_dir(None);
     }
 }

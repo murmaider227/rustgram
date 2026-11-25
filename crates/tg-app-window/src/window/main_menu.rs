@@ -8,16 +8,31 @@ use egui::{
     Align, Area, Color32, CursorIcon, Frame, Id, Key, Layout, Margin, Order, Pos2, Rect, RichText,
     Sense, Stroke, Ui, Vec2,
 };
+use tg_ui::fonts::font_id_from_style;
+use tg_ui::icons::paint_style_icon;
+use tg_ui::stand_in::ToggleStyle;
+use tg_ui::tg_style::{DefaultPaletteResolver, Icon, st};
+use tg_ui::widgets::checkbox::paint_toggle_view;
 
 use tg_app_core::core_types::startup_types::UpdateSnapshot;
 use tg_app_core::stand_in::strings::Strings;
 use tg_app_core::stand_in::theme::{Palette, ThemeMode};
-use tg_app_core::stand_in::types::AuthUser;
+use tg_app_core::stand_in::types::{AuthUser, PeerId};
 
 /// Main menu drawer width (`st::mainMenuWidth`).
 pub const MAIN_MENU_WIDTH: f32 = 274.0;
 /// Main menu top cover height (`st::mainMenuCoverHeight`).
 pub const MAIN_MENU_COVER_HEIGHT: f32 = 134.0;
+/// Main menu row height (`st::mainMenuButton`: 11 px + 20 px line + 9 px).
+pub const MAIN_MENU_ROW_HEIGHT: f32 = 40.0;
+/// Vertical gap around separators and below the cover (`st::mainMenuSkip`).
+pub const MAIN_MENU_SKIP: f32 = 6.0;
+/// Row icon left offset (`st::mainMenuButton.iconLeft`).
+const MAIN_MENU_ICON_LEFT: f32 = 21.0;
+/// Row text left offset (`st::mainMenuButton.padding.left`).
+const MAIN_MENU_TEXT_LEFT: f32 = 61.0;
+/// Night Mode toggle right offset (`st::mainMenuButton.toggleSkip`).
+const MAIN_MENU_TOGGLE_SKIP: f32 = 19.0;
 
 /// One signed-in account entry rendered inside the expandable Main Menu accounts list
 /// (`Window::MainMenu::setupAccounts` / `Settings::SetupAccounts`).
@@ -70,6 +85,8 @@ pub enum MainMenuAction {
     AddAccount,
     /// Open the user's own profile in Info.
     MyProfile,
+    /// The cover's "Set Emoji Status" link (`MainMenu::_setEmojiStatus`).
+    SetEmojiStatus,
     /// Open New Group placeholder box.
     NewGroup,
     /// Open New Channel placeholder box.
@@ -94,6 +111,8 @@ pub enum MainMenuAction {
     About,
     /// Restart to install a staged update (`Update Rustgram` footer row).
     RestartToUpdate,
+    /// Open a side-menu bot's Mini App (`SetupMenuBots`, `WebViewSourceMainMenu`).
+    OpenMenuBot(PeerId),
     /// Dismiss the menu drawer.
     Close,
 }
@@ -114,9 +133,45 @@ pub struct MainMenu {
     accounts_expanded: bool,
     last_update_row_rect: Option<Rect>,
     live_mode: bool,
+    body_rect: Option<Rect>,
+    menu_bots: Vec<MainMenuBot>,
+}
+
+/// One attach-menu bot shown in the main menu (`AttachWebView::attachBots()` with `inMainMenu`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainMenuBot {
+    /// The bot's peer.
+    pub peer_id: PeerId,
+    /// The attach-menu short name (`bot.name`).
+    pub name: String,
+}
+
+/// The side-menu bots of `store` in server order, as `SetupMenuBots` filters them.
+#[must_use]
+pub fn main_menu_bots(store: &tg_bots::mini_app::AttachMenuStore) -> Vec<MainMenuBot> {
+    store
+        .bots
+        .iter()
+        .filter(|bot| bot.in_side_menu && !bot.inactive)
+        .map(|bot| MainMenuBot {
+            peer_id: PeerId(bot.bot_peer_id.0),
+            name: bot.short_name.clone(),
+        })
+        .collect()
 }
 
 impl MainMenu {
+    /// Sets the window body the drawer slides over: tdesktop's `MainMenu` is a child of the
+    /// window body, so it starts below the title bar. `None` uses the whole viewport.
+    pub fn set_body_rect(&mut self, body: Option<Rect>) {
+        self.body_rect = body;
+    }
+
+    /// Replaces the attach-menu bots listed under "My Profile".
+    pub fn set_menu_bots(&mut self, bots: Vec<MainMenuBot>) {
+        self.menu_bots = bots;
+    }
+
     /// Configures whether the drawer renders live-session copy rather than demo/mock copy.
     pub fn set_live_mode(&mut self, live_mode: bool) {
         self.live_mode = live_mode;
@@ -185,7 +240,7 @@ impl MainMenu {
     ) -> Option<MainMenuAction> {
         let mut action = None;
         self.last_update_row_rect = None;
-        let screen = ctx.content_rect();
+        let screen = self.body_rect.unwrap_or_else(|| ctx.content_rect());
         let drawer_width = MAIN_MENU_WIDTH.min(screen.width() * 0.85);
         let update_row = main_menu_update_row_text(update_snapshot);
         let footer_reserve = if update_row.is_some() { 118.0 } else { 64.0 };
@@ -222,8 +277,14 @@ impl MainMenu {
             .show(ctx, |ui| {
                 Frame::NONE
                     .fill(palette.window_bg)
-                    .stroke(Stroke::new(1.0, palette.divider))
+                    .shadow(egui::Shadow {
+                        offset: [0, 0],
+                        blur: 8,
+                        spread: 0,
+                        color: Color32::from_black_alpha(40),
+                    })
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
                         ui.set_min_size(Vec2::new(drawer_width, screen.height()));
                         ui.set_max_size(Vec2::new(drawer_width, screen.height()));
 
@@ -239,7 +300,7 @@ impl MainMenu {
                                 format!("{} ({})", user.name, user.phone),
                             )
                         });
-                        paint_cover(
+                        let status_rect = paint_cover(
                             ui,
                             cover_rect,
                             user,
@@ -247,15 +308,29 @@ impl MainMenu {
                             other_accounts_unmuted_unread,
                             palette,
                         );
-                        if cover_resp.clicked() {
+                        let status_resp = ui.interact(
+                            status_rect,
+                            ui.make_persistent_id("tg_main_menu_set_status"),
+                            Sense::click(),
+                        );
+                        let status_label = tg_lang::tr::lng_menu_set_status();
+                        status_resp.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::Role::Link, true, &status_label)
+                        });
+                        if status_resp.hovered() {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if status_resp.clicked() {
+                            action = Some(MainMenuAction::SetEmojiStatus);
+                        } else if cover_resp.clicked() {
                             self.accounts_expanded = !self.accounts_expanded;
                         }
 
                         // Divider line below cover.
                         ui.painter().line_segment(
                             [
-                                Pos2::new(cover_rect.left(), cover_rect.bottom()),
-                                Pos2::new(cover_rect.right(), cover_rect.bottom()),
+                                Pos2::new(cover_rect.left(), cover_rect.bottom() - 0.5),
+                                Pos2::new(cover_rect.right(), cover_rect.bottom() - 0.5),
                             ],
                             Stroke::new(1.0, palette.divider),
                         );
@@ -267,6 +342,7 @@ impl MainMenu {
                             .max_height(menu_scroll_max_h)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
                                 // Expandable accounts switcher (`MainMenu::setupAccounts` / `Settings::SetupAccounts`).
                                 if self.accounts_expanded {
                                     ui.add_space(4.0);
@@ -294,125 +370,124 @@ impl MainMenu {
                                         action = Some(MainMenuAction::AddAccount);
                                     }
                                     ui.add_space(4.0);
-                                    ui.add(egui::Separator::default().spacing(4.0));
+                                    menu_separator(ui, drawer_width, palette);
                                 }
 
-                                // Menu actions matching `MainMenu::setupMenu` order.
-                                ui.add_space(6.0);
+                                // Rows and order of `MainMenu::setupMenu` (7.4.6).
+                                ui.add_space(MAIN_MENU_SKIP);
                                 if menu_row(
                                     ui,
                                     drawer_width,
-                                    "MP",
-                                    strings.menu_my_profile(),
+                                    st::menu_icon_profile,
+                                    &tg_lang::tr::lng_menu_my_profile(),
                                     palette,
                                 ) {
                                     action = Some(MainMenuAction::MyProfile);
                                 }
-                                ui.add(egui::Separator::default().spacing(8.0));
+                                // `SetupMenuBots`: bots added to the side menu, with the
+                                // `menuIconBot` glyph until their own icon is available.
+                                for bot in &self.menu_bots {
+                                    if menu_row(
+                                        ui,
+                                        drawer_width,
+                                        st::menu_icon_bot,
+                                        &bot.name,
+                                        palette,
+                                    ) {
+                                        action = Some(MainMenuAction::OpenMenuBot(bot.peer_id));
+                                    }
+                                }
+                                menu_separator(ui, drawer_width, palette);
 
-                                if menu_row(
-                                    ui,
-                                    drawer_width,
-                                    "NG",
-                                    strings.menu_new_group(),
-                                    palette,
-                                ) {
-                                    action = Some(MainMenuAction::NewGroup);
+                                let rows = [
+                                    (
+                                        st::menu_icon_groups,
+                                        tg_lang::tr::lng_create_group_title(),
+                                        MainMenuAction::NewGroup,
+                                    ),
+                                    (
+                                        st::menu_icon_channel,
+                                        tg_lang::tr::lng_create_channel_title(),
+                                        MainMenuAction::NewChannel,
+                                    ),
+                                    (
+                                        st::menu_icon_user_show,
+                                        tg_lang::tr::lng_menu_contacts(),
+                                        MainMenuAction::Contacts,
+                                    ),
+                                    (
+                                        st::menu_icon_phone,
+                                        tg_lang::tr::lng_menu_calls(),
+                                        MainMenuAction::Calls,
+                                    ),
+                                    (
+                                        st::menu_icon_saved_messages,
+                                        tg_lang::tr::lng_saved_messages(),
+                                        MainMenuAction::SavedMessages,
+                                    ),
+                                ];
+                                for (icon, label, row_action) in rows {
+                                    if menu_row(ui, drawer_width, icon, &label, palette) {
+                                        action = Some(row_action);
+                                    }
+                                }
+                                if tg_app_settings::wallet::AppWalletHost::is_available(ui.ctx())
+                                    && menu_row(
+                                        ui,
+                                        drawer_width,
+                                        st::wallet_menu_icon,
+                                        &tg_lang::tr::lng_wallet_menu(),
+                                        palette,
+                                    )
+                                {
+                                    tg_app_settings::wallet::AppWalletHost::open(ui.ctx());
+                                    action = Some(MainMenuAction::Close);
                                 }
                                 if menu_row(
                                     ui,
                                     drawer_width,
-                                    "NC",
-                                    strings.menu_new_channel(),
-                                    palette,
-                                ) {
-                                    action = Some(MainMenuAction::NewChannel);
-                                }
-                                if menu_row(
-                                    ui,
-                                    drawer_width,
-                                    "CT",
-                                    strings.menu_contacts(),
-                                    palette,
-                                ) {
-                                    action = Some(MainMenuAction::Contacts);
-                                }
-                                if menu_row(ui, drawer_width, "CL", strings.menu_calls(), palette) {
-                                    action = Some(MainMenuAction::Calls);
-                                }
-                                if menu_row(
-                                    ui,
-                                    drawer_width,
-                                    "SM",
-                                    strings.menu_saved_messages(),
-                                    palette,
-                                ) {
-                                    action = Some(MainMenuAction::SavedMessages);
-                                }
-                                if menu_row(ui, drawer_width, "DL", "Downloads", palette) {
-                                    action = Some(MainMenuAction::Downloads);
-                                }
-                                if menu_row(
-                                    ui,
-                                    drawer_width,
-                                    "ST",
-                                    strings.menu_settings(),
+                                    st::menu_icon_settings,
+                                    &tg_lang::tr::lng_menu_settings(),
                                     palette,
                                 ) {
                                     action = Some(MainMenuAction::Settings);
                                 }
-
-                                // Night Mode toggle row.
-                                let night_label = if theme_mode.is_night() {
-                                    format!("{}  [ON]", strings.menu_night_mode())
-                                } else {
-                                    format!("{}  [OFF]", strings.menu_night_mode())
-                                };
-                                if menu_row(ui, drawer_width, "NM", &night_label, palette) {
+                                if night_mode_row(
+                                    ui,
+                                    drawer_width,
+                                    &tg_lang::tr::lng_menu_night_mode(),
+                                    theme_mode.is_night(),
+                                    palette,
+                                ) {
                                     action = Some(MainMenuAction::ToggleNightMode);
                                 }
-
-                                let lock_label = if has_passcode {
-                                    strings.menu_lock().to_owned()
-                                } else {
-                                    format!("{} (Set...)", strings.menu_lock())
-                                };
-                                if menu_row(ui, drawer_width, "LK", &lock_label, palette) {
-                                    action = Some(MainMenuAction::LockApp);
-                                }
-
-                                ui.add(egui::Separator::default().spacing(8.0));
-                                if menu_row_tinted(
-                                    ui,
-                                    drawer_width,
-                                    "LO",
-                                    strings.menu_logout(),
-                                    palette.attention_fg,
-                                    palette,
-                                ) {
-                                    action = Some(MainMenuAction::Logout);
-                                }
-                                if tg_app_settings::wallet::AppWalletHost::render_main_menu_entry(
-                                    ui,
-                                    drawer_width,
-                                    palette,
-                                ) {
-                                    action = Some(MainMenuAction::Close);
-                                }
+                                let _ = (has_passcode, strings);
                             });
 
                         // Footer anchored at the bottom (`MainMenu::_footer`).
                         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                            let version_text = tg_lang::tr::lng_settings_current_version(
-                                &update_snapshot.current_version.to_string(),
+                            let version_text = format!(
+                                "{} \u{2013} {}",
+                                tg_lang::tr::lng_settings_current_version(
+                                    &current_version_short_text(
+                                        &update_snapshot.current_version.to_string(),
+                                    )
+                                ),
+                                tg_lang::tr::lng_menu_about(),
                             );
                             let footer_resp = Frame::NONE
-                                .inner_margin(Margin::symmetric(20, 14))
+                                .inner_margin(Margin {
+                                    left: 25,
+                                    right: 20,
+                                    top: 8,
+                                    bottom: 12,
+                                })
                                 .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
                                     let r1 = ui.add(
                                         egui::Label::new(
                                             RichText::new(version_text)
-                                                .size(11.5)
+                                                .font(font_id_from_style(st::normal_font))
                                                 .color(palette.window_sub_text_fg),
                                         )
                                         .sense(Sense::click()),
@@ -420,8 +495,7 @@ impl MainMenu {
                                     let r2 = ui.add(
                                         egui::Label::new(
                                             RichText::new("Rustgram Desktop")
-                                                .size(12.5)
-                                                .strong()
+                                                .font(font_id_from_style(st::semibold_font))
                                                 .color(palette.window_sub_text_fg),
                                         )
                                         .sense(Sense::click()),
@@ -454,6 +528,9 @@ impl MainMenu {
     }
 }
 
+/// Paints the 134 px cover (`MainMenu::paintEvent` + `setupUserpicButton`): 48 px userpic at
+/// (24, 20), the name at (26, 84), the "Set Emoji Status" link at (26, 103) and the accounts
+/// chevron on the right. Returns the clickable status link rect.
 fn paint_cover(
     ui: &Ui,
     rect: Rect,
@@ -461,55 +538,92 @@ fn paint_cover(
     accounts_expanded: bool,
     other_accounts_unmuted_unread: u32,
     palette: &Palette,
-) {
+) -> Rect {
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, palette.window_bg);
 
-    // 48px circular avatar at (21, 20), matching `st::mainMenuUserpic`.
-    let center = Pos2::new(rect.left() + 45.0, rect.top() + 44.0);
+    let center = Pos2::new(rect.left() + 24.0 + 24.0, rect.top() + 20.0 + 24.0);
     let [r, g, b] = user.avatar_rgb;
     painter.circle_filled(center, 24.0, Color32::from_rgb(r, g, b));
     painter.text(
         center,
         egui::Align2::CENTER_CENTER,
         &user.initials,
-        egui::FontId::proportional(16.0),
+        font_id_from_style(st::semibold_font),
         Color32::WHITE,
     );
 
-    painter.text(
-        Pos2::new(rect.left() + 21.0, rect.top() + 86.0),
-        egui::Align2::LEFT_TOP,
-        &user.name,
-        egui::FontId::proportional(15.0),
+    let semibold = font_id_from_style(st::semibold_font);
+    let normal = font_id_from_style(st::normal_font);
+    let text_left = rect.left() + 26.0;
+    let chevron_x = rect.right() - 25.0;
+    let name_max_w = (chevron_x - 16.0 - text_left).max(40.0);
+    let name_galley = painter.layout(
+        user.name.clone(),
+        semibold,
+        palette.window_bold_fg,
+        name_max_w,
+    );
+    painter.galley(
+        Pos2::new(text_left, rect.top() + 84.0),
+        name_galley,
         palette.window_bold_fg,
     );
-    painter.text(
-        Pos2::new(rect.left() + 21.0, rect.top() + 107.0),
-        egui::Align2::LEFT_TOP,
-        &user.phone,
-        egui::FontId::proportional(12.5),
-        palette.window_sub_text_fg,
+
+    let status = tg_lang::tr::lng_menu_set_status();
+    let status_galley = painter.layout_no_wrap(status, normal, palette.window_active_text_fg);
+    let status_rect = Rect::from_min_size(
+        Pos2::new(text_left, rect.top() + 103.0),
+        status_galley.size(),
+    );
+    painter.galley(
+        status_rect.min,
+        status_galley,
+        palette.window_active_text_fg,
     );
 
     if !accounts_expanded && other_accounts_unmuted_unread > 0 {
         paint_unread_pill(
             painter,
-            Pos2::new(rect.right() - 40.0, rect.top() + 98.0),
+            Pos2::new(chevron_x - 14.0, rect.top() + 102.0),
             other_accounts_unmuted_unread,
             false,
             palette,
         );
     }
 
-    let chevron = if accounts_expanded { "^" } else { "v" };
-    painter.text(
-        Pos2::new(rect.right() - 22.0, rect.top() + 98.0),
-        egui::Align2::CENTER_CENTER,
-        chevron,
-        egui::FontId::proportional(13.0),
-        palette.window_sub_text_fg,
+    // `MainMenu::ToggleAccountsButton::paintEvent`: a thin chevron that flips when expanded.
+    let c = Pos2::new(chevron_x, rect.top() + 102.0);
+    let (dy_tip, dy_ends) = if accounts_expanded {
+        (-2.5, 2.5)
+    } else {
+        (2.5, -2.5)
+    };
+    let stroke = Stroke::new(1.5, palette.window_sub_text_fg);
+    painter.line_segment(
+        [
+            Pos2::new(c.x - 5.0, c.y + dy_ends),
+            Pos2::new(c.x, c.y + dy_tip),
+        ],
+        stroke,
     );
+    painter.line_segment(
+        [
+            Pos2::new(c.x, c.y + dy_tip),
+            Pos2::new(c.x + 5.0, c.y + dy_ends),
+        ],
+        stroke,
+    );
+    status_rect
+}
+
+/// `currentVersionShortText()`: the version followed by the build architecture.
+fn current_version_short_text(version: &str) -> String {
+    if cfg!(target_pointer_width = "64") {
+        format!("{version} x64")
+    } else {
+        version.to_owned()
+    }
 }
 
 fn format_unread_badge_short(count: u32) -> String {
@@ -666,41 +780,85 @@ fn add_account_row(
     resp.clicked()
 }
 
-fn menu_row(ui: &mut Ui, width: f32, badge: &str, label: &str, palette: &Palette) -> bool {
-    menu_row_tinted(ui, width, badge, label, palette.window_bold_fg, palette)
+/// One `st::mainMenuButton` row: a 24 px outline `menuIcon*` glyph tinted `menuIconFg` at
+/// `iconLeft` and the semibold label at `padding.left`.
+fn menu_row(ui: &mut Ui, width: f32, icon: Icon, label: &str, palette: &Palette) -> bool {
+    let (rect, resp) = menu_row_base(ui, width, icon, label, palette);
+    let _ = rect;
+    resp.clicked()
 }
 
-fn menu_row_tinted(
+fn menu_row_base(
     ui: &mut Ui,
     width: f32,
-    badge: &str,
+    icon: Icon,
     label: &str,
-    text_color: Color32,
     palette: &Palette,
-) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::click());
+) -> (Rect, egui::Response) {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(width, MAIN_MENU_ROW_HEIGHT), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     if resp.hovered() {
         ui.painter().rect_filled(rect, 0.0, palette.window_bg_over);
     }
-    let badge_center = Pos2::new(rect.left() + 31.0, rect.center().y);
-    ui.painter()
-        .circle_filled(badge_center, 11.0, palette.input_bg);
-    ui.painter().text(
-        badge_center,
-        egui::Align2::CENTER_CENTER,
-        badge,
-        egui::FontId::proportional(9.5),
-        palette.window_sub_text_fg,
+    let icon_rect = Rect::from_min_size(
+        Pos2::new(rect.left() + MAIN_MENU_ICON_LEFT, rect.center().y - 12.0),
+        Vec2::splat(24.0),
+    );
+    paint_style_icon(
+        ui.painter(),
+        icon_rect,
+        icon,
+        &DefaultPaletteResolver,
+        Some(palette.window_sub_text_fg),
     );
     ui.painter().text(
-        Pos2::new(rect.left() + 58.0, rect.center().y),
+        Pos2::new(rect.left() + MAIN_MENU_TEXT_LEFT, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(14.0),
-        text_color,
+        font_id_from_style(st::semibold_font),
+        palette.window_bold_fg,
     );
+    (rect, resp)
+}
+
+/// The Night Mode row: `menuIconNightMode` plus a `defaultMenuToggle` switch on the right whose
+/// toggled color is `mainMenuCoverBg` (`st::mainMenu.itemToggle`).
+fn night_mode_row(ui: &mut Ui, width: f32, label: &str, night: bool, palette: &Palette) -> bool {
+    let (rect, resp) = menu_row_base(ui, width, st::menu_icon_night_mode, label, palette);
+    let toggled = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("toggle"), night, 0.12);
+    let mut style =
+        ToggleStyle::from_tg(&st::default_menu_toggle, &tg_ui::theme::DayPalette::new());
+    style.toggled_fg = palette.dialogs_bg_active;
+    style.untoggled_fg = palette.window_sub_text_fg;
+    style.toggled_bg = palette.window_bg;
+    style.untoggled_bg = palette.window_bg;
+    let size = Vec2::new(
+        2.0 * style.border + style.diameter + style.width,
+        2.0 * style.border + style.diameter,
+    );
+    let toggle_rect = Rect::from_min_size(
+        Pos2::new(
+            rect.right() - MAIN_MENU_TOGGLE_SKIP - size.x,
+            rect.center().y - size.y * 0.5,
+        ),
+        size,
+    );
+    paint_toggle_view(ui.painter(), toggle_rect, &style, f64::from(toggled), 1.0);
     resp.clicked()
+}
+
+/// `Ui::PlainShadow` between menu groups with `st::mainMenuSkip` above and below.
+fn menu_separator(ui: &mut Ui, width: f32, palette: &Palette) {
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(width, MAIN_MENU_SKIP * 2.0 + 1.0), Sense::hover());
+    let y = rect.top() + MAIN_MENU_SKIP + 0.5;
+    ui.painter().line_segment(
+        [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+        Stroke::new(1.0, palette.divider),
+    );
 }
 
 /// Paints tdesktop's highlighted accent "Update Rustgram" banner row anchored above the

@@ -27,6 +27,25 @@ pub const GROUP_THUMB_GAP: f32 = 4.0;
 /// Maximum visible thumbnails painted symmetrically around the active item.
 pub const GROUP_THUMBS_MAX_VISIBLE: usize = 11;
 
+/// Gallery indices whose thumbnails the strip shows for the item at `index`
+/// (`GroupThumbs::RefreshFromSlice` with `ComputeContext` = the message's `groupId`): the run of
+/// neighbours that share the current item's album id. `None` when the item is not in an album or
+/// its album has a single item, so the strip stays hidden.
+#[must_use]
+pub fn album_strip_range(items: &[MediaItem], index: usize) -> Option<std::ops::Range<usize>> {
+    let group = items.get(index)?.grouped_id?;
+    let same = |i: usize| items.get(i).and_then(|it| it.grouped_id) == Some(group);
+    let mut from = index;
+    while from > 0 && same(from - 1) {
+        from -= 1;
+    }
+    let mut till = index + 1;
+    while same(till) {
+        till += 1;
+    }
+    (from + 1 < till).then_some(from..till)
+}
+
 /// Computed layout rectangle for a single thumbnail in [`GroupThumbsStrip`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThumbSlot {
@@ -51,6 +70,17 @@ impl GroupThumbsStrip {
         Self {
             last_slots: Vec::new(),
         }
+    }
+
+    /// Thumbnail slots painted by the last [`Self::show`] (empty while the strip is hidden).
+    #[must_use]
+    pub fn slots(&self) -> &[ThumbSlot] {
+        &self.last_slots
+    }
+
+    /// Forgets the painted slots when the strip is hidden.
+    pub fn clear(&mut self) {
+        self.last_slots.clear();
     }
 
     /// Returns the total strip height including vertical padding.

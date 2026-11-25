@@ -58,10 +58,21 @@ pub enum ExceptionKind {
 }
 
 /// Persistent UI state for the Privacy and Security section.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PrivacyState {
     /// Active inline modal/card editor.
     pub editor: PrivacyEditor,
+    /// Current state of `"Suggest frequent contacts"` (`contacts.toggleTopPeers`).
+    pub top_peers_enabled: bool,
+}
+
+impl Default for PrivacyState {
+    fn default() -> Self {
+        Self {
+            editor: PrivacyEditor::None,
+            top_peers_enabled: true,
+        }
+    }
 }
 
 /// Navigation/event outputs from [`render_privacy_section`].
@@ -77,6 +88,8 @@ pub struct PrivacyOutput {
     pub open_active_sessions: bool,
     /// Open Connected Websites section (`settings_websites.cpp`).
     pub open_connected_websites: bool,
+    /// Emitted when the user toggles `"Suggest frequent contacts"` (`contacts.toggleTopPeers`).
+    pub toggled_top_peers: Option<bool>,
     /// Optional toast feedback.
     pub toast: Option<String>,
 }
@@ -109,6 +122,72 @@ pub fn format_global_ttl(secs: i32) -> String {
     }
 }
 
+/// Skip above the Security / Privacy titles (`st::settings_privacy_skip`).
+const SECURITY_TOP_SKIP: f32 = 4.0;
+/// Skip before a section divider (`Builder::addSkip`).
+const SECTION_SKIP: f32 = 8.0;
+
+/// One row of the Privacy list (`BuildPrivacySection`).
+#[derive(Debug, Clone, Copy)]
+enum PrivacyRow {
+    /// A privacy key row that opens `EditPrivacyBox`.
+    Key(PrivacyKey),
+    /// "Messages" (`EditMessagesPrivacyBox`, backed by the global privacy settings).
+    Messages,
+}
+
+/// Privacy rows in Telegram Desktop 7.4.6 order.
+const PRIVACY_ROWS: [PrivacyRow; 12] = [
+    PrivacyRow::Key(PrivacyKey::PhoneNumber),
+    PrivacyRow::Key(PrivacyKey::LastSeen),
+    PrivacyRow::Key(PrivacyKey::ProfilePhoto),
+    PrivacyRow::Key(PrivacyKey::Forwards),
+    PrivacyRow::Key(PrivacyKey::Calls),
+    PrivacyRow::Key(PrivacyKey::VoiceMessages),
+    PrivacyRow::Messages,
+    PrivacyRow::Key(PrivacyKey::Birthday),
+    PrivacyRow::Key(PrivacyKey::GiftsAutoSave),
+    PrivacyRow::Key(PrivacyKey::About),
+    PrivacyRow::Key(PrivacyKey::SavedMusic),
+    PrivacyRow::Key(PrivacyKey::GroupsInvite),
+];
+
+/// Row title on the Privacy and Security page (`lng_settings_*_privacy`, sentence case).
+fn privacy_row_title(key: PrivacyKey) -> String {
+    match key {
+        PrivacyKey::PhoneNumber => tr::lng_settings_phone_number_privacy(),
+        PrivacyKey::LastSeen => tr::lng_settings_last_seen(),
+        PrivacyKey::ProfilePhoto => tr::lng_settings_profile_photo_privacy(),
+        PrivacyKey::Forwards => tr::lng_settings_forwards_privacy(),
+        PrivacyKey::Calls => tr::lng_settings_calls(),
+        PrivacyKey::VoiceMessages => tr::lng_settings_voices_privacy(),
+        PrivacyKey::Birthday => strings::BIRTHDAY_PRIVACY_TITLE.to_owned(),
+        PrivacyKey::GiftsAutoSave => tr::lng_settings_gifts_privacy(),
+        PrivacyKey::About => tr::lng_settings_bio_privacy(),
+        PrivacyKey::SavedMusic => tr::lng_settings_saved_music_privacy(),
+        PrivacyKey::GroupsInvite => tr::lng_settings_groups_invite(),
+        other => other.localized_title(),
+    }
+}
+
+/// Row value label: localized option ("Everybody", "My contacts", "Nobody") plus the
+/// exception counts tdesktop appends (`"Everybody (-2, +1)"`).
+fn privacy_row_summary(rule: &PrivacyRule, key: PrivacyKey) -> String {
+    let base = rule.option.localized_label_for(key);
+    let mut parts = Vec::new();
+    if !rule.never_allow.is_empty() {
+        parts.push(format!("-{}", rule.never_allow.len()));
+    }
+    if !rule.always_allow.is_empty() {
+        parts.push(format!("+{}", rule.always_allow.len()));
+    }
+    if parts.is_empty() {
+        base
+    } else {
+        format!("{base} ({})", parts.join(", "))
+    }
+}
+
 /// Renders the Privacy and Security settings section (`settings_privacy_security.cpp`).
 pub fn render_privacy_section(
     ui: &mut Ui,
@@ -118,26 +197,53 @@ pub fn render_privacy_section(
     colors: &dyn Colors,
 ) -> PrivacyOutput {
     let mut out = PrivacyOutput::default();
+    ui.spacing_mut().item_spacing.y = 0.0;
 
-    // 1. Security subsection.
-    subsection_title(ui, strings::SECURITY_SECTION_TITLE, colors);
+    // 1. Security (`BuildSecuritySection` in `settings_privacy_security.cpp`): Two-Step
+    // Verification, Auto-Delete Messages, Local passcode, Passkeys, Blocked users, Connected
+    // websites (only when there are any), Active sessions, then the sessions footer.
+    ui.add_space(SECURITY_TOP_SKIP);
+    subsection_title(ui, &tr::lng_settings_security(), colors);
 
-    let blocked_count = backend.blocked_users().len();
-    let blocked_label = blocked_count.to_string();
-    let blocked_title = tr::lng_settings_blocked_users();
+    let cloud_state = backend.cloud_password_state();
+    let cloud_label = if cloud_state.has_password {
+        tr::lng_settings_cloud_password_on()
+    } else {
+        tr::lng_settings_cloud_password_off()
+    };
+    let cloud_title = tr::lng_settings_cloud_password_start_title();
     if settings_row(
         ui,
-        &blocked_title,
+        &cloud_title,
         None,
-        Some(&blocked_label),
-        Some(SettingsIconKind::Blocked),
+        Some(&cloud_label),
+        Some(SettingsIconKind::TwoStep),
         false,
-        true,
+        false,
         colors,
     )
     .clicked()
     {
-        state.editor = PrivacyEditor::BlockedUsers;
+        out.open_cloud_password = true;
+    }
+
+    let mut global_priv = backend.global_privacy();
+    let ttl_label = format_global_ttl(global_priv.global_ttl_seconds);
+    if settings_row(
+        ui,
+        &tr::lng_settings_ttl_title(),
+        None,
+        Some(&ttl_label),
+        Some(SettingsIconKind::Timer),
+        false,
+        false,
+        colors,
+    )
+    .clicked()
+    {
+        state.editor = PrivacyEditor::GlobalTtl {
+            selected_secs: global_priv.global_ttl_seconds,
+        };
     }
 
     let passcode_label = if has_local_passcode {
@@ -153,34 +259,12 @@ pub fn render_privacy_section(
         Some(&passcode_label),
         Some(SettingsIconKind::Lock),
         false,
-        true,
+        false,
         colors,
     )
     .clicked()
     {
         out.open_local_passcode = true;
-    }
-
-    let cloud_state = backend.cloud_password_state();
-    let cloud_label = if cloud_state.has_password {
-        tr::lng_settings_cloud_password_on()
-    } else {
-        tr::lng_settings_cloud_password_off()
-    };
-    let cloud_title = tr::lng_settings_cloud_password_start_title();
-    if settings_row(
-        ui,
-        &cloud_title,
-        None,
-        Some(&cloud_label),
-        Some(SettingsIconKind::Key),
-        false,
-        true,
-        colors,
-    )
-    .clicked()
-    {
-        out.open_cloud_password = true;
     }
 
     let passkeys_count = backend.passkeys().len();
@@ -195,9 +279,9 @@ pub fn render_privacy_section(
         &passkeys_title,
         None,
         Some(&passkeys_label),
-        Some(SettingsIconKind::Key),
+        Some(SettingsIconKind::Passkeys),
         false,
-        true,
+        false,
         colors,
     )
     .clicked()
@@ -205,57 +289,66 @@ pub fn render_privacy_section(
         out.open_passkeys = true;
     }
 
-    let sessions_count = backend.active_sessions().len().to_string();
-    let sessions_title = tr::lng_settings_sessions_title();
+    let blocked_count = backend.blocked_users().len();
+    let blocked_label = if blocked_count == 0 {
+        tr::lng_settings_no_blocked_users()
+    } else {
+        blocked_count.to_string()
+    };
+    let blocked_title = tr::lng_settings_blocked_users();
     if settings_row(
         ui,
-        &sessions_title,
+        &blocked_title,
         None,
-        Some(&sessions_count),
+        Some(&blocked_label),
+        Some(SettingsIconKind::Blocked),
+        false,
+        false,
+        colors,
+    )
+    .clicked()
+    {
+        state.editor = PrivacyEditor::BlockedUsers;
+    }
+
+    let websites_count = backend.web_authorizations().len();
+    if websites_count > 0 {
+        let websites_title = tr::lng_settings_logged_in();
+        if settings_row(
+            ui,
+            &websites_title,
+            None,
+            Some(&websites_count.to_string()),
+            Some(SettingsIconKind::IpAddress),
+            false,
+            false,
+            colors,
+        )
+        .clicked()
+        {
+            out.open_connected_websites = true;
+        }
+    }
+
+    let sessions_count = backend.active_sessions().len();
+    let sessions_label = if sessions_count == 0 {
+        String::new()
+    } else {
+        sessions_count.to_string()
+    };
+    if settings_row(
+        ui,
+        &tr::lng_settings_show_sessions(),
+        None,
+        Some(&sessions_label),
         Some(SettingsIconKind::Sessions),
         false,
-        true,
+        false,
         colors,
     )
     .clicked()
     {
         out.open_active_sessions = true;
-    }
-
-    let websites_count = backend.web_authorizations().len().to_string();
-    let websites_title = tr::lng_settings_logged_in();
-    if settings_row(
-        ui,
-        &websites_title,
-        None,
-        Some(&websites_count),
-        Some(SettingsIconKind::Network),
-        false,
-        true,
-        colors,
-    )
-    .clicked()
-    {
-        out.open_connected_websites = true;
-    }
-
-    let mut global_priv = backend.global_privacy();
-    let ttl_label = format_global_ttl(global_priv.global_ttl_seconds);
-    if settings_row(
-        ui,
-        strings::AUTO_DELETE_MESSAGES_TITLE,
-        None,
-        Some(&ttl_label),
-        Some(SettingsIconKind::Timer),
-        false,
-        true,
-        colors,
-    )
-    .clicked()
-    {
-        state.editor = PrivacyEditor::GlobalTtl {
-            selected_secs: global_priv.global_ttl_seconds,
-        };
     }
 
     // Render active editor immediately under Security if it's a Security editor.
@@ -267,16 +360,37 @@ pub fn render_privacy_section(
         render_privacy_editor(ui, state, backend, colors, &mut out);
     }
 
-    settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
+    settings_divider(ui, Some(&tr::lng_settings_sessions_about()), colors);
 
-    // 2. Privacy rules subsection — ALL 13 privacy keys.
+    // 2. Privacy (`BuildPrivacySection`): rows without icons, value label on the right.
+    ui.add_space(SECURITY_TOP_SKIP);
     subsection_title(ui, &tr::lng_settings_privacy_title(), colors);
     let rules = backend.privacy_rules();
-    for key in PrivacyKey::ALL {
-        let rule = rules.get(&key).cloned().unwrap_or_default();
-        let summary = rule.summary(key);
-        let key_title = key.localized_title();
-        if settings_row(
+    let messages_label = if global_priv.noncontact_peers_paid_stars.unwrap_or(0) > 0 {
+        tr::lng_edit_privacy_paid()
+    } else if global_priv.new_noncontact_peers_require_premium {
+        tr::lng_edit_privacy_contacts_and_premium()
+    } else {
+        tr::lng_edit_privacy_everyone()
+    };
+    for row in PRIVACY_ROWS {
+        let (key_title, summary, key) = match row {
+            PrivacyRow::Key(key) => {
+                let rule = rules.get(&key).cloned().unwrap_or_default();
+                (
+                    privacy_row_title(key),
+                    privacy_row_summary(&rule, key),
+                    Some(key),
+                )
+            }
+            PrivacyRow::Messages => (
+                tr::lng_settings_messages_privacy(),
+                messages_label.clone(),
+                None,
+            ),
+        };
+        let clicked = settings_row(
             ui,
             &key_title,
             None,
@@ -286,11 +400,11 @@ pub fn render_privacy_section(
             false,
             colors,
         )
-        .clicked()
-        {
+        .clicked();
+        if let (true, Some(key)) = (clicked, key) {
             state.editor = PrivacyEditor::EditRule {
                 key,
-                draft: rule,
+                draft: rules.get(&key).cloned().unwrap_or_default(),
                 editing_exceptions: None,
             };
         }
@@ -301,6 +415,7 @@ pub fn render_privacy_section(
         render_privacy_editor(ui, state, backend, colors, &mut out);
     }
 
+    ui.add_space(SECTION_SKIP);
     settings_divider(ui, None, colors);
 
     // 3. New Chats / Archive & Sensitive Content.
@@ -381,6 +496,24 @@ pub fn render_privacy_section(
     }
 
     settings_divider(ui, None, colors);
+
+    // 3b. Frequent contacts (`BuildTopPeersSection` in `settings_privacy_security.cpp:1029-1064`).
+    subsection_title(ui, &tr::lng_settings_top_peers_title(), colors);
+    let top_peers_lbl = tr::lng_settings_top_peers_suggest();
+    let top_peers_about = tr::lng_settings_top_peers_about();
+    if settings_toggle_row(
+        ui,
+        &top_peers_lbl,
+        None,
+        None,
+        &mut state.top_peers_enabled,
+        true,
+        colors,
+    ) {
+        out.toggled_top_peers = Some(state.top_peers_enabled);
+    }
+
+    settings_divider(ui, Some(&top_peers_about), colors);
 
     // 4. Delete my account (Self-Destruction TTL) & Payments.
     subsection_title(ui, &tr::lng_self_destruct_title(), colors);

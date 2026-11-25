@@ -290,11 +290,13 @@ impl LiveProxyController {
         Ok(())
     }
 
-    /// Returns `true` when custom or system proxy mode is currently enabled.
+    /// Returns `true` when custom proxy mode is currently enabled (`SettingsProxy::is_enabled`),
+    /// matching tdesktop's `ConnectionState::State::useProxy`.
+    ///
+    /// The default system-proxy mode (`ProxySettingsMode::System`) is not counted as enabled.
     #[must_use]
     pub fn is_proxy_enabled(&self) -> bool {
-        let s = self.proxy_settings();
-        s.is_enabled() || s.is_system()
+        self.proxy_settings().is_enabled()
     }
 
     /// Toggles custom proxy usage on/off (used by shell `Backend::set_proxy_enabled`).

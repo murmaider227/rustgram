@@ -15,7 +15,7 @@ use crate::consts::{
     DIALOGS_SEND_STATE_SKIP, DIALOGS_TOP_BAR_LEFT_PADDING, DIALOGS_UNREAD_HEIGHT,
     DIALOGS_UNREAD_PADDING, FontMetrics,
 };
-use crate::datetime::LocalDateTime;
+use crate::datetime::{LocalDateTime, format_time_short};
 use crate::geometry::{Margins, Rect};
 
 /// Row style metrics (`DialogRow` struct in `dialogs/dialogs.style:14-27`).
@@ -168,7 +168,8 @@ pub fn classify_dialogs_date(last_time: LocalDateTime, now: LocalDateTime) -> Di
 
 /// Formats a dialog row timestamp relative to `now` (`Ui::FormatDialogsDate`).
 ///
-/// - [`DialogsDateKind::Time`][]: `"HH:MM"` when `use_24h` is `true`, otherwise `"H:MM AM/PM"`.
+/// - [`DialogsDateKind::Time`][]: `"H:mm"` (no leading zero on single-digit hours, matching
+///   `QLocale::ShortFormat`) when `use_24h` is `true`, otherwise `"H:MM AM/PM"`.
 /// - [`DialogsDateKind::Weekday`][]: short English weekday (`"Mon"`..`"Sun"`).
 /// - [`DialogsDateKind::Date`][]: `"DD.MM.YY"`.
 #[must_use]
@@ -176,7 +177,7 @@ pub fn format_dialogs_date(last_time: LocalDateTime, now: LocalDateTime, use_24h
     match classify_dialogs_date(last_time, now) {
         DialogsDateKind::Time => {
             if use_24h {
-                format!("{:02}:{:02}", last_time.hour, last_time.minute)
+                format_time_short(last_time)
             } else {
                 let (hour12, suffix) = match last_time.hour {
                     0 => (12, "AM"),

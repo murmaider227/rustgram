@@ -289,34 +289,21 @@ pub fn compute_device_model(
     }
 }
 
-/// Sanitize a user-supplied filename for safe saving on Windows.
+/// Sanitize a user- or network-supplied filename for safe saving on Windows.
 ///
-/// Exact port of `FileNameFromUserString` in `base_file_utilities_win.cpp`:
-/// masks `.lnk`/`.scf` with `.download` and prefixes reserved DOS device names
-/// (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) with `_`.
+/// Reduces any path to its last component, strips drive prefixes, forbidden characters
+/// (`\ / : * ? " < > |`), control/BiDi chars, and trailing dots/spaces, masks `.lnk`/`.scf`
+/// with `.download`, and prefixes reserved DOS device names (`CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`-`COM9`, `LPT1`-`LPT9`) with `_`.
+#[must_use]
 pub fn sanitize_filename(name: &str) -> String {
-    let mut out = name.to_string();
-    let lower = out.to_ascii_lowercase();
-    if lower.ends_with(".lnk") || lower.ends_with(".scf") {
-        out.push_str(".download");
-    }
-
-    const BAD_NAMES: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    let upper = out.to_ascii_uppercase();
-    for bad in BAD_NAMES {
-        if upper.starts_with(bad) {
-            let next = out.as_bytes().get(bad.len()).copied();
-            if next.is_none() || next == Some(b'.') {
-                out.insert(0, '_');
-                break;
-            }
-        }
-    }
-    out
+    crate::file_safety::sanitize_filename(name)
 }
+
+pub use crate::file_safety::{
+    path_has_parent_traversal, resolve_safe_path_in_dir, unique_path_in_dir,
+    write_unique_file_at_destination, write_unique_file_in_dir,
+};
 
 /// Query the real Windows OS version (`RtlGetVersion` on Windows).
 pub fn windows_version() -> WindowsVersion {
@@ -527,16 +514,30 @@ pub fn show_in_folder(path: &Path) -> Result<()> {
 }
 
 /// Open a URL with the default registered browser/handler (`ShellExecuteW("open", url)`).
+///
+/// Enforces [`crate::url_policy::validate_external_url`] (allowlist: `http`, `https`, `tg`,
+/// `ton`, `tonsite`, `mailto`; rejects `file:`, UNC `\\host`, local paths, and all other schemes)
+/// before invoking the OS shell. The single exception is
+/// [`crate::url_policy::WINDOWS_LOCATION_SETTINGS_URI`], which Mini Apps open through
+/// `web_app_open_location_settings`.
 pub fn open_url(url: &str) -> Result<()> {
+    let validated = validate_open_url_target(url)?;
     #[cfg(windows)]
     {
-        win_sys::shell_open(url)
+        win_sys::shell_open(&validated)
     }
     #[cfg(not(windows))]
     {
-        let _ = url;
+        let _ = validated;
         Err(crate::error::PlatformError::Unsupported)
     }
+}
+
+/// Returns the exact string [`open_url`] hands to the OS shell for `url`, or the policy error.
+pub fn validate_open_url_target(url: &str) -> Result<String> {
+    crate::url_policy::validate_external_url(url)
+        .or_else(|err| crate::url_policy::validate_windows_settings_uri(url).map_err(|_| err))
+        .map_err(|err| crate::error::PlatformError::InvalidArgument(err.to_string()))
 }
 
 /// Open a local file or folder with its default shell handler (`UnsafeLaunch`).
@@ -1347,6 +1348,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sec2a_l8_open_url_allows_location_settings_only() {
+        assert_eq!(
+            validate_open_url_target("ms-settings:privacy-location").ok(),
+            Some(crate::url_policy::WINDOWS_LOCATION_SETTINGS_URI.to_owned())
+        );
+        assert!(validate_open_url_target("ms-settings:privacy-webcam").is_err());
+        assert!(validate_open_url_target("file:///C:/x.exe").is_err());
+        assert_eq!(
+            validate_open_url_target("https://example.com/a b").ok(),
+            Some("https://example.com/a%20b".to_owned())
+        );
+    }
+
+    #[test]
     fn windows_version_formatting() {
         assert_eq!(
             format_windows_version_pretty(
@@ -1424,6 +1439,23 @@ mod tests {
         assert_eq!(sanitize_filename("nul.txt"), "_nul.txt");
         assert_eq!(sanitize_filename("com1.log"), "_com1.log");
         assert_eq!(sanitize_filename("console.txt"), "console.txt");
+    }
+
+    #[test]
+    fn open_url_rejects_disallowed_schemes_local_and_unc_paths() {
+        for blocked in [
+            "file:///C:/Windows/System32/calc.exe",
+            r"\\host\share\x.exe",
+            "ms-msdt:/id PCWDiagnostic",
+            r"C:\Windows\System32\cmd.exe",
+            "javascript:alert(1)",
+        ] {
+            let err = open_url(blocked).expect_err("disallowed URL must be rejected");
+            assert!(
+                matches!(err, crate::error::PlatformError::InvalidArgument(_)),
+                "expected InvalidArgument for '{blocked}', got {err:?}"
+            );
+        }
     }
 
     #[cfg(windows)]

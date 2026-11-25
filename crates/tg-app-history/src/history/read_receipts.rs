@@ -1,4 +1,4 @@
-//! Context-menu read-receipt rows ("Seen by N" / "Read at HH:MM"), channel message author lookup
+//! Context-menu read-receipt rows ("Seen by N" / "today at HH:MM"), channel message author lookup
 //! (`channels.getMessageAuthor`), and the "Seen by" participants modal sheet.
 //!
 //! Port origin:
@@ -27,7 +27,6 @@ use tg_ui::widgets::buttons::{IconKind, paint_icon};
 use tg_ui::widgets::menu::MenuItem;
 
 use crate::history::backend::{HistoryBackend, HistoryMessage, HistoryPeerInfo};
-use crate::history::sections_model::civil_from_days;
 use crate::history::theme::HistoryColors;
 
 /// Menu item action IDs emitted by read-receipt and channel-author context-menu rows.
@@ -179,8 +178,8 @@ impl ContextMenuEngagementInfo {
 pub fn format_dm_read_date_label(status: OutboxReadDateStatus, reference_now_unix: i64) -> String {
     match status {
         OutboxReadDateStatus::Read { date_unix } => {
-            let formatted = format_read_timestamp(date_unix, reference_now_unix);
-            format!("Read at {formatted}")
+            // `WhenAction::refreshText`: the row shows the `FormatReadDate` text alone.
+            format_read_timestamp(date_unix, reference_now_unix)
         }
         OutboxReadDateStatus::MyPrivacyHidden => {
             format!(
@@ -195,29 +194,43 @@ pub fn format_dm_read_date_label(status: OutboxReadDateStatus, reference_now_uni
     }
 }
 
-/// Formats a read-receipt Unix timestamp as `"HH:MM"` when on the same calendar day as
-/// `reference_now_unix`, or `"MMM DD, HH:MM"` otherwise.
+/// Formats a read-receipt Unix timestamp in local time like `Api::FormatReadDate`
+/// (`api_who_reacted.cpp`): "today at 11:02", "yesterday at 11:02", or "Nov 21 at 11:02".
 #[must_use]
 pub fn format_read_timestamp(date_unix: i32, reference_now_unix: i64) -> String {
+    use tg_history::datetime::{LocalDateTime, format_time_short};
     let ts = i64::from(date_unix).max(0);
-    let secs_in_day = ts.rem_euclid(86_400);
-    let hh = secs_in_day / 3_600;
-    let mm = (secs_in_day % 3_600) / 60;
-    let day = ts.div_euclid(86_400);
-    let ref_day = reference_now_unix.max(ts).div_euclid(86_400);
-    if day == ref_day {
-        format!("{hh:02}:{mm:02}")
+    let read = LocalDateTime::from_unix_local(ts);
+    let now = LocalDateTime::from_unix_local(reference_now_unix.max(ts));
+    let time = format_time_short(read);
+    let read_day = read.to_local_epoch_secs().div_euclid(86_400);
+    let now_day = now.to_local_epoch_secs().div_euclid(86_400);
+    if read_day == now_day {
+        tr::lng_mediaview_today(&time)
+    } else if read_day + 1 == now_day {
+        tr::lng_mediaview_yesterday(&time)
     } else {
-        const MONTHS: [&str; 12] = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
-        let (_y, m, d) = civil_from_days(day);
-        let mon = MONTHS
-            .get((m.saturating_sub(1)) as usize)
-            .copied()
-            .unwrap_or("Jan");
-        format!("{mon} {d}, {hh:02}:{mm:02}")
+        tr::lng_mediaview_date_time(&day_of_month_short(read.date.month, read.date.day), &time)
     }
+}
+
+/// `langDayOfMonthShort`: short month name and day (`lng_month_day`).
+fn day_of_month_short(month: u8, day: u8) -> String {
+    let name = match month {
+        1 => tr::lng_month1_small(),
+        2 => tr::lng_month2_small(),
+        3 => tr::lng_month3_small(),
+        4 => tr::lng_month4_small(),
+        5 => tr::lng_month5_small(),
+        6 => tr::lng_month6_small(),
+        7 => tr::lng_month7_small(),
+        8 => tr::lng_month8_small(),
+        9 => tr::lng_month9_small(),
+        10 => tr::lng_month10_small(),
+        11 => tr::lng_month11_small(),
+        _ => tr::lng_month12_small(),
+    };
+    tr::lng_month_day(&name, &day.to_string())
 }
 
 fn parse_member_count_from_status(status: &str) -> Option<i32> {
@@ -483,12 +496,27 @@ mod tests {
 
     #[test]
     fn format_read_timestamp_same_day_and_other_day() {
-        let base = 1_795_341_600; // 2026-11-22 10:00:00 UTC
+        use tg_history::datetime::{LocalDateTime, format_time_short};
+        let base: i32 = 1_795_341_600; // 2026-11-22 10:00:00 UTC
+        let local = |ts: i32| format_time_short(LocalDateTime::from_unix_local(i64::from(ts)));
+        let now = i64::from(base) + 3800;
         assert_eq!(
-            format_read_timestamp(base + 3720, i64::from(base) + 7200),
-            "11:02"
+            format_read_timestamp(base + 3720, now),
+            tr::lng_mediaview_today(&local(base + 3720)),
+            "local time, not UTC (`Api::FormatReadDate`)"
         );
-        assert!(format_read_timestamp(base - 86_400, i64::from(base) + 7200).contains("10:00"));
+        assert_eq!(
+            format_read_timestamp(base + 3720 - 86_400, now),
+            tr::lng_mediaview_yesterday(&local(base + 3720))
+        );
+        let old = LocalDateTime::from_unix_local(i64::from(base) + 3720 - 3 * 86_400);
+        assert_eq!(
+            format_read_timestamp(base + 3720 - 3 * 86_400, now),
+            tr::lng_mediaview_date_time(
+                &day_of_month_short(old.date.month, old.date.day),
+                &local(base + 3720)
+            )
+        );
     }
 
     #[test]
@@ -501,7 +529,7 @@ mod tests {
                 },
                 now
             ),
-            "Read at 11:02"
+            format_read_timestamp(1_795_345_320, now)
         );
         let hidden = format_dm_read_date_label(OutboxReadDateStatus::MyPrivacyHidden, now);
         assert!(hidden.contains(&tr::lng_context_read_hidden()));

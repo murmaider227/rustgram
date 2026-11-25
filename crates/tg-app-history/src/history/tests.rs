@@ -184,6 +184,17 @@ fn mock_backend_implements_history_backend_trait() {
     HistoryBackend::mark_history_read(&mut mock, group_id, sent.id);
     let info = HistoryBackend::peer_info(&mock, group_id).expect("peer info");
     assert_eq!(info.unread_count, 0);
+    // Inbox read must never flip our own outgoing message's read checkmark to true.
+    let slice = HistoryBackend::load_slice_around(&mock, group_id, MsgId::SHOW_AT_END, 50, 0);
+    let sent_after = slice
+        .messages
+        .iter()
+        .find(|m| m.id == sent.id)
+        .expect("sent outgoing message present");
+    assert!(
+        !sent_after.is_read,
+        "mark_history_read (inbox read) must not mark outgoing messages read"
+    );
 }
 
 #[test]

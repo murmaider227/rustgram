@@ -39,7 +39,7 @@ pub mod widgets;
 
 use std::sync::{Arc, Mutex};
 
-use egui::{Event, Id, Pos2, Rect, ScrollArea, Ui, UiBuilder};
+use egui::{Event, Id, ScrollArea, Ui, UiBuilder};
 use tg_core::{CoreSettings, GlobalConfig};
 use tg_lang::{Instance as LangInstance, tr};
 use tg_theme::EmbeddedType;
@@ -110,6 +110,8 @@ pub enum SettingsAction {
     OpenBusiness,
     /// Open `EditPeerColorBox` for the currently signed-in user.
     OpenEditSelfColor,
+    /// Toggle `"Suggest frequent contacts"` (`contacts.toggleTopPeers` via `DialogsBackend`).
+    ToggleTopPeers(bool),
     /// Request Log Out confirmation box.
     RequestLogout,
 }
@@ -241,6 +243,9 @@ pub struct SettingsController {
     last_shell_page: Option<SettingsPage>,
     /// Search bar text on Main settings page.
     pub search_query: String,
+    /// The host draws the top bar (the Settings layer's `st::infoLayerTopBar`), so
+    /// [`Self::show`] skips its own and the body fills the whole rect.
+    pub host_top_bar: bool,
     /// Whether the profile QR preview card is open on Main.
     pub qr_open: bool,
     /// Secret keyboard code tracker (`settings_codes.cpp`).
@@ -305,6 +310,7 @@ impl SettingsController {
             section_stack: vec![SettingsSection::Main],
             last_shell_page: None,
             search_query: String::new(),
+            host_top_bar: false,
             qr_open: false,
             secret_codes: SecretCodeTracker::new(),
             debug_options: DebugOptions::default(),
@@ -615,19 +621,18 @@ impl SettingsController {
             SettingsSection::Main => Some(tr::lng_settings_information()),
             _ => None,
         };
-        let (back_clicked, right_clicked) =
-            settings_top_bar(ui, &section_title, right_label.as_deref(), &colors);
-        if back_clicked && !self.pop_section() {
-            action = Some(SettingsAction::Back);
+        let mut body_rect = rect;
+        if !self.host_top_bar {
+            let (back_clicked, right_clicked) =
+                settings_top_bar(ui, &section_title, right_label.as_deref(), &colors);
+            if back_clicked && !self.pop_section() {
+                action = Some(SettingsAction::Back);
+            }
+            if right_clicked && section == SettingsSection::Main {
+                self.push_section(SettingsSection::Information);
+            }
+            body_rect.min.y += settings_top_bar_height();
         }
-        if right_clicked && section == SettingsSection::Main {
-            self.push_section(SettingsSection::Information);
-        }
-
-        let body_rect = Rect::from_min_max(
-            Pos2::new(rect.left(), rect.top() + settings_top_bar_height()),
-            rect.max,
-        );
 
         let mut pending_toast: Option<String> = None;
         let mut pending_nav: Option<SettingsSection> = None;
@@ -727,6 +732,9 @@ impl SettingsController {
                                         pending_nav = Some(SettingsSection::ActiveSessions);
                                     } else if out.open_connected_websites {
                                         pending_nav = Some(SettingsSection::ConnectedWebsites);
+                                    }
+                                    if let Some(enabled) = out.toggled_top_peers {
+                                        action = Some(SettingsAction::ToggleTopPeers(enabled));
                                     }
                                     pending_toast = out.toast;
                                 }
@@ -1033,7 +1041,7 @@ mod tests {
     use super::main_page::search_settings;
     use super::mock::{MOCK_EMAIL_CONFIRM_CODE, MockSettingsBackend};
     use super::privacy::{format_global_ttl, format_ttl_days};
-    use super::scale::{SCALE_STOPS, scale_to_slider, slider_to_scale, snap_scale_stop};
+    use super::scale::{scale_to_slider, scale_values, slider_to_scale, snap_scale_stop};
     use super::{SettingsController, SettingsSection};
 
     #[test]
@@ -1406,10 +1414,17 @@ mod tests {
         assert_eq!(pf.summary(), "All off");
 
         assert_eq!(snap_scale_stop(SCALE_AUTO), 100);
-        assert_eq!(snap_scale_stop(130), 125);
-        for &stop in &SCALE_STOPS {
+        assert_eq!(snap_scale_stop(132), 130);
+        assert_eq!(snap_scale_stop(20), 50);
+        // `SetupInterfaceScale`: 50..=300 % in 5 % steps, so 100 % sits at 20 % of the track.
+        assert_eq!(scale_values(100).len(), 51);
+        assert!((scale_to_slider(100) - 0.2).abs() < 1e-9);
+        assert!((scale_to_slider(300) - 1.0).abs() < 1e-9);
+        for stop in (50..=300).step_by(5) {
             assert_eq!(slider_to_scale(scale_to_slider(stop)), stop);
         }
+        // A configured scale between two steps gets its own slider position.
+        assert_eq!(scale_values(112).len(), 52);
 
         // Language search & tg-lang live switch.
         let backend = MockSettingsBackend::new();

@@ -3959,6 +3959,120 @@ impl ReportMessageBoxState {
     }
 }
 
+/// Outcome of [`BlockFromRepliesBoxState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockFromRepliesAction {
+    /// Confirmed `contacts.blockFromReplies` submission.
+    Submit(tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest),
+    /// User cancelled the modal.
+    Cancelled,
+}
+
+/// Confirmation dialog for blocking a sender from the official `@Replies` chat
+/// (`window/window_peer_menu.cpp:2788-2855`).
+#[derive(Debug, Clone)]
+pub struct BlockFromRepliesBoxState {
+    /// Reply message id inside the Replies chat.
+    pub msg_id: MsgId,
+    /// Display name of the offending sender.
+    pub sender_name: String,
+    /// Whether to report the sender for spam (`flags.2`, default `true`).
+    pub report_spam: bool,
+    /// Whether to delete this reply message (`flags.0`, default `true`).
+    pub delete_message: bool,
+    /// Whether to delete all replies from this sender (`flags.1`, default `true`).
+    pub delete_history: bool,
+}
+
+impl BlockFromRepliesBoxState {
+    /// Creates a new Replies-chat block confirmation modal for `(msg_id, sender_name)`.
+    #[must_use]
+    pub fn new(msg_id: MsgId, sender_name: impl Into<String>) -> Self {
+        let raw = sender_name.into();
+        let clean = if raw.trim().is_empty() {
+            "User".to_owned()
+        } else {
+            raw
+        };
+        Self {
+            msg_id,
+            sender_name: clean,
+            report_spam: true,
+            delete_message: true,
+            delete_history: true,
+        }
+    }
+
+    /// Renders the confirmation modal (`contacts.blockFromReplies`).
+    pub fn show(&mut self, ui: &mut Ui, colors: &HistoryColors) -> Option<BlockFromRepliesAction> {
+        let mut action = None;
+        show_modal_shell(ui, "tg_block_from_replies_modal", 380.0, colors, |ui| {
+            ui.label(
+                egui::RichText::new(tg_lang::tr::lng_blocked_list_confirm_title(
+                    &self.sender_name,
+                ))
+                .strong()
+                .size(16.0)
+                .color(colors.bold_fg),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Block this user from sending you further replies in the Replies chat.",
+                )
+                .size(13.0)
+                .color(colors.sub_text_fg),
+            );
+            ui.add_space(10.0);
+
+            ui.checkbox(&mut self.report_spam, tg_lang::tr::lng_report_spam());
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.delete_message,
+                tg_lang::tr::lng_blocked_list_confirm_reply(),
+            );
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.delete_history,
+                tg_lang::tr::lng_blocked_list_confirm_reply_all(&self.sender_name),
+            );
+
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let confirm_btn = egui::Button::new(
+                        egui::RichText::new(tg_lang::tr::lng_blocked_list_confirm_ok())
+                            .strong()
+                            .size(13.0)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(colors.attention_fg)
+                    .corner_radius(CornerRadius::same(8));
+                    if ui.add(confirm_btn).clicked() {
+                        action = Some(BlockFromRepliesAction::Submit(
+                            tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest {
+                                msg_id: self.msg_id,
+                                delete_message: self.delete_message,
+                                delete_history: self.delete_history,
+                                report_spam: self.report_spam,
+                            },
+                        ));
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(tg_lang::tr::lng_cancel()).clicked() {
+                        action = Some(BlockFromRepliesAction::Cancelled);
+                    }
+                });
+            });
+        });
+
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+            action = Some(BlockFromRepliesAction::Cancelled);
+        }
+        action
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared modal shell helpers
 // ---------------------------------------------------------------------------

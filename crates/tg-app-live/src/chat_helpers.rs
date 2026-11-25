@@ -37,11 +37,13 @@ use crate::convert::{
     avatar_rgb_for_color_index, history_messages_ordered, known_peer_ids, now_unix_i32,
     to_data_peer,
 };
-use crate::media::{block_on_runtime, download_file_bytes, with_rpc_timeout};
+use crate::media::{
+    block_on_runtime, download_file_bytes, download_file_bytes_async, with_rpc_timeout,
+};
 use crate::session::LiveSession;
 use tg_app_core::chat_helpers::backend::{
     AttachedStickerSetSummary, AttachedStickersMedia, ChatHelpersBackend, DefaultEmojiCatalog,
-    DefaultEmojiCatalogKind, DefaultTagReactionsResult, GifCategory, GifItem,
+    DefaultEmojiCatalogKind, DefaultTagReactionsResult, EmojiGroupInfo, GifCategory, GifItem,
     OldFeaturedStickersPage, PaidReactionPrivacy, SearchStickerSetsResult, SearchStickersPage,
     SearchStickersRequest, StickerMedia,
 };
@@ -400,7 +402,9 @@ struct LiveChatHelpersInner {
     sticker_keywords: HashMap<ChatDocId, Vec<String>>,
     gif_items: HashMap<ChatDocId, GifItem>,
     sticker_media_cache: HashMap<ChatDocId, Option<StickerMedia>>,
+    sticker_media_in_flight: HashSet<ChatDocId>,
     gif_frames_cache: HashMap<ChatDocId, Option<Vec<GifFrameRgba>>>,
+    emoji_statuses_sync: tg_api::cached_lists::EmojiStatusesSync,
     stickers_by_emoji: HashMap<String, StickersByEmojiCacheEntry>,
     search_sets_cache: HashMap<(String, bool), SearchStickerSetsCacheEntry>,
     inline_gif_cache: HashMap<String, InlineGifCacheEntry>,
@@ -424,6 +428,7 @@ struct LiveChatHelpersInner {
     last_archived_stickers_update_ms: i64,
     last_archived_emoji_update_ms: i64,
     last_saved_gifs_update_ms: i64,
+    last_emoji_groups_update_ms: i64,
     // Optional synthetic clock override for deterministic cache-expiry tests.
     now_ms_override: Option<i64>,
 }
@@ -436,7 +441,9 @@ impl LiveChatHelpersInner {
             sticker_keywords: HashMap::new(),
             gif_items: HashMap::new(),
             sticker_media_cache: HashMap::new(),
+            sticker_media_in_flight: HashSet::new(),
             gif_frames_cache: HashMap::new(),
+            emoji_statuses_sync: tg_api::cached_lists::EmojiStatusesSync::default(),
             stickers_by_emoji: HashMap::new(),
             search_sets_cache: HashMap::new(),
             inline_gif_cache: HashMap::new(),
@@ -459,6 +466,7 @@ impl LiveChatHelpersInner {
             last_archived_stickers_update_ms: 0,
             last_archived_emoji_update_ms: 0,
             last_saved_gifs_update_ms: 0,
+            last_emoji_groups_update_ms: 0,
             now_ms_override: None,
         }
     }
@@ -2549,109 +2557,90 @@ impl LiveSession {
         })
     }
 
-    fn load_sticker_media_inner(&self, id: ChatDocId) -> Option<StickerMedia> {
-        if let Ok(g) = self.ch_state().inner.lock()
-            && let Some(cached) = g.sticker_media_cache.get(&id)
-        {
-            return cached.clone();
-        }
-
-        let meta = self
-            .ch_state()
-            .inner
-            .lock()
-            .ok()
-            .and_then(|g| g.doc_meta.get(&id).cloned())?;
-
-        let resolved = match meta.sticker_type {
-            StickerType::Tgs => {
-                let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
-                    tl_types::InputDocumentFileLocation {
-                        id: meta.id.0 as i64,
-                        access_hash: meta.access_hash,
-                        file_reference: meta.file_reference.clone(),
-                        thumb_size: String::new(),
-                    },
-                );
-                download_file_bytes(
-                    self.runtime().rpc(),
-                    self.runtime().tokio_handle(),
-                    meta.dc_id,
-                    loc,
-                    (meta.size > 0).then_some(meta.size),
-                )
-                .ok()
-                .map(|bytes| {
-                    if bytes.starts_with(b"{") {
-                        match String::from_utf8(bytes) {
-                            Ok(json) => StickerMedia::LottieJson(json),
-                            Err(e) => StickerMedia::LottieTgs(e.into_bytes()),
-                        }
-                    } else {
-                        StickerMedia::LottieTgs(bytes)
-                    }
-                })
-                .or_else(|| decode_fallback_static_thumb(&meta))
+    /// Fetches and caches emoji mood/category groups via `messages.getEmojiGroups` with 32-bit
+    /// hash caching (`Data::EmojiStatuses::refreshGroups`, `data_emoji_statuses.cpp:202-207`).
+    pub fn refresh_emoji_groups(&self, force: bool) -> Result<Vec<EmojiGroupInfo>, String> {
+        let (now_ms, cached_sync) = {
+            let Ok(g) = self.ch_state().inner.lock() else {
+                return Err("chat helpers state lock poisoned".to_owned());
+            };
+            let now_ms = g.now_ms();
+            if !force
+                && g.last_emoji_groups_update_ms > 0
+                && now_ms.saturating_sub(g.last_emoji_groups_update_ms) < STICKERS_UPDATE_TIMEOUT_MS
+            {
+                return Ok(emoji_groups_to_dto(
+                    &g.emoji_statuses_sync.emoji_groups.groups,
+                ));
             }
-            StickerType::Webp => {
-                let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
-                    tl_types::InputDocumentFileLocation {
-                        id: meta.id.0 as i64,
-                        access_hash: meta.access_hash,
-                        file_reference: meta.file_reference.clone(),
-                        thumb_size: String::new(),
-                    },
-                );
-                download_file_bytes(
-                    self.runtime().rpc(),
-                    self.runtime().tokio_handle(),
-                    meta.dc_id,
-                    loc,
-                    (meta.size > 0).then_some(meta.size),
-                )
-                .ok()
-                .and_then(|bytes| decode_rgba_image_bytes(&bytes))
-                .map(|(width, height, rgba)| StickerMedia::StaticRgba {
-                    width,
-                    height,
-                    rgba,
-                })
-                .or_else(|| decode_fallback_static_thumb(&meta))
-            }
-            StickerType::Webm => {
-                // Prefer static thumbnail for panel grid preview of WebM video stickers.
-                decode_fallback_static_thumb(&meta).or_else(|| {
-                    let thumb_type = meta.thumb_size_type.clone()?;
-                    let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
-                        tl_types::InputDocumentFileLocation {
-                            id: meta.id.0 as i64,
-                            access_hash: meta.access_hash,
-                            file_reference: meta.file_reference.clone(),
-                            thumb_size: thumb_type,
-                        },
-                    );
-                    download_file_bytes(
-                        self.runtime().rpc(),
-                        self.runtime().tokio_handle(),
-                        meta.dc_id,
-                        loc,
-                        None,
-                    )
-                    .ok()
-                    .and_then(|bytes| decode_rgba_image_bytes(&bytes))
-                    .map(|(width, height, rgba)| StickerMedia::StaticRgba {
-                        width,
-                        height,
-                        rgba,
-                    })
-                })
-            }
+            (now_ms, g.emoji_statuses_sync.clone())
         };
 
-        if let Ok(mut g) = self.ch_state().inner.lock() {
-            g.sticker_media_cache.insert(id, resolved.clone());
+        let rpc = self.runtime().rpc().clone();
+        let mut sync = cached_sync;
+        let fetched = block_on_runtime(self.runtime().tokio_handle(), async move {
+            with_rpc_timeout(CHAT_HELPERS_RPC_TIMEOUT, async move {
+                sync.refresh_emoji_groups(&rpc)
+                    .await
+                    .map(|()| sync.emoji_groups)
+            })
+            .await
+        });
+
+        match fetched {
+            Ok(updated) => {
+                let out = emoji_groups_to_dto(&updated.groups);
+                if let Ok(mut g) = self.ch_state().inner.lock() {
+                    g.emoji_statuses_sync.emoji_groups = updated;
+                    g.last_emoji_groups_update_ms = now_ms;
+                }
+                Ok(out)
+            }
+            Err(err) => {
+                debug!(error = %err, "messages.getEmojiGroups failed");
+                if !force && let Ok(mut g) = self.ch_state().inner.lock() {
+                    g.last_emoji_groups_update_ms = failed_refresh_mark(now_ms);
+                    if !g.emoji_statuses_sync.emoji_groups.groups.is_empty() {
+                        return Ok(emoji_groups_to_dto(
+                            &g.emoji_statuses_sync.emoji_groups.groups,
+                        ));
+                    }
+                }
+                Err(err)
+            }
         }
-        resolved
+    }
+
+    fn load_sticker_media_inner(&self, id: ChatDocId) -> Option<StickerMedia> {
+        let meta = {
+            let Ok(mut g) = self.ch_state().inner.lock() else {
+                return None;
+            };
+            if let Some(cached) = g.sticker_media_cache.get(&id) {
+                return cached.clone();
+            }
+            if g.sticker_media_in_flight.contains(&id) {
+                return None;
+            }
+            let meta = g.doc_meta.get(&id)?.clone();
+            g.sticker_media_in_flight.insert(id);
+            meta
+        };
+
+        let state = Arc::clone(&self.chat_helpers.state);
+        let bridge = Arc::downgrade(self.bridge_state());
+        let rpc = self.runtime().rpc().clone();
+        self.runtime().tokio_handle().spawn(async move {
+            let resolved = fetch_sticker_media_async(&rpc, &meta).await;
+            if let Ok(mut g) = state.inner.lock() {
+                g.sticker_media_in_flight.remove(&id);
+                g.sticker_media_cache.insert(id, resolved);
+            }
+            if let Some(b) = bridge.upgrade() {
+                b.notify_ui();
+            }
+        });
+        None
     }
 
     fn load_gif_frame_inner(
@@ -2874,13 +2863,16 @@ fn extract_web_document_dims(doc: Option<&tl_enums::WebDocument>) -> Option<(u32
 }
 
 fn decode_rgba_image_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let img = image::load_from_memory(bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
+    let decoded = tg_media::image::read_image(tg_media::image::ReadArgs {
+        content: bytes.to_vec(),
+        ..Default::default()
+    })
+    .ok()?;
+    let (w, h) = decoded.image.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
-    Some((w, h, rgba.into_raw()))
+    Some((w, h, decoded.image.into_raw()))
 }
 
 fn decode_stripped_thumb(stripped: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
@@ -2912,6 +2904,94 @@ fn decode_fallback_static_thumb(meta: &LiveDocumentMeta) -> Option<StickerMedia>
         });
     }
     None
+}
+
+async fn fetch_sticker_media_async<C: RpcClient + Clone + 'static>(
+    rpc: &C,
+    meta: &LiveDocumentMeta,
+) -> Option<StickerMedia> {
+    match meta.sticker_type {
+        StickerType::Tgs => {
+            let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
+                tl_types::InputDocumentFileLocation {
+                    id: meta.id.0 as i64,
+                    access_hash: meta.access_hash,
+                    file_reference: meta.file_reference.clone(),
+                    thumb_size: String::new(),
+                },
+            );
+            download_file_bytes_async(rpc, meta.dc_id, loc, (meta.size > 0).then_some(meta.size))
+                .await
+                .ok()
+                .map(|bytes| {
+                    if bytes.starts_with(b"{") {
+                        match String::from_utf8(bytes) {
+                            Ok(json) => StickerMedia::LottieJson(json),
+                            Err(e) => StickerMedia::LottieTgs(e.into_bytes()),
+                        }
+                    } else {
+                        StickerMedia::LottieTgs(bytes)
+                    }
+                })
+                .or_else(|| decode_fallback_static_thumb(meta))
+        }
+        StickerType::Webp => {
+            let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
+                tl_types::InputDocumentFileLocation {
+                    id: meta.id.0 as i64,
+                    access_hash: meta.access_hash,
+                    file_reference: meta.file_reference.clone(),
+                    thumb_size: String::new(),
+                },
+            );
+            download_file_bytes_async(rpc, meta.dc_id, loc, (meta.size > 0).then_some(meta.size))
+                .await
+                .ok()
+                .and_then(|bytes| decode_rgba_image_bytes(&bytes))
+                .map(|(width, height, rgba)| StickerMedia::StaticRgba {
+                    width,
+                    height,
+                    rgba,
+                })
+                .or_else(|| decode_fallback_static_thumb(meta))
+        }
+        StickerType::Webm => {
+            if let Some(thumb) = decode_fallback_static_thumb(meta) {
+                return Some(thumb);
+            }
+            let thumb_type = meta.thumb_size_type.clone()?;
+            let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
+                tl_types::InputDocumentFileLocation {
+                    id: meta.id.0 as i64,
+                    access_hash: meta.access_hash,
+                    file_reference: meta.file_reference.clone(),
+                    thumb_size: thumb_type,
+                },
+            );
+            download_file_bytes_async(rpc, meta.dc_id, loc, None)
+                .await
+                .ok()
+                .and_then(|bytes| decode_rgba_image_bytes(&bytes))
+                .map(|(width, height, rgba)| StickerMedia::StaticRgba {
+                    width,
+                    height,
+                    rgba,
+                })
+        }
+    }
+}
+
+fn emoji_groups_to_dto(groups: &[tg_api::cached_lists::CachedEmojiGroup]) -> Vec<EmojiGroupInfo> {
+    groups
+        .iter()
+        .map(|g| EmojiGroupInfo {
+            icon_emoji_id: g.icon_emoji_id,
+            title: g.title.clone(),
+            emoticons: g.emoticons.clone(),
+            is_premium: g.is_premium,
+            is_greeting: g.is_greeting,
+        })
+        .collect()
 }
 
 pub(super) fn user_to_chat_user_info(user: &tg_data::User, is_self: bool) -> UserInfo {
@@ -2989,11 +3069,16 @@ impl ChatHelpersBackend for LiveSession {
     }
 
     fn search_emoji(&mut self, query: &str) -> Vec<EmojiKeywordResult> {
+        self.ensure_emoji_keywords_languages_refreshed();
         self.chat_helpers
             .emoji_keywords
             .lock()
             .map(|kw| kw.query(query, false))
             .unwrap_or_default()
+    }
+
+    fn emoji_groups(&self) -> Result<Vec<EmojiGroupInfo>, String> {
+        self.refresh_emoji_groups(false)
     }
 
     fn is_premium(&self) -> bool {
@@ -3317,6 +3402,23 @@ impl ChatHelpersBackend for LiveSession {
             .unwrap_or(false)
     }
 
+    fn sticker_set_section(&self, set_id: StickerSetId) -> Option<StickerPanelSection> {
+        let g = self.ch_state().inner.lock().ok()?;
+        let set = g.store.sets.get(&set_id)?;
+        Some(StickerPanelSection {
+            id: set.id,
+            flags: set.flags,
+            title: set.title.clone(),
+            short_name: set.short_name.clone(),
+            count: set.count,
+            external_layout: !set.is_in_my_list(),
+            stickers: set.stickers.clone(),
+            thumbnail_document_id: set
+                .thumbnail_document_id
+                .or_else(|| set.stickers.first().copied()),
+        })
+    }
+
     fn saved_gifs(&self) -> Vec<GifItem> {
         let _ = self.refresh_saved_gifs(false);
         self.ch_state()
@@ -3476,6 +3578,7 @@ impl ChatHelpersBackend for LiveSession {
     }
 
     fn search_emoji_suggestions(&mut self, keyword: &str, exact: bool) -> Vec<EmojiKeywordResult> {
+        self.ensure_emoji_keywords_languages_refreshed();
         self.chat_helpers
             .emoji_keywords
             .lock()
@@ -4101,5 +4204,45 @@ fn apply_bot_commands_to_session(
                 })
                 .collect();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_image_limits {
+    use super::decode_rgba_image_bytes;
+
+    fn encode_1bit_gray_png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, width, height);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::One);
+            enc.set_compression(png::Compression::Fast);
+            let mut writer = enc.write_header().expect("write png header");
+            let row_bytes = (width as usize).div_ceil(8);
+            let row = vec![0u8; row_bytes];
+            let mut stream = writer.stream_writer().expect("png stream writer");
+            use std::io::Write as _;
+            for _ in 0..height {
+                stream.write_all(&row).expect("write png row");
+            }
+            stream.finish().expect("finish png stream");
+        }
+        out
+    }
+
+    #[test]
+    fn chat_helpers_decode_rgba_rejects_oversized_pixel_area() {
+        let small = encode_1bit_gray_png(16, 12);
+        let (w, h, rgba) = decode_rgba_image_bytes(&small).expect("small PNG should decode");
+        assert_eq!((w, h), (16, 12));
+        assert_eq!(rgba.len(), 16 * 12 * 4);
+
+        // 11_000 x 11_000 = 121_000_000 > READ_MAX_AREA (108_576_768).
+        let oversized = encode_1bit_gray_png(11_000, 11_000);
+        assert!(
+            decode_rgba_image_bytes(&oversized).is_none(),
+            "oversized PNG exceeding READ_MAX_AREA must be rejected"
+        );
     }
 }

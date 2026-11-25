@@ -3,8 +3,13 @@
 //!
 //! All standard Telegram Desktop phrases live in `tg_lang::tr::*`.
 
-/// Footer caption on the Main Settings page.
-pub const MAIN_FOOTER_TEMPLATE: &str = "Rustgram Desktop v{version}  ·  GPL-3.0  ·  Type secret codes (e.g. debugmode) anywhere in Settings";
+/// Main Settings row labels as Telegram Desktop 7.4.6 shows them (its server langpack overrides
+/// the bundled `lng_settings_section_filters` = "Folders" / `lng_settings_gift_premium`).
+pub const CHAT_FOLDERS_TITLE: &str = "Chat Folders";
+pub const SEND_A_GIFT_TITLE: &str = "Send a Gift";
+/// Privacy row title as 7.4.6 shows it (bundled `lng_settings_birthday_privacy` = "Date of Birth").
+pub const BIRTHDAY_PRIVACY_TITLE: &str = "Birthday";
+pub const FEATURES_URL_TOAST: &str = "Telegram Features: https://telegram.org/tour";
 
 /// Search field placeholder on Main Settings.
 pub const SEARCH_SETTINGS_PLACEHOLDER: &str = "Search settings...";
@@ -84,10 +89,6 @@ pub const CORNER_SCREEN_CORNER: &str = "Screen corner";
 pub const CORNER_SELECTED_PREFIX: &str = "Selected:";
 pub const CORNER_CLICK_HINT: &str =
     "Click any corner on the monitor preview to move custom toasts.";
-pub const RESET_ALL_NOTIFICATIONS_TITLE: &str = "Reset All Notifications";
-pub const RESET_ALL_NOTIFICATIONS_SUBTITLE: &str =
-    "Undo all custom notification settings and exceptions";
-pub const RESET_ALL_NOTIFICATIONS_TOAST: &str = "All notification settings reset to defaults";
 pub const SCOPE_SHOW_PREVIEW: &str = "Show message preview for this scope";
 pub const EXCEPTION_ADDED_TOAST: &str = "Notification exception added";
 pub const RINGTONE_REMOVED_TOAST: &str = "Ringtone removed";

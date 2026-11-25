@@ -324,7 +324,6 @@ struct LiveWindowTestState {
     workspace: LiveActiveWorkspace,
     runtime: Arc<SessionRuntime<tg_app::live::ErasedRpcClient>>,
     bob_peer: PeerId,
-    carol_peer: PeerId,
     last_egui_time: f64,
     _temp_dir: TempDir,
 }
@@ -533,7 +532,6 @@ impl LiveWindowTestState {
             workspace,
             runtime,
             bob_peer: PeerId::from_user(bob_uid as u64),
-            carol_peer: PeerId::from_user(carol_uid as u64),
             last_egui_time: 0.0,
             _temp_dir: temp_dir,
         }
@@ -580,15 +578,15 @@ fn click_pos(harness: &mut Harness<'static, LiveWindowTestState>, pos: Pos2) {
 /// Computes the vertical center of row index `idx` after the separator in `MainMenu`:
 /// 0=New Group, 1=New Channel, 2=Contacts, 3=Calls, 4=Saved Messages, 5=Downloads, 6=Settings, 7=Night Mode.
 fn main_menu_item_pos(row_after_sep: usize) -> Pos2 {
-    let base_y = MAIN_MENU_COVER_HEIGHT + 6.0 + 42.0 + 8.0;
-    Pos2::new(120.0, base_y + (row_after_sep as f32 + 0.5) * 42.0)
+    // Cover, `st::mainMenuSkip`, the My Profile row, then the separator (skip + 1 px + skip).
+    let base_y = MAIN_MENU_COVER_HEIGHT + 6.0 + 40.0 + 13.0;
+    Pos2::new(120.0, base_y + (row_after_sep as f32 + 0.5) * 40.0)
 }
 
 #[test]
 fn live_active_window_renders_chat_settings_calls_stories_and_boxes() {
     let state = LiveWindowTestState::start();
     let bob_peer = state.bob_peer;
-    let carol_peer = state.carol_peer;
 
     let mut harness = HarnessBuilder::default()
         .with_size(Vec2::new(1280.0, 820.0))
@@ -617,8 +615,8 @@ fn live_active_window_renders_chat_settings_calls_stories_and_boxes() {
             .session()
             .expect("active SessionController")
             .active_peer(),
-        carol_peer,
-        "initial active peer should be the second dialog (Carol Tester)"
+        PeerId::ZERO,
+        "a live primary window opens with no chat, like tdesktop's showByInitialId"
     );
     assert!(
         harness.query_by_label("Bob Tester (1 unread)").is_some(),
@@ -737,7 +735,10 @@ fn live_active_window_renders_chat_settings_calls_stories_and_boxes() {
         "Settings items must be visible in live mode"
     );
 
-    // 4. Open Main Menu -> Calls entry point and verify live Recent Calls box opens.
+    // 4. Close the Settings layer (it sits over the window at this width), then open
+    //    Main Menu -> Calls entry point and verify live Recent Calls box opens.
+    harness.key_press(egui::Key::Escape);
+    step_n(&mut harness, 4);
     click_pos(
         &mut harness,
         Pos2::new(36.0, SIDEBAR_MENU_BUTTON_HEIGHT * 0.5),
@@ -770,7 +771,25 @@ fn live_active_window_renders_chat_settings_calls_stories_and_boxes() {
         .close_recent_calls();
     step_n(&mut harness, 2);
 
-    // 5. Open Main Menu -> New Group box and verify unified BoxHost works in live mode.
+    // 5. Calls also opened Settings -> Calls as a layer; close it (Escape pops the section,
+    //    then the layer), then open Main Menu -> New Group box and verify unified BoxHost
+    //    works in live mode.
+    for _ in 0..3 {
+        let settings_open = matches!(
+            harness
+                .state()
+                .workspace
+                .controller()
+                .session()
+                .and_then(|s| s.main_section()),
+            Some(SectionMemento::Settings { .. })
+        );
+        if !settings_open {
+            break;
+        }
+        harness.key_press(egui::Key::Escape);
+        step_n(&mut harness, 3);
+    }
     click_pos(
         &mut harness,
         Pos2::new(36.0, SIDEBAR_MENU_BUTTON_HEIGHT * 0.5),

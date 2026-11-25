@@ -1,15 +1,18 @@
-//! Floating Emoji / Stickers / GIFs panel anchored to the history compose bar,
-//! with smooth show/hide animation, rounded shadow chrome, and callback delivery.
+//! Emoji / Stickers / GIFs panel: floating above the history compose bar (narrow windows) or
+//! docked as a full-height third column (wide windows), with show/hide animation, rounded
+//! shadow chrome in floating mode, and callback delivery.
 //!
-//! Port origin: `Telegram/SourceFiles/chat_helpers/tabbed_panel.h` and
-//! `Telegram/SourceFiles/chat_helpers/tabbed_panel.cpp`.
+//! Port origin: `Telegram/SourceFiles/chat_helpers/tabbed_panel.h`,
+//! `Telegram/SourceFiles/chat_helpers/tabbed_panel.cpp` and
+//! `Telegram/SourceFiles/chat_helpers/tabbed_section.cpp` (docked `TabbedSection`).
 
-use egui::{Area, Color32, CornerRadius, Frame, Id, Order, Pos2, Rect, Stroke, Vec2};
+use egui::{Area, Color32, CornerRadius, Frame, Id, Order, Pos2, Rect, Stroke, Ui, Vec2};
 use tg_emoji::EmojiTextureCache;
 use tg_ui::fonts::ensure_tdesktop_fonts;
 use tg_ui::tg_style::st;
 
 use crate::chat_helpers::backend::ChatHelpersBackend;
+use crate::chat_helpers::emoji_list_widget::{DOCKED_PANEL_FLAG, theme_color};
 use crate::chat_helpers::tabbed_selector::{ChatHelpersEvent, SelectorTab, TabbedSelector};
 use tg_app_core::stand_in::theme::Palette;
 
@@ -25,6 +28,27 @@ pub const TABBED_PANEL_HEIGHT_RATIO: f32 = st::emoji_pan_height_ratio as f32;
 pub const TABBED_PANEL_RADIUS: u8 = st::emoji_pan_radius.0 as u8;
 /// Show/hide transition duration (`st::emojiPanShowDuration`).
 pub const TABBED_PANEL_ANIM_DURATION_SECS: f64 = st::emoji_pan_show_duration as f64 / 1000.0;
+
+/// Docked column width (`columnMinimalWidthThird`), used by `TabbedSection`.
+pub const TABBED_SECTION_WIDTH: f32 = 292.0;
+/// Widest docked column (`columnMaximalWidthThird`).
+pub const TABBED_SECTION_MAX_WIDTH: f32 = 392.0;
+/// Left (chat list) column minimum (`columnMinimalWidthLeft`).
+const COLUMN_MIN_WIDTH_LEFT: f32 = 260.0;
+/// Main (chat) column minimum (`columnMinimalWidthMain`).
+const COLUMN_MIN_WIDTH_MAIN: f32 = 380.0;
+
+/// Whether a window body of `body_width` px fits three columns, so the panel docks as a third
+/// column instead of floating (`SessionController::minimalThreeColumnWidth`).
+#[must_use]
+pub fn panel_docks_at_width(body_width: f32, has_dialogs: bool) -> bool {
+    let left = if has_dialogs {
+        COLUMN_MIN_WIDTH_LEFT
+    } else {
+        0.0
+    };
+    body_width >= left + COLUMN_MIN_WIDTH_MAIN + TABBED_SECTION_WIDTH
+}
 
 /// Animation visibility state of [`TabbedPanel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +113,12 @@ impl TabbedPanel {
     /// Returns a mutable reference to the inner [`TabbedSelector`].
     pub fn selector_mut(&mut self) -> &mut TabbedSelector {
         &mut self.selector
+    }
+
+    /// Returns `true` once after the Stickers footer settings button was clicked (the host
+    /// opens the installed sticker sets box).
+    pub fn take_sticker_settings_requested(&mut self) -> bool {
+        self.selector.take_sticker_settings_requested()
     }
 
     /// Configures drop-down placement (below anchor) vs drop-up placement (above compose bar).
@@ -234,6 +264,74 @@ impl TabbedPanel {
         Rect::from_min_size(Pos2::new(left, top), Vec2::new(width, desired_h))
     }
 
+    /// Renders the panel docked as a full-height column filling `rect` (`TabbedSection`):
+    /// no shadow, no rounded corners, a `shadowFg` line on the left edge, and no
+    /// click-outside dismissal. The host reserves the column (Package A's layout slot).
+    ///
+    /// Returns `rect` while the panel is shown, `None` when hidden.
+    pub fn show_docked<F>(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        backend: &mut dyn ChatHelpersBackend,
+        emoji_cache: &mut EmojiTextureCache,
+        palette: &Palette,
+        mut on_event: F,
+    ) -> Option<Rect>
+    where
+        F: FnMut(ChatHelpersEvent),
+    {
+        if !self.is_rendered() {
+            return None;
+        }
+        let ctx = ui.ctx().clone();
+        ensure_tdesktop_fonts(&ctx);
+        if self.visibility != PanelVisibility::Visible {
+            // A docked section has no show animation (`TabbedSection` is a plain column).
+            match self.visibility {
+                PanelVisibility::Hiding => {
+                    self.hide_fast();
+                    return None;
+                }
+                _ => self.show_immediate(),
+            }
+        }
+        let now = ctx.input(|i| i.time);
+        for ev in self.selector.handle_keyboard(&ctx, backend) {
+            if ev == ChatHelpersEvent::CloseRequested {
+                self.hide_animated(now);
+            } else {
+                on_event(ev);
+            }
+        }
+
+        ctx.data_mut(|d| d.insert_temp(Id::unique(DOCKED_PANEL_FLAG), true));
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, palette.window_bg);
+        let mut close = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+            ui.set_min_size(rect.size());
+            ui.set_max_size(rect.size());
+            for ev in self.selector.show(ui, backend, emoji_cache, palette) {
+                if ev == ChatHelpersEvent::CloseRequested {
+                    close = true;
+                } else {
+                    on_event(ev);
+                }
+            }
+        });
+        ui.painter().line_segment(
+            [rect.left_top(), rect.left_bottom()],
+            Stroke::new(1.0, theme_color(&ctx, "shadowFg", palette.divider)),
+        );
+        ctx.data_mut(|d| d.insert_temp(Id::unique(DOCKED_PANEL_FLAG), false));
+        if close {
+            self.hide_fast();
+        }
+        Some(rect)
+    }
+
     /// Renders the floating [`TabbedPanel`] above (or below) `anchor_rect` and invokes `on_event`
     /// for each chosen emoji, sticker, GIF, or premium lock event.
     ///
@@ -254,6 +352,7 @@ impl TabbedPanel {
             return None;
         }
         ensure_tdesktop_fonts(ctx);
+        ctx.data_mut(|d| d.insert_temp(Id::unique(DOCKED_PANEL_FLAG), false));
 
         let now = ctx.input(|i| i.time);
         let progress = self.current_progress(now);

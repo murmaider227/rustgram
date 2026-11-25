@@ -686,11 +686,14 @@ fn dialogs_date_formatting_rules() {
     // Reference "now": Sunday 2026-11-22 10:00:00
     let now = LocalDateTime::new(2026, 11, 22, 10, 0, 0);
 
-    // Same calendar day -> time format.
+    // Same calendar day -> time format (tdesktop H:mm, no leading zero on hour).
     let same_day = LocalDateTime::new(2026, 11, 22, 8, 5, 0);
     assert_eq!(classify_dialogs_date(same_day, now), DialogsDateKind::Time);
-    assert_eq!(format_dialogs_date(same_day, now, true), "08:05");
+    assert_eq!(format_dialogs_date(same_day, now, true), "8:05");
     assert_eq!(format_dialogs_date(same_day, now, false), "8:05 AM");
+
+    let early_morning = LocalDateTime::new(2026, 11, 22, 3, 7, 0);
+    assert_eq!(format_dialogs_date(early_morning, now, true), "3:07");
 
     // Yesterday late evening (11 hours ago, < 20h) -> STILL time format (exact tdesktop rule!).
     let yesterday_recent = LocalDateTime::new(2026, 11, 21, 23, 0, 0);

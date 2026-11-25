@@ -564,7 +564,7 @@ fn wp62_fake_rpc_tgv_pattern_wallpaper_download_rasterize_and_wgpu_snapshot() {
         &item.config.wallpaper.background_colors,
         eff_rot,
         40,
-        Some((192, 192)),
+        Some((93, 192)), // pattern scaled to the area height at 1440:2960 (`CacheBackgroundByRequest`)
         PatternTileMode::Centered,
     )
     .expect("direct svg_pattern render +40");
@@ -583,7 +583,7 @@ fn wp62_fake_rpc_tgv_pattern_wallpaper_download_rasterize_and_wgpu_snapshot() {
         &wp_dark.background_colors,
         eff_rot,
         -50,
-        Some((192, 192)),
+        Some((93, 192)), // pattern scaled to the area height at 1440:2960 (`CacheBackgroundByRequest`)
         PatternTileMode::Centered,
     )
     .expect("direct svg_pattern render -50");

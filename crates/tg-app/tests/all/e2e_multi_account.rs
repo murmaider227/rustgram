@@ -14,7 +14,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui::{PointerButton, Pos2, Vec2};
 use egui_kittest::kittest::Queryable;
@@ -749,6 +749,20 @@ fn multi_account_menu_switch_background_unread_tray_and_logout() {
             .contains(&MultiAccountFrameAction::SwitchedAccount(1))
     );
 
+    // Switching to slot 1 opens no chat (tdesktop's primary window clears the section stack,
+    // `SessionNavigation::showByInitialId`), so Erin's 2 unread stay unread next to slot 2's
+    // (Gamma Three) 3 muted unread messages: the tray total is 5.
+    let tray_before_bg = harness
+        .state()
+        .tray_mock
+        .lock()
+        .expect("lock")
+        .tray_unread_count;
+    assert_eq!(
+        tray_before_bg, 5,
+        "after switching to slot 1, Erin's 2 unread and slot 2's 3 muted unread remain"
+    );
+
     // 6. Background unread & notification on INACTIVE slot 0 (Alice One):
     //    Push a real TL UpdateNewMessage onto acc0's FakeRpcClient while slot 1 is active!
     let incoming_msg_id = 42i32;
@@ -773,33 +787,42 @@ fn multi_account_menu_switch_background_unread_tray_and_logout() {
             seq: 2,
         }));
 
-    // Wait briefly for acc0's background SessionRuntime actor to process the update, then step UI.
-    std::thread::sleep(Duration::from_millis(80));
-    step_n(&mut harness, 8);
+    // Poll with a deadline until acc0's background SessionRuntime actor processes the update
+    // and MultiAccountWorkspaceHost propagates the unread increment to slot 0 & the tray badge.
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut slot0_unread = 0;
+    let mut tray_unread = 0;
+    while Instant::now() < deadline {
+        harness.step();
+        slot0_unread = harness
+            .state()
+            .host
+            .account_summaries()
+            .into_iter()
+            .find(|s| s.slot_index == 0)
+            .expect("slot 0 summary")
+            .unread_badge
+            .count;
+        tray_unread = harness
+            .state()
+            .tray_mock
+            .lock()
+            .expect("lock")
+            .tray_unread_count;
+        if slot0_unread >= 1 && tray_unread > tray_before_bg {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // Verify slot 0's unread count incremented in the background and summed tray badge rose by 1!
-    let slot0_unread = harness
-        .state()
-        .host
-        .account_summaries()
-        .into_iter()
-        .find(|s| s.slot_index == 0)
-        .expect("slot 0 summary")
-        .unread_badge
-        .count;
     assert!(
         slot0_unread >= 1,
         "inactive slot 0 must receive background unread updates, got {slot0_unread}"
     );
     assert!(
-        harness
-            .state()
-            .tray_mock
-            .lock()
-            .expect("lock")
-            .tray_unread_count
-            >= 6,
-        "summed tray badge must include background unread from inactive slot 0"
+        tray_unread > tray_before_bg,
+        "summed tray badge must include background unread from inactive slot 0, got {tray_unread}"
     );
 
     // Verify clicking a notification from inactive slot 0 switches active slot back to 0 and opens Dan's chat!

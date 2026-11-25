@@ -439,6 +439,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             draft: None,
             typing: None,
             badges: DialogBadgesState::default(),
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 2. Group chat: Rustgram Core Port (pinned, unread counter + @ mention + active call)
@@ -481,6 +483,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
                 mention_muted: false,
                 ..Default::default()
             },
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 3. Direct chat with live typing indicator + online dot + premium badge (pinned)
@@ -526,6 +530,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
                 reaction_muted: false,
                 ..Default::default()
             },
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 4. Direct chat with red Draft prefix + online dot (pinned)
@@ -566,6 +572,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             }),
             typing: None,
             badges: DialogBadgesState::default(),
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 5. Verified Broadcast Channel (pinned, muted gray unread counter + mute icon)
@@ -607,6 +615,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
                 unread_muted: true,
                 ..Default::default()
             },
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 6. Special row: Replies (with unread mention badge)
@@ -648,6 +658,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
                 mention: true,
                 ..Default::default()
             },
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 7. Outgoing Sent (single check) + online user
@@ -683,6 +695,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             draft: None,
             typing: None,
             badges: DialogBadgesState::default(),
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 8. Outgoing Sending (clock icon)
@@ -718,6 +732,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             draft: None,
             typing: None,
             badges: DialogBadgesState::default(),
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 9. Forum supergroup with group typing + poll badge
@@ -762,6 +778,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
                 poll: true,
                 ..Default::default()
             },
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 10. Bot with "Open" right button
@@ -797,6 +815,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             draft: None,
             typing: None,
             badges: DialogBadgesState::default(),
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: true,
         },
         // 11. Unread reaction heart badge on a personal chat (weekday timestamp)
@@ -838,6 +858,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
                 reaction_muted: false,
                 ..Default::default()
             },
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
         // 12. Channel (muted, older date DD.MM.YY)
@@ -879,6 +901,8 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
                 unread_muted: true,
                 ..Default::default()
             },
+            is_contact: false,
+            media_preview: None,
             has_bot_app_button: false,
         },
     ]
@@ -1076,6 +1100,8 @@ fn generate_synthetic_dialog(idx: usize, now: LocalDateTime) -> DialogItem {
         draft,
         typing: None,
         badges,
+        is_contact: false,
+        media_preview: None,
         has_bot_app_button: matches!(kind, DialogPeerKind::Bot) && idx % 20 == 9,
     }
 }

@@ -439,12 +439,19 @@ pub fn auto_download_from_stored(
 /// Lazily loads server auto-download presets via `account.getAutoDownloadSettings` and
 /// returns the active [`AutoDownloadSettings`].
 pub fn fetch_auto_download_live(live: &LiveSession) -> AutoDownloadSettings {
+    // While one request is in flight (the startup warm-up sends it), other callers get the
+    // cached values instead of a second request that would block the UI thread until the
+    // connection is ready; the window repaints when the reply is applied.
     let (loaded, cached, active_preset, from_tdata) = live
         .cache
         .lock()
-        .map(|c| {
+        .map(|mut c| {
+            let skip = c.auto_download_loaded || c.auto_download_fetching;
+            if !skip {
+                c.auto_download_fetching = true;
+            }
             (
-                c.auto_download_loaded,
+                skip,
                 c.auto_download.clone(),
                 c.active_auto_download_preset,
                 c.auto_download_from_tdata,
@@ -483,6 +490,7 @@ pub fn fetch_auto_download_live(live: &LiveSession) -> AutoDownloadSettings {
             };
             if let Ok(mut c) = live.cache.lock() {
                 c.auto_download_loaded = true;
+                c.auto_download_fetching = false;
                 c.auto_download_presets = Some(presets);
                 c.auto_download = effective.clone();
             }
@@ -492,6 +500,7 @@ pub fn fetch_auto_download_live(live: &LiveSession) -> AutoDownloadSettings {
             debug!(error = %err, "account.getAutoDownloadSettings failed");
             if let Ok(mut c) = live.cache.lock() {
                 c.auto_download_loaded = true;
+                c.auto_download_fetching = false;
             }
             cached
         }
@@ -1308,6 +1317,7 @@ pub fn apply_stored_session_settings_live(
         c.phone_hidden = stored.phone_number_hidden;
         c.auto_download = auto_dl;
         c.auto_download_from_tdata = has_custom_auto_download;
+        c.trusted_mini_app_bots = stored.trusted_mini_app_bots.clone();
         c.session_settings_dirty = false;
     }
 }
@@ -1323,6 +1333,7 @@ pub fn collect_stored_session_settings_live(
     if let Ok(c) = live.cache.lock() {
         out.archive_collapsed = c.archive_collapsed;
         out.phone_number_hidden = c.phone_hidden;
+        out.trusted_mini_app_bots = c.trusted_mini_app_bots.clone();
         if c.auto_download_from_tdata || c.auto_download_loaded {
             let mut converted = auto_download_to_stored(&c.auto_download);
             converted.peer_overrides = base.auto_download.peer_overrides.clone();

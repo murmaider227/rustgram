@@ -204,6 +204,23 @@ pub struct PremiumFeatureItem {
     pub is_new: bool,
 }
 
+/// Non-personal Telegram Premium promo telemetry event sent via `help.saveAppLog` (`peer = 0`),
+/// matching `SendScreenShow` / `SendScreenAccept` (`settings/sections/settings_premium.cpp:519-549`).
+///
+/// Personal identifiers (peer IDs, phone numbers, account data) are intentionally excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PremiumPromoLogEvent {
+    /// Premium promo screen opened (`"premium.promo_screen_show"`).
+    ScreenShow {
+        /// Ordered promo feature slugs shown on screen (`premium_promo_order`).
+        order: Vec<String>,
+        /// Entry-point source tag (`source`; empty defaults to `"settings"`).
+        source: String,
+    },
+    /// User accepted / clicked subscribe on the Premium promo screen (`"premium.promo_screen_accept"`).
+    ScreenAccept,
+}
+
 /// Bundle for the Telegram Premium promo screen (`settings_premium.cpp`).
 #[derive(Debug, Clone)]
 pub struct PremiumPromoBundle {
@@ -375,6 +392,12 @@ pub trait PaymentsBackend: Send {
 
     /// Loads Telegram Premium promo data, tiers, limits, and features.
     fn load_premium_promo(&self) -> Result<PremiumPromoBundle, String>;
+
+    /// Sends a non-personal Premium promo telemetry event via `help.saveAppLog` (`peer = 0`),
+    /// matching `SendScreenShow` / `SendScreenAccept` (`settings/sections/settings_premium.cpp`).
+    fn log_premium_promo_event(&self, _event: &PremiumPromoLogEvent) -> Result<bool, String> {
+        Ok(false)
+    }
 
     /// Loads a read-only payment form preview for a Telegram Premium subscription tier
     /// (`payments.getPaymentForm`). Never submits a charge automatically.

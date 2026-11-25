@@ -16,6 +16,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUSTGRAM_VERSION");
     println!("cargo:rerun-if-env-changed=TGFORK_VERSION");
     println!("cargo:rerun-if-changed=../../assets/icon.svg");
+    println!("cargo::rustc-check-cfg=cfg(rustgram_window_icon_rgba)");
 
     // 16 MB main-thread stack for rustgram.exe: the dev profile builds tg-app unoptimized, and the default 1 MB
     // Windows stack is too small for deep egui layouts without inlining.
@@ -46,12 +47,13 @@ mod win_resources {
     const FILE_DESCRIPTION: &str = "Rustgram Desktop";
     const ORIGINAL_FILENAME: &str = "rustgram.exe";
     const INTERNAL_NAME: &str = "rustgram";
-    const COMPANY_NAME: &str = "The Rustgram Authors";
-    const LEGAL_COPYRIGHT: &str = "Copyright (c) 2026 The Rustgram Authors (GPL-3.0)";
+    const COMPANY_NAME: &str = "Rustgram Authors";
+    const LEGAL_COPYRIGHT: &str = "Copyright (c) 2026 Rustgram Authors (GPL-3.0)";
 
     pub fn embed_windows_resources() {
         let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
         let icon_path = resolve_or_render_icon(&out_dir);
+        write_window_icon_rgba(&out_dir);
         let version_str = env::var("RUSTGRAM_VERSION")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -126,9 +128,55 @@ mod win_resources {
         ico_path
     }
 
+    /// Window icon size used by `tg_app::startup::icon::DEFAULT_WINDOW_ICON_SIZE`.
+    const WINDOW_ICON_SIZE: u32 = 64;
+
+    /// Pre-renders the 64 px straight-alpha RGBA window icon into `OUT_DIR`, so the app does not
+    /// load the system font database and rasterize the SVG at every start (~20 ms).
+    fn write_window_icon_rgba(out_dir: &Path) {
+        let manifest_dir =
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+        let svg_path = manifest_dir
+            .join("..")
+            .join("..")
+            .join("assets")
+            .join("icon.svg");
+        let rendered = fs::read(&svg_path)
+            .map_err(|e| format!("read svg: {e}"))
+            .and_then(|svg| parse_icon_tree(&svg))
+            .and_then(|tree| render_tree_rgba(&tree, WINDOW_ICON_SIZE));
+        if let Ok(rgba) = rendered
+            && fs::write(out_dir.join("window_icon_64.rgba"), rgba).is_ok()
+        {
+            println!("cargo:rustc-cfg=rustgram_window_icon_rgba");
+        }
+    }
+
     fn render_svg_to_ico(svg_path: &Path, out_path: &Path) -> Result<(), String> {
         let svg_data = fs::read(svg_path).map_err(|e| format!("read svg: {e}"))?;
+        let tree = parse_icon_tree(&svg_data)?;
+        let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
 
+        for &size in ICON_SIZES {
+            let rgba = render_tree_rgba(&tree, size)?;
+            let image = ico::IconImage::from_rgba_data(size, size, rgba);
+            let entry = if size >= 256 {
+                ico::IconDirEntry::encode_as_png(&image)
+            } else {
+                ico::IconDirEntry::encode(&image)
+            }
+            .map_err(|e| e.to_string())?;
+            icon_dir.add_entry(entry);
+        }
+
+        let mut out = Vec::new();
+        icon_dir.write(&mut out).map_err(|e| e.to_string())?;
+        let mut file = File::create(out_path).map_err(|e| e.to_string())?;
+        file.write_all(&out).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn parse_icon_tree(svg_data: &[u8]) -> Result<usvg::Tree, String> {
         let mut options = usvg::Options::default();
         {
             let db = options.fontdb_mut();
@@ -151,26 +199,7 @@ mod win_resources {
             }
         }
 
-        let tree = usvg::Tree::from_data(&svg_data, &options).map_err(|e| e.to_string())?;
-        let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
-
-        for &size in ICON_SIZES {
-            let rgba = render_tree_rgba(&tree, size)?;
-            let image = ico::IconImage::from_rgba_data(size, size, rgba);
-            let entry = if size >= 256 {
-                ico::IconDirEntry::encode_as_png(&image)
-            } else {
-                ico::IconDirEntry::encode(&image)
-            }
-            .map_err(|e| e.to_string())?;
-            icon_dir.add_entry(entry);
-        }
-
-        let mut out = Vec::new();
-        icon_dir.write(&mut out).map_err(|e| e.to_string())?;
-        let mut file = File::create(out_path).map_err(|e| e.to_string())?;
-        file.write_all(&out).map_err(|e| e.to_string())?;
-        Ok(())
+        usvg::Tree::from_data(svg_data, &options).map_err(|e| e.to_string())
     }
 
     fn render_tree_rgba(tree: &usvg::Tree, size: u32) -> Result<Vec<u8>, String> {
@@ -217,7 +246,6 @@ mod win_resources {
             | (u64::from(quad.1) << 32)
             | (u64::from(quad.2) << 16)
             | u64::from(quad.3);
-        let quad_str = format!("{}.{}.{}.{}", quad.0, quad.1, quad.2, quad.3);
 
         let mut res = winresource::WindowsResource::new();
         res.set_icon(&icon_path.to_string_lossy());
@@ -227,7 +255,7 @@ mod win_resources {
         res.set("InternalName", INTERNAL_NAME);
         res.set("CompanyName", COMPANY_NAME);
         res.set("LegalCopyright", LEGAL_COPYRIGHT);
-        res.set("FileVersion", &quad_str);
+        res.set("FileVersion", version_str);
         res.set("ProductVersion", version_str);
         res.set_version_info(winresource::VersionInfo::FILEVERSION, packed);
         res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, packed);
@@ -436,8 +464,6 @@ mod win_resources {
     }
 
     fn build_vs_version_info(version_str: &str, quad: (u16, u16, u16, u16)) -> Vec<u8> {
-        let quad_str = format!("{}.{}.{}.{}", quad.0, quad.1, quad.2, quad.3);
-
         // VS_FIXEDFILEINFO (52 bytes).
         let file_ver_ms = (u32::from(quad.0) << 16) | u32::from(quad.1);
         let file_ver_ls = (u32::from(quad.2) << 16) | u32::from(quad.3);
@@ -460,7 +486,7 @@ mod win_resources {
         let entries = [
             ("CompanyName", COMPANY_NAME),
             ("FileDescription", FILE_DESCRIPTION),
-            ("FileVersion", quad_str.as_str()),
+            ("FileVersion", version_str),
             ("InternalName", INTERNAL_NAME),
             ("LegalCopyright", LEGAL_COPYRIGHT),
             ("OriginalFilename", ORIGINAL_FILENAME),

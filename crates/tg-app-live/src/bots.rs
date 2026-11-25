@@ -420,16 +420,41 @@ impl LiveSession {
         Ok(game_high_scores_from_tl(&resp))
     }
 
-    fn ensure_bot_full_loaded(&self, bot_id: BotUserId) {
-        let needs_full = self.bots_read_session(|s| {
-            s.user(DataUserId(bot_id.0)).is_some_and(|u| {
+    /// Whether `peer` is a bot whose `users.getFullUser` (with `bot_info`) is not loaded yet.
+    pub(crate) fn bot_full_info_needed(&self, peer: DataPeerId) -> bool {
+        let Some(uid) = peer.to_user() else {
+            return false;
+        };
+        self.bots_read_session(|s| {
+            s.user(uid).is_some_and(|u| {
                 u.is_bot()
                     && (u.common.loaded_status < LoadedStatus::Full
                         || u.bot_info.as_ref().is_none_or(|b| !b.inited))
             })
-        });
-        if needs_full && let Err(err) = self.fetch_bot_full_info(bot_id) {
-            debug!(bot = bot_id.0, error = %err, "users.getFullUser for bot failed");
+        })
+    }
+
+    /// Loads the bot's full info if [`Self::bot_full_info_needed`] (used by
+    /// [`crate::open_chat_prefetch`]).
+    pub(crate) fn load_bot_full_info_now(&self, peer: DataPeerId) {
+        let Some(uid) = peer.to_user() else {
+            return;
+        };
+        if self.bot_full_info_needed(peer)
+            && let Err(err) = self.fetch_bot_full_info(BotUserId(uid.0))
+        {
+            debug!(bot = uid.0, error = %err, "users.getFullUser for bot failed");
+        }
+    }
+
+    fn ensure_bot_full_loaded(&self, bot_id: BotUserId) {
+        let peer = DataPeerId::from_user(DataUserId(bot_id.0));
+        if !crate::open_chat_prefetch::wait_in_flight(
+            self,
+            peer,
+            crate::open_chat_prefetch::OpenChatRequest::BotInfo,
+        ) {
+            self.load_bot_full_info_now(peer);
         }
     }
 
@@ -716,6 +741,13 @@ impl BotsBackend for LiveSession {
             .lock()
             .map(|s| s.attach_menu.clone())
             .unwrap_or_default()
+    }
+
+    fn load_attach_menu_bot(
+        &self,
+        bot_id: BotUserId,
+    ) -> Result<tg_bots::mini_app::AttachMenuBot, String> {
+        crate::live_extras::get_attach_menu_bot(self, bot_id)
     }
 
     fn candidate_peers(&self) -> Vec<BotPeerCandidate> {
@@ -1222,16 +1254,27 @@ impl BotsBackend for LiveSession {
             enabled,
         })?;
         let bots_state = bots_state_for_session(self.runtime().session());
-        if let Ok(mut guard) = bots_state.lock() {
-            if let Some(entry) = guard
+        let needs_single_fetch = if let Ok(mut guard) = bots_state.lock() {
+            let found = if let Some(entry) = guard
                 .attach_menu
                 .bots
                 .iter_mut()
                 .find(|b| b.bot_id == bot_id)
             {
                 entry.inactive = !enabled;
-            }
+                true
+            } else {
+                false
+            };
             guard.attach_menu_loaded = true;
+            enabled && !found
+        } else {
+            false
+        };
+        if needs_single_fetch {
+            let _ = crate::live_extras::get_attach_menu_bot(self, bot_id);
+        }
+        if let Ok(guard) = bots_state.lock() {
             return Ok(guard.attach_menu.clone());
         }
         Ok(AttachMenuStore::new())

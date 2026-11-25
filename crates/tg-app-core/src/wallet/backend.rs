@@ -141,6 +141,39 @@ pub struct PendingTxApproval {
     pub ton_connect_emulation: Option<TonConnectEmulation>,
 }
 
+impl PendingTxApproval {
+    /// Returns a deterministic SHA-256 hex digest of the exact transaction request shown to the
+    /// user so an approval click cannot silently sign a swapped or altered request.
+    #[must_use]
+    pub fn content_hash(&self) -> String {
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(b"rustgram-tc-tx-v1\0");
+        buf.extend_from_slice(&self.session_id.to_le_bytes());
+        push_len_prefixed(&mut buf, self.dapp_name.as_bytes());
+        push_len_prefixed(&mut buf, self.dapp_domain.as_bytes());
+        push_len_prefixed(&mut buf, self.request.request_id.as_bytes());
+        match self.request.valid_until {
+            Some(v) => {
+                buf.push(1);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        push_opt_len_prefixed(&mut buf, self.request.network.as_deref());
+        push_opt_len_prefixed(&mut buf, self.request.from.as_deref());
+        buf.extend_from_slice(&(self.request.messages.len() as u64).to_le_bytes());
+        for msg in &self.request.messages {
+            push_len_prefixed(&mut buf, msg.address.as_bytes());
+            buf.extend_from_slice(&msg.amount_nano.to_le_bytes());
+            push_opt_len_prefixed(&mut buf, msg.payload_boc.as_deref());
+            push_opt_len_prefixed(&mut buf, msg.state_init_boc.as_deref());
+            push_opt_len_prefixed(&mut buf, msg.decoded_comment.as_deref());
+        }
+        let digest = tg_updater::package::sha256_digest(&buf);
+        tg_storage::sha256_hex(&digest)
+    }
+}
+
 /// Pending TON Connect `signData` approval (`Wallet::TonConnectSignDataRequestBoxState`).
 ///
 /// Every `signData` payload must be reviewed and explicitly confirmed by the user before signing.
@@ -154,6 +187,40 @@ pub struct PendingSignDataApproval {
     pub dapp_domain: String,
     /// Decrypted `signData` request details (`text`, `binary`, or `cell`).
     pub request: TonConnectSignDataRequest,
+}
+
+impl PendingSignDataApproval {
+    /// Returns a deterministic SHA-256 hex digest of the exact `signData` request shown to the
+    /// user so an approval click cannot silently sign a swapped or altered payload.
+    #[must_use]
+    pub fn content_hash(&self) -> String {
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(b"rustgram-tc-signdata-v1\0");
+        buf.extend_from_slice(&self.session_id.to_le_bytes());
+        push_len_prefixed(&mut buf, self.dapp_name.as_bytes());
+        push_len_prefixed(&mut buf, self.dapp_domain.as_bytes());
+        push_len_prefixed(&mut buf, self.request.request_id.as_bytes());
+        push_len_prefixed(&mut buf, self.request.kind.as_bytes());
+        push_len_prefixed(&mut buf, self.request.payload.as_bytes());
+        push_opt_len_prefixed(&mut buf, self.request.schema.as_deref());
+        let digest = tg_updater::package::sha256_digest(&buf);
+        tg_storage::sha256_hex(&digest)
+    }
+}
+
+fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn push_opt_len_prefixed(buf: &mut Vec<u8>, opt: Option<&str>) {
+    match opt {
+        Some(s) => {
+            buf.push(1);
+            push_len_prefixed(buf, s.as_bytes());
+        }
+        None => buf.push(0),
+    }
 }
 
 /// Fee & payload quote prepared before the user confirms a TEP-74 Jetton transfer.
@@ -384,8 +451,13 @@ pub trait WalletBackend: Send {
     /// Declines and dismisses the pending TON Connect connection request.
     fn decline_ton_connect(&mut self);
 
-    /// Approves, signs, and submits the pending TON Connect transaction request.
-    fn approve_ton_connect_tx(&mut self) -> Result<SendReceipt, String>;
+    /// Approves, signs, and submits the pending TON Connect transaction request, ONLY if the
+    /// currently shown head request matches `request_id` and `content_hash`.
+    fn approve_ton_connect_tx(
+        &mut self,
+        request_id: &str,
+        content_hash: &str,
+    ) -> Result<SendReceipt, String>;
 
     /// Declines and dismisses the pending TON Connect transaction request.
     fn decline_ton_connect_tx(&mut self);
@@ -395,8 +467,13 @@ pub trait WalletBackend: Send {
         None
     }
 
-    /// Approves and signs the pending TON Connect `signData` request (only after user confirmation).
-    fn approve_ton_connect_sign_data(&mut self) -> Result<SignDataResult, String> {
+    /// Approves and signs the pending TON Connect `signData` request (only after user confirmation
+    /// and ONLY if the currently shown head request matches `request_id` and `content_hash`).
+    fn approve_ton_connect_sign_data(
+        &mut self,
+        _request_id: &str,
+        _content_hash: &str,
+    ) -> Result<SignDataResult, String> {
         Err("signData is not supported by this backend".to_owned())
     }
 

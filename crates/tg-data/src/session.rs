@@ -19,11 +19,11 @@ use crate::forum::{ForumState, ForumTopicData};
 use crate::history::{Draft, DraftKey, History};
 use crate::id::{
     ARCHIVE_FOLDER_ID, ChannelId, ChatId, FilterId, FolderId, FullMsgId, MsgId, MsgRange, PeerId,
-    UserId,
+    PhotoId, UNKNOWN_PHOTO_ID, UserId,
 };
 use crate::lastseen::{LastseenStatus, UserStatusInput};
 use crate::message::{
-    Message, MessageContent, MessageFlags, MessageReactionsSummary, ServiceAction,
+    Message, MessageContent, MessageFlags, MessageReactionsSummary, PhotoData, ServiceAction,
 };
 use crate::peer::{Channel, ChannelFlags, Chat, ChatFlags, Peer, User};
 use crate::rights::{ChatBannedRights, SendCheckContext};
@@ -45,6 +45,7 @@ pub struct Session {
     badge_settings: BadgeSettings,
     dialogs_unread_on_top: bool,
     peers: HashMap<PeerId, Peer>,
+    photos: HashMap<PhotoId, PhotoData>,
     access_hashes: HashMap<PeerId, i64>,
     /// Tracks server messages that reference an unloaded or `min`-only peer so
     /// `inputPeerUserFromMessage` / `inputPeerChannelFromMessage` can be constructed
@@ -83,6 +84,7 @@ impl Session {
             badge_settings: BadgeSettings::default(),
             dialogs_unread_on_top: false,
             peers: HashMap::new(),
+            photos: HashMap::new(),
             access_hashes: HashMap::new(),
             messages_with_peer: HashMap::new(),
             contacts_loaded: false,
@@ -328,6 +330,37 @@ impl Session {
                 .peer_updated(peer_id, PeerUpdateFlags::ONLINE_STATUS);
         }
         changed
+    }
+
+    /// Stores or refreshes full `PhotoData` (including `access_hash` and `file_reference`)
+    /// in the session's photo registry (`Data::Session::processPhoto` in `data/data_session.cpp`).
+    pub fn cache_photo(&mut self, photo: PhotoData) {
+        if photo.id.is_zero() || photo.id == UNKNOWN_PHOTO_ID {
+            return;
+        }
+        self.photos.insert(photo.id, photo);
+    }
+
+    /// Looks up cached [`PhotoData`] by `PhotoId` (`Data::Session::photo` in `data/data_session.cpp`).
+    #[must_use]
+    pub fn photo(&self, id: PhotoId) -> Option<&PhotoData> {
+        if id.is_zero() || id == UNKNOWN_PHOTO_ID {
+            return None;
+        }
+        self.photos.get(&id)
+    }
+
+    /// Removes a deleted photo from the session's photo cache.
+    pub fn remove_photo(&mut self, id: PhotoId) -> Option<PhotoData> {
+        self.photos.remove(&id)
+    }
+
+    /// Returns the cached [`PhotoData`] for `peer_id`'s currently active profile/chat photo,
+    /// if both the peer's `userpic_photo_id` and its full photo metadata are known.
+    #[must_use]
+    pub fn peer_active_photo(&self, peer_id: PeerId) -> Option<&PhotoData> {
+        let photo_id = self.peer(peer_id)?.common().userpic_photo_id;
+        self.photo(photo_id)
     }
 
     /// Sets a loaded peer's blocked status (`PeerData::setIsBlocked` in
@@ -920,6 +953,11 @@ impl Session {
                         | MessageFlags::MENTIONS_ME
                         | MessageFlags::HAS_UNREAD_REACTION,
                 );
+                if had_reaction && let Some(reactions) = msg.reactions.as_mut() {
+                    for rr in &mut reactions.recent_reactors {
+                        rr.unread = false;
+                    }
+                }
                 let mut unread_changed = false;
                 if let Some(history) = self.histories.get_mut(&p) {
                     if had_mention {
@@ -946,6 +984,93 @@ impl Session {
             }
         }
         unknown
+    }
+
+    /// Marks unread reactions on specific visible messages in `peer_id` as read locally,
+    /// matching `HistoryItem::markReactionsRead` (`history/history_item.cpp:1969-1983`).
+    ///
+    /// Only regular server messages that currently have unread reactions (flag, unread recent
+    /// reactor, or membership in `history.unread_reactions`) are modified and returned.
+    /// Does NOT clear unrelated `MEDIA_IS_UNREAD` or `MENTIONS_ME` flags.
+    pub fn mark_messages_reactions_read(&mut self, peer_id: PeerId, ids: &[MsgId]) -> Vec<MsgId> {
+        let mut marked = Vec::new();
+        let mut seen = BTreeSet::new();
+        for &msg_id in ids {
+            if !msg_id.is_server() || !seen.insert(msg_id) {
+                continue;
+            }
+            let full_id = FullMsgId::new(peer_id, msg_id);
+            let in_history_set = self
+                .histories
+                .get(&peer_id)
+                .is_some_and(|h| h.unread_reactions.contains(&msg_id));
+            let (has_unread, topic_root, saved_sublist_peer) = match self.messages.get_mut(&full_id)
+            {
+                Some(msg) => {
+                    let had_flag = msg.flags.contains(MessageFlags::HAS_UNREAD_REACTION);
+                    let had_recent = msg
+                        .reactions
+                        .as_ref()
+                        .is_some_and(|r| r.recent_reactors.iter().any(|rr| rr.unread));
+                    if had_flag || had_recent || in_history_set {
+                        msg.flags.remove(MessageFlags::HAS_UNREAD_REACTION);
+                        if let Some(reactions) = msg.reactions.as_mut() {
+                            for rr in &mut reactions.recent_reactors {
+                                rr.unread = false;
+                            }
+                        }
+                        (
+                            true,
+                            msg.topic_root_id(),
+                            msg.forward_from.as_ref().and_then(|f| f.saved_from_peer),
+                        )
+                    } else {
+                        (false, None, None)
+                    }
+                }
+                None => (in_history_set, None, None),
+            };
+            if !has_unread {
+                continue;
+            }
+            if let Some(history) = self.histories.get_mut(&peer_id) {
+                history.unread_reactions.remove(&msg_id);
+                history.unread_reactions_count = (history.unread_reactions_count - 1).max(0);
+                self.changes
+                    .history_updated(peer_id, HistoryUpdateFlags::UNREAD_REACTIONS);
+            }
+            if let Some(top_id) = topic_root
+                && let Some(topic) = self
+                    .forums
+                    .get_mut(&peer_id)
+                    .and_then(|f| f.topic_mut(top_id))
+            {
+                topic.unread_reactions_count = (topic.unread_reactions_count - 1).max(0);
+            }
+            if let Some(saved_peer) = saved_sublist_peer {
+                if peer_id == self.self_peer_id() {
+                    if let Some(sub) = self.saved_messages.sublist_mut(saved_peer) {
+                        sub.unread_reactions_count = (sub.unread_reactions_count - 1).max(0);
+                    }
+                } else if let Some(ch_id) = peer_id.to_channel()
+                    && let Some(sub) = self
+                        .monoforums
+                        .get_mut(&ch_id)
+                        .and_then(|m| m.sublist_mut(saved_peer))
+                {
+                    sub.unread_reactions_count = (sub.unread_reactions_count - 1).max(0);
+                }
+            }
+            self.changes.message_updated(
+                full_id,
+                MessageUpdateFlags::EDITED | MessageUpdateFlags::DIALOG_ROW_REPAINT,
+            );
+            marked.push(msg_id);
+        }
+        if !marked.is_empty() {
+            self.sync_dialog_lists(peer_id);
+        }
+        marked
     }
 
     /// Clears cached history messages strictly older than `available_min_id` and records
@@ -1132,6 +1257,86 @@ impl Session {
             self.sync_dialog_lists(id.peer);
         }
         true
+    }
+
+    /// Optimistically strips reactions by `participant_id` from one message (`Some(msg_id)`)
+    /// or across all cached messages in `peer_id` (`None`), returning the number of modified
+    /// messages.
+    ///
+    /// Port of `Data::Session::removeReactionsFromParticipant` (`data/data_session.cpp:3518-3544`)
+    /// and `HistoryItem::removeReactionsFromParticipant` (`history/history_item.cpp:3903-3922`).
+    pub fn remove_reactions_from_participant(
+        &mut self,
+        peer_id: PeerId,
+        msg_id: Option<MsgId>,
+        participant_id: PeerId,
+        known_reaction: Option<&crate::peer::ReactionId>,
+    ) -> usize {
+        let targets: Vec<FullMsgId> = match msg_id {
+            Some(mid) => {
+                let full_id = FullMsgId::new(peer_id, mid);
+                if self.messages.contains_key(&full_id) {
+                    vec![full_id]
+                } else {
+                    Vec::new()
+                }
+            }
+            None => self
+                .messages
+                .keys()
+                .copied()
+                .filter(|id| id.peer == peer_id)
+                .collect(),
+        };
+        if targets.is_empty() {
+            return 0;
+        }
+
+        let is_self = participant_id == self.self_peer_id();
+        let mut modified = 0usize;
+        let mut badges_changed = false;
+
+        for full_id in targets {
+            let Some(msg) = self.messages.get_mut(&full_id) else {
+                continue;
+            };
+            let had_unread = msg.has_unread_reaction();
+            let Some(reactions) = msg.reactions.as_mut() else {
+                continue;
+            };
+            if !reactions.remove_from_participant(participant_id, known_reaction, is_self) {
+                continue;
+            }
+            if reactions.is_empty() {
+                msg.reactions = None;
+                msg.flags.remove(MessageFlags::CAN_VIEW_REACTIONS);
+            }
+            let now_unread = msg
+                .reactions
+                .as_ref()
+                .is_some_and(|r| r.recent_reactors.iter().any(|rr| rr.unread));
+            msg.flags.set(MessageFlags::HAS_UNREAD_REACTION, now_unread);
+
+            if had_unread
+                && !now_unread
+                && let Some(history) = self.histories.get_mut(&peer_id)
+            {
+                history.unread_reactions.remove(&full_id.msg);
+                history.unread_reactions_count = (history.unread_reactions_count - 1).max(0);
+                self.changes
+                    .history_updated(peer_id, HistoryUpdateFlags::UNREAD_REACTIONS);
+                badges_changed = true;
+            }
+
+            self.changes
+                .message_updated(full_id, MessageUpdateFlags::EDITED);
+            modified += 1;
+        }
+
+        if badges_changed {
+            self.sync_dialog_lists(peer_id);
+        }
+        modified
     }
 
     /// Deletes messages in `peer_id` by `MsgId`, updating loaded ranges, unread counters,

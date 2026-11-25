@@ -14,37 +14,66 @@ use tg_ui::widgets::sliders::MediaSlider;
 use super::strings;
 use super::widgets::{SettingsIconKind, settings_row_pad_x, settings_toggle_row};
 
-/// Standard tdesktop discrete interface scale stops (`100%`..=`300%`).
-pub const SCALE_STOPS: [i32; 6] = [100, 125, 150, 200, 250, 300];
+/// Distance between two interface scale values on the slider (`SetupInterfaceScale`: `step = 5`).
+pub const SCALE_STEP: i32 = 5;
 
-/// Clamps and snaps an interface scale percentage to the closest supported stop in [`SCALE_STOPS`].
+/// The interface scale values the slider steps through, as `SetupInterfaceScale` builds them:
+/// `kScaleMin..=MaxScaleForRatio(1)` (50..=300 %) in 5 % steps, plus the configured scale when
+/// it falls between two steps.
+#[must_use]
+pub fn scale_values(config_scale: i32) -> Vec<i32> {
+    let mut values = Vec::with_capacity(((SCALE_MAX - SCALE_MIN) / SCALE_STEP + 2) as usize);
+    let mut value = SCALE_MIN;
+    while value != SCALE_MAX {
+        values.push(value);
+        if config_scale > value && config_scale < value + SCALE_STEP {
+            values.push(config_scale);
+        }
+        value += SCALE_STEP;
+    }
+    values.push(SCALE_MAX);
+    values
+}
+
+/// Clamps an interface scale percentage to the slider range and snaps it to the closest
+/// 5 % step (`SCALE_AUTO` maps to the default 100 %).
 #[must_use]
 pub fn snap_scale_stop(scale: i32) -> i32 {
     if scale == SCALE_AUTO {
         return SCALE_DEFAULT;
     }
     let clamped = scale.clamp(SCALE_MIN, SCALE_MAX);
-    SCALE_STOPS
-        .iter()
-        .copied()
-        .min_by_key(|&stop| (stop - clamped).abs())
-        .unwrap_or(SCALE_DEFAULT)
+    let steps = ((clamped - SCALE_MIN) as f32 / SCALE_STEP as f32).round() as i32;
+    (SCALE_MIN + steps * SCALE_STEP).clamp(SCALE_MIN, SCALE_MAX)
 }
 
-/// Maps a scale percentage to normalized slider position `0.0..=1.0`.
+/// Maps a scale percentage to the normalized slider position `0.0..=1.0` (`valueFromScale`).
 #[must_use]
 pub fn scale_to_slider(scale: i32) -> f64 {
-    let snapped = snap_scale_stop(scale);
-    let idx = SCALE_STOPS.iter().position(|&s| s == snapped).unwrap_or(0);
-    idx as f64 / (SCALE_STOPS.len() - 1) as f64
+    scale_to_slider_in(&scale_values(scale), scale)
 }
 
-/// Maps a normalized slider position `0.0..=1.0` back to a scale percentage stop.
+fn scale_to_slider_in(values: &[i32], scale: i32) -> f64 {
+    let count = values.len().max(2);
+    let index = values.iter().position(|&v| v == scale).unwrap_or_else(|| {
+        values
+            .iter()
+            .position(|&v| v == snap_scale_stop(scale))
+            .unwrap_or(count - 1)
+    });
+    index as f64 / (count - 1) as f64
+}
+
+/// Maps a normalized slider position `0.0..=1.0` back to a scale percentage.
 #[must_use]
 pub fn slider_to_scale(pos: f64) -> i32 {
-    let clamped = pos.clamp(0.0, 1.0);
-    let idx = (clamped * (SCALE_STOPS.len() - 1) as f64).round() as usize;
-    SCALE_STOPS.get(idx).copied().unwrap_or(SCALE_DEFAULT)
+    slider_to_scale_in(&scale_values(SCALE_DEFAULT), pos)
+}
+
+fn slider_to_scale_in(values: &[i32], pos: f64) -> i32 {
+    let last = values.len().saturating_sub(1);
+    let index = (pos.clamp(0.0, 1.0) * last as f64).round() as usize;
+    values.get(index).copied().unwrap_or(SCALE_DEFAULT)
 }
 
 /// Renders the Default Interface Scale controls (`Auto` toggle + scale slider + live preview bubble).
@@ -57,16 +86,17 @@ pub fn render_scale_controls(
     colors: &dyn Colors,
 ) -> bool {
     let mut changed = false;
+    // `st::settings_scale_padding`: the slider sits under the row text (60 px), 22 px on the right.
     let pad_x = st::settings_scale_padding
         .left
         .scaled()
         .max(settings_row_pad_x() as i32) as f32;
+    let pad_right = st::settings_scale_padding.right.scaled().max(16) as f32;
     let mut is_auto = global.config_scale == SCALE_AUTO;
-    let auto_subtitle = format!("{} ({}%)", tr::lng_settings_scale(), global.screen_scale);
     if settings_toggle_row(
         ui,
         strings::SCALE_DEFAULT_TITLE,
-        Some(&auto_subtitle),
+        None,
         Some(SettingsIconKind::Scale),
         &mut is_auto,
         true,
@@ -83,63 +113,68 @@ pub fn render_scale_controls(
     }
 
     let effective_scale = global.eval_scale(global.config_scale);
-    let mut slider_val = scale_to_slider(effective_scale);
+    let values = scale_values(global.config_scale);
+    let mut slider_val = scale_to_slider_in(&values, effective_scale);
 
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
-        let avail = (ui.available_width() - pad_x - 52.0).max(120.0);
-        let slider_resp = MediaSlider::new(
-            &mut slider_val,
-            MediaSliderStyle::default_media_slider(colors),
+    // Slider row (`MakeSliderWithLabel` inside `settingsScalePadding` = (60, 7, 22, 4)): the
+    // `settingsScale` slider (15 px seek) under the row text, the `300%`-wide label at the right.
+    let label_font = font_id_from_style(st::settings_scale_label.style.font);
+    let label_fg = colors.color("windowActiveTextFg");
+    let label_w = ui
+        .painter()
+        .layout_no_wrap("300%".to_owned(), label_font.clone(), label_fg)
+        .size()
+        .x;
+    let label_h = ui.fonts_mut(|f| f.row_height(&label_font));
+    let pad_top = st::settings_scale_padding.top.scaled().max(0) as f32;
+    let pad_bottom = st::settings_scale_padding.bottom.scaled().max(0) as f32;
+    let full_w = ui.available_width();
+    ui.add_space(pad_top);
+    let (row_rect, _) = ui.allocate_exact_size(Vec2::new(full_w, label_h), Sense::hover());
+    ui.add_space(pad_bottom);
+    let label_skip = st::normal_font.scaled_size() as f32 * 0.5;
+    let slider_w = (full_w - pad_x - pad_right - label_w - label_skip).max(120.0);
+    let slider_rect = Rect::from_min_size(
+        Pos2::new(row_rect.left() + pad_x, row_rect.top()),
+        Vec2::new(slider_w, row_rect.height()),
+    );
+    let slider_resp = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(slider_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                MediaSlider::new(
+                    &mut slider_val,
+                    MediaSliderStyle::from_tg(&st::settings_scale, colors),
+                )
+                .always_display_marker(true)
+                .width(slider_w)
+                .show(ui)
+            },
         )
-        .always_display_marker(true)
-        .width(avail)
-        .show(ui);
-        if slider_resp.changed() {
-            let new_scale = slider_to_scale(slider_val);
-            global.config_scale = new_scale;
-            global.scale = new_scale;
-            changed = true;
-        }
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(format!("{effective_scale}%"))
-                .font(font_id_from_style(st::settings_scale_label.style.font))
-                .color(colors.color("windowActiveTextFg")),
-        );
-    });
-
-    // Tick stop labels below slider.
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
-        let avail = (ui.available_width() - pad_x - 52.0).max(120.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, 16.0), Sense::hover());
-        let step_count = (SCALE_STOPS.len() - 1) as f32;
-        for (i, stop) in SCALE_STOPS.iter().enumerate() {
-            let x = rect.left() + (i as f32 / step_count) * rect.width();
-            let active = *stop == snap_scale_stop(effective_scale);
-            let fg = if active {
-                colors.color("windowActiveTextFg")
-            } else {
-                colors.color("windowSubTextFg")
-            };
-            let align = if i == 0 {
-                Align2::LEFT_CENTER
-            } else if i == SCALE_STOPS.len() - 1 {
-                Align2::RIGHT_CENTER
-            } else {
-                Align2::CENTER_CENTER
-            };
-            ui.painter().text(
-                Pos2::new(x, rect.center().y),
-                align,
-                format!("{stop}%"),
-                egui::FontId::new(10.5, family_regular()),
-                fg,
-            );
-        }
-    });
+        .inner;
+    if slider_resp.changed() {
+        let new_scale = slider_to_scale_in(&values, slider_val);
+        global.config_scale = new_scale;
+        global.scale = new_scale;
+        changed = true;
+    }
+    let value_text = format!("{effective_scale}%");
+    let value_rect = ui.painter().text(
+        Pos2::new(row_rect.right() - pad_right, row_rect.center().y),
+        Align2::RIGHT_CENTER,
+        &value_text,
+        label_font,
+        label_fg,
+    );
+    // `st::settings_scale_label` is a FlatLabel: keep it in the accessibility tree.
+    ui.interact(
+        value_rect,
+        ui.scope_id().with("scale_value_label"),
+        Sense::hover(),
+    )
+    .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &value_text));
 
     if show_preview {
         ui.add_space(8.0);

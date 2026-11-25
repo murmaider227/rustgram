@@ -463,6 +463,12 @@ pub fn apply_palette_visuals(ctx: &egui::Context, colors: &dyn Colors) {
     visuals.extreme_bg_color = input_bg;
     visuals.faint_bg_color = window_bg_over;
     visuals.override_text_color = Some(window_fg);
+    // Search / composer / emoji-search placeholders use tdesktop's opaque `placeholderFg`
+    // (`st::defaultInputField.placeholderFg`), not a translucent fade of `windowFg`.
+    visuals.weak_text_color = colors
+        .get("placeholderFg")
+        .filter(|c| c.a() > 0)
+        .or(Some(with_alpha(window_fg, 0.55)));
     visuals.selection.bg_fill = with_alpha(active_bg, 0.25);
     visuals.selection.stroke = egui::Stroke::new(1.5, active_bg);
     visuals.widgets.noninteractive.bg_fill = window_bg;
@@ -473,5 +479,49 @@ pub fn apply_palette_visuals(ctx: &egui::Context, colors: &dyn Colors) {
     visuals.widgets.hovered.bg_stroke.color = border_active;
     visuals.widgets.active.bg_fill = active_bg;
     visuals.widgets.active.bg_stroke.color = active_bg;
-    ctx.set_visuals(visuals);
+    // tdesktop's look depends only on its palette, never on the OS light/dark setting. Pin the
+    // egui theme to the palette so a later OS theme report (eframe's default preference follows
+    // the system) cannot swap in egui's stock style for the other mode.
+    let theme = if is_dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    };
+    ctx.set_theme(theme);
+    ctx.set_visuals_of(theme, visuals);
+}
+
+#[cfg(test)]
+mod palette_theme_tests {
+    use super::*;
+
+    fn run_frame(ctx: &egui::Context, system_theme: Option<egui::Theme>) {
+        let input = egui::RawInput {
+            system_theme,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |_| {});
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn os_theme_reported_after_start_up_does_not_replace_the_palette_visuals() {
+        for (embedded, dark, os) in [
+            (EmbeddedType::Default, false, egui::Theme::Dark),
+            (EmbeddedType::Night, true, egui::Theme::Light),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(egui::ThemePreference::System);
+            // eframe creates the app (which applies the palette) before the first frame
+            // reports the OS theme; the OS theme arrives afterwards.
+            run_frame(&ctx, None);
+            ThemeManager::with_embedded(embedded).apply_to_egui(&ctx);
+            run_frame(&ctx, Some(os));
+            run_frame(&ctx, Some(os));
+            let visuals = ctx.global_style().visuals.clone();
+            assert_eq!(visuals.dark_mode, dark, "{embedded:?} with OS {os:?}");
+            let window_bg = ThemeManager::with_embedded(embedded).color("windowBg");
+            assert_eq!(visuals.panel_fill, window_bg, "{embedded:?} with OS {os:?}");
+        }
+    }
 }

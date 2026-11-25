@@ -359,6 +359,9 @@ pub struct StoredSessionSettings {
     pub extra_favorite_reactions: Vec<StoredReactionId>,
     /// Number of times stash hint was shown.
     pub stash_hint_shows_count: i32,
+    /// Bot peer IDs (`PeerId.0` encoded) trusted to open Mini Apps without re-prompting
+    /// (`Storage::Account::isPeerTrustedOpenWebView`).
+    pub trusted_mini_app_bots: BTreeSet<i64>,
 }
 
 impl Default for StoredSessionSettings {
@@ -393,6 +396,7 @@ impl Default for StoredSessionSettings {
             phone_number_hidden: false,
             extra_favorite_reactions: Vec::new(),
             stash_hint_shows_count: 0,
+            trusted_mini_app_bots: BTreeSet::new(),
         }
     }
 }
@@ -522,6 +526,11 @@ impl StoredSessionSettings {
                 w.write_qstring(&auth.location);
                 w.write_qstring(&auth.bot_name);
             }
+        }
+
+        w.write_i32(self.trusted_mini_app_bots.len() as i32);
+        for &bot_peer_id in &self.trusted_mini_app_bots {
+            w.write_i64(bot_peer_id);
         }
 
         w.into_bytes()
@@ -898,6 +907,12 @@ impl StoredSessionSettings {
                 }
             }
         }
+        if !r.at_end() {
+            let count = read_checked_count(&mut r, 8)?;
+            for _ in 0..count {
+                out.trusted_mini_app_bots.insert(r.read_i64()?);
+            }
+        }
 
         if !auto_download_bytes.is_empty() {
             out.auto_download = StoredAutoDownload::deserialize(&auto_download_bytes)?;
@@ -1070,6 +1085,10 @@ mod tests {
             bot_access_hash: 999_111,
             bot_name: "HelperBot".to_owned(),
         });
+        s.trusted_mini_app_bots
+            .insert(PeerId::from_user(700_001).0 as i64);
+        s.trusted_mini_app_bots
+            .insert(PeerId::from_user(700_002).0 as i64);
 
         let bytes = s.serialize();
         let parsed = StoredSessionSettings::deserialize(&bytes).expect("deserialize v2");
@@ -1094,6 +1113,9 @@ mod tests {
             phone_number_hidden: true,
             ..StoredSessionSettings::default()
         };
+        settings
+            .trusted_mini_app_bots
+            .insert(PeerId::from_user(88_123).0 as i64);
         settings.auto_download.set_bytes_limit(
             AutoDownloadSource::User,
             AutoDownloadType::Photo,
@@ -1115,5 +1137,15 @@ mod tests {
             .expect("read parsed session settings")
             .expect("session settings present");
         assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn session_settings_legacy_blob_without_trusted_bots_defaults_empty() {
+        let s = StoredSessionSettings::default();
+        let full = s.serialize();
+        // Truncate the trailing 4-byte `trusted_mini_app_bots` count (0) to simulate a pre-WP-74 blob.
+        let legacy = &full[..full.len() - 4];
+        let parsed = StoredSessionSettings::deserialize(legacy).expect("deserialize legacy");
+        assert!(parsed.trusted_mini_app_bots.is_empty());
     }
 }

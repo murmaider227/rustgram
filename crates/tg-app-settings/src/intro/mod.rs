@@ -531,6 +531,7 @@ pub struct IntroWidget {
     pub error: String,
     icon_cache: TgforkIconCache,
     nearest_dc_fetched: bool,
+    nearest_dc_rx: Option<std::sync::mpsc::Receiver<InvokeResult<tl_types::NearestDc>>>,
 }
 
 impl std::fmt::Debug for IntroWidget {
@@ -644,6 +645,7 @@ impl IntroWidget {
             error: String::new(),
             icon_cache: TgforkIconCache::default(),
             nearest_dc_fetched: false,
+            nearest_dc_rx: None,
         }
     }
 
@@ -1297,6 +1299,63 @@ impl IntroWidget {
         }
     }
 
+    /// Sends `help.getNearestDc` once without blocking the frame, like tdesktop's
+    /// `Intro::Widget::getNearestDC` (the first request also opens the connection and creates the
+    /// auth key, which takes seconds). The reply is applied by [`Self::poll_nearest_dc`].
+    /// The offline fake client keeps the synchronous path so tests stay deterministic.
+    fn request_nearest_dc(&mut self, ctx: &egui::Context) {
+        if self.nearest_dc_fetched {
+            return;
+        }
+        if self.fake_rpc.is_some() {
+            self.fetch_nearest_dc();
+            return;
+        }
+        self.nearest_dc_fetched = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rpc = Arc::clone(&self.invoker.0);
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("intro-nearest-dc".to_owned())
+            .spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                let res = rt.block_on(rpc.help_get_nearest_dc());
+                let _ = tx.send(res);
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.nearest_dc_rx = Some(rx);
+        }
+    }
+
+    /// Applies a finished background `help.getNearestDc` reply: the suggested phone country, and
+    /// the main DC while the user has not started a login request yet.
+    fn poll_nearest_dc(&mut self) {
+        let Some(rx) = self.nearest_dc_rx.as_ref() else {
+            return;
+        };
+        let res = match rx.try_recv() {
+            Ok(res) => res,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.nearest_dc_rx = None;
+                return;
+            }
+        };
+        self.nearest_dc_rx = None;
+        if let Ok(nearest) = res {
+            if self.login.apply_nearest_dc(&nearest) {
+                self.invoker.set_main_dc_id(nearest.nearest_dc);
+            }
+            self.phone.apply_suggested_country(&nearest.country);
+        }
+    }
+
     /// Transitions from Start (or Phone) -> QR login (`StartWidget::submit` -> `goNext<QrWidget>`).
     pub fn start_qr_flow(&mut self, now: Instant) -> Result<(), ApiError> {
         let prev = self.current_step();
@@ -1695,7 +1754,8 @@ impl IntroWidget {
         palette: &Palette,
         _strings: &dyn Strings,
     ) -> Option<IntroAction> {
-        self.fetch_nearest_dc();
+        self.request_nearest_dc(ui.ctx());
+        self.poll_nearest_dc();
 
         let mut emitted = None;
         let now = tg_app_core::clock::now();

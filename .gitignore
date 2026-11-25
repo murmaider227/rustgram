@@ -1,7 +1,6 @@
 /target
 /target-*
 # Lock file is committed at integration points only; parallel branches must not touch it.
-Cargo.lock
 *.log
 /tdata
 /.idea

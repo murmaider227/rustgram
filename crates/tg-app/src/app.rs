@@ -119,15 +119,51 @@ impl TgforkApp {
         working_dir: PathBuf,
         data_name: String,
     ) -> Self {
-        let mut live_host = crate::live::LiveAppHost::bootstrap(
-            Some(cc.egui_ctx.clone()),
-            settings.clone(),
-            settings_path.clone(),
-            working_dir,
-            data_name,
-        );
+        Self::new_live_prefetched(cc, settings, settings_path, working_dir, data_name, None)
+    }
+
+    /// Like [`Self::new_live`], continuing a [`crate::live::LiveBootstrapPrefetch`] that opened
+    /// `tdata` and started the MTProto sessions while the window was being created.
+    #[must_use]
+    pub fn new_live_prefetched(
+        cc: &eframe::CreationContext<'_>,
+        settings: ShellSettings,
+        settings_path: PathBuf,
+        working_dir: PathBuf,
+        data_name: String,
+        prefetch: Option<crate::live::LiveBootstrapPrefetch>,
+    ) -> Self {
+        crate::startup::profiler::mark("new_live_enter");
+        // The shell parts below need no network, so they are built while the prefetch thread is
+        // still connecting; joining it comes last.
+        let mock = MockSession::new(false);
+        crate::startup::profiler::mark("new_live_after_mock_session");
+        let mut app = Self::with_session(cc, mock, settings.clone(), settings_path.clone());
+        let egui_ctx = Some(cc.egui_ctx.clone());
+        let mut live_host = match prefetch {
+            Some(prefetch) => crate::live::LiveAppHost::bootstrap_prefetched(
+                egui_ctx,
+                settings.clone(),
+                settings_path.clone(),
+                working_dir,
+                data_name,
+                prefetch,
+            ),
+            None => crate::live::LiveAppHost::bootstrap(
+                egui_ctx,
+                settings.clone(),
+                settings_path.clone(),
+                working_dir,
+                data_name,
+            ),
+        };
+        crate::startup::profiler::mark("new_live_after_bootstrap");
         live_host.set_window_hwnd(crate::live::passkeys::win32_hwnd_from_window_handle(cc));
-        let mut app = Self::with_session(cc, MockSession::new(false), settings, settings_path);
+        // Keep the egui style the shell controller applied last, as when it was built after the
+        // live host.
+        app.controller
+            .theme_manager_mut()
+            .apply_to_egui(&cc.egui_ctx);
         app.live_host = Some(live_host);
         app
     }
@@ -373,6 +409,7 @@ impl TgforkApp {
 
 impl eframe::App for TgforkApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let _first_frame_marks = crate::startup::profiler::FrameMarks::begin();
         let ctx = ui.ctx().clone();
         let hwnd = extract_eframe_hwnd(frame);
         let has_crash_recovery = self
@@ -512,9 +549,18 @@ impl eframe::App for TgforkApp {
         if self.controller.take_open_recent_calls_request() {
             self.calls_host.open_recent_calls();
         }
+        if let Some((peer_id, video)) = self.controller.take_start_call_request() {
+            self.calls_host.start_outgoing_call(peer_id, video);
+        }
         self.controller.dispatch_demo_overlay_requests(&ctx);
 
         self.dispatch_webview_requests();
+        let locked = self.controller.root_screen() == RootScreen::PasscodeLock;
+        self.webview_host.set_passcode_locked(locked);
+        if locked {
+            close_demo_overlays_for_passcode_lock(&ctx);
+            self.stories.close_for_passcode_lock();
+        }
 
         self.notify_tray
             .set_active_peer(self.controller.active_focused_peer());
@@ -529,6 +575,9 @@ impl eframe::App for TgforkApp {
             .update_and_render(&ctx, self.controller.theme_mode());
         for ev in self.webview_host.take_events() {
             self.controller.handle_webview_event(ev, &ctx);
+        }
+        if locked {
+            return;
         }
         crate::statistics::AppStatisticsHost::update_and_render(
             &ctx,
@@ -567,6 +616,9 @@ impl eframe::App for TgforkApp {
         );
         self.stories
             .update_and_render(&ctx, &self.controller.palette());
+        if self.stories.take_update_app_request() {
+            self.controller.request_update_check();
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -589,6 +641,17 @@ impl eframe::App for TgforkApp {
             drop(startup.single_instance_guard);
         }
     }
+}
+
+/// Closes every demo overlay that could show account content over the passcode lock
+/// (`Application::closeAdditionalWindows`, `application.cpp`): Statistics, Business, Theme
+/// Studio, Payments and the wallet.
+pub fn close_demo_overlays_for_passcode_lock(ctx: &egui::Context) {
+    crate::statistics::AppStatisticsHost::close(ctx);
+    crate::business::AppBusinessHost::close(ctx);
+    crate::themes::AppThemesHost::close(ctx);
+    crate::payments::AppPaymentsHost::close(ctx);
+    crate::wallet::AppWalletHost::close(ctx);
 }
 
 fn build_notify_settings_store() -> NotifySettingsStore {
@@ -625,6 +688,25 @@ fn build_notify_settings_store() -> NotifySettingsStore {
     store
 }
 
+/// Live-mode working directory and `tdata` key (`-key`, default `data`).
+fn live_working_dir_and_key(startup: Option<&StartupContext>) -> (PathBuf, String) {
+    startup
+        .map(|s| {
+            let key = if s.plan.parsed_args.key.is_empty() {
+                "data".to_owned()
+            } else {
+                s.plan.parsed_args.key.clone()
+            };
+            (s.plan.resolved_working_dir.path.clone(), key)
+        })
+        .unwrap_or_else(|| {
+            (
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                "data".to_owned(),
+            )
+        })
+}
+
 /// Launches the native Windows desktop window titled `"Rustgram"`.
 pub fn run_app(mut config: AppConfig) -> anyhow::Result<()> {
     let startup = config.startup.take();
@@ -632,6 +714,7 @@ pub fn run_app(mut config: AppConfig) -> anyhow::Result<()> {
         .settings_path
         .unwrap_or_else(ShellSettings::default_path);
     let mut settings = ShellSettings::load_from(&settings_path);
+    crate::startup::profiler::mark("settings_load");
     if let Some(override_frame) = config.native_window_frame {
         settings.native_window_frame = override_frame;
     }
@@ -646,9 +729,11 @@ pub fn run_app(mut config: AppConfig) -> anyhow::Result<()> {
     let initial_native_frame = config
         .native_window_frame
         .unwrap_or(settings.native_window_frame);
+    let icon = load_window_icon();
+    crate::startup::profiler::mark("load_window_icon");
     let mut viewport = apply_initial_viewport_frame(
         ViewportBuilder::default()
-            .with_icon(load_window_icon())
+            .with_icon(icon)
             .with_min_inner_size(Vec2::new(WINDOW_MIN_WIDTH as f32, WINDOW_MIN_HEIGHT as f32)),
         initial_native_frame,
         has_crash_recovery,
@@ -672,35 +757,42 @@ pub fn run_app(mut config: AppConfig) -> anyhow::Result<()> {
         }
     }
 
-    let native_options = eframe::NativeOptions {
+    let mut native_options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
+    // eframe's default features also compile in wgpu, and with both renderers available eframe
+    // picks wgpu, which here cost ~370 MiB of private bytes (driver probing of every adapter and
+    // pre-allocated memory blocks) and ~0.5 s before the first frame. `RUSTGRAM_RENDERER=wgpu`
+    // switches back, e.g. for a machine without a usable OpenGL driver.
+    if std::env::var("RUSTGRAM_RENDERER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("wgpu")) {
+        native_options.renderer = eframe::Renderer::Wgpu;
+    }
 
     let start_signed_in = config.start_signed_in;
     let live_mode = config.live_mode;
+    let live_target = live_mode.then(|| live_working_dir_and_key(startup.as_ref()));
+    // Opening `tdata` and starting the MTProto sessions does not need the window, so it runs
+    // while eframe creates the window and the GL context.
+    let live_prefetch = live_target.as_ref().and_then(|(working_dir, data_name)| {
+        crate::live::LiveBootstrapPrefetch::spawn(working_dir.clone(), data_name.clone())
+    });
+    crate::startup::profiler::mark("before_eframe_run_native");
     eframe::run_native(
         "Rustgram",
         native_options,
         Box::new(move |cc| {
-            let mut app = if live_mode {
-                let (working_dir, data_name) = startup
-                    .as_ref()
-                    .map(|s| {
-                        let key = if s.plan.parsed_args.key.is_empty() {
-                            "data".to_owned()
-                        } else {
-                            s.plan.parsed_args.key.clone()
-                        };
-                        (s.plan.resolved_working_dir.path.clone(), key)
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                            "data".to_owned(),
-                        )
-                    });
-                TgforkApp::new_live(cc, settings, settings_path, working_dir, data_name)
+            crate::startup::profiler::mark("creator_cb_enter");
+            let mut app = if let Some((working_dir, data_name)) = live_target {
+                TgforkApp::new_live_prefetched(
+                    cc,
+                    settings,
+                    settings_path,
+                    working_dir,
+                    data_name,
+                    live_prefetch,
+                )
             } else {
                 let mock_session = MockSession::new(start_signed_in);
                 TgforkApp::with_session(cc, mock_session, settings, settings_path)
@@ -708,6 +800,7 @@ pub fn run_app(mut config: AppConfig) -> anyhow::Result<()> {
             if let Some(startup_ctx) = startup {
                 app = app.with_startup(&cc.egui_ctx, startup_ctx, start_in_tray);
             }
+            crate::startup::profiler::mark("creator_cb_return");
             Ok(Box::new(app))
         }),
     )

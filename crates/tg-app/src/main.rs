@@ -6,6 +6,11 @@
 //!
 //! Port origin: `Telegram/SourceFiles/main.cpp`.
 
+#[global_allocator]
+static GLOBAL_ALLOC: tg_app::startup::profiler::ProfilingAllocator =
+    tg_app::startup::profiler::ProfilingAllocator;
+
 fn main() -> anyhow::Result<()> {
+    tg_app::startup::profiler::init_from_env();
     tg_app::startup::run_from_cli()
 }

@@ -609,7 +609,7 @@ fn wallet_live_sign_data_requires_confirmation_and_verifies_signatures() {
 
     // User presses Sign -> signs with tg_wallet::tonconnect::sign_ton_connect_data & replies.
     let result = backend
-        .approve_ton_connect_sign_data()
+        .approve_ton_connect_sign_data(&pending.request.request_id, &pending.content_hash())
         .expect("approve text signData");
     assert!(backend.pending_sign_data().is_none());
     assert_eq!(result.address, addr.to_raw());
@@ -648,9 +648,13 @@ fn wallet_live_sign_data_requires_confirmation_and_verifies_signatures() {
         message: dapp_session.encrypt_message(cell_req.as_bytes()).unwrap(),
     });
     assert_eq!(backend.poll_ton_connect_events().unwrap(), 1);
-    assert_eq!(backend.pending_sign_data().unwrap().request.kind, "cell");
+    let pending_cell = backend.pending_sign_data().unwrap();
+    assert_eq!(pending_cell.request.kind, "cell");
     let cell_sig = backend
-        .approve_ton_connect_sign_data()
+        .approve_ton_connect_sign_data(
+            &pending_cell.request.request_id,
+            &pending_cell.content_hash(),
+        )
         .expect("approve cell signData");
     assert!(verify_ton_connect_data(&pubkey, &cell_sig).is_ok());
 

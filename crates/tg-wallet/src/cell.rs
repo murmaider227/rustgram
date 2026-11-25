@@ -15,9 +15,21 @@ use crate::address::TonAddress;
 pub const MAX_CELL_BITS: usize = 1023;
 /// Maximum number of child references in a single TVM cell.
 pub const MAX_CELL_REFS: usize = 4;
+/// Maximum allowed depth of a TVM cell subtree (TON TVM spec `max_depth = 1024`).
+pub const MAX_CELL_DEPTH: u16 = 1024;
+
+/// Precomputed canonical SHA-256 hash of an empty cell (`SHA-256([0x00, 0x00])`).
+const EMPTY_CELL_HASH: [u8; 32] = [
+    0x96, 0xa2, 0x96, 0xd2, 0x24, 0xf2, 0x85, 0xc6, 0x7b, 0xee, 0x93, 0xc3, 0x0f, 0x8a, 0x30, 0x91,
+    0x57, 0xf0, 0xda, 0xa3, 0x5d, 0xc5, 0xb8, 0x7e, 0x41, 0x0b, 0x78, 0x63, 0x0a, 0x09, 0xcf, 0xc7,
+];
 
 /// An immutable TVM cell containing up to 1023 bits and up to 4 references.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Representation hash, subtree depth, and level mask are computed once at construction time
+/// (children first) so DAGs with shared child references cannot trigger exponential traversal or
+/// stack overflow.
+#[derive(Debug, Clone)]
 pub struct Cell {
     /// Bit data packed MSB-first (unused trailing bits in the last byte are zeroed).
     data: Vec<u8>,
@@ -27,6 +39,40 @@ pub struct Cell {
     refs: Vec<Arc<Cell>>,
     /// Whether this cell is an exotic cell (pruned branch, library, merkle proof/update).
     exotic: bool,
+    /// Precomputed TVM level mask.
+    level_mask: u8,
+    /// Precomputed subtree depth (`0..=MAX_CELL_DEPTH`).
+    depth: u16,
+    /// Precomputed canonical 256-bit TVM representation hash (`SHA-256`).
+    hash: [u8; 32],
+}
+
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && self.depth == other.depth
+            && self.level_mask == other.level_mask
+            && self.bit_len == other.bit_len
+            && self.exotic == other.exotic
+            && self.data == other.data
+    }
+}
+
+impl Eq for Cell {}
+
+impl Drop for Cell {
+    fn drop(&mut self) {
+        if self.refs.is_empty() {
+            return;
+        }
+        // Iterative drop prevents stack overflow when freeing deep cell chains.
+        let mut stack: Vec<Arc<Cell>> = std::mem::take(&mut self.refs);
+        while let Some(arc) = stack.pop() {
+            if let Ok(mut cell) = Arc::try_unwrap(arc) {
+                stack.append(&mut cell.refs);
+            }
+        }
+    }
 }
 
 impl Cell {
@@ -38,10 +84,16 @@ impl Cell {
             bit_len: 0,
             refs: Vec::new(),
             exotic: false,
+            level_mask: 0,
+            depth: 0,
+            hash: EMPTY_CELL_HASH,
         }
     }
 
     /// Creates a validated cell from raw MSB-packed bytes, bit count, references, and exotic flag.
+    ///
+    /// Computes `depth`, `level_mask`, and `hash` once from the already-constructed children and
+    /// rejects any cell whose depth would exceed [`MAX_CELL_DEPTH`].
     pub fn new(
         mut data: Vec<u8>,
         bit_len: usize,
@@ -74,11 +126,64 @@ impl Cell {
             let mask = !((1_u8 << (8 - rem)) - 1);
             *last &= mask;
         }
+
+        let mut depth = 0_u16;
+        for child in &refs {
+            let next_depth = child
+                .depth
+                .checked_add(1)
+                .ok_or_else(|| WalletError::Cell(format!("cell depth exceeds {MAX_CELL_DEPTH}")))?;
+            if next_depth > MAX_CELL_DEPTH {
+                return Err(WalletError::Cell(format!(
+                    "cell depth {next_depth} exceeds {MAX_CELL_DEPTH}"
+                )));
+            }
+            if next_depth > depth {
+                depth = next_depth;
+            }
+        }
+
+        let level_mask = if exotic {
+            // For pruned branch (type 1), level mask is stored in byte 1; otherwise 0.
+            if bit_len >= 16 && data.first().copied() == Some(1) {
+                data[1]
+            } else {
+                0
+            }
+        } else {
+            refs.iter().fold(0_u8, |acc, r| acc | r.level_mask)
+        };
+
+        let d1 = (refs.len() as u8) | (u8::from(exotic) << 3) | (level_mask << 5);
+        let d2 = ((bit_len / 8) + bit_len.div_ceil(8)) as u8;
+
+        let mut hasher = Sha256::new();
+        hasher.update([d1, d2]);
+        if rem != 0 && !data.is_empty() {
+            hasher.update(&data[..data.len() - 1]);
+            let last = data[data.len() - 1] | (1_u8 << (7 - rem));
+            hasher.update([last]);
+        } else {
+            hasher.update(&data);
+        }
+        for child in &refs {
+            hasher.update(child.depth.to_be_bytes());
+        }
+        for child in &refs {
+            hasher.update(child.hash);
+        }
+        let digest = hasher.finalize();
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&digest);
+
         Ok(Self {
             data,
             bit_len,
             refs,
             exotic,
+            level_mask,
+            depth,
+            hash,
         })
     }
 
@@ -108,21 +213,14 @@ impl Cell {
 
     /// Level mask of an ordinary cell (bitwise OR of child level masks; `0` for standard cells).
     #[must_use]
-    pub fn level_mask(&self) -> u8 {
-        if self.exotic {
-            // For pruned branch (type 1), level mask is stored in byte 1; otherwise 0.
-            if self.bit_len >= 16 && self.data.first().copied() == Some(1) {
-                return self.data[1];
-            }
-            return 0;
-        }
-        self.refs.iter().fold(0_u8, |acc, r| acc | r.level_mask())
+    pub const fn level_mask(&self) -> u8 {
+        self.level_mask
     }
 
     /// First descriptor byte `d1 = refs_count + 8 * is_exotic + 32 * level_mask`.
     #[must_use]
     pub fn d1(&self) -> u8 {
-        (self.refs.len() as u8) | (u8::from(self.exotic) << 3) | (self.level_mask() << 5)
+        (self.refs.len() as u8) | (u8::from(self.exotic) << 3) | (self.level_mask << 5)
     }
 
     /// Second descriptor byte `d2 = floor(bit_len / 8) + ceil(bit_len / 8)`.
@@ -149,30 +247,14 @@ impl Cell {
 
     /// Maximum depth of the cell subtree (`0` for a leaf cell, `1 + max(child.depth())` otherwise).
     #[must_use]
-    pub fn depth(&self) -> u16 {
-        self.refs
-            .iter()
-            .map(|r| r.depth().saturating_add(1))
-            .max()
-            .unwrap_or(0)
+    pub const fn depth(&self) -> u16 {
+        self.depth
     }
 
-    /// Computes the canonical 256-bit TVM representation hash (`SHA-256`) of this cell.
+    /// Returns the precomputed canonical 256-bit TVM representation hash (`SHA-256`) of this cell.
     #[must_use]
-    pub fn hash(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update([self.d1(), self.d2()]);
-        hasher.update(self.padded_data());
-        for child in &self.refs {
-            hasher.update(child.depth().to_be_bytes());
-        }
-        for child in &self.refs {
-            hasher.update(child.hash());
-        }
-        let digest = hasher.finalize();
-        let mut out = [0_u8; 32];
-        out.copy_from_slice(&digest);
-        out
+    pub const fn hash(&self) -> [u8; 32] {
+        self.hash
     }
 
     /// Opens a [`CellSlice`] cursor at bit 0, ref 0 for reading this cell.
@@ -550,5 +632,27 @@ mod tests {
         assert_eq!(s.load_ref().unwrap().bit_len(), 0);
         assert_eq!(s.remaining_bits(), 0);
         assert_eq!(s.remaining_refs(), 0);
+    }
+
+    #[test]
+    fn sec2c_w1_cell_rejects_depth_over_1024_without_stack_overflow() {
+        let mut cur = Arc::new(Cell::empty());
+        for expected_depth in 1..=MAX_CELL_DEPTH {
+            let mut b = CellBuilder::new();
+            b.store_ref(Arc::clone(&cur)).unwrap();
+            let next = b.end_cell().expect("depth <= 1024 must succeed");
+            assert_eq!(next.depth(), expected_depth);
+            cur = Arc::new(next);
+        }
+        // Depth 1025 must be rejected cleanly without recursing.
+        let mut over = CellBuilder::new();
+        over.store_ref(cur).unwrap();
+        let err = over
+            .end_cell()
+            .expect_err("depth 1025 must exceed MAX_CELL_DEPTH");
+        assert!(
+            err.to_string().contains("depth"),
+            "unexpected error for depth overflow: {err}"
+        );
     }
 }

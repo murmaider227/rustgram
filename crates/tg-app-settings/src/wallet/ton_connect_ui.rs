@@ -24,6 +24,10 @@ pub struct TonConnectUiState {
     pub link_input: String,
     /// Last validation or signing error message.
     pub error: Option<String>,
+    /// `(request_id, content_hash)` of the `sendTransaction` request last rendered to the user.
+    pub shown_tx_target: Option<(String, String)>,
+    /// `(request_id, content_hash)` of the `signData` request last rendered to the user.
+    pub shown_sign_data_target: Option<(String, String)>,
 }
 
 /// Outcome returned by [`render_ton_connect`].
@@ -259,6 +263,8 @@ pub fn render_ton_connect(
                     &mut outcome,
                 );
                 ui.add_space(10.0);
+            } else {
+                state.shown_tx_target = None;
             }
 
             // 3. Pending SignData Confirmation Box (`wallet_ton_connect_request_box.cpp:737-900`).
@@ -272,6 +278,8 @@ pub fn render_ton_connect(
                     &mut outcome,
                 );
                 ui.add_space(10.0);
+            } else {
+                state.shown_sign_data_target = None;
             }
 
             // 4. Connect a new dApp via tc:// link.
@@ -511,6 +519,15 @@ fn render_pending_tx_box(
             );
 
             ui.add_space(10.0);
+            let current_target = (
+                pending_tx.request.request_id.clone(),
+                pending_tx.content_hash(),
+            );
+            let target_for_click = state
+                .shown_tx_target
+                .clone()
+                .unwrap_or_else(|| current_target.clone());
+            state.shown_tx_target = Some(current_target);
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add(
@@ -526,9 +543,10 @@ fn render_pending_tx_box(
                     )
                     .clicked()
                 {
-                    match backend.approve_ton_connect_tx() {
+                    match backend.approve_ton_connect_tx(&target_for_click.0, &target_for_click.1) {
                         Ok(receipt) => {
                             state.error = None;
+                            state.shown_tx_target = None;
                             *outcome = TonConnectOutcome::Toast(format!(
                                 "Signed tx {}",
                                 &receipt.message_hash_hex[..12.min(receipt.message_hash_hex.len())]
@@ -542,6 +560,7 @@ fn render_pending_tx_box(
                     .clicked()
                 {
                     backend.decline_ton_connect_tx();
+                    state.shown_tx_target = None;
                     *outcome = TonConnectOutcome::Toast("Transaction declined".to_owned());
                 }
             });
@@ -912,6 +931,12 @@ fn render_pending_sign_data_box(
                 });
 
             ui.add_space(10.0);
+            let current_target = (pending.request.request_id.clone(), pending.content_hash());
+            let target_for_click = state
+                .shown_sign_data_target
+                .clone()
+                .unwrap_or_else(|| current_target.clone());
+            state.shown_sign_data_target = Some(current_target);
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add(
@@ -927,9 +952,12 @@ fn render_pending_sign_data_box(
                     )
                     .clicked()
                 {
-                    match backend.approve_ton_connect_sign_data() {
+                    match backend
+                        .approve_ton_connect_sign_data(&target_for_click.0, &target_for_click.1)
+                    {
                         Ok(res) => {
                             state.error = None;
+                            state.shown_sign_data_target = None;
                             *outcome = TonConnectOutcome::Toast(format!(
                                 "{} ({})",
                                 tr::lng_wallet_connect_sign_done(),
@@ -944,6 +972,7 @@ fn render_pending_sign_data_box(
                     .clicked()
                 {
                     backend.decline_ton_connect_sign_data();
+                    state.shown_sign_data_target = None;
                     *outcome = TonConnectOutcome::Toast("Sign data request declined".to_owned());
                 }
                 if ui

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tg_crypto::{AuthKey, Side, decrypt_message_v2, encrypt_data_v2};
 use tg_tl::mtproto::{CoreMessage, GzipPacked, MsgContainer, types as mtp_types};
 use tg_tl::{
-    Boxed, Deserializable, Identifiable, RawObject, Serializable, enums as tl_enums,
+    Boxed, Cursor, Deserializable, Identifiable, RawObject, Serializable, enums as tl_enums,
     functions as tl_functions, types as tl_types,
 };
 
@@ -23,10 +23,104 @@ pub const MAX_MESSAGE_LENGTH: usize = 16 * 1024 * 1024;
 pub const MAX_UNPACKED_MESSAGE_LENGTH: usize = 32 * 1024 * 1024;
 /// Maximum nested `gzip_packed` recursion depth (`kMaxGzipNesting = 64`).
 pub const MAX_GZIP_NESTING: usize = 64;
+/// Maximum combined nesting depth across `msg_container` and `gzip_packed` wrappers.
+pub const MAX_RECEIVE_NESTING: usize = MAX_GZIP_NESTING;
+/// Maximum cumulative inner messages accepted from one incoming MTProto packet across
+/// all nested `msg_container` and `gzip_packed` layers.
+pub const MAX_RECEIVE_MESSAGES: usize = 4_096;
+/// Maximum cumulative allocated/unpacked bytes across all `msg_container` and `gzip_packed`
+/// layers within one incoming MTProto packet.
+pub const MAX_RECEIVE_ALLOC_BYTES: usize = MAX_UNPACKED_MESSAGE_LENGTH;
 /// Container split threshold in bytes (`kCutContainerOnSize = 16 * 1024` ints = 64 KiB).
 pub const CUT_CONTAINER_ON_BYTES: usize = 16 * 1024 * 4;
 /// Minimum outgoing request body size before attempting `gzip_packed` compression.
 pub const GZIP_COMPRESS_THRESHOLD: usize = 512;
+
+/// Shared nesting-depth, message-count, and allocation budget enforced across
+/// `msg_container` and `gzip_packed` unpacking for a single incoming MTProto packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveBudget {
+    depth: usize,
+    max_depth: usize,
+    messages_remaining: usize,
+    bytes_remaining: usize,
+}
+
+impl ReceiveBudget {
+    /// Creates a new [`ReceiveBudget`] with explicit depth, message-count, and byte limits.
+    pub const fn new(max_depth: usize, max_messages: usize, max_bytes: usize) -> Self {
+        Self {
+            depth: 0,
+            max_depth,
+            messages_remaining: max_messages,
+            bytes_remaining: max_bytes,
+        }
+    }
+
+    /// Returns the current combined container/gzip nesting depth.
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Returns the remaining inner message count budget.
+    pub const fn messages_remaining(&self) -> usize {
+        self.messages_remaining
+    }
+
+    /// Returns the remaining allocation/decompression byte budget.
+    pub const fn bytes_remaining(&self) -> usize {
+        self.bytes_remaining
+    }
+
+    /// Enters one level of container or gzip nesting, failing if `max_depth` is reached.
+    pub fn enter_nesting(&mut self) -> Result<(), InvocationError> {
+        if self.depth >= self.max_depth {
+            return Err(InvocationError::Protocol(format!(
+                "receive nesting exceeds {}",
+                self.max_depth
+            )));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// Leaves one level of container or gzip nesting.
+    pub fn leave_nesting(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// Charges `count` messages against the shared receive message-count budget.
+    pub fn charge_messages(&mut self, count: usize) -> Result<(), InvocationError> {
+        if count > self.messages_remaining {
+            return Err(InvocationError::Protocol(
+                "receive message count budget exhausted".to_string(),
+            ));
+        }
+        self.messages_remaining -= count;
+        Ok(())
+    }
+
+    /// Charges `bytes` against the shared receive allocation/decompression byte budget.
+    pub fn charge_bytes(&mut self, bytes: usize) -> Result<(), InvocationError> {
+        if bytes > self.bytes_remaining {
+            return Err(InvocationError::Protocol(
+                "receive allocation budget exhausted".to_string(),
+            ));
+        }
+        self.bytes_remaining -= bytes;
+        Ok(())
+    }
+}
+
+impl Default for ReceiveBudget {
+    fn default() -> Self {
+        Self::new(
+            MAX_RECEIVE_NESTING,
+            MAX_RECEIVE_MESSAGES,
+            MAX_RECEIVE_ALLOC_BYTES,
+        )
+    }
+}
 
 /// Unique client-side request identifier (`mtpRequestId`).
 pub type RequestId = u64;
@@ -197,18 +291,62 @@ pub fn pack_container(messages: Vec<CoreMessage>) -> Vec<u8> {
 }
 
 /// Unpacks a `msg_container#73f1f8dc` body into its inner [`CoreMessage`]s, validating
-/// MTProto 4-byte message alignment.
+/// MTProto 4-byte message alignment and enforcing the default [`ReceiveBudget`].
 pub fn unpack_container(body: &[u8]) -> Result<Vec<CoreMessage>, InvocationError> {
-    let container = Boxed::<MsgContainer>::from_bytes(body)?.0;
-    for msg in &container.messages {
-        let len = msg.body.0.len();
-        if len < 4 || (len & 0x03) != 0 {
+    let mut budget = ReceiveBudget::default();
+    unpack_container_with_budget(body, &mut budget)
+}
+
+/// Unpacks a `msg_container#73f1f8dc` body into its inner [`CoreMessage`]s while charging
+/// message count and allocation bytes against the shared `budget` before allocating.
+pub fn unpack_container_with_budget(
+    body: &[u8],
+    budget: &mut ReceiveBudget,
+) -> Result<Vec<CoreMessage>, InvocationError> {
+    let mut cursor = Cursor::new(body);
+    let ctor = cursor.read_u32()?;
+    if ctor != MsgContainer::CONSTRUCTOR_ID {
+        return Err(InvocationError::Protocol(format!(
+            "expected msg_container constructor 0x{:08x}, got 0x{ctor:08x}",
+            MsgContainer::CONSTRUCTOR_ID
+        )));
+    }
+    let count = cursor.read_i32()?;
+    if count < 0 {
+        return Err(InvocationError::Protocol(format!(
+            "negative msg_container message count {count}"
+        )));
+    }
+    let count_usize = count as usize;
+    // Charge message count before allocating or iterating so container bombs fail fast.
+    budget.charge_messages(count_usize)?;
+
+    let per_msg_overhead = core::mem::size_of::<CoreMessage>();
+    let prealloc = count_usize
+        .min(cursor.remaining() / 20)
+        .min(budget.bytes_remaining() / per_msg_overhead.max(1))
+        .min(1024);
+    let mut messages = Vec::with_capacity(prealloc);
+
+    for _ in 0..count_usize {
+        let msg_id = cursor.read_i64()?;
+        let seqno = cursor.read_i32()?;
+        let bytes = cursor.read_i32()?;
+        if bytes < 4 || (bytes & 0x03) != 0 {
             return Err(InvocationError::Protocol(format!(
-                "invalid inner message length {len} in msg_container"
+                "invalid inner message length {bytes} in msg_container"
             )));
         }
+        let len = bytes as usize;
+        let payload = cursor.read_slice(len)?;
+        budget.charge_bytes(len.saturating_add(per_msg_overhead))?;
+        messages.push(CoreMessage {
+            msg_id,
+            seqno,
+            body: RawObject(payload.to_vec()),
+        });
     }
-    Ok(container.messages)
+    Ok(messages)
 }
 
 /// Compresses `body` into `gzip_packed#3072cfa1` if `body.len() >= GZIP_COMPRESS_THRESHOLD`
@@ -253,21 +391,51 @@ pub fn unwrap_gzip_layers(
     budget: &mut usize,
     depth: usize,
 ) -> Result<Vec<u8>, InvocationError> {
+    let remaining_depth = MAX_GZIP_NESTING.saturating_sub(depth);
+    let mut shared = ReceiveBudget::new(remaining_depth, MAX_RECEIVE_MESSAGES, *budget);
+    let result = unwrap_gzip_layers_with_budget(body, &mut shared);
+    *budget = shared.bytes_remaining();
+    result
+}
+
+/// Unwraps one or more nested `gzip_packed` layers using the shared [`ReceiveBudget`] for
+/// combined depth and allocation accounting.
+pub fn unwrap_gzip_layers_with_budget(
+    body: &[u8],
+    budget: &mut ReceiveBudget,
+) -> Result<Vec<u8>, InvocationError> {
     let mut current = body.to_vec();
-    let mut cur_depth = depth;
+    let mut layers = 0usize;
     while current.len() >= 4
         && u32::from_le_bytes([current[0], current[1], current[2], current[3]])
             == GzipPacked::CONSTRUCTOR_ID
     {
-        if cur_depth >= MAX_GZIP_NESTING {
-            return Err(InvocationError::Protocol(format!(
-                "gzip nesting exceeds {MAX_GZIP_NESTING}"
-            )));
+        if let Err(e) = budget.enter_nesting() {
+            for _ in 0..layers {
+                budget.leave_nesting();
+            }
+            return Err(e);
         }
-        let unpacked = gzip_unpack(&current, *budget)?;
-        *budget = budget.saturating_sub(unpacked.len());
+        layers += 1;
+        let unpacked = match gzip_unpack(&current, budget.bytes_remaining()) {
+            Ok(u) => u,
+            Err(e) => {
+                for _ in 0..layers {
+                    budget.leave_nesting();
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = budget.charge_bytes(unpacked.len()) {
+            for _ in 0..layers {
+                budget.leave_nesting();
+            }
+            return Err(e);
+        }
         current = unpacked;
-        cur_depth += 1;
+    }
+    for _ in 0..layers {
+        budget.leave_nesting();
     }
     Ok(current)
 }

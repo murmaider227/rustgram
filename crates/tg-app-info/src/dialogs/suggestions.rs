@@ -10,13 +10,16 @@
 
 use std::collections::BTreeSet;
 
-use egui::{Align2, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, CornerRadius, CursorIcon, Key, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use tg_history::elide_text_right;
 use tg_ui::fonts::font_id_from_style;
 use tg_ui::icons::paint_style_icon;
 use tg_ui::tg_style::st;
 use tg_ui::theme::Colors;
+use tg_ui::userpic::userpic_colors;
 
-use crate::dialogs::layout::DialogColors;
+use crate::dialogs::layout::{DialogColors, measure_text_i32};
+use tg_app_core::core_types::dto::contacts_extras::ContactBirthdayEntry;
 use tg_app_core::stand_in::theme::Palette;
 use tg_app_core::stand_in::types::PeerId;
 
@@ -24,12 +27,18 @@ pub use tg_app_core::core_types::misc::{
     PromoDataSnapshot, PromoSuggestion, PromoSuggestionKind, SuggestionAction, SuggestionPriority,
 };
 
+/// Server suggestion key for the Today's Birthdays top-bar banner
+/// (`kSugBirthdayContacts` in `suggestion_birthday_contacts.cpp:30`).
+pub const KEY_BIRTHDAY_CONTACTS_TODAY: &str = "BIRTHDAY_CONTACTS_TODAY";
+
 /// Stateful container selecting the active top-bar suggestion and tracking local dismissals.
 #[derive(Debug, Default, Clone)]
 pub struct PromoSuggestionsState {
     items: Vec<PromoSuggestion>,
     dismissed: BTreeSet<String>,
     expires: i32,
+    today_birthdays: Vec<ContactBirthdayEntry>,
+    birthdays_synced: bool,
 }
 
 impl PromoSuggestionsState {
@@ -57,6 +66,87 @@ impl PromoSuggestionsState {
         }
         next.sort_by_key(|s| s.priority);
         self.items = next;
+        if self.birthdays_synced {
+            self.rebuild_birthday_contacts_suggestion();
+        }
+    }
+
+    /// Synchronizes today's contact birthdays from `contacts.getBirthdays`
+    /// (`PromoSuggestions::requestContactBirthdays` + `suggestion_birthday_contacts.cpp`).
+    ///
+    /// Filters `entries` to contacts whose birthday falls on `(today_month, today_day)`.
+    /// When one or more contacts have a birthday today (and the banner was not dismissed),
+    /// populates or enriches the `"BIRTHDAY_CONTACTS_TODAY"` suggestion banner; when none
+    /// match, clears any stale birthday-contacts banner.
+    pub fn sync_contact_birthdays(
+        &mut self,
+        today_month: u8,
+        today_day: u8,
+        entries: Vec<ContactBirthdayEntry>,
+    ) {
+        self.birthdays_synced = true;
+        self.today_birthdays = entries
+            .into_iter()
+            .filter(|entry| {
+                (1..=12).contains(&entry.birthday.month)
+                    && (1..=31).contains(&entry.birthday.day)
+                    && entry.birthday.month == today_month
+                    && entry.birthday.day == today_day
+            })
+            .collect();
+        self.rebuild_birthday_contacts_suggestion();
+    }
+
+    /// Returns contacts whose birthday matches today from the last `contacts.getBirthdays` sync.
+    #[must_use]
+    pub fn today_birthdays(&self) -> &[ContactBirthdayEntry] {
+        &self.today_birthdays
+    }
+
+    fn rebuild_birthday_contacts_suggestion(&mut self) {
+        if self.today_birthdays.is_empty() {
+            self.items.retain(|s| s.key != KEY_BIRTHDAY_CONTACTS_TODAY);
+            return;
+        }
+        if self.dismissed.contains(KEY_BIRTHDAY_CONTACTS_TODAY) {
+            return;
+        }
+        let is_single = self.today_birthdays.len() == 1;
+        let (title, description, peer_id) = if is_single {
+            let first = &self.today_birthdays[0];
+            let short_name = first
+                .display_name
+                .split_whitespace()
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&first.display_name);
+            (
+                strip_bold_markers(
+                    &tg_lang::tr::lng_dialogs_suggestions_birthday_contact_title(short_name),
+                ),
+                tg_lang::tr::lng_dialogs_suggestions_birthday_contact_about(),
+                Some(first.peer_id),
+            )
+        } else {
+            (
+                strip_bold_markers(
+                    &tg_lang::tr::lng_dialogs_suggestions_birthday_contacts_title(
+                        self.today_birthdays.len() as i64,
+                    ),
+                ),
+                tg_lang::tr::lng_dialogs_suggestions_birthday_contacts_about(),
+                None,
+            )
+        };
+        self.push(PromoSuggestion {
+            key: KEY_BIRTHDAY_CONTACTS_TODAY.to_owned(),
+            priority: SuggestionPriority::BirthdayContacts,
+            kind: PromoSuggestionKind::BirthdayContacts,
+            title,
+            description,
+            peer_id,
+            dismissible: true,
+        });
     }
 
     /// Adds a custom/local suggestion (useful for tests or client-side offers).
@@ -222,10 +312,15 @@ pub fn render_top_bar_suggestion(
         colors.color("windowBgRipple")
     };
     ui.painter().rect_filled(card, CornerRadius::same(8), bg);
+    let border_stroke = if body_resp.has_focus() {
+        Stroke::new(1.5, colors.color("windowBgActive"))
+    } else {
+        Stroke::new(1.0, colors.color("shadowFg"))
+    };
     ui.painter().rect_stroke(
         card,
         CornerRadius::same(8),
-        Stroke::new(1.0, colors.color("shadowFg")),
+        border_stroke,
         egui::StrokeKind::Inside,
     );
 
@@ -233,18 +328,65 @@ pub fn render_top_bar_suggestion(
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
 
+    // Leading contact avatar stack for Today's Birthdays (`suggestion_birthday_contacts.cpp:92-134`).
+    let mut text_left = card.left() + 12.0;
+    if active.kind == PromoSuggestionKind::BirthdayContacts && !state.today_birthdays().is_empty() {
+        let count = state.today_birthdays().len().min(3);
+        let dia = 26.0_f32;
+        let step = 16.0_f32;
+        let radius = dia * 0.5;
+        let start_x = card.left() + 10.0 + radius;
+        let center_y = card.center().y;
+        let ring_bg = bg;
+        for (idx, entry) in state.today_birthdays().iter().take(count).enumerate().rev() {
+            let cx = start_x + idx as f32 * step;
+            let center = Pos2::new(cx, center_y);
+            let color_idx = (entry.peer_id.bare() % 7) as u8;
+            let bottom_col = userpic_colors(color_idx, &colors).color2;
+            if count > 1 {
+                ui.painter().circle_filled(center, radius + 1.5, ring_bg);
+            }
+            ui.painter().circle_filled(center, radius, bottom_col);
+            let initial = entry
+                .display_name
+                .chars()
+                .find(|c| c.is_alphanumeric())
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            ui.painter().text(
+                center,
+                Align2::CENTER_CENTER,
+                initial,
+                egui::FontId::proportional(11.5),
+                Color32::WHITE,
+            );
+        }
+        let stack_w = dia + (count.saturating_sub(1)) as f32 * step;
+        text_left = card.left() + 10.0 + stack_w + 8.0;
+    }
+
+    let text_max_w = (body_rect.right() - text_left - 6.0).max(24.0) as i32;
+    let title_font = font_id_from_style(st::semibold_font);
+    let desc_font = font_id_from_style(st::normal_font);
+    let elided_title = elide_text_right(&active.title, text_max_w, |s| {
+        measure_text_i32(ui.painter(), s, title_font.clone())
+    });
+    let elided_desc = elide_text_right(&active.description, text_max_w, |s| {
+        measure_text_i32(ui.painter(), s, desc_font.clone())
+    });
+
     ui.painter().text(
-        Pos2::new(card.left() + 12.0, card.top() + 15.0),
+        Pos2::new(text_left, card.top() + 15.0),
         Align2::LEFT_CENTER,
-        &active.title,
-        font_id_from_style(st::semibold_font),
+        elided_title,
+        title_font,
         colors.color("windowFg"),
     );
     ui.painter().text(
-        Pos2::new(card.left() + 12.0, card.top() + 33.0),
+        Pos2::new(text_left, card.top() + 33.0),
         Align2::LEFT_CENTER,
-        &active.description,
-        font_id_from_style(st::normal_font),
+        elided_desc,
+        desc_font,
         colors.sub_text_fg(),
     );
 
@@ -254,13 +396,15 @@ pub fn render_top_bar_suggestion(
             close_rect,
             st::box_title_close_icon,
             &colors,
-            Some(if close_r.hovered() {
+            Some(if close_r.hovered() || close_r.has_focus() {
                 colors.color("windowFg")
             } else {
                 colors.sub_text_fg()
             }),
         );
-        if close_r.clicked() {
+        let close_kb = close_r.has_focus()
+            && ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Space));
+        if close_r.clicked() || close_kb {
             state.mark_dismissed(&active.key);
             return Some(SuggestionAction::Dismiss {
                 key: active.key,
@@ -269,11 +413,17 @@ pub fn render_top_bar_suggestion(
         }
     }
 
-    if body_resp.clicked() {
+    let body_kb = body_resp.has_focus()
+        && ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Space));
+    if body_resp.clicked() || body_kb {
         return Some(SuggestionAction::Activate(active));
     }
 
     None
+}
+
+fn strip_bold_markers(text: &str) -> String {
+    text.replace("**", "")
 }
 
 #[cfg(test)]

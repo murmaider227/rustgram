@@ -409,7 +409,10 @@ fn deserialize_expr(
     };
 
     if boxed_field {
-        format!("Box::new({inner})")
+        let rust_ty = rust_type_path(ty, def, param_name, index, config);
+        format!(
+            "{{ {buf_var}.charge_alloc(core::mem::size_of::<{rust_ty}>())?; Box::new({inner}) }}"
+        )
     } else {
         inner
     }
@@ -612,13 +615,19 @@ fn emit_type_struct(
     if !has_fields && def.params.is_empty() {
         let _ = writeln!(
             out,
-            "{indent}    fn deserialize(_buf: &mut crate::Cursor<'_>) -> Result<Self, crate::DeserializeError> {{ Ok(Self) }}"
+            "{indent}    fn deserialize(__buf: &mut crate::Cursor<'_>) -> Result<Self, crate::DeserializeError> {{ __buf.charge_elements(1)?; Ok(Self) }}"
         );
     } else {
         let _ = writeln!(
             out,
             "{indent}    fn deserialize(__buf: &mut crate::Cursor<'_>) -> Result<Self, crate::DeserializeError> {{"
         );
+        let _ = writeln!(
+            out,
+            "{indent}        let mut __depth = __buf.enter_depth()?;"
+        );
+        let _ = writeln!(out, "{indent}        let __buf = &mut *__depth;");
+        let _ = writeln!(out, "{indent}        __buf.charge_elements(1)?;");
         emit_deserialize_params(
             def,
             Some(&owner_result),
@@ -797,7 +806,7 @@ fn emit_enum(
         } else {
             let _ = writeln!(
                 out,
-                "{indent}            0x{:08x} => Ok(Self::{variant}),",
+                "{indent}            0x{:08x} => {{ __buf.charge_elements(1)?; Ok(Self::{variant}) }},",
                 ctor.id
             );
         }
@@ -959,6 +968,11 @@ fn emit_function_struct(
         out,
         "{indent}    fn deserialize(__buf: &mut crate::Cursor<'_>) -> Result<Self, crate::DeserializeError> {{"
     );
+    let _ = writeln!(
+        out,
+        "{indent}        let mut __depth = __buf.enter_depth()?;"
+    );
+    let _ = writeln!(out, "{indent}        let __buf = &mut *__depth;");
     let _ = writeln!(out, "{indent}        let __id = __buf.read_u32()?;");
     let _ = writeln!(out, "{indent}        if __id != 0x{:08x} {{", def.id);
     let _ = writeln!(
@@ -966,6 +980,7 @@ fn emit_function_struct(
         "{indent}            return Err(crate::DeserializeError::UnexpectedConstructor {{ id: __id }});"
     );
     let _ = writeln!(out, "{indent}        }}");
+    let _ = writeln!(out, "{indent}        __buf.charge_elements(1)?;");
     if !has_fields && def.params.is_empty() {
         let _ = writeln!(out, "{indent}        Ok(Self)");
     } else {

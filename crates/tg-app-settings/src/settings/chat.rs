@@ -4,9 +4,7 @@
 //! Port origin: `Telegram/SourceFiles/settings/sections/settings_chat.cpp`
 //! and `Telegram/SourceFiles/boxes/background_box.cpp`.
 
-use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2,
-};
+use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use tg_core::settings::{DoubleClickQuickAction, InputSubmitSettings, QuickDialogAction};
 use tg_core::{CoreSettings, GlobalConfig};
 use tg_lang::tr;
@@ -20,15 +18,14 @@ use tg_ui::widgets::buttons::RoundButton;
 use tg_ui::widgets::input_field::InputField;
 
 use super::backend::SettingsBackend;
-use super::scale::render_scale_controls;
 use super::strings;
 use super::theme_bridge::{
-    LiveThemeColors, builtin_backgrounds, core_color_to_theme, theme_color_to_core,
-    theme_color_to_egui, theme_to_core_embedded,
+    LiveThemeColors, core_color_to_theme, theme_color_to_core, theme_color_to_egui,
+    theme_to_core_embedded,
 };
 use super::widgets::{
-    SettingsIconKind, paint_tinted_icon, settings_card, settings_checkbox_row, settings_divider,
-    settings_radio_row, settings_row, settings_row_pad_x, settings_toggle_row, subsection_title,
+    SettingsIconKind, settings_card, settings_checkbox_row, settings_divider, settings_radio_row,
+    settings_row, settings_row_pad_x, settings_toggle_row, subsection_title,
 };
 
 /// Persistent UI state for Chat Settings.
@@ -54,6 +51,8 @@ pub struct ChatSettingsState {
     pub emoji_sets_manager: crate::chat_helpers::EmojiSetsManager,
     /// Whether custom font family editor is expanded.
     pub font_editor_open: bool,
+    /// Whether "Choose from gallery" opened the Chat Background gallery box.
+    pub gallery_open: bool,
 }
 
 impl Default for ChatSettingsState {
@@ -69,6 +68,7 @@ impl Default for ChatSettingsState {
             emoji_sets_open: false,
             emoji_sets_manager: crate::chat_helpers::EmojiSetsManager::default(),
             font_editor_open: false,
+            gallery_open: false,
         }
     }
 }
@@ -80,7 +80,8 @@ pub struct ChatSettingsOutput {
     pub toggled_dark_mode: Option<bool>,
     /// Vertical folders sidebar toggled (sync with shell `folders_sidebar_enabled`).
     pub toggled_folders_sidebar: bool,
-    /// User clicked "Theme Studio / Cloud Wallpapers" (`AppThemesHost::open`).
+    /// User clicked "Choose from gallery": the Chat Background gallery box
+    /// (`AppThemesHost` on [`crate::themes::ThemesTab::Backgrounds`]) was opened.
     pub open_theme_studio: bool,
     /// User clicked the "Keyboard Shortcuts" navigation row.
     pub open_shortcuts: bool,
@@ -88,81 +89,92 @@ pub struct ChatSettingsOutput {
     pub toast: Option<String>,
 }
 
+/// Vertical skip around dividers and titles (`Builder::addSkip`).
+const SECTION_SKIP: f32 = 8.0;
+
 /// Renders the Chat Settings (`settings_chat.cpp`) section.
 #[allow(clippy::too_many_arguments)]
 pub fn render_chat_settings_section(
     ui: &mut Ui,
     state: &mut ChatSettingsState,
     core: &mut CoreSettings,
-    global: &mut GlobalConfig,
+    _global: &mut GlobalConfig,
     live_theme: &mut LiveThemeColors,
     backend: &mut dyn SettingsBackend,
     colors: &dyn Colors,
 ) -> ChatSettingsOutput {
     let mut out = ChatSettingsOutput::default();
     let was_dark = live_theme.is_dark();
+    ui.spacing_mut().item_spacing.y = 0.0;
 
-    // 1. Color Theme selector (`Window::Theme::EmbeddedThemes()`).
+    // 1. Themes (`SetupThemeOptions` / `SetupDefaultThemes` in `settings_chat.cpp`).
+    ui.add_space(SECTION_SKIP);
     subsection_title(ui, &tr::lng_settings_themes(), colors);
+    ui.add_space(st::settings_themes_top_skip.scaled().clamp(4, 10) as f32 - 4.0);
     render_embedded_theme_cards(ui, core, live_theme, colors, &mut out);
-
     ui.add_space(st::settings_themes_bottom_skip.scaled().max(8) as f32);
-    // 2. Accent color swatches (`Window::Theme::DefaultAccentColors`).
-    render_accent_palette(ui, state, core, live_theme, colors, &mut out);
 
+    // 2. Accent colors (`Window::Theme::DefaultAccentColors`) + "System accent color".
+    render_accent_palette(ui, state, core, live_theme, colors, &mut out);
     if live_theme.is_dark() != was_dark {
         out.toggled_dark_mode = Some(live_theme.is_dark());
     }
-
     ui.add_space(6.0);
-    settings_toggle_row(
+    settings_checkbox_row(
         ui,
-        strings::FOLLOW_SYSTEM_DARK_MODE,
-        None,
-        None,
-        &mut core.system_dark_mode_enabled,
-        true,
-        colors,
-    );
-    let sys_accent_lbl = tr::lng_settings_theme_system_accent_color();
-    settings_toggle_row(
-        ui,
-        &sys_accent_lbl,
-        None,
-        None,
         &mut core.system_accent_color_enabled,
+        &tr::lng_settings_theme_system_accent_color(),
         true,
         colors,
     );
-
+    ui.add_space(SECTION_SKIP);
     settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
 
-    // 3. Chat Background picker (`tg-theme::WallPaper`).
-    subsection_title(ui, &tr::lng_settings_section_background(), colors);
-    render_background_picker(ui, state, colors, &mut out);
-    ui.add_space(4.0);
+    // 3. Theme settings (`SetupThemeSettings`): name color, auto-night mode, font family.
+    subsection_title(ui, &tr::lng_settings_theme_settings(), colors);
+    let profile = backend.profile();
+    let name_resp = settings_row(
+        ui,
+        &tr::lng_settings_theme_name_color(),
+        None,
+        None,
+        Some(SettingsIconKind::NameColor),
+        false,
+        false,
+        colors,
+    );
+    paint_name_color_pill(
+        ui,
+        &name_resp,
+        &profile.first_name,
+        profile.photo_color_index,
+        colors,
+    );
+    if name_resp.clicked() {
+        out.toast = Some(tr::lng_settings_theme_name_color());
+    }
+
+    let auto_night_label = if core.system_dark_mode_enabled {
+        tr::lng_settings_auto_night_mode_on()
+    } else {
+        tr::lng_settings_auto_night_mode_off()
+    };
     if settings_row(
         ui,
-        "Theme Studio / Cloud Wallpapers",
-        Some("Edit colors, cloud themes, chat themes & wallpapers"),
+        &tr::lng_settings_auto_night_mode(),
         None,
-        Some(SettingsIconKind::Brush),
+        Some(&auto_night_label),
+        Some(SettingsIconKind::NightMode),
         false,
-        true,
+        false,
         colors,
     )
     .clicked()
     {
-        crate::themes::AppThemesHost::open(ui.ctx(), None);
-        out.open_theme_studio = true;
+        core.system_dark_mode_enabled = !core.system_dark_mode_enabled;
     }
 
-    settings_divider(ui, None, colors);
-
-    // 4. Text Size / Interface Scale & Custom Font.
-    subsection_title(ui, strings::TEXT_SIZE_AND_FONT, colors);
-    render_scale_controls(ui, global, true, colors);
-    ui.add_space(6.0);
     let default_lbl = tr::lng_settings_call_device_default();
     let font_label = if core.custom_font_family.is_empty() {
         default_lbl.clone()
@@ -213,8 +225,54 @@ pub fn render_chat_settings_section(
             .show(ui);
         });
     }
-
+    ui.add_space(SECTION_SKIP);
     settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
+
+    // 4. Chat wallpaper (`SetupChatBackground` / `BackgroundRow`): current wallpaper thumbnail
+    // with "Choose from gallery" / "Choose from file" links.
+    subsection_title(ui, &tr::lng_settings_section_background(), colors);
+    render_background_row(ui, state, colors, &mut out);
+    ui.add_space(SECTION_SKIP);
+    settings_divider(ui, None, colors);
+    ui.add_space(SECTION_SKIP);
+
+    // 5. Chat list quick action (`SetupChatListQuickAction`).
+    let dialog_quick_title = tr::lng_settings_quick_dialog_action_title();
+    let dialog_quick_about = tr::lng_settings_quick_dialog_action_about();
+    subsection_title(ui, &dialog_quick_title, colors);
+    let dialog_quick_val = match core.quick_dialog_action {
+        QuickDialogAction::Mute => tr::lng_settings_quick_dialog_action_mute(),
+        QuickDialogAction::Pin => tr::lng_settings_quick_dialog_action_pin(),
+        QuickDialogAction::Read => tr::lng_settings_quick_dialog_action_read(),
+        QuickDialogAction::Archive => tr::lng_settings_quick_dialog_action_archive(),
+        QuickDialogAction::Delete => tr::lng_settings_quick_dialog_action_delete(),
+        QuickDialogAction::Disabled => tr::lng_settings_quick_dialog_action_disabled(),
+    };
+    if settings_row(
+        ui,
+        &dialog_quick_val,
+        None,
+        None,
+        Some(SettingsIconKind::Folder),
+        false,
+        false,
+        colors,
+    )
+    .clicked()
+    {
+        core.quick_dialog_action = match core.quick_dialog_action {
+            QuickDialogAction::Disabled => QuickDialogAction::Mute,
+            QuickDialogAction::Mute => QuickDialogAction::Pin,
+            QuickDialogAction::Pin => QuickDialogAction::Read,
+            QuickDialogAction::Read => QuickDialogAction::Archive,
+            QuickDialogAction::Archive => QuickDialogAction::Delete,
+            QuickDialogAction::Delete => QuickDialogAction::Disabled,
+        };
+    }
+    ui.add_space(SECTION_SKIP);
+    settings_divider(ui, Some(&dialog_quick_about), colors);
+    ui.add_space(SECTION_SKIP);
 
     // 5. Messages & Layout options.
     subsection_title(ui, strings::MESSAGES_SECTION, colors);
@@ -257,38 +315,6 @@ pub fn render_chat_settings_section(
             DoubleClickQuickAction::Reply => DoubleClickQuickAction::React,
             DoubleClickQuickAction::React => DoubleClickQuickAction::None,
             DoubleClickQuickAction::None => DoubleClickQuickAction::Reply,
-        };
-    }
-
-    let dialog_quick_title = tr::lng_settings_quick_dialog_action_title();
-    let dialog_quick_about = tr::lng_settings_quick_dialog_action_about();
-    let dialog_quick_val = match core.quick_dialog_action {
-        QuickDialogAction::Mute => tr::lng_settings_quick_dialog_action_mute(),
-        QuickDialogAction::Pin => tr::lng_settings_quick_dialog_action_pin(),
-        QuickDialogAction::Read => tr::lng_settings_quick_dialog_action_read(),
-        QuickDialogAction::Archive => tr::lng_settings_quick_dialog_action_archive(),
-        QuickDialogAction::Delete => tr::lng_settings_quick_dialog_action_delete(),
-        QuickDialogAction::Disabled => tr::lng_settings_quick_dialog_action_disabled(),
-    };
-    if settings_row(
-        ui,
-        &dialog_quick_title,
-        Some(&dialog_quick_about),
-        Some(&dialog_quick_val),
-        None,
-        false,
-        false,
-        colors,
-    )
-    .clicked()
-    {
-        core.quick_dialog_action = match core.quick_dialog_action {
-            QuickDialogAction::Disabled => QuickDialogAction::Mute,
-            QuickDialogAction::Mute => QuickDialogAction::Pin,
-            QuickDialogAction::Pin => QuickDialogAction::Read,
-            QuickDialogAction::Read => QuickDialogAction::Archive,
-            QuickDialogAction::Archive => QuickDialogAction::Delete,
-            QuickDialogAction::Delete => QuickDialogAction::Disabled,
         };
     }
 
@@ -615,109 +641,228 @@ fn render_embedded_theme_cards(
     colors: &dyn Colors,
     out: &mut ChatSettingsOutput,
 ) {
+    // `SetupDefaultThemes`: 80x92 previews spread across the row, two 40x14 bubbles at
+    // (6, 8) with a 6 px skip, a radio 12 px above the bottom, the name below (`settingsTheme`).
     let themes = embedded_themes();
     let pad_x = settings_row_pad_x();
-    let preview_sz = st::settings_theme_preview_size;
-    let bubble_r = st::settings_theme_bubble_radius.scaled().clamp(2, 12) as u8;
-    let outline_w = (st::settings_theme_outline_width.scaled() as f32).max(2.0);
-    let gap = st::settings_theme_min_skip.scaled().max(8) as f32;
+    let card_w = 80.0_f32;
+    let preview_h = 92.0_f32;
+    let bubble = Vec2::new(40.0, 14.0);
+    let bubble_r = st::settings_theme_bubble_radius.scaled().clamp(1, 12) as u8;
+    let count = themes.len().max(1) as f32;
+    let full_w = ui.available_width();
+    let avail = (full_w - pad_x * 2.0).max(card_w * count);
+    let gap = ((avail - card_w * count) / (count - 1.0).max(1.0)).max(4.0);
+    let (row, _) = ui.allocate_exact_size(Vec2::new(full_w, preview_h + 26.0), Sense::hover());
 
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
-        let avail = (ui.available_width() - pad_x).max(260.0);
-        let card_w =
-            ((avail - gap * 3.0) / 4.0).clamp(preview_sz.width.scaled().min(64) as f32, 118.0);
-        let preview_h = (preview_sz.height.scaled() as f32).clamp(56.0, 68.0);
-        let card_h = preview_h + 24.0;
-
-        for mut scheme in themes {
-            let core_kind = theme_to_core_embedded(scheme.kind);
-            let custom_accent = core
-                .themes_accent_colors
-                .get(core_kind)
-                .map(core_color_to_theme);
-            if let Some(acc) = custom_accent {
-                let colorizer = colorizer_from(&scheme, acc);
-                colorize_scheme(&mut scheme, &colorizer);
-            }
-
-            let selected = live_theme.kind == scheme.kind;
-            let display_name = localized_theme_name(scheme.kind);
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            }
-            if resp.clicked() {
-                live_theme.update(scheme.kind, custom_accent);
-                out.toast = Some(format!("{}: {display_name}", tr::lng_settings_themes()));
-            }
-
-            // Swatch card background.
-            let bg_rect = Rect::from_min_size(rect.min, Vec2::new(card_w, preview_h));
-            ui.painter().rect_filled(
-                bg_rect,
-                CornerRadius::same(8),
-                theme_color_to_egui(scheme.background),
-            );
-            // Incoming & outgoing mini message bubbles inside preview card.
-            let in_bubble = Rect::from_min_size(
-                Pos2::new(bg_rect.left() + 8.0, bg_rect.top() + 10.0),
-                Vec2::new(card_w * 0.56, 13.0),
-            );
-            let out_bubble = Rect::from_min_size(
-                Pos2::new(bg_rect.right() - 8.0 - card_w * 0.56, bg_rect.top() + 28.0),
-                Vec2::new(card_w * 0.56, 13.0),
-            );
-            ui.painter().rect_filled(
-                in_bubble,
-                CornerRadius::same(bubble_r),
-                theme_color_to_egui(scheme.received),
-            );
-            ui.painter().rect_filled(
-                out_bubble,
-                CornerRadius::same(bubble_r),
-                theme_color_to_egui(scheme.sent),
-            );
-
-            // Selection ring.
-            let border = if selected {
-                Stroke::new(outline_w, colors.color("windowBgActive"))
-            } else {
-                Stroke::new(1.0, colors.color("shadowFg"))
-            };
-            ui.painter()
-                .rect_stroke(bg_rect, CornerRadius::same(8), border, StrokeKind::Inside);
-
-            // Real checkmark badge when selected.
-            if selected {
-                let c = Pos2::new(bg_rect.right() - 11.0, bg_rect.bottom() - 11.0);
-                ui.painter()
-                    .circle_filled(c, 7.5, colors.color("windowBgActive"));
-                paint_tinted_icon(
-                    ui.painter(),
-                    Rect::from_center_size(c, Vec2::splat(10.0)),
-                    st::default_checkbox_icon,
-                    colors,
-                    Some(Color32::WHITE),
-                );
-            }
-
-            // Theme name label underneath.
-            ui.painter().text(
-                Pos2::new(rect.center().x, bg_rect.bottom() + 12.0),
-                Align2::CENTER_CENTER,
-                &display_name,
-                egui::FontId::new(12.0, tg_ui::fonts::family_regular()),
-                if selected {
-                    colors.color("windowActiveTextFg")
-                } else {
-                    colors.color("windowFg")
-                },
-            );
-
-            ui.add_space(gap);
+    for (i, mut scheme) in themes.into_iter().enumerate() {
+        let core_kind = theme_to_core_embedded(scheme.kind);
+        let custom_accent = core
+            .themes_accent_colors
+            .get(core_kind)
+            .map(core_color_to_theme);
+        if let Some(acc) = custom_accent {
+            let colorizer = colorizer_from(&scheme, acc);
+            colorize_scheme(&mut scheme, &colorizer);
         }
-    });
+
+        let selected = live_theme.kind == scheme.kind;
+        let display_name = localized_theme_name(scheme.kind);
+        let left = row.left() + pad_x + i as f32 * (card_w + gap);
+        let rect = Rect::from_min_size(Pos2::new(left, row.top()), Vec2::new(card_w, row.height()));
+        let resp = ui.interact(rect, ui.scope_id().with(("theme_card", i)), Sense::click());
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, &display_name)
+        });
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            live_theme.update(scheme.kind, custom_accent);
+            out.toast = Some(format!("{}: {display_name}", tr::lng_settings_themes()));
+        }
+
+        let preview = Rect::from_min_size(rect.min, Vec2::new(card_w, preview_h));
+        ui.painter().rect_filled(
+            preview,
+            CornerRadius::same(4),
+            theme_color_to_egui(scheme.background),
+        );
+        let in_bubble = Rect::from_min_size(preview.min + Vec2::new(6.0, 8.0), bubble);
+        let out_bubble = Rect::from_min_size(
+            Pos2::new(preview.right() - 6.0 - bubble.x, in_bubble.bottom() + 6.0),
+            bubble,
+        );
+        ui.painter().rect_filled(
+            in_bubble,
+            CornerRadius::same(bubble_r),
+            theme_color_to_egui(scheme.received),
+        );
+        ui.painter().rect_filled(
+            out_bubble,
+            CornerRadius::same(bubble_r),
+            theme_color_to_egui(scheme.sent),
+        );
+
+        // Radio (`st::default_radio`, 9 px) in the scheme's radio colors.
+        let radio_c = Pos2::new(preview.center().x, preview.bottom() - 12.0 - 9.0);
+        let (radio_fg, radio_w) = if selected {
+            (theme_color_to_egui(scheme.radiobutton_active), 2.0)
+        } else {
+            (theme_color_to_egui(scheme.radiobutton_inactive), 1.5)
+        };
+        ui.painter()
+            .circle_stroke(radio_c, 8.0, Stroke::new(radio_w, radio_fg));
+        if selected {
+            ui.painter().circle_filled(radio_c, 4.5, radio_fg);
+        }
+
+        ui.painter().text(
+            Pos2::new(rect.center().x, preview.bottom() + 7.0),
+            Align2::CENTER_TOP,
+            &display_name,
+            font_id_from_style(st::normal_font),
+            if selected {
+                colors.color("windowActiveTextFg")
+            } else {
+                colors.color("windowSubTextFg")
+            },
+        );
+    }
+}
+
+/// Paints the "Your name color" value: the first name in the user's peer color on a tinted pill.
+fn paint_name_color_pill(
+    ui: &Ui,
+    row: &egui::Response,
+    name: &str,
+    color_index: u8,
+    colors: &dyn Colors,
+) {
+    if name.is_empty() {
+        return;
+    }
+    let token = format!("historyPeer{}NameFg", (color_index % 7) + 1);
+    let mut fg = colors.color(&token);
+    if fg.a() == 0 {
+        fg = colors.color("windowActiveTextFg");
+    }
+    let font = font_id_from_style(st::normal_font);
+    let galley = ui.painter().layout_no_wrap(name.to_owned(), font, fg);
+    let pad = 8.0_f32;
+    let pill = Rect::from_min_size(
+        Pos2::new(
+            row.rect.right() - settings_row_pad_x() - galley.size().x - pad * 2.0 + 8.0,
+            row.rect.center().y - 11.0,
+        ),
+        Vec2::new(galley.size().x + pad * 2.0, 22.0),
+    );
+    ui.painter().rect_filled(
+        pill,
+        CornerRadius::same(11),
+        Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 36),
+    );
+    ui.painter().galley(
+        Pos2::new(pill.left() + pad, pill.center().y - galley.size().y * 0.5),
+        galley,
+        fg,
+    );
+}
+
+/// Current wallpaper thumbnail with the "Choose from gallery" / "Choose from file" links
+/// (`BackgroundRow` in `settings_chat.cpp`).
+fn render_background_row(
+    ui: &mut Ui,
+    state: &mut ChatSettingsState,
+    colors: &dyn Colors,
+    out: &mut ChatSettingsOutput,
+) {
+    let pad_x = settings_row_pad_x();
+    let thumb = 76.0_f32;
+    let full_w = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(Vec2::new(full_w, thumb + 8.0), Sense::hover());
+    let thumb_rect = Rect::from_min_size(
+        Pos2::new(row.left() + pad_x, row.top() + 4.0),
+        Vec2::splat(thumb),
+    );
+    {
+        let bg = crate::themes::active_chat_background(ui.ctx());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(thumb_rect));
+        child.set_clip_rect(thumb_rect.intersect(ui.clip_rect()));
+        if let Ok(mut bg) = bg.lock() {
+            bg.paint_thumbnail(&mut child, thumb_rect, 480.0);
+        };
+    }
+
+    let link_x = thumb_rect.right() + 16.0;
+    let link_font = font_id_from_style(st::normal_font);
+    let link_fg = colors.color("windowActiveTextFg");
+    let links = [
+        (tr::lng_settings_bg_from_gallery(), thumb_rect.top() + 12.0),
+        (tr::lng_settings_bg_from_file(), thumb_rect.top() + 45.0),
+    ];
+    for (i, (label, y)) in links.iter().enumerate() {
+        let r = ui.painter().text(
+            Pos2::new(link_x, *y),
+            Align2::LEFT_TOP,
+            label,
+            link_font.clone(),
+            link_fg,
+        );
+        let resp = ui.interact(r, ui.scope_id().with(("bg_link", i)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, label));
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            ui.painter().line_segment(
+                [
+                    Pos2::new(r.left(), r.bottom() - 1.0),
+                    Pos2::new(r.right(), r.bottom() - 1.0),
+                ],
+                Stroke::new(1.0, link_fg),
+            );
+        }
+        if resp.clicked() {
+            if i == 0 {
+                // `controller->show(Box<BackgroundBox>(controller))`.
+                open_background_gallery_box(ui.ctx(), state, out);
+            } else {
+                choose_background_file(ui.ctx(), out);
+            }
+        }
+    }
+}
+
+/// "Choose from gallery": opens the Chat Background gallery box (`BackgroundBox`) instead of
+/// expanding presets inline.
+fn open_background_gallery_box(
+    ctx: &egui::Context,
+    state: &mut ChatSettingsState,
+    out: &mut ChatSettingsOutput,
+) {
+    crate::themes::AppThemesHost::open(ctx, Some(crate::themes::ThemesTab::Backgrounds));
+    state.gallery_open = true;
+    out.open_theme_studio = true;
+}
+
+/// "Choose from file": loads an image and makes it the global chat wallpaper.
+fn choose_background_file(ctx: &egui::Context, out: &mut ChatSettingsOutput) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title(tr::lng_settings_bg_from_file())
+        .add_filter("Images", &["jpg", "jpeg", "png", "webp"])
+        .pick_file()
+    else {
+        return;
+    };
+    match image::open(&path) {
+        Ok(img) => {
+            let config = crate::themes::BackgroundConfig::from_image(img.to_rgba8(), false, false);
+            if let Ok(mut bg) = crate::themes::active_chat_background(ctx).lock() {
+                bg.set_global(config);
+            }
+            out.toast = Some(tr::lng_settings_section_background());
+        }
+        Err(err) => out.toast = Some(err.to_string()),
+    }
 }
 
 fn render_accent_palette(
@@ -733,20 +878,15 @@ fn render_accent_palette(
     let core_kind = theme_to_core_embedded(live_theme.kind);
     let pad_x = settings_row_pad_x();
     let swatch_sz = (st::settings_accent_color_size.scaled() as f32).clamp(24.0, 32.0);
-    let swatch_r = swatch_sz * 0.42;
+    let swatch_r = swatch_sz * 0.5 - 1.0;
     let swatch_line = (st::settings_accent_color_line.scaled() as f32).max(2.0);
 
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(pad_x);
-        ui.label(
-            egui::RichText::new(tr::lng_settings_theme_accent_title())
-                .font(font_id_from_style(st::normal_font))
-                .color(colors.color("windowSubTextFg")),
-        );
-    });
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
+        let slots = presets.len() as f32 + 1.0;
+        let step = ((ui.available_width() - pad_x - swatch_sz) / (slots - 1.0).max(1.0))
+            .clamp(swatch_sz + 4.0, 44.0);
         for (idx, preset) in presets.iter().copied().enumerate() {
             let selected = match active_accent {
                 Some(a) => a == preset,
@@ -774,20 +914,21 @@ fn render_accent_palette(
             ui.painter()
                 .circle_filled(rect.center(), swatch_r, theme_color_to_egui(preset));
             if selected {
-                ui.painter().circle_stroke(
+                // Selected swatch: a ring with a window-colored gap (`settingsAccentColorLine`).
+                ui.painter().circle_filled(
                     rect.center(),
-                    swatch_r + 2.0,
-                    Stroke::new(swatch_line, colors.color("windowBoldFg")),
+                    swatch_r + 3.0,
+                    theme_color_to_egui(preset),
                 );
-                paint_tinted_icon(
-                    ui.painter(),
-                    Rect::from_center_size(rect.center(), Vec2::splat(11.0)),
-                    st::default_checkbox_icon,
-                    colors,
-                    Some(Color32::WHITE),
+                ui.painter()
+                    .circle_filled(rect.center(), swatch_r + 0.5, colors.color("windowBg"));
+                ui.painter().circle_filled(
+                    rect.center(),
+                    swatch_r - swatch_line + 1.0,
+                    theme_color_to_egui(preset),
                 );
             }
-            ui.add_space(4.0);
+            ui.add_space(step - swatch_sz);
         }
 
         // Custom color hex toggle button with real `st::menu_icon_add`.
@@ -795,20 +936,20 @@ fn render_accent_palette(
         if cust_resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        ui.painter()
-            .circle_filled(cust_rect.center(), swatch_r, colors.color("windowBgOver"));
-        ui.painter().circle_stroke(
-            cust_rect.center(),
-            swatch_r,
-            Stroke::new(1.5, colors.color("windowActiveTextFg")),
-        );
-        paint_tinted_icon(
-            ui.painter(),
-            cust_rect.shrink(6.0),
-            st::menu_icon_add,
-            colors,
-            Some(colors.color("windowActiveTextFg")),
-        );
+        // "Custom color" swatch: a ring of colored dots (`settingsAccentColorCustom`).
+        let dot_colors = [
+            Color32::from_rgb(0xe8, 0x5c, 0x5c),
+            Color32::from_rgb(0xf3, 0xa5, 0x2e),
+            Color32::from_rgb(0x5c, 0xc0, 0x5c),
+            Color32::from_rgb(0x44, 0xa4, 0xe8),
+            Color32::from_rgb(0xa0, 0x6c, 0xe0),
+            Color32::from_rgb(0xe0, 0x6c, 0xb8),
+        ];
+        for (k, dot) in dot_colors.iter().enumerate() {
+            let angle = std::f32::consts::TAU * k as f32 / dot_colors.len() as f32;
+            let c = cust_rect.center() + Vec2::new(angle.cos(), angle.sin()) * (swatch_r * 0.55);
+            ui.painter().circle_filled(c, swatch_r * 0.24, *dot);
+        }
         if cust_resp
             .on_hover_text(strings::CUSTOM_ACCENT_TOOLTIP)
             .clicked()
@@ -870,75 +1011,6 @@ fn render_accent_palette(
             });
         });
     }
-}
-
-fn render_background_picker(
-    ui: &mut Ui,
-    state: &mut ChatSettingsState,
-    colors: &dyn Colors,
-    out: &mut ChatSettingsOutput,
-) {
-    let presets = builtin_backgrounds();
-    let pad_x = settings_row_pad_x();
-    let thumb_w = (st::settings_background_thumb.scaled() as f32).clamp(56.0, 72.0);
-    let thumb_h = (thumb_w * 0.78).max(46.0);
-
-    ui.horizontal(|ui| {
-        ui.add_space(pad_x);
-        ui.horizontal_wrapped(|ui| {
-            for bg in &presets {
-                let selected = state.selected_bg_id == bg.id;
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(thumb_w, thumb_h), Sense::click());
-                if resp.hovered() {
-                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                }
-                if resp.clicked() {
-                    state.selected_bg_id = bg.id.to_owned();
-                    out.toast = Some(format!(
-                        "{}: {}",
-                        tr::lng_settings_section_background(),
-                        bg.name
-                    ));
-                }
-
-                // Multi-band gradient preview swatch.
-                ui.painter()
-                    .rect_filled(rect, CornerRadius::same(6), bg.color_a);
-                let lower = Rect::from_min_max(Pos2::new(rect.left(), rect.center().y), rect.max);
-                ui.painter()
-                    .rect_filled(lower, CornerRadius::same(4), bg.color_b);
-                let dot = Pos2::new(rect.center().x, rect.center().y);
-                ui.painter().circle_filled(dot, 12.0, bg.color_c);
-
-                let stroke = if selected {
-                    Stroke::new(2.2, colors.color("windowBgActive"))
-                } else {
-                    Stroke::new(1.0, colors.color("shadowFg"))
-                };
-                ui.painter()
-                    .rect_stroke(rect, CornerRadius::same(6), stroke, StrokeKind::Inside);
-
-                resp.on_hover_text(bg.name);
-            }
-        });
-    });
-
-    ui.add_space(6.0);
-    settings_checkbox_row(
-        ui,
-        &mut state.bg_tiled,
-        &tr::lng_settings_bg_tile(),
-        true,
-        colors,
-    );
-    settings_checkbox_row(
-        ui,
-        &mut state.bg_blurred,
-        strings::BLUR_BACKGROUND,
-        true,
-        colors,
-    );
 }
 
 fn render_sticker_sets_manager(

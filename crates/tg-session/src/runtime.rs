@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use tg_api::convert::{apply_tl_users_and_chats, entities_from_tl_with_self, input_peer_for};
 use tg_api::{
     DialogsLoader, DialogsPageResult, DraftManager, FlushedRead, HistoryLoader, HistorySlice,
-    LoadDirection, MessageSender, PresenceUpdateResult, ReadHistoryManager, RpcClient,
+    Invoker, LoadDirection, MessageSender, PresenceUpdateResult, ReadHistoryManager, RpcClient,
     SendMessageOutcome, SendOptions, SendProgressKind, SendProgressManager, SendProgressUpdate,
     TypingPeerInfo, UpdateEvent, UpdatesHandler,
 };
@@ -57,6 +57,9 @@ pub struct SessionRuntimeConfig {
     /// Whether to call `users.getUsers([InputUser::Self_])` on startup if self peer is missing
     /// (default: `true`).
     pub fetch_self_user_on_start: bool,
+    /// The account's own user as saved in local storage, applied before the startup sync, so
+    /// `users.getUsers(Self)` is not needed (tdesktop reads it from local storage as well).
+    pub initial_self_user: Option<tg_tl::types::User>,
     /// Capacity of `tg_data::Session`'s [`ChangeEvent`] broadcast channel.
     pub changes_capacity: usize,
     /// Optional pre-loaded updates state (`pts`/`qts`/`date`/`seq`/channel `pts`) to resume
@@ -82,6 +85,7 @@ impl std::fmt::Debug for SessionRuntimeConfig {
             )
             .field("load_initial_dialogs", &self.load_initial_dialogs)
             .field("fetch_self_user_on_start", &self.fetch_self_user_on_start)
+            .field("has_initial_self_user", &self.initial_self_user.is_some())
             .field("changes_capacity", &self.changes_capacity)
             .field("initial_updates_state", &self.initial_updates_state)
             .field(
@@ -101,6 +105,7 @@ impl Default for SessionRuntimeConfig {
             run_get_difference_on_start: true,
             load_initial_dialogs: true,
             fetch_self_user_on_start: true,
+            initial_self_user: None,
             changes_capacity: tg_data::changes::DEFAULT_CHANGES_CAPACITY,
             initial_updates_state: None,
             updates_state_store: None,
@@ -1502,80 +1507,128 @@ impl<C: RpcClient> SessionActor<C> {
         let now_ms = self.now_ms();
 
         // 1. Ensure self user is loaded (so Saved Messages and self name work after resume).
-        if self.config.fetch_self_user_on_start {
-            let need_self = {
-                let session = self.session.read().await;
-                session.peer(session.self_peer_id()).is_none()
-            };
-            if need_self {
-                match self
-                    .rpc
-                    .invoke(&tl_fns::users::GetUsers {
-                        id: vec![tl_enums::InputUser::Self_],
-                    })
-                    .await
-                {
-                    Ok(users) => {
-                        let mut session = self.session.write().await;
-                        apply_tl_users_and_chats(&mut session, &users, &[]);
-                        self.dialogs.register_peers_from_tl(&users, &[]);
-                    }
-                    Err(err) => {
-                        let mapped: tg_api::InvocationError = err.into();
-                        debug!(error = %mapped, "users.getUsers(Self) skipped on startup");
-                    }
-                }
-            }
+        //    A copy saved in local storage is applied first; otherwise it is requested together
+        //    with the updates state and the first dialogs page below (one round trip for all of
+        //    them) and applied before the dialogs page.
+        if let Some(user) = self.config.initial_self_user.clone() {
+            let users = vec![tl_enums::User::User(user)];
+            let mut session = self.session.write().await;
+            apply_tl_users_and_chats(&mut session, &users, &[]);
+            drop(session);
+            self.dialogs.register_peers_from_tl(&users, &[]);
         }
+        let need_self = self.config.fetch_self_user_on_start && {
+            let session = self.session.read().await;
+            session.peer(session.self_peer_id()).is_none()
+        };
 
         // 2. Initialize or resume updates state.
         //    - If valid persisted state exists (`pts > 0`), restore it and immediately call
         //      `updates.getDifference(pts, date, qts)` (skipping `updates.getState`).
         //    - On first start (no persisted state), call `updates.getState`, followed by
         //      `updates.getDifference` when `run_get_difference_on_start` is enabled.
-        if self.config.init_updates_state {
-            let persisted = self.load_initial_persisted_state();
-            if let Some(saved) = persisted.filter(PersistedUpdatesState::is_valid) {
-                let mut session = self.session.write().await;
-                self.updates
-                    .resume_from_state(&self.rpc, &mut session, &saved, now_ms)
-                    .await?;
-                drop(session);
-                self.drain_update_events().await;
-            } else {
-                let mut session = self.session.write().await;
-                self.updates
-                    .initialize(&self.rpc, &mut session, now_ms)
-                    .await?;
-                drop(session);
-                self.drain_update_events().await;
-
-                // 3. Call `updates.getDifference` on start to catch up any gap since last session.
-                if self.config.run_get_difference_on_start {
-                    let mut session = self.session.write().await;
-                    self.updates
-                        .on_new_session_created(&self.rpc, &mut session, self.now_ms())
-                        .await?;
-                    drop(session);
-                    self.drain_update_events().await;
-                }
-            }
-        } else {
-            // No startup `updates.getState` / `getDifference` is in flight, so clear the initial
-            // `requesting` gate so RPC-returned `apply_updates` calls are not silently dropped.
-            self.updates
-                .restore_state(&PersistedUpdatesState::default(), now_ms);
-        }
-
         // 4. Load the first page of main dialogs (`limit = 20`) + pinned dialogs.
-        if self.config.load_initial_dialogs {
-            let page = self.dialogs.load_next_page(&self.rpc, 0).await?;
-            if let Some(page) = page {
-                self.apply_dialogs_page(&page).await;
-            }
-        }
+        // Like tdesktop (`Api::Updates` and `ApiWrap::requestDialogs` start independently), the
+        // dialogs requests do not wait for the updates sync: both run concurrently.
+        let persisted = if self.config.init_updates_state {
+            self.load_initial_persisted_state()
+        } else {
+            None
+        };
+        let init_updates_state = self.config.init_updates_state;
+        let run_get_difference_on_start = self.config.run_get_difference_on_start;
+        let load_initial_dialogs = self.config.load_initial_dialogs;
+        let started_at = self.started_at;
+        let rpc = &self.rpc;
+        let session_lock = &self.session;
+        let updates = &mut self.updates;
+        let dialogs = &mut self.dialogs;
+        let new_session_rx = &mut self.new_session_rx;
 
+        let updates_fut = async move {
+            if !init_updates_state {
+                // No startup `updates.getState` / `getDifference` is in flight, so clear the
+                // initial `requesting` gate so RPC-returned `apply_updates` calls are not silently
+                // dropped.
+                updates.restore_state(&PersistedUpdatesState::default(), now_ms);
+                return Ok(());
+            }
+            let ran_difference =
+                if let Some(saved) = persisted.filter(PersistedUpdatesState::is_valid) {
+                    let mut session = session_lock.write().await;
+                    updates
+                        .resume_from_state(rpc, &mut session, &saved, now_ms)
+                        .await?;
+                    true
+                } else {
+                    {
+                        // The session stays unlocked while `updates.getState` (and, on a cold
+                        // start, the auth key exchange before it) is in flight, so the UI can
+                        // read it meanwhile.
+                        let state = rpc.updates_get_state().await?;
+                        let mut session = session_lock.write().await;
+                        updates
+                            .initialize_with_state(rpc, &mut session, &state, now_ms)
+                            .await?;
+                    }
+                    // 3. Call `updates.getDifference` on start to catch up any gap since last session.
+                    if run_get_difference_on_start {
+                        let mut session = session_lock.write().await;
+                        let started_ms = started_at.elapsed().as_millis() as u64;
+                        updates
+                            .on_new_session_created(rpc, &mut session, started_ms)
+                            .await?;
+                    }
+                    run_get_difference_on_start
+                };
+            // The startup `getDifference` was answered after any `new_session_created` the server
+            // sent for this session, so a queued notification would only repeat it.
+            if ran_difference && let Some(rx) = new_session_rx.as_mut() {
+                while rx.try_recv().is_ok() {}
+            }
+            Ok::<(), tg_api::ApiError>(())
+        };
+        let dialogs_fut = async move {
+            if load_initial_dialogs {
+                dialogs.load_next_page(rpc, 0).await
+            } else {
+                Ok(None)
+            }
+        };
+        let self_fut = async move {
+            if need_self {
+                Some(
+                    rpc.invoke(&tl_fns::users::GetUsers {
+                        id: vec![tl_enums::InputUser::Self_],
+                    })
+                    .await,
+                )
+            } else {
+                None
+            }
+        };
+        let (updates_res, dialogs_res, self_res) = tokio::join!(updates_fut, dialogs_fut, self_fut);
+
+        match self_res {
+            Some(Ok(users)) => {
+                let mut session = self.session.write().await;
+                apply_tl_users_and_chats(&mut session, &users, &[]);
+                drop(session);
+                self.dialogs.register_peers_from_tl(&users, &[]);
+            }
+            Some(Err(err)) => {
+                let mapped: tg_api::InvocationError = err.into();
+                debug!(error = %mapped, "users.getUsers(Self) skipped on startup");
+            }
+            None => {}
+        }
+        self.drain_update_events().await;
+        if let Ok(Some(page)) = &dialogs_res {
+            self.apply_dialogs_page(page).await;
+        }
         self.persist_updates_state_if_changed();
+        updates_res?;
+        dialogs_res?;
         Ok(())
     }
 

@@ -93,7 +93,9 @@ impl BubbleHoverQuickActions {
             if is_hovered {
                 self.fade_anim.sample(now_secs, 1.0) as f32
             } else {
+                // Hover lost: hide at once and stop the fade so nothing keeps repainting.
                 self.hovered_msg = None;
+                self.fade_anim.stop();
                 0.0
             }
         } else {
@@ -108,8 +110,27 @@ impl BubbleHoverQuickActions {
     }
 }
 
+#[cfg(test)]
+mod tests_wp75 {
+    use super::*;
+
+    #[test]
+    fn hover_loss_stops_the_fade_animation_immediately() {
+        let mut quick = BubbleHoverQuickActions::default();
+        let msg = MsgId(7);
+        let shown = quick.opacity_for(msg, true, 10.0, false);
+        assert!(shown < 1.0, "fade-in starts from transparent");
+        assert!(quick.is_animating());
+        assert_eq!(quick.opacity_for(msg, false, 10.01, false), 0.0);
+        assert!(
+            !quick.is_animating(),
+            "hover loss must stop the fade animation (history_view_quick_action.cpp)"
+        );
+    }
+}
+
 /// Paints compact hover corner quick-action buttons beside `bubble_rect` (Quick Reply, Quick
-/// React, Quick Forward) and returns any triggered [`HistoryQuickActionOutcome`].
+/// React) and returns any triggered [`HistoryQuickActionOutcome`].
 #[allow(clippy::too_many_arguments)]
 pub fn show_bubble_hover_quick_actions(
     ui: &mut Ui,
@@ -156,11 +177,11 @@ pub fn show_bubble_hover_quick_actions(
             },
         ));
     }
-    buttons.push((
-        tg_ui::tg_style::st::menu_icon_forward,
-        "Quick Forward",
-        HistoryQuickActionOutcome::Forward(msg.id),
-    ));
+    // tdesktop has only the corner Reply and Reaction buttons (`cornerReply`,
+    // `cornerReaction`); there is no hover Forward button next to bubbles.
+    if buttons.is_empty() {
+        return None;
+    }
 
     let total_w = buttons.len() as f32 * btn_size + buttons.len().saturating_sub(1) as f32 * gap;
     let start_x = if msg.outgoing {

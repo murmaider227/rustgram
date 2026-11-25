@@ -997,17 +997,25 @@ pub(crate) fn moderate_messages(
         }
     }
 
-    // 3. Delete all messages from participant
+    // 3. Delete all messages from participant (`ApiWrap::deleteAllFromParticipantSend`,
+    //    `apiwrap.cpp:1551-1565`): loop while `AffectedHistory.offset > 0`, feeding each page's
+    //    `(pts, pts_count)` into SessionActor's single updates handler.
+    const MAX_DELETE_PARTICIPANT_HISTORY_LOOPS: usize = 64;
     for &pid in &req.delete_all_from_peers {
         if let Some(participant) = input_peer(live, pid) {
-            let tl_enums::messages::AffectedHistory::AffectedHistory(aff) = invoke_rpc(
-                live,
-                tl_fns::channels::DeleteParticipantHistory {
-                    channel: channel.clone(),
-                    participant,
-                },
-            )?;
-            let _ = live.apply_affected_history(Some(req.peer_id), aff.pts, aff.pts_count);
+            for _ in 0..MAX_DELETE_PARTICIPANT_HISTORY_LOOPS {
+                let tl_enums::messages::AffectedHistory::AffectedHistory(aff) = invoke_rpc(
+                    live,
+                    tl_fns::channels::DeleteParticipantHistory {
+                        channel: channel.clone(),
+                        participant: participant.clone(),
+                    },
+                )?;
+                let _ = live.apply_affected_history(Some(req.peer_id), aff.pts, aff.pts_count);
+                if aff.offset <= 0 {
+                    break;
+                }
+            }
             result.deleted_all_peers += 1;
         }
     }

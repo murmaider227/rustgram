@@ -120,20 +120,52 @@ pub fn now_unix_i64() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// Converts a Unix timestamp (seconds) into `tg_history::LocalDateTime`.
+/// Converts a Unix timestamp (seconds) into `tg_history::LocalDateTime` in the local time zone
+/// (`base::unixtime::parse` / `QDateTime::fromSecsSinceEpoch`).
 #[must_use]
 pub fn unix_to_local_datetime(ts: i32) -> LocalDateTime {
     if ts <= 0 {
         return LocalDateTime::new(1970, 1, 1, 0, 0, 0);
     }
-    LocalDateTime::from_unix_utc(i64::from(ts))
+    LocalDateTime::from_unix_local(i64::from(ts))
 }
 
-/// Formats a Unix timestamp as `HH:MM`.
+/// Formats a Unix timestamp in local time using tdesktop's short 24-hour format (`"H:mm"`,
+/// e.g. `"3:07"`, `"16:29"`, matching `QLocale::ShortFormat`).
 #[must_use]
 pub fn format_short_time(ts: i32) -> String {
-    let dt = unix_to_local_datetime(ts);
-    format!("{:02}:{:02}", dt.hour, dt.minute)
+    tg_history::datetime::format_time_short(unix_to_local_datetime(ts))
+}
+
+/// Formats a local civil date as `DD.MM.YY` (`QLocale::ShortFormat` short date).
+#[must_use]
+fn format_short_calendar_date(dt: LocalDateTime) -> String {
+    let yy = dt.date.year.rem_euclid(100);
+    format!("{:02}.{:02}.{:02}", dt.date.day, dt.date.month, yy)
+}
+
+/// Formats a dialog list timestamp in local time following tdesktop's `Ui::FormatDialogsDate`
+/// (`Telegram/SourceFiles/ui/text/format_values.cpp:724-740`):
+/// - same calendar day OR within 20 hours of `now`: `"H:mm"` (e.g. `"3:07"`, `"16:29"`)
+/// - within 6 calendar days: localized short weekday (`"Mon"`..`"Sun"`)
+/// - 7 or more days away: short date (`"DD.MM.YY"`).
+#[must_use]
+pub fn format_dialogs_date_local(last_time: LocalDateTime, now: LocalDateTime) -> String {
+    match tg_history::classify_dialogs_date(last_time, now) {
+        tg_history::DialogsDateKind::Time => tg_history::datetime::format_time_short(last_time),
+        tg_history::DialogsDateKind::Weekday => {
+            let wd = last_time.date.weekday() as u8;
+            tg_lang::with_current(|inst| tg_lang::keys::day_of_week(inst, wd))
+        }
+        tg_history::DialogsDateKind::Date => format_short_calendar_date(last_time),
+    }
+}
+
+/// Formats a Unix timestamp as a dialog list timestamp relative to `now_ts` in local time
+/// (`Ui::FormatDialogsDate`).
+#[must_use]
+pub fn format_dialogs_date_at(ts: i32, now_ts: i32) -> String {
+    format_dialogs_date_local(unix_to_local_datetime(ts), unix_to_local_datetime(now_ts))
 }
 
 /// Returns all loaded messages for `peer_id` in chronological order (oldest to newest).
@@ -201,14 +233,65 @@ pub fn format_month_year(ts: i32) -> String {
     format!("{m} {}", dt.date.year)
 }
 
-/// Formats a Unix timestamp as `"YYYY-MM-DD HH:MM"`.
+/// Formats a Unix timestamp relative to `now_ts` in local time following tdesktop's
+/// `Ui::FormatDateTime` (`Telegram/SourceFiles/ui/text/format_values.cpp:82-102`):
+/// - same local day: `lng_mediaview_today` (`"today at H:mm"`)
+/// - yesterday: `lng_mediaview_yesterday` (`"yesterday at H:mm"`)
+/// - older/other day: `lng_mediaview_date_time` (`"DD.MM.YY at H:mm"`).
+#[must_use]
+pub fn format_date_time_at(ts: i32, now_ts: i32) -> String {
+    let dt = unix_to_local_datetime(ts);
+    let now = unix_to_local_datetime(now_ts);
+    let time_str = tg_history::datetime::format_time_short(dt);
+    if dt.date == now.date {
+        tg_lang::tr::lng_mediaview_today(&time_str)
+    } else if dt.date.days_to(now.date) == 1 {
+        tg_lang::tr::lng_mediaview_yesterday(&time_str)
+    } else {
+        let date_str = format_short_calendar_date(dt);
+        tg_lang::tr::lng_mediaview_date_time(&date_str, &time_str)
+    }
+}
+
+/// Formats a Unix timestamp in local time using tdesktop's `Ui::FormatDateTime` relative to
+/// the current wall clock (`"today at H:mm"` / `"yesterday at H:mm"` / `"DD.MM.YY at H:mm"`).
 #[must_use]
 pub fn format_date_time(ts: i32) -> String {
+    format_date_time_at(ts, now_unix_i32())
+}
+
+/// Formats a read-receipt Unix timestamp relative to `now_ts` in local time following tdesktop's
+/// `Api::FormatReadDate` (`Telegram/SourceFiles/api/api_who_reacted.cpp:702-726`):
+/// - same local day: `lng_mediaview_today` (`"today at H:mm"`)
+/// - yesterday: `lng_mediaview_yesterday` (`"yesterday at H:mm"`)
+/// - earlier: `lng_mediaview_date_time` with short month/day (`"Nov 20 at H:mm"`).
+#[must_use]
+pub fn format_read_date_at(ts: i32, now_ts: i32) -> String {
+    if ts <= 0 {
+        return String::new();
+    }
     let dt = unix_to_local_datetime(ts);
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        dt.date.year, dt.date.month, dt.date.day, dt.hour, dt.minute
-    )
+    let now = unix_to_local_datetime(now_ts);
+    let time_str = tg_history::datetime::format_time_short(dt);
+    if dt.date == now.date {
+        tg_lang::tr::lng_mediaview_today(&time_str)
+    } else if dt.date.days_to(now.date) == 1 {
+        tg_lang::tr::lng_mediaview_yesterday(&time_str)
+    } else {
+        let read_d = tg_lang::SimpleDate {
+            year: dt.date.year,
+            month: dt.date.month,
+            day: dt.date.day,
+        };
+        let today_d = tg_lang::SimpleDate {
+            year: now.date.year,
+            month: now.date.month,
+            day: now.date.day,
+        };
+        let date_str =
+            tg_lang::with_current(|inst| tg_lang::keys::day_of_month(inst, read_d, today_d));
+        tg_lang::tr::lng_mediaview_date_time(&date_str, &time_str)
+    }
 }
 
 /// Computes 1-2 uppercase avatar monogram initials from a display name.
@@ -644,40 +727,78 @@ pub fn peer_to_history_peer_info(
 
     let (can_pin, can_delete, contact_status) = match peer {
         Peer::User(u) => {
+            let bar = peer.common().bar_settings;
             let banner = if peer.common().block_status == BlockStatus::Blocked {
                 Some(ContactStatusBanner::Blocked)
-            } else if !u.is_self()
-                && !u.is_bot()
-                && !u.is_contact()
-                && !u.is_service_user()
-                && peer
-                    .common()
-                    .bar_settings
-                    .contains(tg_data::PeerBarSettings::ADD_CONTACT)
-            {
-                Some(ContactStatusBanner::AddOrBlock {
-                    peer_name: summary.title.clone(),
-                })
+            } else if !u.is_self() && !u.is_service_user() {
+                if u.is_contact() && bar.contains(tg_data::PeerBarSettings::SHARE_CONTACT) {
+                    Some(ContactStatusBanner::SharePhoneNumber {
+                        peer_name: summary.title.clone(),
+                    })
+                } else if !u.is_bot()
+                    && !u.is_contact()
+                    && (bar.contains(tg_data::PeerBarSettings::ADD_CONTACT)
+                        || bar.contains(tg_data::PeerBarSettings::BLOCK_CONTACT))
+                {
+                    Some(ContactStatusBanner::AddOrBlock {
+                        peer_name: summary.title.clone(),
+                    })
+                } else if bar.contains(tg_data::PeerBarSettings::REPORT_SPAM) {
+                    Some(ContactStatusBanner::ReportSpam {
+                        peer_name: summary.title.clone(),
+                        is_channel: false,
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             };
             (true, true, banner)
         }
-        Peer::Chat(c) => (
-            c.am_creator()
-                || c.admin_rights
-                    .contains(tg_data::ChatAdminRights::PIN_MESSAGES),
-            c.can_delete_messages(),
-            None,
-        ),
-        Peer::Channel(ch) => (
-            ch.am_creator()
-                || ch
-                    .admin_rights
-                    .contains(tg_data::ChatAdminRights::PIN_MESSAGES),
-            ch.can_delete_messages(),
-            None,
-        ),
+        Peer::Chat(c) => {
+            let banner = if peer
+                .common()
+                .bar_settings
+                .contains(tg_data::PeerBarSettings::REPORT_SPAM)
+            {
+                Some(ContactStatusBanner::ReportSpam {
+                    peer_name: summary.title.clone(),
+                    is_channel: false,
+                })
+            } else {
+                None
+            };
+            (
+                c.am_creator()
+                    || c.admin_rights
+                        .contains(tg_data::ChatAdminRights::PIN_MESSAGES),
+                c.can_delete_messages(),
+                banner,
+            )
+        }
+        Peer::Channel(ch) => {
+            let banner = if peer
+                .common()
+                .bar_settings
+                .contains(tg_data::PeerBarSettings::REPORT_SPAM)
+            {
+                Some(ContactStatusBanner::ReportSpam {
+                    peer_name: summary.title.clone(),
+                    is_channel: ch.is_broadcast(),
+                })
+            } else {
+                None
+            };
+            (
+                ch.am_creator()
+                    || ch
+                        .admin_rights
+                        .contains(tg_data::ChatAdminRights::PIN_MESSAGES),
+                ch.can_delete_messages(),
+                banner,
+            )
+        }
     };
 
     Some(HistoryPeerInfo {
@@ -726,7 +847,9 @@ pub fn dialog_item_from_session(
                 Peer::Chat(_) => false,
             };
             let premium = p.as_user().is_some_and(tg_data::User::is_premium);
-            let online = p.as_user().is_some_and(|u| u.is_online(now));
+            let online = special != SpecialRowKind::SavedMessages
+                && p.as_user()
+                    .is_some_and(|u| !u.is_self() && u.is_online(now));
             (
                 peer_dialog_kind(p),
                 special,
@@ -801,18 +924,8 @@ pub fn dialog_item_from_session(
         .and_then(|mid| session.message(tg_data::FullMsgId::new(peer_id, mid)));
     let (last_message_id, last_message, last_sender, last_message_time, send_state) =
         if let Some(msg) = top_msg {
-            let preview = tg_session::runtime::format_message_preview(msg);
-            let sender = if !peer_id.is_user() && !msg.is_post() {
-                msg.from_id.map(|fid| {
-                    if fid == session.self_peer_id() {
-                        "You".to_owned()
-                    } else {
-                        peer_display_title(session, fid)
-                    }
-                })
-            } else {
-                None
-            };
+            let preview = crate::preview_text::message_preview_text(session, msg);
+            let sender = crate::preview_text::preview_sender(session, msg);
             let send_state = if !msg.is_outgoing() || peer_id == session.self_peer_id() {
                 DialogSendState::None
             } else if msg.flags.contains(MessageFlags::BEING_SENT) {
@@ -869,6 +982,10 @@ pub fn dialog_item_from_session(
         .and_then(Peer::as_user)
         .and_then(|u| u.bot_info.as_ref())
         .is_some_and(|b| b.has_main_app);
+    let is_contact = peer
+        .and_then(Peer::as_user)
+        .is_some_and(|u| !u.is_self() && u.is_contact());
+    let media_preview = top_msg.and_then(crate::preview_text::message_media_preview);
 
     Some(DialogItem {
         peer_id: from_data_peer(peer_id),
@@ -880,7 +997,7 @@ pub fn dialog_item_from_session(
         verified,
         premium,
         online,
-        active_call: false,
+        active_call: peer.is_some_and(Peer::has_active_group_call),
         muted: history.muted,
         pinned,
         pinned_order,
@@ -896,6 +1013,8 @@ pub fn dialog_item_from_session(
         typing: active_typing_state(session, peer_id),
         badges,
         has_bot_app_button,
+        is_contact,
+        media_preview,
     })
 }
 
@@ -942,14 +1061,12 @@ pub fn dialog_entry_from_session(
             is_saved_messages: item.special == SpecialRowKind::SavedMessages,
         }
     };
+    let timestamp = format_dialogs_date_local(item.last_message_time, unix_to_local_datetime(now));
     Some(DialogEntry {
         peer: summary,
         last_message: item.last_message,
         last_sender: item.last_sender,
-        timestamp: format!(
-            "{:02}:{:02}",
-            item.last_message_time.hour, item.last_message_time.minute
-        ),
+        timestamp,
         unread_count: item.badges.unread_counter.max(0) as u32,
         pinned: item.pinned,
         folders: item.folders,
@@ -1027,7 +1144,7 @@ pub fn message_to_history_message_with_resolvers(
             (ui_text, ui_media, None, lp)
         }
         MessageContent::Service(action) => {
-            let ui_service = convert_service_action(action, session);
+            let ui_service = history_service_action(session, msg, action);
             (UiText::default(), None, Some(ui_service), None)
         }
     };
@@ -1189,7 +1306,8 @@ pub fn message_to_history_message_with_resolvers(
         from_id,
         sender_name,
         date_unix: msg.date,
-        outgoing: msg.is_outgoing(),
+        outgoing: msg.is_outgoing()
+            || crate::preview_text::has_saved_messages_out_layout(session, msg),
         is_post: msg.is_post(),
         text,
         media,
@@ -1924,6 +2042,56 @@ fn convert_message_media(
     }
 }
 
+/// History service pill for `action`: tdesktop's text where `preview_text` knows it, otherwise the
+/// structured [`UiServiceAction`].
+fn history_service_action(
+    session: &Session,
+    msg: &Message,
+    action: &DataServiceAction,
+) -> UiServiceAction {
+    if let DataServiceAction::PinMessage = action
+        && let Some(target) = msg.reply_to.as_ref().and_then(|r| r.reply_to_msg_id)
+    {
+        let peer = msg
+            .reply_to
+            .as_ref()
+            .and_then(|r| r.reply_to_peer_id)
+            .unwrap_or(msg.peer_id);
+        if let Some(pinned) = session.message(tg_data::FullMsgId::new(peer, target))
+            && let MessageContent::Regular {
+                media: MessageMedia::Empty | MessageMedia::WebPage(_),
+                ..
+            } = &pinned.content
+        {
+            let text = crate::preview_text::message_preview_text(session, pinned);
+            let chars: Vec<char> = text.chars().collect();
+            let preview = if chars.len() > 21 {
+                let mut cut: String = chars[..16].iter().collect();
+                cut.push('\u{2026}');
+                cut
+            } else {
+                text
+            };
+            return UiServiceAction::PinnedMessage {
+                msg_id: from_data_msg(target),
+                preview,
+            };
+        }
+    }
+    match crate::preview_text::known_service_text(session, msg, action) {
+        Some(text) => UiServiceAction::Custom(text),
+        None => convert_service_action(action, session),
+    }
+}
+
+/// Structured [`UiServiceAction`] for `action` (no message context).
+pub(crate) fn service_action_to_ui(
+    action: &DataServiceAction,
+    session: &Session,
+) -> UiServiceAction {
+    convert_service_action(action, session)
+}
+
 fn convert_service_action(action: &DataServiceAction, session: &Session) -> UiServiceAction {
     match action {
         DataServiceAction::ChatCreate { title, .. }
@@ -1945,7 +2113,9 @@ fn convert_service_action(action: &DataServiceAction, session: &Session) -> UiSe
         DataServiceAction::ChatAddUser { users } => {
             let names: Vec<String> = users
                 .iter()
-                .map(|uid| peer_display_title(session, DataPeerId::from_user(*uid)))
+                .map(|uid| {
+                    crate::preview_text::peer_real_name(session, DataPeerId::from_user(*uid))
+                })
                 .collect();
             if names.len() == 1 {
                 UiServiceAction::UserJoined {
@@ -2369,7 +2539,7 @@ pub fn peer_to_info_profile(
             !c.allows_forwarding(),
             false,
             c.count.max(0) as u32,
-            c.admins.len() as u32,
+            basic_group_admins_count(c),
             c.default_restrictions,
             0,
             None,
@@ -2434,6 +2604,15 @@ pub fn peer_to_info_profile(
     };
 
     let media_counts = compute_shared_media_counts(session, peer_id, common_groups);
+    let group_call = match peer {
+        Peer::User(_) => tg_app_core::info::backend::ProfileGroupCallState::default(),
+        Peer::Chat(_) | Peer::Channel(_) => tg_app_core::info::backend::ProfileGroupCallState {
+            active: peer.has_active_group_call(),
+            has_participants: peer.has_non_empty_group_call(),
+            call_id: peer.group_call().map(|(id, hash)| (id.0 as i64, hash)),
+            can_manage: peer.can_manage_group_call(),
+        },
+    };
 
     Some(InfoPeerProfile {
         id: from_data_peer(peer_id),
@@ -2470,7 +2649,19 @@ pub fn peer_to_info_profile(
         bot_reads_all_messages,
         has_mini_app,
         media_counts,
+        group_call,
     })
+}
+
+/// `Info::Profile::AdminsCountValue` for a basic group: admins plus the creator, `0` until the
+/// participant list is loaded.
+fn basic_group_admins_count(chat: &tg_data::Chat) -> u32 {
+    if chat.participants.is_empty() {
+        0
+    } else {
+        let creator = u32::from(chat.creator.0 != 0);
+        (chat.admins.len() as u32).saturating_add(creator)
+    }
 }
 
 fn compute_shared_media_counts(
@@ -2629,19 +2820,44 @@ pub fn message_to_info_media_item(
     }
 }
 
-/// Converts a `tg_data::Message` with photo/document media into a viewer [`ViewerMediaItem`].
+/// `OverlayWidget::refreshFromLabel`: the original sender's own name (forward origin first),
+/// never the "Saved Messages" label.
+fn viewer_sender_name(session: &Session, msg: &Message) -> String {
+    if let Some(fwd) = &msg.forward_from {
+        if let Some(pid) = fwd.from_id {
+            return crate::preview_text::peer_real_name(session, pid);
+        }
+        if let Some(name) = fwd.from_name.as_ref().filter(|n| !n.is_empty()) {
+            return name.clone();
+        }
+    }
+    let pid = msg.from_id.unwrap_or(msg.peer_id);
+    crate::preview_text::peer_real_name(session, pid)
+}
+
+/// Converts a `tg_data::Message` with photo/document media into a viewer [`ViewerMediaItem`],
+/// formatting `date_text` relative to the current wall clock (`Ui::FormatDateTime`).
 #[must_use]
 pub fn message_to_viewer_media_item(session: &Session, msg: &Message) -> Option<ViewerMediaItem> {
+    message_to_viewer_media_item_at(session, msg, now_unix_i32())
+}
+
+/// Converts a `tg_data::Message` with photo/document media into a viewer [`ViewerMediaItem`],
+/// formatting `date_text` relative to `now_ts` in local time (`Ui::FormatDateTime`).
+#[must_use]
+pub fn message_to_viewer_media_item_at(
+    session: &Session,
+    msg: &Message,
+    now_ts: i32,
+) -> Option<ViewerMediaItem> {
     let MessageContent::Regular { text, media } = &msg.content else {
         return None;
     };
-    let sender_name = msg
-        .from_id
-        .map(|pid| peer_display_title(session, pid))
-        .unwrap_or_else(|| peer_display_title(session, msg.peer_id));
-    let date_text = format_date_time(msg.date);
+    let sender_name = viewer_sender_name(session, msg);
+    let date_text = format_date_time_at(msg.date, now_ts);
     let caption = data_text_to_ui_text(text);
     let allows_save = !msg.flags.contains(MessageFlags::NO_FORWARDS);
+    let grouped_id = msg.grouped_id.filter(|&id| id != 0).map(|id| id as i64);
 
     match media {
         MessageMedia::Photo(p) => {
@@ -2669,6 +2885,14 @@ pub fn message_to_viewer_media_item(session: &Session, msg: &Message) -> Option<
                 allows_delete: msg.is_outgoing(),
                 allows_save,
                 local_path: None,
+                attached_stickers_media: p.has_stickers.then(|| {
+                    tg_app_core::chat_helpers::backend::AttachedStickersMedia::Photo {
+                        id: p.id.0 as i64,
+                        access_hash: p.access_hash as i64,
+                        file_reference: p.file_reference.clone(),
+                    }
+                }),
+                grouped_id,
             })
         }
         MessageMedia::Document(d) => {
@@ -2707,6 +2931,8 @@ pub fn message_to_viewer_media_item(session: &Session, msg: &Message) -> Option<
                 allows_delete: msg.is_outgoing(),
                 allows_save,
                 local_path: None,
+                attached_stickers_media: None,
+                grouped_id,
             })
         }
         MessageMedia::VideoStream(vs) => Some(ViewerMediaItem {
@@ -2733,6 +2959,8 @@ pub fn message_to_viewer_media_item(session: &Session, msg: &Message) -> Option<
             allows_delete: msg.is_outgoing(),
             allows_save: false,
             local_path: None,
+            attached_stickers_media: None,
+            grouped_id,
         }),
         _ => None,
     }
@@ -2924,35 +3152,51 @@ pub fn peer_to_call_info(session: &Session, peer_id: DataPeerId) -> CallPeerInfo
     }
 }
 
+/// Computes the default folder icon when `filter.icon_emoji` is empty or unrecognized
+/// (`Ui::ComputeDefaultFilterIcon` in `Telegram/SourceFiles/ui/filter_icons.cpp:303-334`).
+///
+/// Any folder with explicit `always` / `never` peer lists (such as a `"Work"` folder pinned
+/// to specific chats) or with no category inclusion flags returns [`FolderIcon::Custom`].
+#[must_use]
+fn default_filter_icon(filter: &ChatFilter) -> FolderIcon {
+    let all = ChatFilterFlags::CONTACTS
+        | ChatFilterFlags::NON_CONTACTS
+        | ChatFilterFlags::GROUPS
+        | ChatFilterFlags::CHANNELS
+        | ChatFilterFlags::BOTS;
+    let removed = ChatFilterFlags::NO_READ | ChatFilterFlags::NO_MUTED;
+    let people = ChatFilterFlags::CONTACTS | ChatFilterFlags::NON_CONTACTS;
+    let included = filter.flags & all;
+    let excluded = filter.flags & removed;
+    if !filter.always.is_empty() || !filter.never.is_empty() || included.is_empty() {
+        FolderIcon::Custom
+    } else if included == ChatFilterFlags::CONTACTS
+        || included == ChatFilterFlags::NON_CONTACTS
+        || included == people
+    {
+        FolderIcon::Private
+    } else if included == ChatFilterFlags::GROUPS {
+        FolderIcon::Groups
+    } else if included == ChatFilterFlags::CHANNELS {
+        FolderIcon::Channels
+    } else if included == ChatFilterFlags::BOTS {
+        FolderIcon::Bots
+    } else if excluded == ChatFilterFlags::NO_READ {
+        FolderIcon::Unread
+    } else if excluded == ChatFilterFlags::NO_MUTED {
+        FolderIcon::Unmuted
+    } else {
+        FolderIcon::Custom
+    }
+}
+
 /// Converts a `tg_data::ChatFilter` into a `dialogs::backend::ChatFolder`.
 #[must_use]
 pub fn chat_filter_to_dialog_folder(filter: &ChatFilter, session: &Session) -> DialogChatFolder {
-    let icon = FolderIcon::from_emoticon(&filter.icon_emoji)
-        .map(FolderIconKind::from)
-        .unwrap_or_else(|| {
-            if filter.flags.contains(ChatFilterFlags::NO_READ) {
-                FolderIconKind::Unread
-            } else if filter.flags.contains(ChatFilterFlags::NO_MUTED) {
-                FolderIconKind::Unmuted
-            } else if filter.flags.contains(ChatFilterFlags::CHANNELS)
-                && !filter.flags.contains(ChatFilterFlags::GROUPS)
-                && !filter.flags.contains(ChatFilterFlags::CONTACTS)
-            {
-                FolderIconKind::Channels
-            } else if filter.flags.contains(ChatFilterFlags::GROUPS)
-                && !filter.flags.contains(ChatFilterFlags::CONTACTS)
-            {
-                FolderIconKind::Groups
-            } else if filter.flags.contains(ChatFilterFlags::BOTS)
-                && !filter.flags.contains(ChatFilterFlags::CONTACTS)
-            {
-                FolderIconKind::Bots
-            } else if filter.flags.contains(ChatFilterFlags::CONTACTS) {
-                FolderIconKind::Private
-            } else {
-                FolderIconKind::Custom
-            }
-        });
+    let icon = FolderIconKind::from(
+        FolderIcon::from_emoticon(&filter.icon_emoji)
+            .unwrap_or_else(|| default_filter_icon(filter)),
+    );
 
     let unread_state = session
         .filters()
@@ -2976,29 +3220,8 @@ pub fn chat_filter_to_dialog_folder(filter: &ChatFilter, session: &Session) -> D
 /// Converts a `tg_data::ChatFilter` into a `settings::backend::ChatFolder`.
 #[must_use]
 pub fn chat_filter_to_settings_folder(filter: &ChatFilter) -> SettingsChatFolder {
-    let icon = FolderIcon::from_emoticon(&filter.icon_emoji).unwrap_or_else(|| {
-        if filter.flags.contains(ChatFilterFlags::NO_READ) {
-            FolderIcon::Unread
-        } else if filter.flags.contains(ChatFilterFlags::NO_MUTED) {
-            FolderIcon::Unmuted
-        } else if filter.flags.contains(ChatFilterFlags::BOTS)
-            && !filter.flags.contains(ChatFilterFlags::CONTACTS)
-        {
-            FolderIcon::Bots
-        } else if filter.flags.contains(ChatFilterFlags::CHANNELS)
-            && !filter.flags.contains(ChatFilterFlags::GROUPS)
-        {
-            FolderIcon::Channels
-        } else if filter.flags.contains(ChatFilterFlags::GROUPS)
-            && !filter.flags.contains(ChatFilterFlags::CONTACTS)
-        {
-            FolderIcon::Groups
-        } else if filter.flags.contains(ChatFilterFlags::CONTACTS) {
-            FolderIcon::Private
-        } else {
-            FolderIcon::Custom
-        }
-    });
+    let icon = FolderIcon::from_emoticon(&filter.icon_emoji)
+        .unwrap_or_else(|| default_filter_icon(filter));
     SettingsChatFolder {
         id: filter.id,
         title: filter.title.text.clone(),

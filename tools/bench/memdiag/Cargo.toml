@@ -1,0 +1,16 @@
+[package]
+name = "memdiag"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+backtrace = "0.3"
+
+[profile.release]
+opt-level = 2
+debug = false
+
+[workspace]

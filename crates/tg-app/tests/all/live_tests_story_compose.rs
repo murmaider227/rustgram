@@ -817,13 +817,18 @@ fn kittest_strip_add_story_opens_composer_edits_privacy_and_posts_live_story() {
         );
 
     harness.step();
-    // 1. Click "+ Add Story" button on StoriesStrip -> opens SendStoryBox.
-    harness.get_by_label("+ Add Story").click();
+    // 1. With no stories the strip stays hidden (`Dialogs::Stories::List` has no elements), so
+    //    the composer opens through the host (the "+" create button path) -> SendStoryBox.
+    assert!(
+        harness.state().host.last_strip_rect().is_none(),
+        "an empty stories strip must not be shown"
+    );
+    harness.state_mut().host.open_composer();
     harness.step();
     harness.step();
     assert!(
         harness.state().host.composer().is_some(),
-        "clicking '+ Add Story' must open SendStoryBox"
+        "open_composer must open SendStoryBox"
     );
 
     // 2. Pick sample photo, type formatted caption, pick 12h period, disallow forwards.

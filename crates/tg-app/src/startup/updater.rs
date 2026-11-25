@@ -605,14 +605,9 @@ impl UpdateController {
             };
         }
 
-        let verifying_key_res = match std::env::var(UPDATER_PUBLIC_KEY_ENV)
-            .ok()
-            .filter(|k| !k.trim().is_empty())
-            .or_else(|| {
-                std::env::var(LEGACY_UPDATER_PUBLIC_KEY_ENV)
-                    .ok()
-                    .filter(|k| !k.trim().is_empty())
-            }) {
+        let (key_hex_override, github_repo) =
+            resolve_updater_env_overrides(cfg!(debug_assertions), |name| std::env::var(name).ok());
+        let verifying_key_res = match key_hex_override {
             Some(hex_key) => verifying_key_from_hex(&hex_key),
             None => release_verifying_key(),
         };
@@ -644,16 +639,6 @@ impl UpdateController {
                 };
             }
         };
-
-        let github_repo = std::env::var(UPDATER_REPO_ENV)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                std::env::var(LEGACY_UPDATER_REPO_ENV)
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_owned());
 
         let config = UpdateConfig {
             github_repo,
@@ -810,6 +795,34 @@ impl Drop for UpdateController {
     }
 }
 
+/// Resolves optional updater verifying-key hex and GitHub repository slug overrides from the
+/// environment.
+///
+/// Security invariant (B4): environment overrides (`RUSTGRAM_UPDATER_PUBLIC_KEY`,
+/// `RUSTGRAM_UPDATE_REPO`, and their `TGFORK_*` fallbacks) are honored ONLY when
+/// `allow_env_overrides` is `true` (`cfg!(debug_assertions)` in production). Release builds
+/// always return `(None, DEFAULT_GITHUB_REPO)` so updates strictly use the compiled-in
+/// [`release_verifying_key`] and official repository.
+pub(crate) fn resolve_updater_env_overrides<F>(
+    allow_env_overrides: bool,
+    mut get_env: F,
+) -> (Option<String>, String)
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if !allow_env_overrides {
+        return (None, DEFAULT_GITHUB_REPO.to_owned());
+    }
+    let key_override = get_env(UPDATER_PUBLIC_KEY_ENV)
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| get_env(LEGACY_UPDATER_PUBLIC_KEY_ENV).filter(|k| !k.trim().is_empty()));
+    let github_repo = get_env(UPDATER_REPO_ENV)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| get_env(LEGACY_UPDATER_REPO_ENV).filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_owned());
+    (key_override, github_repo)
+}
+
 fn publish_snapshot(target: &Arc<Mutex<UpdateSnapshot>>, snap: &UpdateSnapshot) {
     if let Ok(mut guard) = target.lock() {
         *guard = snap.clone();
@@ -946,5 +959,52 @@ mod tests {
         assert!(!ctrl.global_config.auto_update);
         assert!(ctrl.global_config.install_beta_version);
         assert!(ctrl.has_synced_update_snapshot());
+    }
+
+    #[test]
+    fn b4_release_profile_config_ignores_updater_key_and_repo_env_overrides() {
+        // Synthetic non-zero Ed25519 verifying key hex (derived from a fixed test seed).
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x55_u8; 32]);
+        let override_key_hex: String = signing
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let override_repo = "attacker/evil-rustgram";
+
+        let fake_env = |name: &str| match name {
+            UPDATER_PUBLIC_KEY_ENV | LEGACY_UPDATER_PUBLIC_KEY_ENV => {
+                Some(override_key_hex.clone())
+            }
+            UPDATER_REPO_ENV | LEGACY_UPDATER_REPO_ENV => Some(override_repo.to_owned()),
+            _ => None,
+        };
+
+        // 1. Release profile (`allow_env_overrides = false`) MUST ignore all env overrides.
+        let (rel_key_hex, rel_repo) = resolve_updater_env_overrides(false, fake_env);
+        assert!(
+            rel_key_hex.is_none(),
+            "release config must ignore RUSTGRAM_UPDATER_PUBLIC_KEY"
+        );
+        assert_eq!(rel_repo, DEFAULT_GITHUB_REPO);
+        let rel_key = match rel_key_hex {
+            Some(h) => verifying_key_from_hex(&h),
+            None => release_verifying_key(),
+        };
+        match (rel_key, release_verifying_key()) {
+            (Ok(got), Ok(expected)) => assert_eq!(got.to_bytes(), expected.to_bytes()),
+            (Err(UpdateError::UnconfiguredPublicKey), Err(UpdateError::UnconfiguredPublicKey)) => {}
+            (got, expected) => panic!(
+                "release config must match compiled-in release_verifying_key(), got {got:?} vs {expected:?}"
+            ),
+        }
+
+        // 2. Debug profile (`allow_env_overrides = true`) still honors overrides for local testing.
+        let (dbg_key_hex, dbg_repo) = resolve_updater_env_overrides(true, fake_env);
+        assert_eq!(dbg_repo, override_repo);
+        let dbg_key = verifying_key_from_hex(&dbg_key_hex.expect("debug key override"))
+            .expect("debug override key must parse");
+        assert_eq!(dbg_key.to_bytes(), signing.verifying_key().to_bytes());
     }
 }

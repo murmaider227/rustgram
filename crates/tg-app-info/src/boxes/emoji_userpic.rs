@@ -8,10 +8,14 @@
 //! `Telegram/SourceFiles/info/userpic/info_userpic_emoji_builder_preview.cpp`,
 //! and `Telegram/SourceFiles/info/userpic/info_userpic_emoji_builder_common.cpp`.
 
+use std::sync::{Arc, Mutex};
+
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Role, Sense, Stroke, Ui, Vec2,
-    WidgetInfo,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Pos2, Rect, Role, Sense, Stroke, Ui,
+    Vec2, WidgetInfo,
 };
+use tg_app_core::chat_helpers::backend::{ChatHelpersBackend, DefaultEmojiCatalogKind};
+use tg_emoji::EmojiTextureCache;
 use tg_lang::tr;
 use tg_ui::fonts::{family_regular, family_semibold, font_id_from_style};
 use tg_ui::layers::{BoxButton, BoxModal};
@@ -115,6 +119,24 @@ pub const STOP_COLOR_SWATCHES: [u32; 8] = [
     0x40A7E3, 0x2EBD6B, 0xF5A623, 0xE55353, 0x9B59B6, 0x1ABC9C, 0xFF6B81, 0x34495E,
 ];
 
+/// Server-suggested default custom-emoji entry loaded via
+/// `account.getDefaultProfilePhotoEmojis` or `account.getDefaultGroupPhotoEmojis`
+/// (`api/api_peer_photo.cpp:854-905`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestedEmojiEntry {
+    /// Custom emoji document ID returned in `emojiList.document_id`.
+    pub emoji_id: i64,
+    /// Visual Unicode glyph painted via `tg_emoji::EmojiTextureCache`.
+    pub glyph: String,
+    /// Accessible name and tooltip label.
+    pub label: String,
+}
+
+/// Curated fallback glyphs for server custom-emoji document IDs whose local sticker metadata
+/// is not yet hydrated.
+const SUGGESTED_PROFILE_GLYPHS: [&str; 8] = ["🌟", "🎯", "👑", "🦋", "🎧", "🔥", "💎", "🚀"];
+const SUGGESTED_GROUP_GLYPHS: [&str; 8] = ["💬", "🌍", "⚡", "🎨", "🏆", "📚", "🎵", "🌿"];
+
 /// Stateful Emoji Userpic Builder dialog (`UserpicBuilder::EmojiBuilderWidget`).
 #[derive(Debug, Clone)]
 pub struct EmojiUserpicBoxState {
@@ -122,6 +144,14 @@ pub struct EmojiUserpicBoxState {
     pub peer_id: PeerId,
     /// Display title of the peer (for header context).
     pub peer_title: String,
+    /// Which server catalog to query (`ProfilePhoto` for users, `GroupPhoto` for groups/channels).
+    pub catalog_kind: DefaultEmojiCatalogKind,
+    /// Server-suggested default emojis loaded via `ChatHelpersBackend::default_emoji_catalog`.
+    pub suggested_emojis: Vec<SuggestedEmojiEntry>,
+    /// Whether `default_emoji_catalog` has been queried at least once.
+    pub catalog_loaded: bool,
+    /// Optional non-fatal error message if fetching the server catalog failed.
+    pub catalog_error: Option<String>,
     /// Selected emoji document ID (`videoSizeEmojiMarkup.emoji_id`).
     pub emoji_id: i64,
     /// Selected emoji glyph for live preview.
@@ -140,10 +170,25 @@ impl EmojiUserpicBoxState {
     /// Creates an Emoji Userpic Builder initialized with the default Rocket + Azure gradient.
     #[must_use]
     pub fn new(peer_id: PeerId, peer_title: impl Into<String>) -> Self {
+        Self::with_catalog_kind(peer_id, peer_title, DefaultEmojiCatalogKind::ProfilePhoto)
+    }
+
+    /// Creates an Emoji Userpic Builder configured for a specific [`DefaultEmojiCatalogKind`]
+    /// (`ProfilePhoto` for users, `GroupPhoto` for groups/channels).
+    #[must_use]
+    pub fn with_catalog_kind(
+        peer_id: PeerId,
+        peer_title: impl Into<String>,
+        catalog_kind: DefaultEmojiCatalogKind,
+    ) -> Self {
         let first = DEFAULT_EMOJI_PRESETS[0];
         Self {
             peer_id,
             peer_title: peer_title.into(),
+            catalog_kind,
+            suggested_emojis: Vec::new(),
+            catalog_loaded: false,
+            catalog_error: None,
             emoji_id: first.emoji_id,
             emoji_glyph: first.glyph.to_owned(),
             background_colors: DEFAULT_BG_PALETTES[0].1.to_vec(),
@@ -151,6 +196,83 @@ impl EmojiUserpicBoxState {
             custom_emoji_id_input: String::new(),
             error: None,
         }
+    }
+
+    /// Creates an Emoji Userpic Builder and immediately loads the server default emoji catalog
+    /// via [`ChatHelpersBackend::default_emoji_catalog`].
+    #[must_use]
+    pub fn with_default_catalog(
+        peer_id: PeerId,
+        peer_title: impl Into<String>,
+        catalog_kind: DefaultEmojiCatalogKind,
+        chat_helpers: &dyn ChatHelpersBackend,
+    ) -> Self {
+        let mut state = Self::with_catalog_kind(peer_id, peer_title, catalog_kind);
+        state.load_default_catalog(chat_helpers, false);
+        state
+    }
+
+    /// Loads default suggested emojis from `chat_helpers` (`account.getDefaultProfilePhotoEmojis`
+    /// or `account.getDefaultGroupPhotoEmojis`, matching `info_profile_top_bar.cpp:1798-1800`).
+    pub fn load_default_catalog(&mut self, chat_helpers: &dyn ChatHelpersBackend, force: bool) {
+        self.catalog_loaded = true;
+        match chat_helpers.default_emoji_catalog(self.catalog_kind, force) {
+            Ok(catalog) => {
+                let fallback_table = match self.catalog_kind {
+                    DefaultEmojiCatalogKind::GroupPhoto => &SUGGESTED_GROUP_GLYPHS,
+                    _ => &SUGGESTED_PROFILE_GLYPHS,
+                };
+                self.suggested_emojis = catalog
+                    .document_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, doc_id)| {
+                        let raw_id = doc_id.0 as i64;
+                        if let Some(preset) =
+                            DEFAULT_EMOJI_PRESETS.iter().find(|p| p.emoji_id == raw_id)
+                        {
+                            SuggestedEmojiEntry {
+                                emoji_id: raw_id,
+                                glyph: preset.glyph.to_owned(),
+                                label: format!("Suggested {}", preset.name),
+                            }
+                        } else {
+                            let alt = chat_helpers
+                                .sticker_document(*doc_id)
+                                .map(|d| d.alt_emoji.as_str())
+                                .filter(|s| !s.is_empty());
+                            let glyph = alt
+                                .unwrap_or(fallback_table[idx % fallback_table.len()])
+                                .to_owned();
+                            SuggestedEmojiEntry {
+                                emoji_id: raw_id,
+                                glyph,
+                                label: format!("Suggested Emoji #{}", doc_id.0),
+                            }
+                        }
+                    })
+                    .collect();
+                self.catalog_error = None;
+                if let Some(first) = self.suggested_emojis.first()
+                    && self.emoji_id == DEFAULT_EMOJI_PRESETS[0].emoji_id
+                    && self.custom_emoji_id_input.is_empty()
+                {
+                    self.emoji_id = first.emoji_id;
+                    self.emoji_glyph = first.glyph.clone();
+                }
+            }
+            Err(err) => {
+                self.catalog_error = Some(err);
+            }
+        }
+    }
+
+    /// Selects a server-suggested default emoji entry.
+    pub fn select_suggested(&mut self, entry: &SuggestedEmojiEntry) {
+        self.emoji_id = entry.emoji_id;
+        self.emoji_glyph = entry.glyph.clone();
+        self.custom_emoji_id_input.clear();
+        self.error = None;
     }
 
     /// Selects a built-in emoji preset.
@@ -246,7 +368,7 @@ impl EmojiUserpicBoxState {
 
     /// Renders the circular avatar preview, gradient stop editor, and emoji picker grid.
     pub fn show_body(&mut self, ui: &mut Ui, colors: &dyn Colors) {
-        let width = ui.available_width().max(260.0);
+        let width = (ui.available_width() - 14.0).max(240.0);
 
         // 1. Live circular preview (`EmojiPreview`)
         let preview_h = 124.0;
@@ -254,11 +376,11 @@ impl EmojiUserpicBoxState {
         let center = prev_rect.center();
         let radius = 52.0;
         paint_gradient_avatar_circle(ui.painter(), center, radius, &self.background_colors);
-        ui.painter().text(
-            center,
-            Align2::CENTER_CENTER,
+        paint_emoji_glyph(
+            ui.painter(),
+            ui.ctx(),
             &self.emoji_glyph,
-            FontId::proportional(44.0),
+            Rect::from_center_size(center, Vec2::splat(52.0)),
             Color32::WHITE,
         );
 
@@ -375,7 +497,58 @@ impl EmojiUserpicBoxState {
 
         ui.add_space(10.0);
 
-        // 4. Emoji picker grid
+        // 4. Server-suggested default emoji catalog (`account.getDefaultProfilePhotoEmojis` /
+        //    `account.getDefaultGroupPhotoEmojis`)
+        if !self.suggested_emojis.is_empty() {
+            let section_lbl = match self.catalog_kind {
+                DefaultEmojiCatalogKind::GroupPhoto => "Suggested for Group",
+                _ => "Suggested for Profile",
+            };
+            ui.label(
+                egui::RichText::new(section_lbl)
+                    .font(FontId::new(12.5, family_semibold()))
+                    .color(colors.color("windowSubTextFg")),
+            );
+            ui.add_space(4.0);
+            let mut chosen_suggested: Option<SuggestedEmojiEntry> = None;
+            ui.horizontal_wrapped(|ui| {
+                for entry in &self.suggested_emojis {
+                    let active =
+                        self.emoji_id == entry.emoji_id && self.custom_emoji_id_input.is_empty();
+                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
+                    resp.widget_info(|| {
+                        WidgetInfo::selected(Role::Button, true, active, &entry.label)
+                    });
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    let bg = if active {
+                        colors.color("windowBgActive")
+                    } else if resp.hovered() {
+                        colors.color("windowBgOver")
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(r, CornerRadius::same(8), bg);
+                    paint_emoji_glyph(
+                        ui.painter(),
+                        ui.ctx(),
+                        &entry.glyph,
+                        Rect::from_center_size(r.center(), Vec2::splat(24.0)),
+                        colors.color("windowFg"),
+                    );
+                    if resp.on_hover_text(&entry.label).clicked() {
+                        chosen_suggested = Some(entry.clone());
+                    }
+                }
+            });
+            if let Some(entry) = chosen_suggested {
+                self.select_suggested(&entry);
+            }
+            ui.add_space(8.0);
+        }
+
+        // 5. Built-in emoji presets grid
         ui.label(
             egui::RichText::new("Choose Emoji")
                 .font(FontId::new(12.5, family_semibold()))
@@ -399,11 +572,11 @@ impl EmojiUserpicBoxState {
                     Color32::TRANSPARENT
                 };
                 ui.painter().rect_filled(r, CornerRadius::same(8), bg);
-                ui.painter().text(
-                    r.center(),
-                    Align2::CENTER_CENTER,
+                paint_emoji_glyph(
+                    ui.painter(),
+                    ui.ctx(),
                     preset.glyph,
-                    FontId::proportional(20.0),
+                    Rect::from_center_size(r.center(), Vec2::splat(24.0)),
                     colors.color("windowFg"),
                 );
                 if resp.on_hover_text(preset.name).clicked() {
@@ -474,6 +647,35 @@ fn paint_gradient_avatar_circle(painter: &egui::Painter, center: Pos2, radius: f
             Pos2::new(center.x + radius * 0.18, center.y - radius * 0.24),
             radius * 0.44,
             Color32::from_rgba_unmultiplied(fourth.r(), fourth.g(), fourth.b(), 110),
+        );
+    }
+}
+
+/// Paints a Unicode emoji glyph via per-context `tg_emoji::EmojiTextureCache` with text fallback.
+fn paint_emoji_glyph(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    emoji: &str,
+    rect: Rect,
+    fallback_color: Color32,
+) {
+    let cache = ctx.data_mut(|d| {
+        d.get_temp_mut_or_insert_with(Id::unique("tg_emoji_userpic_emoji_cache"), || {
+            Arc::new(Mutex::new(EmojiTextureCache::new()))
+        })
+        .clone()
+    });
+    let painted = cache
+        .lock()
+        .map(|mut guard| guard.paint_emoji_str(painter, ctx, emoji, rect, Color32::WHITE))
+        .unwrap_or(false);
+    if !painted {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            emoji,
+            FontId::proportional((rect.height() * 0.8).clamp(16.0, 44.0)),
+            fallback_color,
         );
     }
 }

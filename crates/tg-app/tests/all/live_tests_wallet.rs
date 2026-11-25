@@ -651,7 +651,9 @@ async fn live_wallet_ton_connect_full_flow_and_vault_persistence_against_local_f
     assert_eq!(pending_tx.request.request_id, "req-77");
     assert_eq!(pending_tx.request.total_nano(), 500_000_000);
 
-    let tx_receipt = reloaded.approve_ton_connect_tx().expect("approve tx");
+    let tx_receipt = reloaded
+        .approve_ton_connect_tx(&pending_tx.request.request_id, &pending_tx.content_hash())
+        .expect("approve tx");
     assert_eq!(tc_state.sent_bocs.lock().expect("bocs").len(), 1);
     assert!(reloaded.pending_tx_approval().is_none());
 

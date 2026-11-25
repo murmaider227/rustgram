@@ -15,6 +15,7 @@ pub mod ipc;
 pub mod plan;
 pub mod platform;
 pub mod profile_paths;
+pub mod profiler;
 pub use crate::core_types::restore_windows;
 pub mod updater;
 
@@ -118,8 +119,9 @@ pub fn run_from_cli() -> anyhow::Result<()> {
         Some(&exe_path),
         &StartupPrefs::default(),
     );
-    let mut prefs = StartupPrefs::load_from(&prelim.resolved_working_dir.path);
+    let prefs = StartupPrefs::load_from(&prelim.resolved_working_dir.path);
     let plan = StartupPlan::build(&raw_args, &work_env, Some(&exe_path), &prefs);
+    profiler::mark("cli_and_plan");
 
     match plan.action {
         StartupAction::ShowHelp => {
@@ -149,10 +151,12 @@ pub fn run_from_cli() -> anyhow::Result<()> {
         );
     }
     init_tracing_with_file_logger(Arc::clone(&log_manager), plan.debug_logging);
+    profiler::mark("logger_init");
 
     // Apply explicit Windows AppUserModelID early (before creating windows or toast notifications).
     let mut platform_hooks = RealWindowsPlatform;
     platform::apply_process_app_id(&plan, &mut platform_hooks);
+    profiler::mark("app_id");
 
     // Single-instance check & argument forwarding via `tg-platform` named mutex + named pipe.
     let (single_instance_guard, activation_queue) = if plan.use_single_instance {
@@ -200,13 +204,11 @@ pub fn run_from_cli() -> anyhow::Result<()> {
     };
 
     // Start-menu shortcut validation + first-run `tg://` / `tonsite://` registration.
-    let platform_report =
-        platform::apply_startup_integration(&plan, &exe_path, &mut prefs, &mut platform_hooks);
-    if platform_report.url_schemes_registered
-        && let Err(err) = prefs.save_to(&working_dir)
-    {
-        tracing::warn!(%err, "Could not save updated startup_prefs.json");
-    }
+    profiler::mark("single_instance");
+    // The Start-menu shortcut (COM) and registry writes take ~40 ms and nothing on the way to the
+    // first frame depends on them, so they run on a background thread.
+    spawn_startup_integration(plan.clone(), exe_path.clone(), prefs.clone());
+    profiler::mark("platform_integration");
 
     // Initialize `tg-core` crash handler (panic hook + Windows SEH filter) and inspect `tdata/working`.
     let crash_manager = CrashReportManager::new(&working_dir);
@@ -233,6 +235,7 @@ pub fn run_from_cli() -> anyhow::Result<()> {
             None
         }
     };
+    profiler::mark("crash_manager");
 
     // Start periodic self-update checker unless disabled via `-noupdate` or prefs.
     let update_controller = UpdateController::start(
@@ -242,6 +245,7 @@ pub fn run_from_cli() -> anyhow::Result<()> {
         plan.parsed_args.clone(),
         &prefs,
     );
+    profiler::mark("update_controller_start");
 
     let live_mode = plan.live_mode || is_live_mode_env_enabled();
     let native_window_frame = std::env::var("RUSTGRAM_NATIVE_FRAME")
@@ -267,6 +271,28 @@ pub fn run_from_cli() -> anyhow::Result<()> {
     };
 
     run_app(config)
+}
+
+/// Runs [`platform::apply_startup_integration`] (Start-menu shortcut validation and first-run
+/// `tg://` / `tonsite://` registration) on a background thread, saving `startup_prefs.json` when
+/// the handlers were registered. If the thread cannot start, the integration is retried on the
+/// next launch (the prefs flag stays unset).
+fn spawn_startup_integration(plan: StartupPlan, exe_path: PathBuf, mut prefs: StartupPrefs) {
+    let spawned = std::thread::Builder::new()
+        .name("startup-integration".to_owned())
+        .spawn(move || {
+            let mut hooks = RealWindowsPlatform;
+            let report =
+                platform::apply_startup_integration(&plan, &exe_path, &mut prefs, &mut hooks);
+            if report.url_schemes_registered
+                && let Err(err) = prefs.save_to(&plan.resolved_working_dir.path)
+            {
+                tracing::warn!(%err, "Could not save updated startup_prefs.json");
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(%err, "Could not start the startup integration thread");
+    }
 }
 
 fn init_console_only_tracing(debug: bool) {

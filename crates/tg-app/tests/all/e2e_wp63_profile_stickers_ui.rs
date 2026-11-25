@@ -1,6 +1,6 @@
 //! End-to-end `egui_kittest` tests and headless `wgpu` screenshot capture for WP-63:
 //! - `StickerSetBox` pack-owner controls (rename, reorder, remove sticker entries, delete pack)
-//! - `stickers_gift_box_pack` gift-box sticker pack ribbon in `StickersListWidget`
+//! - `stickers_gift_box_pack` tiers (the Stickers tab shows no gift-box ribbon, as in 7.4.6)
 //! - Peer Profile UI: `info_profile_balance_pill`, Set Main Profile Tab selector,
 //!   Personal Channel picker, Report Profile Photo & Suggest Birthday actions, channel gift notifications
 //! - Star Gift TON blockchain withdrawal dialog (2FA SRP prompt + Fragment URL, fake backend only),
@@ -291,13 +291,11 @@ fn wp63_stickers_gift_box_pack_ribbon_and_tiers() {
             events.extend(widget.show(ui, &mut helpers_backend, &palette));
         });
     h.run_steps(4);
+    // Telegram Desktop 7.4.6 shows no gift-box ribbon in the Stickers tab (UI parity stage 2);
+    // `GiftBoxPack` only resolves gift stickers for gift messages.
     assert!(
-        h.query_all_by_label_contains("Gift Boxes").next().is_some(),
-        "StickersListWidget must render the Gift Boxes ribbon"
-    );
-    assert!(
-        h.query_all_by_label_contains("TON").next().is_some(),
-        "Gift Boxes ribbon must render TON tier mode toggle"
+        h.query_all_by_label_contains("Gift Boxes").next().is_none(),
+        "StickersListWidget must not render a Gift Boxes ribbon"
     );
 }
 
@@ -655,7 +653,7 @@ fn capture_wp63_after_screenshots() {
             save_wgpu_png(&mut h, &format!("sticker_set_box_{tag}_after"));
         }
 
-        // 2. StickersListWidget with Gift Boxes ribbon
+        // 2. StickersListWidget (Stickers tab)
         {
             let mut h = build_snap_harness(size);
             let now = h.ctx.input(|i| i.time);

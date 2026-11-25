@@ -66,6 +66,9 @@ pub fn init_headless_env() {
         unsafe {
             std::env::set_var("RUSTGRAM_HEADLESS_AUDIO", "1");
         }
+        // Message times and date separators render in UTC so snapshots do not depend on the
+        // machine's time zone.
+        tg_history::datetime::set_utc_offset_override(Some(0));
     });
 }
 

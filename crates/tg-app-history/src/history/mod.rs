@@ -58,6 +58,10 @@ mod tests;
 mod tests_scroll_bottom;
 #[cfg(test)]
 mod tests_video_editor_wire2;
+#[cfg(test)]
+mod tests_wp75_media_refresh;
+#[cfg(test)]
+mod tests_wp79_live_history;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -102,19 +106,20 @@ use crate::history::backend::{
     VideoAttachment, VoiceAttachment, to_bot_full, to_bot_peer, to_bot_peer_kind,
 };
 use crate::history::bars::{
-    BUSINESS_BOT_BAR_HEIGHT, BusinessBotBarEvent, CONTACT_STATUS_HEIGHT, ContactStatusEvent,
-    JOIN_REQUESTS_BAR_HEIGHT, PINNED_BAR_HEIGHT, PinnedBarEvent, TopBarEvent,
-    UPLOAD_PROGRESS_ROW_HEIGHT, paint_business_bot_bar, paint_contact_status_bar,
-    paint_join_requests_bar, paint_pinned_bar, paint_scroll_to_bottom_button,
-    paint_selection_top_bar, paint_top_bar, paint_upload_progress_bar,
+    BOT_START_BAR_HEIGHT, BUSINESS_BOT_BAR_HEIGHT, BusinessBotBarEvent, CONTACT_STATUS_HEIGHT,
+    ContactStatusEvent, JOIN_REQUESTS_BAR_HEIGHT, PINNED_BAR_HEIGHT, PinnedBarEvent, TopBarEvent,
+    UPLOAD_PROGRESS_ROW_HEIGHT, paint_bot_start_bar, paint_business_bot_bar,
+    paint_contact_status_bar_with_confirm, paint_join_requests_bar, paint_pinned_bar,
+    paint_scroll_to_bottom_button, paint_selection_top_bar, paint_top_bar,
+    paint_upload_progress_bar,
 };
 use crate::history::compose::{ComposeBotChrome, ComposeControls, ComposeEvent, SendShortcut};
 use crate::history::compose_boxes::{
     AddPollOptionAction, AddPollOptionBoxState, AttachFilesAction, AttachFilesBoxState,
-    CreatePollBoxAction, CreatePollBoxState, DeleteConfirmAction, DeleteConfirmBoxState,
-    LocationPickerAction, LocationPickerBoxState, PhotoEditorModalState, ReportMessageAction,
-    ReportMessageBoxState, ScheduleBoxAction, ScheduleBoxMode, ScheduleBoxState,
-    ShareContactAction, ShareContactBoxState,
+    BlockFromRepliesAction, BlockFromRepliesBoxState, CreatePollBoxAction, CreatePollBoxState,
+    DeleteConfirmAction, DeleteConfirmBoxState, LocationPickerAction, LocationPickerBoxState,
+    PhotoEditorModalState, ReportMessageAction, ReportMessageBoxState, ScheduleBoxAction,
+    ScheduleBoxMode, ScheduleBoxState, ShareContactAction, ShareContactBoxState,
 };
 use crate::history::compose_extras::{
     InlineBotQueryHook, ReactionsPickerAction, ReactionsPickerState, TRANSLATE_BAR_HEIGHT,
@@ -170,6 +175,16 @@ struct PendingHistoryCallback {
     deliver_at_ms: u64,
 }
 
+/// Forward draft to put on the compose bar once the chosen chat is open
+/// (`MainWidget::setForwardDraft` after picking a chat in "Forward to...").
+#[derive(Debug, Clone)]
+struct PendingForwardDraft {
+    target_peer: PeerId,
+    from_peer: PeerId,
+    msg_ids: Vec<MsgId>,
+    summary: String,
+}
+
 #[derive(Debug, Clone)]
 struct PendingInlinePrefill {
     target_peer: PeerId,
@@ -212,6 +227,14 @@ pub enum HistoryAction {
     },
     /// User clicked a link or mention/bot command URL in a message.
     OpenLink(String),
+    /// User clicked a hidden `messageEntityTextUrl` link or sandboxed widget external link
+    /// requiring scheme validation and confirmation before opening externally.
+    OpenHiddenLink {
+        /// Target URL.
+        url: String,
+        /// When `true`, always show confirmation even on allowlisted domains (widget `ConfirmExternal`).
+        force_confirm: bool,
+    },
     /// User launched a Bot Mini App (or embedded HTML5 Game WebView) from the chat.
     ///
     /// Port of `InlineBots::AttachWebView::open` (`inline_bots/bot_attach_web_view.cpp`):
@@ -223,6 +246,10 @@ pub enum HistoryAction {
         url: Option<String>,
         /// Optional deep-link `start_param` payload.
         start_param: Option<String>,
+        /// Keyboard, bot menu and switch-inline buttons ask first (`WebViewInstance::confirmOpen`
+        /// in `bot_attach_web_view.cpp`) unless the bot is verified or already trusted; attach
+        /// menu, main app and game launches have their own flow.
+        confirm_open: bool,
     },
     /// User clicked a `switch_inline` button without `same_peer`: open a peer picker filtered
     /// by `peer_types`, then switch to the chosen chat with `@bot_username query` prefilled.
@@ -359,6 +386,7 @@ pub struct HistoryWidget {
     attach_box: Option<AttachFilesBoxState>,
     delete_box: Option<DeleteConfirmBoxState>,
     report_box: Option<ReportMessageBoxState>,
+    block_from_replies_box: Option<BlockFromRepliesBoxState>,
     rich_editor: Option<tg_app_media::webview::rich_editor::RichEditorWindow>,
     video_drafts_dir: Option<PathBuf>,
     rich_export_dir: Option<PathBuf>,
@@ -401,6 +429,12 @@ pub struct HistoryWidget {
     bot_modal: Option<BotModalBox>,
     last_inline_compose_text: String,
     pending_inline_prefill: Option<PendingInlinePrefill>,
+    pending_forward_draft: Option<PendingForwardDraft>,
+    /// `BotInfo::startToken` per bot chat, set by a `tg://resolve?domain=<bot>&start=<token>`
+    /// link and sent with `messages.startBot` when the user presses START.
+    bot_start_tokens: HashMap<PeerId, String>,
+    /// Whether the last frame showed the bottom START bar instead of the composer.
+    bot_start_shown: bool,
     pending_game_url_bot: Option<PeerId>,
     trusted_game_bots: HashSet<PeerId>,
     // Layer-233 history extras (`todo.rs`, `sponsored.rs`, `factcheck.rs`, `monoforum.rs`)
@@ -451,6 +485,8 @@ pub struct HistoryWidget {
     /// newly arrived) trigger Lottie message-effect playback; history loaded on open or by
     /// scrolling up never replays effects.
     effect_watermark: HashMap<PeerId, MsgId>,
+    /// Peer currently showing inline Report Spam confirmation inside the contact status bar.
+    contact_status_report_confirm_peer: Option<PeerId>,
 }
 
 /// Returns `(msg_id, effect_id)` for messages above `peer_id`'s watermark (newly sent or newly
@@ -530,6 +566,7 @@ impl HistoryWidget {
             attach_box: None,
             delete_box: None,
             report_box: None,
+            block_from_replies_box: None,
             rich_editor: None,
             video_drafts_dir: None,
             rich_export_dir: None,
@@ -559,6 +596,9 @@ impl HistoryWidget {
             bot_modal: None,
             last_inline_compose_text: String::new(),
             pending_inline_prefill: None,
+            pending_forward_draft: None,
+            bot_start_tokens: HashMap::new(),
+            bot_start_shown: false,
             pending_game_url_bot: None,
             trusted_game_bots: HashSet::new(),
             todo_box: None,
@@ -598,6 +638,7 @@ impl HistoryWidget {
             geo_provider: None,
             bot_location_pending: None,
             effect_watermark: HashMap::new(),
+            contact_status_report_confirm_peer: None,
         }
     }
 
@@ -614,6 +655,28 @@ impl HistoryWidget {
     #[must_use]
     pub fn widget_helper_path(&self) -> Option<&std::path::Path> {
         self.widget_helper_path.as_deref()
+    }
+
+    /// Opens the Replies-chat block confirmation modal for `(msg_id, sender_name)`.
+    pub fn open_block_from_replies_modal(&mut self, msg_id: MsgId, sender_name: impl Into<String>) {
+        self.block_from_replies_box = Some(BlockFromRepliesBoxState::new(msg_id, sender_name));
+    }
+
+    /// Returns `true` while the Replies-chat block confirmation modal is visible.
+    #[must_use]
+    pub const fn is_block_from_replies_open(&self) -> bool {
+        self.block_from_replies_box.is_some()
+    }
+
+    /// Returns read-only access to the inline Saved Messages self-forwards tagger.
+    #[must_use]
+    pub const fn self_forwards_tagger(&self) -> &SelfForwardsTaggerState {
+        &self.self_forwards_tagger
+    }
+
+    /// Returns mutable access to the inline Saved Messages self-forwards tagger.
+    pub fn self_forwards_tagger_mut(&mut self) -> &mut SelfForwardsTaggerState {
+        &mut self.self_forwards_tagger
     }
 
     /// Exchanges the current composer content with the per-chat compose stash (`Ctrl+S` /
@@ -1107,6 +1170,42 @@ impl HistoryWidget {
         });
     }
 
+    /// Queues a forward draft for `target_peer`: once that chat is open, its compose bar shows
+    /// the forward preview for `msg_ids` from `from_peer` (`MainWidget::setForwardDraft`).
+    pub fn set_pending_forward_draft(
+        &mut self,
+        target_peer: PeerId,
+        from_peer: PeerId,
+        msg_ids: Vec<MsgId>,
+        summary: impl Into<String>,
+    ) {
+        self.pending_forward_draft = Some(PendingForwardDraft {
+            target_peer,
+            from_peer,
+            msg_ids,
+            summary: summary.into(),
+        });
+    }
+
+    /// Stores the `start` token of a `tg://resolve?domain=<bot>&start=<token>` link for
+    /// `bot_peer`: the chat then shows the bottom START bar until the user presses it
+    /// (`HistoryWidget::isBotStart`, `botInfo->startToken`).
+    pub fn set_bot_start_token(&mut self, bot_peer: PeerId, token: impl Into<String>) {
+        self.bot_start_tokens.insert(bot_peer, token.into());
+    }
+
+    /// Returns the pending `start` token for `bot_peer`, if any.
+    #[must_use]
+    pub fn bot_start_token(&self, bot_peer: PeerId) -> Option<&str> {
+        self.bot_start_tokens.get(&bot_peer).map(String::as_str)
+    }
+
+    /// Returns `true` when the last frame showed the bottom START bar instead of the composer.
+    #[must_use]
+    pub const fn is_bot_start_shown(&self) -> bool {
+        self.bot_start_shown
+    }
+
     /// Returns a reference to the bot reply keyboard panel state.
     #[must_use]
     pub const fn reply_keyboard(&self) -> &ReplyKeyboardWidget {
@@ -1201,6 +1300,91 @@ impl HistoryWidget {
                 info.summary.kind,
             );
         }
+    }
+
+    /// Drains incremental live updates from `backend` for the already-open `peer_id` and applies
+    /// them to [`HistoryInnerWidget`] without re-opening the chat.
+    fn sync_live_history_updates(
+        &mut self,
+        peer_id: PeerId,
+        peer_info: &HistoryPeerInfo,
+        backend: &mut dyn HistoryBackend,
+        ctx: &egui::Context,
+    ) {
+        let updates = backend.drain_history_updates(peer_id);
+        if updates.is_empty() {
+            return;
+        }
+        let mut reply_markup_dirty = false;
+        for upd in updates {
+            match upd {
+                tg_app_core::history::backend::HistoryLiveUpdate::ReloadRequired => {
+                    let was_scrolled_up = self.inner.show_scroll_down_button();
+                    let anchor = if was_scrolled_up {
+                        self.inner
+                            .messages()
+                            .last()
+                            .map_or(MsgId::SHOW_AT_END, |m| m.id)
+                    } else {
+                        MsgId::SHOW_AT_END
+                    };
+                    self.inner
+                        .load_peer(peer_id, anchor, backend, peer_info.summary.kind);
+                    reply_markup_dirty = true;
+                }
+                tg_app_core::history::backend::HistoryLiveUpdate::MessagesDeleted(ids) => {
+                    self.inner.remove_messages(&ids, peer_info.summary.kind);
+                    // Cancel active edit/reply targeting a deleted message (`HistoryWidget::itemRemoved`).
+                    let target_deleted = match &self.compose.mode {
+                        crate::history::compose::ComposeMode::Edit { msg_id, .. }
+                        | crate::history::compose::ComposeMode::Reply { msg_id, .. } => {
+                            ids.contains(msg_id)
+                        }
+                        _ => false,
+                    };
+                    if target_deleted {
+                        self.compose.mode = crate::history::compose::ComposeMode::Normal;
+                    }
+                    reply_markup_dirty = true;
+                }
+                tg_app_core::history::backend::HistoryLiveUpdate::MessageAdded(msg) => {
+                    if let Some(desc) = backend.inline_media_descriptor(peer_id, msg.id) {
+                        self.inner
+                            .media_runtime_mut()
+                            .register_descriptor(msg.id, desc);
+                    }
+                    if msg.extra.reply_markup.is_some() {
+                        reply_markup_dirty = true;
+                    }
+                    self.inner
+                        .apply_live_added_message(*msg, peer_info.summary.kind);
+                }
+                tg_app_core::history::backend::HistoryLiveUpdate::MessageEdited(msg) => {
+                    if let Some(desc) = backend.inline_media_descriptor(peer_id, msg.id) {
+                        self.inner
+                            .media_runtime_mut()
+                            .register_descriptor(msg.id, desc);
+                    }
+                    if msg.extra.reply_markup.is_some() {
+                        reply_markup_dirty = true;
+                    }
+                    self.inner.update_message_in_place(*msg);
+                }
+                tg_app_core::history::backend::HistoryLiveUpdate::OutboxRead { max_id } => {
+                    self.inner.mark_outbox_read_up_to(max_id);
+                }
+                tg_app_core::history::backend::HistoryLiveUpdate::UnreadChanged {
+                    unread_count,
+                    inbox_read_till,
+                } => {
+                    self.inner.apply_unread_state(unread_count, inbox_read_till);
+                }
+            }
+        }
+        if reply_markup_dirty {
+            self.sync_reply_keyboard_from_loaded(peer_id, backend);
+        }
+        ctx.request_repaint();
     }
 
     /// Opens a specialized history section (scheduled, pinned list, comments thread, forum topics,
@@ -1822,6 +2006,11 @@ impl HistoryWidget {
             self.last_compose_text_for_hint = self.compose.text.clone();
             self.stash_hint
                 .track_change(&self.compose.text, false, true, now_ms_u64);
+        } else {
+            // Pull live MTProto updates (incoming/outgoing messages, edits, deletions,
+            // read receipts) into the already-open history view (`History::addNewMessage` /
+            // `HistoryWidget::newItemAdded`, `itemEdited`, `itemRemoved`).
+            self.sync_live_history_updates(peer_id, &peer_info, backend, ui.ctx());
         }
 
         // WP-38: Sync active streamed bot drafts, poll interactive emoji sync, and flush due read metrics.
@@ -1931,6 +2120,16 @@ impl HistoryWidget {
                     bots_be,
                 );
             }
+        }
+
+        if self
+            .pending_forward_draft
+            .as_ref()
+            .is_some_and(|d| d.target_peer == peer_id)
+            && let Some(draft) = self.pending_forward_draft.take()
+        {
+            self.compose
+                .start_forward(draft.from_peer, draft.msg_ids, draft.summary);
         }
 
         let mut action = None;
@@ -2175,28 +2374,80 @@ impl HistoryWidget {
             list_top = pin_rect.bottom();
         }
 
-        // 4. Optional Contact Status bar (`history_view_contact_status.cpp`).
+        // 4. Optional Contact Status bar (`history_view_contact_status.cpp`, WP-66 / WP-70).
         if let Some(ref banner) = peer_info.contact_status {
             let cs_rect = Rect::from_min_size(
                 Pos2::new(rect.left(), list_top),
                 Vec2::new(rect.width(), CONTACT_STATUS_HEIGHT),
             );
-            if let Some(cev) = paint_contact_status_bar(ui, cs_rect, banner, &colors) {
+            let confirming_spam = self.contact_status_report_confirm_peer == Some(peer_id);
+            if let Some(cev) =
+                paint_contact_status_bar_with_confirm(ui, cs_rect, banner, confirming_spam, &colors)
+            {
                 match cev {
                     ContactStatusEvent::AddContact => {
-                        backend.add_contact(peer_id);
-                        self.show_toast("Added to contacts", now_secs);
+                        self.contact_status_report_confirm_peer = None;
+                        match backend.accept_contact(peer_id) {
+                            Ok(()) => {
+                                self.show_toast(
+                                    tg_lang::tr::lng_new_contact_add_done(&peer_info.summary.title),
+                                    now_secs,
+                                );
+                            }
+                            Err(_) => {
+                                backend.add_contact(peer_id);
+                                self.show_toast(
+                                    tg_lang::tr::lng_new_contact_add_done(&peer_info.summary.title),
+                                    now_secs,
+                                );
+                            }
+                        }
+                    }
+                    ContactStatusEvent::SharePhone => {
+                        self.contact_status_report_confirm_peer = None;
+                        match backend.accept_contact(peer_id) {
+                            Ok(()) => {
+                                self.show_toast(
+                                    tg_lang::tr::lng_new_contact_share_done(
+                                        &peer_info.summary.title,
+                                    ),
+                                    now_secs,
+                                );
+                            }
+                            Err(err) => self.show_toast(err, now_secs),
+                        }
                     }
                     ContactStatusEvent::ToggleBlock => {
+                        self.contact_status_report_confirm_peer = None;
                         backend.toggle_block_peer(peer_id);
                         self.show_toast("Updated block status", now_secs);
                     }
+                    ContactStatusEvent::ReportSpam => {
+                        self.contact_status_report_confirm_peer = Some(peer_id);
+                    }
+                    ContactStatusEvent::ConfirmReportSpam => {
+                        self.contact_status_report_confirm_peer = None;
+                        match backend.report_spam(peer_id) {
+                            Ok(_) => {
+                                backend.dismiss_contact_status(peer_id);
+                                self.show_toast(tg_lang::tr::lng_report_spam_done(), now_secs);
+                            }
+                            Err(err) => self.show_toast(err, now_secs),
+                        }
+                    }
+                    ContactStatusEvent::CancelReportSpam => {
+                        self.contact_status_report_confirm_peer = None;
+                    }
                     ContactStatusEvent::Dismiss => {
+                        self.contact_status_report_confirm_peer = None;
+                        let _ = backend.hide_peer_settings_bar(peer_id);
                         backend.dismiss_contact_status(peer_id);
                     }
                 }
             }
             list_top = cs_rect.bottom();
+        } else if self.contact_status_report_confirm_peer == Some(peer_id) {
+            self.contact_status_report_confirm_peer = None;
         }
 
         // 4b. Whole-chat Translate Bar (`history_view_translate_bar.cpp`).
@@ -2429,21 +2680,9 @@ impl HistoryWidget {
             Pos2::new(rect.left(), list_top),
             Pos2::new(rect.right(), rect.bottom()),
         );
-        if peer_info.summary.is_saved_messages {
-            let sublists = backend.saved_sublists(peer_id);
-            let (remaining, tab_act) = self.subsection_tabs.show_for_saved(
-                ui,
-                content_bounds,
-                peer_id,
-                None,
-                &sublists,
-                &colors,
-            );
-            content_bounds = remaining;
-            if let Some(HistorySectionAction::OpenSection(next)) = tab_act {
-                self.active_section = Some(next);
-            }
-        } else if matches!(peer_info.summary.kind, PeerKind::Group) {
+        // Saved Messages has no subsection tabs: `SubsectionTabs::UsedFor` is only true for
+        // monoforum admins and forum channels / bots (`PeerData::displaySubsectionTabs`).
+        if matches!(peer_info.summary.kind, PeerKind::Group) {
             let topics = backend.forum_topics(peer_id);
             if !topics.is_empty() {
                 let (remaining, tab_act) = self.subsection_tabs.show_for_forum(
@@ -2467,8 +2706,19 @@ impl HistoryWidget {
             }
         }
 
+        // 5a. Bot chats with a pending `start` token or no history show the START bar in place of
+        //     the composer and its keyboard (`HistoryWidget::isBotStart`).
+        // Live sessions return a snapshot for every peer; only real bots get the bar.
+        let is_bot_chat = bot_snapshot
+            .as_ref()
+            .is_some_and(|s| s.peer_kind == tg_bots::stand_in::PeerKind::Bot);
+        let bot_start = peer_info.summary.can_send
+            && is_bot_chat
+            && (self.bot_start_tokens.contains_key(&peer_id) || self.inner.messages().is_empty());
+        self.bot_start_shown = bot_start;
+
         // 5. Compute bottom reply keyboard & compose controls heights & rects.
-        let reply_kb_h = if peer_info.summary.can_send {
+        let reply_kb_h = if peer_info.summary.can_send && !bot_start {
             self.reply_keyboard
                 .desired_height(ui, content_bounds.width())
         } else {
@@ -2478,9 +2728,12 @@ impl HistoryWidget {
             Pos2::new(content_bounds.left(), content_bounds.bottom() - reply_kb_h),
             Vec2::new(content_bounds.width(), reply_kb_h),
         );
-        let compose_h = self
-            .compose
-            .desired_height(content_bounds.width(), peer_info.summary.can_send);
+        let compose_h = if bot_start {
+            BOT_START_BAR_HEIGHT
+        } else {
+            self.compose
+                .desired_height(content_bounds.width(), peer_info.summary.can_send)
+        };
         let compose_rect = Rect::from_min_size(
             Pos2::new(content_bounds.left(), reply_kb_rect.top() - compose_h),
             Vec2::new(content_bounds.width(), compose_h),
@@ -2539,8 +2792,12 @@ impl HistoryWidget {
         }
 
         // 5d. Broadcast channel Pull-to-Next-Unread-Channel footer strip (`history_view_pull_to_next_channel.cpp`).
+        // tdesktop shows it only while the list is over-scrolled past its bottom, drawn over the
+        // list; at rest nothing sits between the messages and the bottom bar.
         let is_broadcast_channel = peer_info.summary.kind == PeerKind::Channel;
-        let show_pull_footer = is_broadcast_channel && !self.inner.show_scroll_down_button();
+        let show_pull_footer = is_broadcast_channel
+            && !self.inner.show_scroll_down_button()
+            && self.pull_next_channel.pull_px() > 0.0;
         let pull_footer_h = if show_pull_footer {
             pull_to_next_channel::PULL_NEXT_FOOTER_HEIGHT
         } else {
@@ -2551,12 +2808,12 @@ impl HistoryWidget {
             Vec2::new(content_bounds.width(), pull_footer_h),
         );
 
-        // 6. Scrollable virtualized message list between header bars and the pull/stop/upload/compose controls.
+        // 6. Scrollable virtualized message list between header bars and the stop/upload/compose controls.
         let list_rect = Rect::from_min_max(
             content_bounds.min,
             Pos2::new(
                 content_bounds.right(),
-                pull_footer_rect.top().max(content_bounds.top() + 40.0),
+                stop_draft_rect.top().max(content_bounds.top() + 40.0),
             ),
         );
         let inner_events = self.inner.show_with_bots(
@@ -2586,6 +2843,7 @@ impl HistoryWidget {
 
         // 6b. Empty bot chat info header ("What can this bot do?" + START button).
         if self.inner.messages().is_empty()
+            && is_bot_chat
             && let Some(ref snap) = bot_snapshot
         {
             let info_ev = ui
@@ -2650,6 +2908,7 @@ impl HistoryWidget {
                             bot_id: PeerId::from_user(snap.bot_id.0),
                             url: None,
                             start_param: None,
+                            confirm_open: false,
                         });
                     }
                 }
@@ -2919,25 +3178,37 @@ impl HistoryWidget {
             use_rich_inline_results: has_bots_backend,
             palette,
         };
-        let compose_events = self.compose.show_extended_with_bots(
-            ui,
-            compose_rect,
-            peer_id,
-            peer_info.summary.can_send,
-            peer_info.summary.muted,
-            &compose_placeholder,
-            &colors,
-            backend,
-            slow_remaining,
-            &send_as_peers,
-            can_send_when_online,
-            Some(bot_chrome),
-        );
+        let compose_events = if bot_start {
+            if paint_bot_start_bar(ui, compose_rect, &colors)
+                && let Some(text) = self.send_bot_start(peer_id, backend, now_secs)
+            {
+                action = Some(HistoryAction::SendMessage { peer_id, text });
+            }
+            Vec::new()
+        } else {
+            self.compose.show_extended_with_bots(
+                ui,
+                compose_rect,
+                peer_id,
+                peer_info.summary.can_send,
+                peer_info.summary.muted,
+                &compose_placeholder,
+                &colors,
+                backend,
+                slow_remaining,
+                &send_as_peers,
+                can_send_when_online,
+                Some(bot_chrome),
+            )
+        };
         if self.compose.text != self.last_compose_text_for_hint {
             self.last_compose_text_for_hint = self.compose.text.clone();
+            // The field cleared by a send / edit / forward is not a user cut
+            // (`trackChange(false)`): re-sending the same text must not show the hint.
+            let user_driven = !(self.compose.text.is_empty() && !compose_events.is_empty());
             if let Some(tip) = self.stash_hint.track_change(
                 &self.compose.text,
-                true,
+                user_driven,
                 peer_info.summary.can_send,
                 now_ms_u64,
             ) {
@@ -3324,6 +3595,7 @@ impl HistoryWidget {
                             bot_id,
                             url: Some(url),
                             start_param: None,
+                            confirm_open: true,
                         });
                     }
                 },
@@ -3405,6 +3677,13 @@ impl HistoryWidget {
 
         // 8c. Inline Self-Forwards Tagger (`history_view_self_forwards_tagger.cpp`).
         if self.self_forwards_tagger.is_visible() {
+            if !self.self_forwards_tagger.has_loaded_default_tags()
+                && let Some(ch) = backend.as_chat_helpers_backend()
+                && let Ok(res) = ch.default_tag_reactions(false)
+            {
+                self.self_forwards_tagger
+                    .seed_default_tag_reactions(&res.reactions);
+            }
             let saved_tags = backend.saved_reaction_tags(None);
             if let Some(tag_act) =
                 self.self_forwards_tagger
@@ -3531,7 +3810,11 @@ impl HistoryWidget {
         }
 
         // 8c. Compose, message-action, and bot modal boxes.
-        self.show_active_modals(ui, peer_id, &peer_info, backend, now_secs, palette, &colors);
+        if let Some(modal_act) =
+            self.show_active_modals(ui, peer_id, &peer_info, backend, now_secs, palette, &colors)
+        {
+            action = Some(modal_act);
+        }
         if self.poll_bot_location_share(backend, now_secs).is_none()
             && self.bot_location_pending.is_some()
         {
@@ -3564,6 +3847,50 @@ impl HistoryWidget {
         self.last_inline_compose_text.clear();
         self.compose.bot_popup_active = false;
         self.sync_reply_keyboard_from_loaded(peer_id, backend);
+    }
+
+    /// START bar click (`HistoryWidget::sendBotStartCommand`): a pending `start` token goes out
+    /// with `messages.startBot`, otherwise a plain `/start` message is sent.
+    fn send_bot_start(
+        &mut self,
+        peer_id: PeerId,
+        backend: &mut dyn HistoryBackend,
+        now_secs: f64,
+    ) -> Option<String> {
+        let sent = match self.bot_start_tokens.remove(&peer_id) {
+            Some(token) if !token.is_empty() => match backend.as_bots_backend_mut() {
+                Some(bots) => {
+                    let params = tg_bots::protocol::StartBotParams::for_private_chat(
+                        tg_bots::stand_in::UserId(peer_id.bare()),
+                        token,
+                        0,
+                    );
+                    bots.start_bot(&params).map(|_| ())
+                }
+                None => Err("Bots are not available in this session".to_owned()),
+            },
+            _ => backend
+                .send_message(
+                    peer_id,
+                    SendMessageRequest {
+                        text: tg_text::TextWithEntities::simple("/start"),
+                        reply_to: None,
+                        silent: false,
+                    },
+                )
+                .map(|_| ()),
+        };
+        match sent {
+            Ok(()) => {
+                self.reload_active_peer(backend);
+                self.sync_reply_keyboard_from_loaded(peer_id, backend);
+                Some("/start".to_owned())
+            }
+            Err(err) => {
+                self.show_toast(err, now_secs);
+                None
+            }
+        }
     }
 
     fn sync_reply_keyboard_from_loaded(&mut self, peer_id: PeerId, backend: &dyn HistoryBackend) {
@@ -3732,6 +4059,7 @@ impl HistoryWidget {
                         bot_id,
                         url: Some(url),
                         start_param: None,
+                        confirm_open: false,
                     })
                 }
             }
@@ -3912,6 +4240,7 @@ impl HistoryWidget {
                     bot_id: PeerId::from_user(bot_id.0),
                     url: Some(url),
                     start_param: None,
+                    confirm_open: true,
                 })
             }
             BotButtonAction::CopyText { text } => {
@@ -4071,6 +4400,7 @@ impl HistoryWidget {
                     bot_id: PeerId::from_user(bot_id.0),
                     url: Some(url),
                     start_param: None,
+                    confirm_open: true,
                 })
             }
             _ => None,
@@ -4220,6 +4550,7 @@ impl HistoryWidget {
                                     bot_id: PeerId::from_user(bot_id.0),
                                     url: Some(url),
                                     start_param: None,
+                                    confirm_open: true,
                                 });
                             }
                         }
@@ -4355,6 +4686,7 @@ impl HistoryWidget {
                                     bot_id: PeerId::from_user(bot.bot_id.0),
                                     url: None,
                                     start_param: None,
+                                    confirm_open: false,
                                 });
                             }
                         }
@@ -4436,6 +4768,7 @@ impl HistoryWidget {
                         bot_id: game_bot_id,
                         url: Some(url),
                         start_param: None,
+                        confirm_open: false,
                     })
                 } else {
                     self.show_toast(format!("Opening external link: {url}"), now_secs);
@@ -4588,6 +4921,7 @@ impl HistoryWidget {
                     bot_id: PeerId::from_user(bot.bot_id.0),
                     url: None,
                     start_param: None,
+                    confirm_open: false,
                 })
             }
         }
@@ -4811,6 +5145,12 @@ impl HistoryWidget {
                 InnerEvent::OpenLink(url) => {
                     out_action = Some(HistoryAction::OpenLink(url));
                 }
+                InnerEvent::OpenHiddenLink(url) => {
+                    out_action = Some(HistoryAction::OpenHiddenLink {
+                        url,
+                        force_confirm: false,
+                    });
+                }
                 InnerEvent::CopiedRich { summary, rich } => {
                     self.compose.copied_rich_buffer = Some(rich);
                     self.show_toast(summary, now_secs);
@@ -5024,6 +5364,13 @@ impl HistoryWidget {
                 InnerEvent::Report(msg_ids) => {
                     self.report_box = Some(ReportMessageBoxState::new(msg_ids));
                 }
+                InnerEvent::BlockFromReplies {
+                    msg_id,
+                    sender_name,
+                } => {
+                    self.block_from_replies_box =
+                        Some(BlockFromRepliesBoxState::new(msg_id, sender_name));
+                }
                 InnerEvent::OpenReactionsPicker { msg_id, pos } => {
                     self.reactions_picker.open(msg_id, pos);
                 }
@@ -5032,6 +5379,21 @@ impl HistoryWidget {
                         .find_loaded_message(msg_id)
                         .map(|m| m.reactions.clone())
                         .unwrap_or_default();
+                    let can_moderate = peer_info.can_delete
+                        && matches!(peer_info.summary.kind, PeerKind::Group | PeerKind::Channel);
+                    let has_paid = summary.iter().any(|r| r.emoji == "⭐" || r.emoji == "★");
+                    let paid_privacy = if has_paid {
+                        Some(
+                            backend
+                                .as_chat_helpers_backend()
+                                .and_then(|ch| ch.paid_reaction_privacy(false).ok())
+                                .unwrap_or(
+                                    tg_app_core::chat_helpers::backend::PaidReactionPrivacy::Default,
+                                ),
+                        )
+                    } else {
+                        None
+                    };
                     match backend.message_reactions_list(
                         peer_id,
                         msg_id,
@@ -5040,10 +5402,82 @@ impl HistoryWidget {
                         PEER_LIST_PAGE_LIMIT,
                     ) {
                         Ok(page) => {
-                            self.who_reacted_modal =
-                                Some(ReactionsListWidget::new(peer_id, msg_id, summary, page));
+                            let modal = ReactionsListWidget::new(peer_id, msg_id, summary, page)
+                                .with_moderation(can_moderate)
+                                .with_paid_privacy(paid_privacy);
+                            self.who_reacted_modal = Some(modal);
                         }
                         Err(err) => self.show_toast(err, now_secs),
+                    }
+                }
+                InnerEvent::TogglePaidReactionPrivacy(msg_id) => {
+                    if let Some(ch) = backend.as_chat_helpers_backend_mut() {
+                        let current = ch.paid_reaction_privacy(false).unwrap_or(
+                            tg_app_core::chat_helpers::backend::PaidReactionPrivacy::Default,
+                        );
+                        let next = match current {
+                            tg_app_core::chat_helpers::backend::PaidReactionPrivacy::Anonymous => {
+                                tg_app_core::chat_helpers::backend::PaidReactionPrivacy::Default
+                            }
+                            _ => tg_app_core::chat_helpers::backend::PaidReactionPrivacy::Anonymous,
+                        };
+                        match ch.toggle_paid_reaction_privacy(peer_id, msg_id, next) {
+                            Ok(_) => {
+                                let label = if matches!(
+                                    next,
+                                    tg_app_core::chat_helpers::backend::PaidReactionPrivacy::Anonymous
+                                ) {
+                                    "Paid reaction set to Anonymous"
+                                } else {
+                                    "Shown in Paid Top Senders"
+                                };
+                                self.show_toast(label, now_secs);
+                            }
+                            Err(err) => self.show_toast(err, now_secs),
+                        }
+                    }
+                }
+                InnerEvent::ReportMessageReaction(msg_id) => {
+                    let target_peer = backend
+                        .message_reactions_list(peer_id, msg_id, None, None, 10)
+                        .ok()
+                        .and_then(|page| {
+                            page.entries
+                                .into_iter()
+                                .find(|e| !e.is_my)
+                                .map(|e| e.peer_id)
+                        })
+                        .or_else(|| self.find_loaded_message(msg_id).map(|m| m.from_id));
+                    if let Some(reaction_peer_id) = target_peer
+                        && let Some(ch) = backend.as_chat_helpers_backend()
+                    {
+                        match ch.report_reaction(peer_id, msg_id, reaction_peer_id) {
+                            Ok(_) => self.show_toast(tg_lang::tr::lng_report_spam_done(), now_secs),
+                            Err(err) => self.show_toast(err, now_secs),
+                        }
+                    }
+                }
+                InnerEvent::RemoveParticipantReactions {
+                    msg_id,
+                    participant_id,
+                } => {
+                    let resolved_participant = backend
+                        .message_reactions_list(peer_id, msg_id, None, None, 10)
+                        .ok()
+                        .and_then(|page| {
+                            page.entries
+                                .into_iter()
+                                .find(|e| !e.is_my)
+                                .map(|e| e.peer_id)
+                        })
+                        .unwrap_or(participant_id);
+                    if let Some(ch) = backend.as_chat_helpers_backend_mut() {
+                        match ch.delete_participant_reactions(peer_id, resolved_participant) {
+                            Ok(_) => {
+                                self.show_toast("Removed participant reactions", now_secs);
+                            }
+                            Err(err) => self.show_toast(err, now_secs),
+                        }
                     }
                 }
                 InnerEvent::OpenSeenBy { msg_id, readers } => {
@@ -5064,11 +5498,10 @@ impl HistoryWidget {
                         tg_app_core::core_types::dto::engagement::OutboxReadDateStatus::Read {
                             date_unix,
                         } => {
-                            let ts = read_receipts::format_read_timestamp(
+                            read_receipts::format_read_timestamp(
                                 date_unix,
                                 (now_secs.round() as i64).max(i64::from(date_unix) + 60),
-                            );
-                            format!("Read at {ts}")
+                            )
                         }
                         tg_app_core::core_types::dto::engagement::OutboxReadDateStatus::MyPrivacyHidden => {
                             "Enable Last Seen & Read Time in Privacy Settings to see exact read times."
@@ -5403,7 +5836,8 @@ impl HistoryWidget {
         now_secs: f64,
         palette: &Palette,
         colors: &HistoryColors,
-    ) {
+    ) -> Option<HistoryAction> {
+        let mut out_action: Option<HistoryAction> = None;
         if let Some(ref mut box_state) = self.schedule_box
             && let Some(ev) = box_state.show(ui, colors, false)
         {
@@ -5451,15 +5885,9 @@ impl HistoryWidget {
                         }
                     }
                     tg_tgw::RendererToHostMsg::OpenLink { url, telegram } => {
-                        match tg_tgw::evaluate_link_open(&url, telegram, true, false) {
-                            tg_tgw::LinkPolicyDecision::OpenTelegram { url: u, .. }
-                            | tg_tgw::LinkPolicyDecision::ConfirmExternal { url: u, .. } => {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(u));
-                            }
-                            tg_tgw::LinkPolicyDecision::Refused(reason)
-                            | tg_tgw::LinkPolicyDecision::Dropped(reason) => {
-                                toast_to_show = Some(reason);
-                            }
+                        match route_widget_open_link(&url, telegram) {
+                            Ok(action) => out_action = Some(action),
+                            Err(reason) => toast_to_show = Some(reason),
                         }
                     }
                     tg_tgw::RendererToHostMsg::BotQuery {
@@ -5945,6 +6373,39 @@ impl HistoryWidget {
             self.report_box = None;
         }
 
+        if let Some(ref mut box_state) = self.block_from_replies_box
+            && let Some(ev) = box_state.show(ui, colors)
+        {
+            let sender_name = box_state.sender_name.clone();
+            if let BlockFromRepliesAction::Submit(req) = ev {
+                match backend.block_from_replies(req) {
+                    Ok(()) => {
+                        if req.delete_message || req.delete_history {
+                            let target_from =
+                                self.find_loaded_message(req.msg_id).map(|m| m.from_id);
+                            let to_remove: Vec<MsgId> = if req.delete_history
+                                && let Some(from_id) = target_from
+                            {
+                                self.inner
+                                    .messages()
+                                    .iter()
+                                    .filter(|m| m.from_id == from_id || m.id == req.msg_id)
+                                    .map(|m| m.id)
+                                    .collect()
+                            } else {
+                                vec![req.msg_id]
+                            };
+                            self.inner
+                                .remove_messages(&to_remove, peer_info.summary.kind);
+                        }
+                        self.show_toast(format!("Blocked {sender_name} from Replies"), now_secs);
+                    }
+                    Err(err) => self.show_toast(err, now_secs),
+                }
+            }
+            self.block_from_replies_box = None;
+        }
+
         // Layer-233 modals: EditTodoListBox, AddTodoListTasksBox, AboutSponsoredBox,
         // ReportSponsoredBox, and EditFactCheckBox.
         if let Some(ref mut box_state) = self.todo_box
@@ -6282,6 +6743,66 @@ impl HistoryWidget {
                 Some(ReactionsListAction::OpenPeer(target_peer)) => {
                     self.show_toast(format!("Peer #{}", target_peer.bare()), now_secs);
                 }
+                Some(ReactionsListAction::TogglePaidPrivacy(privacy)) => {
+                    if let Some(ch) = backend.as_chat_helpers_backend_mut() {
+                        match ch.toggle_paid_reaction_privacy(modal.peer_id, modal.msg_id, privacy)
+                        {
+                            Ok(_) => {
+                                modal.paid_privacy = Some(privacy);
+                                let label = if matches!(
+                                    privacy,
+                                    tg_app_core::chat_helpers::backend::PaidReactionPrivacy::Anonymous
+                                ) {
+                                    "Paid reaction set to Anonymous"
+                                } else {
+                                    "Shown in Paid Top Senders"
+                                };
+                                self.show_toast(label, now_secs);
+                            }
+                            Err(err) => modal.error = Some(err),
+                        }
+                    }
+                    self.who_reacted_modal = Some(modal);
+                }
+                Some(ReactionsListAction::ReportReaction(reaction_peer_id)) => {
+                    if let Some(ch) = backend.as_chat_helpers_backend() {
+                        match ch.report_reaction(modal.peer_id, modal.msg_id, reaction_peer_id) {
+                            Ok(_) => {
+                                self.show_toast(tg_lang::tr::lng_report_spam_done(), now_secs);
+                            }
+                            Err(err) => modal.error = Some(err),
+                        }
+                    }
+                    self.who_reacted_modal = Some(modal);
+                }
+                Some(ReactionsListAction::DeleteParticipantReaction(participant_id)) => {
+                    if let Some(ch) = backend.as_chat_helpers_backend_mut() {
+                        match ch.delete_participant_reaction(
+                            modal.peer_id,
+                            modal.msg_id,
+                            participant_id,
+                        ) {
+                            Ok(()) => {
+                                modal.remove_participant_entries(participant_id);
+                                self.show_toast("Reaction removed", now_secs);
+                            }
+                            Err(err) => modal.error = Some(err),
+                        }
+                    }
+                    self.who_reacted_modal = Some(modal);
+                }
+                Some(ReactionsListAction::DeleteParticipantReactions(participant_id)) => {
+                    if let Some(ch) = backend.as_chat_helpers_backend_mut() {
+                        match ch.delete_participant_reactions(modal.peer_id, participant_id) {
+                            Ok(_) => {
+                                modal.remove_participant_entries(participant_id);
+                                self.show_toast("Removed participant reactions", now_secs);
+                            }
+                            Err(err) => modal.error = Some(err),
+                        }
+                    }
+                    self.who_reacted_modal = Some(modal);
+                }
                 None => {
                     self.who_reacted_modal = Some(modal);
                 }
@@ -6331,7 +6852,7 @@ impl HistoryWidget {
             let paused = !self.effects_animations_enabled || !self.effects_chat_enabled;
             match modal.show(ui, &modal_palette, paused) {
                 Some(AboutCocoonAction::OpenLink(url)) => {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                    out_action = Some(HistoryAction::OpenLink(url.clone()));
                     self.show_toast(format!("Opening {url}"), now_secs);
                     self.about_cocoon_box = Some(modal);
                 }
@@ -6464,6 +6985,7 @@ impl HistoryWidget {
                 }
             }
         }
+        out_action
     }
 
     fn find_loaded_message(&self, msg_id: MsgId) -> Option<&HistoryMessage> {
@@ -6529,5 +7051,44 @@ impl HistoryWidget {
                 });
         });
         None
+    }
+}
+
+/// Maps a sandboxed widget `OpenLink` bridge message through `tg_tgw::evaluate_link_open` into a
+/// [`HistoryAction`], ensuring `LinkPolicyDecision::ConfirmExternal` routes through the hidden-link
+/// confirmation flow (`force_confirm: true`) instead of opening immediately.
+pub(crate) fn route_widget_open_link(url: &str, telegram: bool) -> Result<HistoryAction, String> {
+    match tg_tgw::evaluate_link_open(url, telegram, true, false) {
+        tg_tgw::LinkPolicyDecision::OpenTelegram { url: u, .. } => Ok(HistoryAction::OpenLink(u)),
+        tg_tgw::LinkPolicyDecision::ConfirmExternal { url: u, .. } => {
+            Ok(HistoryAction::OpenHiddenLink {
+                url: u,
+                force_confirm: true,
+            })
+        }
+        tg_tgw::LinkPolicyDecision::Refused(reason)
+        | tg_tgw::LinkPolicyDecision::Dropped(reason) => Err(reason),
+    }
+}
+
+#[cfg(test)]
+mod seca_widget_link_tests {
+    use super::*;
+
+    #[test]
+    fn seca_a1_widget_confirm_external_routes_to_forced_hidden_link_confirm() {
+        assert_eq!(
+            route_widget_open_link("https://example.org/docs", false),
+            Ok(HistoryAction::OpenHiddenLink {
+                url: "https://example.org/docs".to_owned(),
+                force_confirm: true,
+            })
+        );
+        assert_eq!(
+            route_widget_open_link("https://t.me/telegram", true),
+            Ok(HistoryAction::OpenLink("https://t.me/telegram".to_owned()))
+        );
+        assert!(route_widget_open_link("file:///C:/Windows/calc.exe", false).is_err());
+        assert!(route_widget_open_link("javascript:alert(1)", false).is_err());
     }
 }

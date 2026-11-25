@@ -157,6 +157,15 @@ fn normalize_fingerprint(fp: &str) -> String {
         .collect()
 }
 
+/// Returns `true` if `fingerprints` contains at least one non-empty SHA-256 DTLS fingerprint.
+#[must_use]
+pub(crate) fn has_valid_sha256_fingerprint(fingerprints: &[DtlsFingerprint]) -> bool {
+    fingerprints.iter().any(|fp| {
+        fp.hash.eq_ignore_ascii_case("sha-256")
+            && !normalize_fingerprint(&fp.fingerprint).is_empty()
+    })
+}
+
 /// Outputs produced by draining [`DtlsSrtpSession::poll_outputs`].
 #[derive(Debug, Default)]
 pub struct DtlsPollOutput {
@@ -189,12 +198,20 @@ pub struct DtlsSrtpSession {
 impl DtlsSrtpSession {
     /// Create a new DTLS 1.2 session (`is_client = true` for active Telegram SFU client,
     /// `is_client = false` for passive server in loopback tests).
+    ///
+    /// Fails closed if `expected_fingerprints` does not contain at least one SHA-256 peer
+    /// fingerprint.
     pub fn new(
         identity: &DtlsIdentity,
         is_client: bool,
         expected_fingerprints: Vec<DtlsFingerprint>,
         now: Instant,
     ) -> VoipResult<Self> {
+        if !has_valid_sha256_fingerprint(&expected_fingerprints) {
+            return Err(VoipError::Dtls(
+                "DTLS requires at least one expected SHA-256 peer fingerprint".into(),
+            ));
+        }
         let config = Config::builder()
             .with_crypto_provider(rust_crypto::default_provider())
             .use_server_cookie(false)
@@ -281,7 +298,7 @@ impl DtlsSrtpSession {
                     self.negotiated_profile = Some(profile);
                 }
                 Output::Connected => {
-                    if !self.expected_fingerprints.is_empty() && !self.peer_verified {
+                    if !self.peer_verified {
                         return Err(VoipError::Dtls(
                             "DTLS connected without peer certificate verification".into(),
                         ));
@@ -352,7 +369,9 @@ impl DtlsSrtpSession {
 
     fn verify_peer_fingerprint(&self, observed_sha256: &str) -> VoipResult<()> {
         if self.expected_fingerprints.is_empty() {
-            return Ok(());
+            return Err(VoipError::Dtls(
+                "remote DTLS fingerprint list is empty".into(),
+            ));
         }
         let observed_norm = normalize_fingerprint(observed_sha256);
         let matched = self.expected_fingerprints.iter().any(|fp| {
@@ -612,7 +631,13 @@ mod tests {
 
         let now = Instant::now();
         let mut client = DtlsSrtpSession::new(&client_id, true, vec![wrong_fp], now).unwrap();
-        let mut server = DtlsSrtpSession::new(&server_id, false, Vec::new(), now).unwrap();
+        let mut server = DtlsSrtpSession::new(
+            &server_id,
+            false,
+            vec![client_id.to_group_fingerprint("active")],
+            now,
+        )
+        .unwrap();
 
         let mut mismatch_err = false;
         for _ in 0..16 {
@@ -637,5 +662,29 @@ mod tests {
             }
         }
         assert!(mismatch_err, "mismatched peer fingerprint must fail DTLS");
+    }
+
+    #[test]
+    fn sec2c_w2_dtls_rejects_empty_fingerprint_list() {
+        let id = DtlsIdentity::generate().unwrap();
+        let now = Instant::now();
+
+        let err = DtlsSrtpSession::new(&id, true, Vec::new(), now)
+            .err()
+            .expect("empty DTLS fingerprint list must be rejected");
+        assert!(
+            err.to_string().contains("fingerprint"),
+            "unexpected error for empty fingerprint list: {err}"
+        );
+
+        let non_sha256 = vec![DtlsFingerprint {
+            hash: "sha-1".into(),
+            setup: Some("passive".into()),
+            fingerprint: "AA:BB:CC:DD".into(),
+        }];
+        assert!(
+            DtlsSrtpSession::new(&id, true, non_sha256, now).is_err(),
+            "fingerprint list with no SHA-256 entry must be rejected"
+        );
     }
 }

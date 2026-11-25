@@ -173,8 +173,9 @@ pub use search::{
 pub use stickers::{
     CLOUD_RECENT_ATTACHED_SET_ID, CLOUD_RECENT_SET_ID, COLLECTIBLE_SET_ID, CUSTOM_SET_ID,
     CachedStickerSet, DEFAULT_SET_ID, FAVED_SET_ID, FEATURED_SET_ID, InstallStickerSetOutcome,
-    NONE_SET_ID, RECENT_SET_ID, STICKERS_UPDATE_TIMEOUT_MS, StickerSetFlags, StickerSetSpec,
-    StickersSyncManager, StickersType, parse_sticker_set_flags, tl_sticker_set_hash_to_u64,
+    MAX_STICKER_SET_TITLE_LEN, NONE_SET_ID, RECENT_SET_ID, STICKERS_UPDATE_TIMEOUT_MS,
+    StickerSetFlags, StickerSetSpec, StickersSyncManager, StickersType, parse_sticker_set_flags,
+    tl_sticker_set_hash_to_u64,
 };
 pub use types::{
     ApiCredentials, ForwardOptions, LoadDirection, SendOptions, code_settings_desktop_default,

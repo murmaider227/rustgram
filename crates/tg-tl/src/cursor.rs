@@ -3,19 +3,160 @@
 //! Port of `tl::Reader` and `tl::string_type::read` from `lib_tl/tl/tl_basic_types.h`
 //! and `mtproto/core_types.h`.
 
+use std::ops::{Deref, DerefMut};
+
 use crate::error::DeserializeError;
 
-/// Zero-copy cursor over a serialized TL byte slice.
+/// Default maximum TL deserialization nesting depth.
+pub const DEFAULT_MAX_DEPTH: usize = 64;
+
+/// Default maximum cumulative TL elements/constructors decoded by a single [`Cursor`].
+pub const DEFAULT_MAX_ELEMENTS: usize = 262_144;
+
+/// Default maximum cumulative heap bytes allocated while decoding with a single [`Cursor`] (64 MiB).
+pub const DEFAULT_MAX_ALLOC_BYTES: usize = 64 * 1024 * 1024;
+
+/// Safety limits enforced by [`Cursor`] during TL deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    /// Maximum nesting depth across structs, functions, and vectors.
+    pub max_depth: usize,
+    /// Maximum cumulative decoded TL elements and constructors.
+    pub max_elements: usize,
+    /// Maximum cumulative heap bytes allocated while decoding.
+    pub max_alloc_bytes: usize,
+}
+
+impl DecodeLimits {
+    /// Default TL deserialization safety limits.
+    pub const DEFAULT: Self = Self {
+        max_depth: DEFAULT_MAX_DEPTH,
+        max_elements: DEFAULT_MAX_ELEMENTS,
+        max_alloc_bytes: DEFAULT_MAX_ALLOC_BYTES,
+    };
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// RAII guard returned by [`Cursor::enter_depth`] that decrements nesting depth on drop.
+pub struct DepthGuard<'c, 'a> {
+    cursor: &'c mut Cursor<'a>,
+}
+
+impl<'a> Deref for DepthGuard<'_, 'a> {
+    type Target = Cursor<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        self.cursor
+    }
+}
+
+impl DerefMut for DepthGuard<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.cursor
+    }
+}
+
+impl Drop for DepthGuard<'_, '_> {
+    fn drop(&mut self) {
+        self.cursor.depth = self.cursor.depth.saturating_sub(1);
+    }
+}
+
+/// Zero-copy cursor over a serialized TL byte slice with nesting-depth and cumulative
+/// element/allocation budgets.
 #[derive(Debug, Clone)]
 pub struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
+    depth: usize,
+    elements: usize,
+    allocated_bytes: usize,
+    limits: DecodeLimits,
 }
 
 impl<'a> Cursor<'a> {
-    /// Creates a new cursor positioned at the start of `data`.
+    /// Creates a new cursor positioned at the start of `data` with [`DecodeLimits::DEFAULT`].
     pub const fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self::with_limits(data, DecodeLimits::DEFAULT)
+    }
+
+    /// Creates a new cursor positioned at the start of `data` with custom [`DecodeLimits`].
+    pub const fn with_limits(data: &'a [u8], limits: DecodeLimits) -> Self {
+        Self {
+            data,
+            pos: 0,
+            depth: 0,
+            elements: 0,
+            allocated_bytes: 0,
+            limits,
+        }
+    }
+
+    /// Returns the configured [`DecodeLimits`] for this cursor.
+    pub const fn limits(&self) -> DecodeLimits {
+        self.limits
+    }
+
+    /// Returns the current nesting depth.
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Returns the cumulative number of decoded elements charged to this cursor so far.
+    pub const fn elements_decoded(&self) -> usize {
+        self.elements
+    }
+
+    /// Returns the cumulative heap allocation bytes charged to this cursor so far.
+    pub const fn allocated_bytes(&self) -> usize {
+        self.allocated_bytes
+    }
+
+    /// Returns the remaining allocation byte budget.
+    pub const fn remaining_alloc_bytes(&self) -> usize {
+        self.limits
+            .max_alloc_bytes
+            .saturating_sub(self.allocated_bytes)
+    }
+
+    /// Enters one level of deserialization nesting, returning an error if `max_depth` is reached.
+    pub fn enter_depth(&mut self) -> Result<DepthGuard<'_, 'a>, DeserializeError> {
+        if self.depth >= self.limits.max_depth {
+            return Err(DeserializeError::MaxDepthExceeded {
+                limit: self.limits.max_depth,
+            });
+        }
+        self.depth += 1;
+        Ok(DepthGuard { cursor: self })
+    }
+
+    /// Charges `count` decoded elements against the cursor's cumulative element budget.
+    pub fn charge_elements(&mut self, count: usize) -> Result<(), DeserializeError> {
+        self.elements = self.elements.saturating_add(count);
+        if self.elements > self.limits.max_elements {
+            return Err(DeserializeError::BudgetExceeded {
+                kind: "elements",
+                limit: self.limits.max_elements,
+            });
+        }
+        Ok(())
+    }
+
+    /// Charges `bytes` of heap allocation against the cursor's cumulative byte budget.
+    pub fn charge_alloc(&mut self, bytes: usize) -> Result<(), DeserializeError> {
+        self.allocated_bytes = self.allocated_bytes.saturating_add(bytes);
+        if self.allocated_bytes > self.limits.max_alloc_bytes {
+            return Err(DeserializeError::BudgetExceeded {
+                kind: "bytes",
+                limit: self.limits.max_alloc_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// Returns the current byte offset from the start of the underlying slice.
@@ -131,6 +272,7 @@ impl<'a> Cursor<'a> {
                 remaining: rem,
             });
         }
+        self.charge_alloc(len)?;
         let payload = self.read_slice(len)?.to_vec();
         let _ = self.read_slice(pad)?;
         Ok(payload)

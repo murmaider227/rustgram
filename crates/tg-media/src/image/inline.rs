@@ -90,6 +90,228 @@ pub fn from_inline_bytes(bytes: &[u8]) -> Result<RgbaImage> {
     Ok(read.image)
 }
 
+/// Offsets of the tables inside [`STRIPPED_JPEG_HEADER`] (segment payload starts).
+const HEADER_DQT_LUMA: usize = 25;
+const HEADER_DQT_CHROMA: usize = 94;
+const HEADER_DHT_DC_LUMA: usize = 182;
+const HEADER_DHT_AC_LUMA: usize = 215;
+const HEADER_DHT_DC_CHROMA: usize = 398;
+const HEADER_DHT_AC_CHROMA: usize = 431;
+
+/// JPEG zig-zag scan order (index = zig-zag position, value = natural row-major index).
+const ZIGZAG: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+/// Canonical Huffman code table built from a DHT segment (`code`, `length`) per symbol.
+struct HuffTable {
+    codes: [(u16, u8); 256],
+}
+
+impl HuffTable {
+    fn from_header(offset: usize) -> Self {
+        let bits = &STRIPPED_JPEG_HEADER[offset..offset + 16];
+        let mut values = &STRIPPED_JPEG_HEADER[offset + 16..];
+        let mut codes = [(0u16, 0u8); 256];
+        let mut code: u16 = 0;
+        for (len_minus_one, &count) in bits.iter().enumerate() {
+            for _ in 0..count {
+                if let Some((&symbol, rest)) = values.split_first() {
+                    codes[usize::from(symbol)] = (code, (len_minus_one + 1) as u8);
+                    values = rest;
+                }
+                code = code.wrapping_add(1);
+            }
+            code <<= 1;
+        }
+        Self { codes }
+    }
+}
+
+/// Bit writer with JPEG `0xFF` byte stuffing.
+#[derive(Default)]
+struct BitWriter {
+    out: Vec<u8>,
+    acc: u32,
+    used: u8,
+}
+
+impl BitWriter {
+    fn put(&mut self, value: u16, len: u8) {
+        for i in (0..len).rev() {
+            self.acc = (self.acc << 1) | u32::from((value >> i) & 1);
+            self.used += 1;
+            if self.used == 8 {
+                let byte = (self.acc & 0xFF) as u8;
+                self.out.push(byte);
+                if byte == 0xFF {
+                    self.out.push(0x00);
+                }
+                self.acc = 0;
+                self.used = 0;
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        while self.used != 0 {
+            self.put(1, 1);
+        }
+        self.out
+    }
+}
+
+/// Magnitude category and the low bits of a coefficient (JPEG "SSSS" + additional bits).
+fn coefficient_bits(value: i32) -> (u8, u16) {
+    let magnitude = value.unsigned_abs();
+    let size = (32 - magnitude.leading_zeros()) as u8;
+    let bits = if value < 0 {
+        (value - 1) as u32 & ((1u32 << size) - 1)
+    } else {
+        value as u32
+    };
+    (size, bits as u16)
+}
+
+fn encode_block(
+    writer: &mut BitWriter,
+    block: &[f32; 64],
+    quant_offset: usize,
+    dc: &HuffTable,
+    ac: &HuffTable,
+    prev_dc: &mut i32,
+) {
+    let mut coeffs = [0i32; 64];
+    for v in 0..8 {
+        for u in 0..8 {
+            let cu = if u == 0 {
+                std::f32::consts::FRAC_1_SQRT_2
+            } else {
+                1.0
+            };
+            let cv = if v == 0 {
+                std::f32::consts::FRAC_1_SQRT_2
+            } else {
+                1.0
+            };
+            let mut sum = 0.0f32;
+            for y in 0..8 {
+                for x in 0..8 {
+                    sum += block[y * 8 + x]
+                        * (((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI) / 16.0).cos()
+                        * (((2 * y + 1) as f32 * v as f32 * std::f32::consts::PI) / 16.0).cos();
+                }
+            }
+            coeffs[v * 8 + u] = (0.25 * cu * cv * sum) as i32;
+        }
+    }
+    let mut zz = [0i32; 64];
+    for (pos, &natural) in ZIGZAG.iter().enumerate() {
+        let q = f32::from(STRIPPED_JPEG_HEADER[quant_offset + pos]);
+        zz[pos] = (coeffs[natural] as f32 / q).round() as i32;
+    }
+    let diff = zz[0] - *prev_dc;
+    *prev_dc = zz[0];
+    let (size, bits) = coefficient_bits(diff);
+    let (code, len) = dc.codes[usize::from(size)];
+    writer.put(code, len);
+    writer.put(bits, size);
+    let mut run = 0u8;
+    for &value in &zz[1..] {
+        if value == 0 {
+            run += 1;
+            continue;
+        }
+        while run > 15 {
+            let (code, len) = ac.codes[0xF0];
+            writer.put(code, len);
+            run -= 16;
+        }
+        let (size, bits) = coefficient_bits(value);
+        let (code, len) = ac.codes[usize::from((run << 4) | size)];
+        writer.put(code, len);
+        writer.put(bits, size);
+        run = 0;
+    }
+    if run > 0 {
+        let (code, len) = ac.codes[0x00];
+        writer.put(code, len);
+    }
+}
+
+/// Encodes `image` as Telegram stripped thumbnail bytes (`photoStrippedSize`), the inverse of
+/// [`from_inline_bytes`]: a baseline JPEG scan using the quantization and Huffman tables of
+/// [`STRIPPED_JPEG_HEADER`] (Y 2x2, Cb/Cr 1x1), prefixed with `[0x01, height, width]`.
+///
+/// Telegram servers produce these bytes; the client only decodes them. This encoder exists for
+/// demo and test data. Images larger than 255 px are cropped to 255 px per side.
+#[must_use]
+pub fn encode_stripped_thumb(image: &RgbaImage) -> Vec<u8> {
+    let w = image.width().clamp(1, 255);
+    let h = image.height().clamp(1, 255);
+    let pixel = |x: u32, y: u32| -> [f32; 3] {
+        let p = image.get_pixel(x.min(w - 1), y.min(h - 1)).0;
+        let (r, g, b) = (f32::from(p[0]), f32::from(p[1]), f32::from(p[2]));
+        [
+            0.299 * r + 0.587 * g + 0.114 * b,
+            -0.168_736 * r - 0.331_264 * g + 0.5 * b + 128.0,
+            0.5 * r - 0.418_688 * g - 0.081_312 * b + 128.0,
+        ]
+    };
+    let dc_luma = HuffTable::from_header(HEADER_DHT_DC_LUMA);
+    let ac_luma = HuffTable::from_header(HEADER_DHT_AC_LUMA);
+    let dc_chroma = HuffTable::from_header(HEADER_DHT_DC_CHROMA);
+    let ac_chroma = HuffTable::from_header(HEADER_DHT_AC_CHROMA);
+    let mut writer = BitWriter::default();
+    let mut prev = [0i32; 3];
+    for mcu_y in (0..h).step_by(16) {
+        for mcu_x in (0..w).step_by(16) {
+            for (bx, by) in [(0, 0), (8, 0), (0, 8), (8, 8)] {
+                let mut block = [0.0f32; 64];
+                for y in 0..8 {
+                    for x in 0..8 {
+                        block[y * 8 + x] =
+                            pixel(mcu_x + bx + x as u32, mcu_y + by + y as u32)[0] - 128.0;
+                    }
+                }
+                encode_block(
+                    &mut writer,
+                    &block,
+                    HEADER_DQT_LUMA,
+                    &dc_luma,
+                    &ac_luma,
+                    &mut prev[0],
+                );
+            }
+            for (component, prev_dc) in prev.iter_mut().enumerate().skip(1) {
+                let mut block = [0.0f32; 64];
+                for y in 0..8u32 {
+                    for x in 0..8u32 {
+                        let mut sum = 0.0f32;
+                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                            sum += pixel(mcu_x + x * 2 + dx, mcu_y + y * 2 + dy)[component];
+                        }
+                        block[(y * 8 + x) as usize] = sum / 4.0 - 128.0;
+                    }
+                }
+                encode_block(
+                    &mut writer,
+                    &block,
+                    HEADER_DQT_CHROMA,
+                    &dc_chroma,
+                    &ac_chroma,
+                    prev_dc,
+                );
+            }
+        }
+    }
+    let mut out = vec![0x01, h as u8, w as u8];
+    out.extend(writer.finish());
+    out
+}
+
 /// Expands Telegram compressed vector path bytes (`photoPathSize`) into an ASCII SVG path string.
 ///
 /// Mirrors `Images::ExpandPathInlineBytes` from `image_prepare.cpp`.
@@ -393,4 +615,46 @@ pub fn parse_svg_path(expanded: &str) -> Result<VectorPath> {
     }
 
     Ok(VectorPath { commands })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quadrant_image() -> RgbaImage {
+        // Left half red, right half blue; bottom quarter white (orientation + colour probe).
+        RgbaImage::from_fn(40, 30, |x, y| {
+            if y >= 22 {
+                image::Rgba([255, 255, 255, 255])
+            } else if x < 20 {
+                image::Rgba([220, 30, 30, 255])
+            } else {
+                image::Rgba([30, 60, 220, 255])
+            }
+        })
+    }
+
+    #[test]
+    fn stripped_round_trip_keeps_orientation_and_colours() {
+        let source = quadrant_image();
+        let bytes = encode_stripped_thumb(&source);
+        assert_eq!(&bytes[..3], &[0x01, 30, 40]);
+        let decoded = from_inline_bytes(&bytes).expect("stripped thumbnail decodes");
+        assert_eq!(decoded.dimensions(), (40, 30));
+        let left = decoded.get_pixel(6, 8).0;
+        let right = decoded.get_pixel(33, 8).0;
+        let bottom = decoded.get_pixel(20, 27).0;
+        assert!(
+            left[0] > 160 && left[1] < 90 && left[2] < 90,
+            "left must stay red (no flip, no green cast): {left:?}"
+        );
+        assert!(
+            right[2] > 160 && right[0] < 90 && right[1] < 120,
+            "right must stay blue: {right:?}"
+        );
+        assert!(
+            bottom.iter().take(3).all(|&c| c > 200),
+            "bottom band must stay white (no vertical flip): {bottom:?}"
+        );
+    }
 }

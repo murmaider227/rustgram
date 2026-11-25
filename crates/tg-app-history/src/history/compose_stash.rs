@@ -182,9 +182,7 @@ impl StashHintManager {
                 self.memory = None;
                 if self.should_show_hint() {
                     self.shown_count += 1;
-                    return Some(
-                        "Tip: Press Ctrl+S to stash your draft and restore it later.".to_owned(),
-                    );
+                    return Some(tg_lang::tr::lng_stash_hint("Ctrl+S"));
                 }
             }
             return None;

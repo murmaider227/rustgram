@@ -5,12 +5,15 @@
 //! Port origin: `Telegram/SourceFiles/main/main_session.cpp` and
 //! `Telegram/SourceFiles/window/notifications_manager.cpp` (event wiring).
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tg_api::{DcId, InvocationError, RpcClient};
-use tg_data::{ChangeEvent, MessageUpdateFlags, Session};
+use tg_data::{
+    ChangeEvent, HistoryUpdateFlags, MessageUpdateFlags, MsgId as DataMsgId, PeerId as DataPeerId,
+    Session,
+};
 use tg_session::{SessionEvent, SessionRuntime};
 use tg_tl::{Deserializable, RemoteCall, Serializable, enums as tl_enums};
 use tokio::runtime::Handle;
@@ -111,6 +114,40 @@ impl<C: RpcClient + Clone + 'static> RpcClient for RuntimeBridgedRpc<C> {
     }
 }
 
+/// Maximum individual message IDs tracked per peer before collapsing into a slice reload.
+const MAX_HISTORY_DELTAS_PER_PEER: usize = 256;
+
+/// Maximum distinct peers retained in `history_deltas` before collapsing into a global reload flag.
+const MAX_TRACKED_HISTORY_DELTA_PEERS: usize = 128;
+
+/// Coalesced per-peer history deltas captured from `tg_data::ChangeEvent`s for an open chat view.
+#[derive(Debug, Default, Clone)]
+pub struct PeerHistoryDelta {
+    /// Newly added message IDs in arrival order.
+    pub added: Vec<DataMsgId>,
+    /// Edited or metadata-updated message IDs (text, reactions, views, pinned flag, etc.).
+    pub edited: Vec<DataMsgId>,
+    /// Deleted/destroyed message IDs.
+    pub deleted: Vec<DataMsgId>,
+    /// True if `HistoryUpdateFlags::OUTBOX_READ` fired for this peer.
+    pub outbox_read_changed: bool,
+    /// True if `HistoryUpdateFlags::UNREAD_VIEW` fired for this peer.
+    pub unread_changed: bool,
+    /// True if the open history should reload its slice (e.g. broadcast lag or delta overflow).
+    pub reload_required: bool,
+}
+
+impl PeerHistoryDelta {
+    fn maybe_collapse_if_oversized(&mut self) {
+        if self.added.len() + self.edited.len() + self.deleted.len() > MAX_HISTORY_DELTAS_PER_PEER {
+            self.added.clear();
+            self.edited.clear();
+            self.deleted.clear();
+            self.reload_required = true;
+        }
+    }
+}
+
 /// Shared state updated asynchronously by [`LiveRuntimeBridge`] and polled synchronously
 /// from the `egui` UI thread.
 #[derive(Debug)]
@@ -125,6 +162,11 @@ pub struct LiveBridgeState {
     /// and `updates.getDifference` / `updates.getChannelDifference`, matching
     /// `Updates::applyUpdate` in `api/api_updates.cpp:2947-2958`).
     pub story_updates: Mutex<VecDeque<tl_enums::Update>>,
+    /// Per-peer coalesced history change deltas drained by an open `HistoryWidget`.
+    pub history_deltas: Mutex<HashMap<DataPeerId, PeerHistoryDelta>>,
+    /// Set when the change stream lagged or tracked too many unopened peers; forces next open
+    /// history drain to emit `ReloadRequired`.
+    pub history_deltas_lagged: AtomicBool,
     /// Current connection indicator state.
     pub connection_status: Mutex<ConnectionStatus>,
     /// Last sync or RPC error banner message, if any.
@@ -148,10 +190,102 @@ impl LiveBridgeState {
             notify_events: Mutex::new(VecDeque::new()),
             session_events: Mutex::new(VecDeque::new()),
             story_updates: Mutex::new(VecDeque::new()),
+            history_deltas: Mutex::new(HashMap::new()),
+            history_deltas_lagged: AtomicBool::new(false),
             connection_status: Mutex::new(ConnectionStatus::Connecting),
             last_error: Mutex::new(None),
             generation: AtomicU64::new(0),
         }
+    }
+
+    fn with_peer_delta(&self, peer_id: DataPeerId, f: impl FnOnce(&mut PeerHistoryDelta)) {
+        let Ok(mut guard) = self.history_deltas.lock() else {
+            return;
+        };
+        if !guard.contains_key(&peer_id) && guard.len() >= MAX_TRACKED_HISTORY_DELTA_PEERS {
+            guard.clear();
+            self.history_deltas_lagged.store(true, Ordering::Release);
+            return;
+        }
+        let delta = guard.entry(peer_id).or_default();
+        if !delta.reload_required {
+            f(delta);
+            delta.maybe_collapse_if_oversized();
+        }
+    }
+
+    /// Records a newly added message for `peer_id`.
+    pub fn record_message_added(&self, peer_id: DataPeerId, msg_id: DataMsgId) {
+        self.with_peer_delta(peer_id, |delta| {
+            delta.deleted.retain(|&id| id != msg_id);
+            if !delta.added.contains(&msg_id) {
+                delta.added.push(msg_id);
+            }
+        });
+    }
+
+    /// Records an edited or updated message for `peer_id`.
+    pub fn record_message_edited(&self, peer_id: DataPeerId, msg_id: DataMsgId) {
+        self.with_peer_delta(peer_id, |delta| {
+            if !delta.added.contains(&msg_id) && !delta.edited.contains(&msg_id) {
+                delta.edited.push(msg_id);
+            }
+        });
+    }
+
+    /// Records a deleted/destroyed message for `peer_id`.
+    pub fn record_message_deleted(&self, peer_id: DataPeerId, msg_id: DataMsgId) {
+        self.with_peer_delta(peer_id, |delta| {
+            delta.added.retain(|&id| id != msg_id);
+            delta.edited.retain(|&id| id != msg_id);
+            if !delta.deleted.contains(&msg_id) {
+                delta.deleted.push(msg_id);
+            }
+        });
+    }
+
+    /// Records that outgoing messages were read by the recipient in `peer_id`.
+    pub fn record_outbox_read(&self, peer_id: DataPeerId) {
+        self.with_peer_delta(peer_id, |delta| {
+            delta.outbox_read_changed = true;
+        });
+    }
+
+    /// Records that inbox read watermark or unread count changed for `peer_id`.
+    pub fn record_unread_changed(&self, peer_id: DataPeerId) {
+        self.with_peer_delta(peer_id, |delta| {
+            delta.unread_changed = true;
+        });
+    }
+
+    /// Marks the change stream as lagged so the next open history drain reloads its slice.
+    pub fn mark_history_deltas_lagged(&self) {
+        if let Ok(mut guard) = self.history_deltas.lock() {
+            guard.clear();
+        }
+        self.history_deltas_lagged.store(true, Ordering::Release);
+    }
+
+    /// Clears pending deltas for `peer_id` (called right before loading a fresh full slice).
+    pub fn clear_history_delta(&self, peer_id: DataPeerId) {
+        if let Ok(mut guard) = self.history_deltas.lock() {
+            guard.remove(&peer_id);
+        }
+    }
+
+    /// Drains any pending history delta for `peer_id`.
+    pub fn take_history_delta(&self, peer_id: DataPeerId) -> Option<PeerHistoryDelta> {
+        let lagged = self.history_deltas_lagged.swap(false, Ordering::AcqRel);
+        let mut delta = self
+            .history_deltas
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(&peer_id));
+        if lagged {
+            let entry = delta.get_or_insert_with(PeerHistoryDelta::default);
+            entry.reload_required = true;
+        }
+        delta
     }
 
     /// Registers the active `egui::Context` so background updates trigger immediate repaints.
@@ -264,6 +398,7 @@ impl LiveRuntimeBridge {
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "LiveRuntimeBridge ChangeEvent receiver lagged");
+                        state_changes.mark_history_deltas_lagged();
                         state_changes.notify_ui();
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -342,7 +477,17 @@ async fn handle_change_event(
 ) {
     match event {
         ChangeEvent::MessageUpdated { id, flags } => {
-            if flags.contains(MessageUpdateFlags::NEW_ADDED) {
+            if flags.contains(MessageUpdateFlags::DESTROYED) {
+                state.record_message_deleted(id.peer, id.msg);
+                if let Ok(mut guard) = state.notify_events.lock() {
+                    guard.push_back(IncomingNotifyEvent::MessageDeleted {
+                        session_id,
+                        peer_id: from_data_peer(id.peer),
+                        msg_id: from_data_msg(id.msg),
+                    });
+                }
+            } else if flags.contains(MessageUpdateFlags::NEW_ADDED) {
+                state.record_message_added(id.peer, id.msg);
                 let maybe_notif = {
                     let session = session_lock.read().await;
                     session.message(id).and_then(|msg| {
@@ -359,40 +504,42 @@ async fn handle_change_event(
                 {
                     guard.push_back(IncomingNotifyEvent::Notification(Box::new(notif)));
                 }
-            } else if flags.contains(MessageUpdateFlags::DESTROYED)
-                && let Ok(mut guard) = state.notify_events.lock()
-            {
-                guard.push_back(IncomingNotifyEvent::MessageDeleted {
-                    session_id,
-                    peer_id: from_data_peer(id.peer),
-                    msg_id: from_data_msg(id.msg),
-                });
+            } else if flags.intersects(
+                MessageUpdateFlags::EDITED
+                    | MessageUpdateFlags::REPLY_MARKUP
+                    | MessageUpdateFlags::NEW_UNREAD_REACTION,
+            ) {
+                state.record_message_edited(id.peer, id.msg);
             }
         }
-        ChangeEvent::HistoryUpdated { peer_id, flags }
-            if flags.contains(tg_data::HistoryUpdateFlags::UNREAD_VIEW) =>
-        {
-            let read_till = {
-                let session = session_lock.read().await;
-                session.history(peer_id).and_then(|h| {
-                    let till = h.inbox_read_till_id();
-                    if till.0 > 0 {
-                        Some(from_data_msg(till))
-                    } else if h.unread_count == Some(0) && !h.unread_mark {
-                        Some(MsgId::SHOW_AT_END)
-                    } else {
-                        None
-                    }
-                })
-            };
-            if let Some(read_till_id) = read_till
-                && let Ok(mut guard) = state.notify_events.lock()
-            {
-                guard.push_back(IncomingNotifyEvent::HistoryRead {
-                    session_id,
-                    peer_id: from_data_peer(peer_id),
-                    read_till_id,
-                });
+        ChangeEvent::HistoryUpdated { peer_id, flags } => {
+            if flags.contains(HistoryUpdateFlags::OUTBOX_READ) {
+                state.record_outbox_read(peer_id);
+            }
+            if flags.contains(HistoryUpdateFlags::UNREAD_VIEW) {
+                state.record_unread_changed(peer_id);
+                let read_till = {
+                    let session = session_lock.read().await;
+                    session.history(peer_id).and_then(|h| {
+                        let till = h.inbox_read_till_id();
+                        if till.0 > 0 {
+                            Some(from_data_msg(till))
+                        } else if h.unread_count == Some(0) && !h.unread_mark {
+                            Some(MsgId::SHOW_AT_END)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(read_till_id) = read_till
+                    && let Ok(mut guard) = state.notify_events.lock()
+                {
+                    guard.push_back(IncomingNotifyEvent::HistoryRead {
+                        session_id,
+                        peer_id: from_data_peer(peer_id),
+                        read_till_id,
+                    });
+                }
             }
         }
         _ => {}

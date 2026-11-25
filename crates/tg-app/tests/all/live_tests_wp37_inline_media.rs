@@ -1355,6 +1355,8 @@ fn media_overlay_theme_file_preview_parses_and_emits_apply_cancel_share() {
         allows_delete: false,
         allows_save: true,
         local_path: None,
+        grouped_id: None,
+        attached_stickers_media: None,
     };
 }
 

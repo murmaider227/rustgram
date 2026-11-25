@@ -27,7 +27,7 @@ use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 
 use crate::convert::{
     apply_tl_user, apply_tl_users_and_chats, input_peer_for, input_user_for, peer_id_from_tl,
-    text_with_entities_to_tl, user_status_from_tl,
+    photo_from_tl, text_with_entities_to_tl, user_status_from_tl,
 };
 use crate::error::ApiError;
 use crate::rpc::RpcClient;
@@ -301,6 +301,11 @@ pub fn apply_sponsored_peers(
 
 /// Applies deleted own profile photo IDs returned by `photos.deletePhotos` to `session`.
 pub fn apply_deleted_photos_local(session: &mut Session, deleted: &[i64]) {
+    for &id in deleted {
+        if id != 0 {
+            session.remove_photo(PhotoId::from_tl(id));
+        }
+    }
     let self_uid = session.self_user_id();
     if let Some(self_user) = session.user_mut(self_uid) {
         let current_id = self_user.common.userpic_photo_id.to_tl();
@@ -326,6 +331,10 @@ pub fn apply_uploaded_contact_photo_local(
 ) -> i64 {
     let tl_enums::photos::Photo::Photo(resp) = resp;
     apply_tl_users_and_chats(session, &resp.users, &[]);
+
+    if let Some(data) = photo_from_tl(&resp.photo) {
+        session.cache_photo(data);
+    }
 
     let photo_id = match &resp.photo {
         tl_enums::Photo::Photo(p) => p.id,

@@ -159,6 +159,13 @@ impl DeleteMessagesBoxState {
 
     /// Executes the deletion against `backend`.
     pub fn submit(&self, backend: &mut dyn InfoBackend) -> Result<usize, String> {
+        if self.peer_kind == InfoPeerKind::Group
+            && matches!(self.mode, DeleteMode::DeleteAndLeave)
+            && self.revoke_for_everyone
+            && backend.delete_basic_chat(self.peer_id).is_ok()
+        {
+            return Ok(0);
+        }
         let ids = match &self.mode {
             DeleteMode::Messages(ids) => ids.clone(),
             DeleteMode::ClearHistory | DeleteMode::DeleteAndLeave => Vec::new(),

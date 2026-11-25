@@ -33,6 +33,11 @@ pub enum MembersAction {
     RemoveMember(PeerId),
 }
 
+/// Member count from which tdesktop shows the members search field.
+const SEARCH_MEMBERS_AFTER_COUNT: u32 = 20;
+/// Name / status left edge (`st::infoMembersList.item.namePosition.x`).
+const MEMBER_TEXT_LEFT: f32 = 79.0;
+
 /// Renders a group's members list with inline search, admin badges, and quick actions.
 pub struct MembersSection;
 
@@ -83,15 +88,30 @@ impl MembersSection {
         let width = ui.available_width().max(200.0);
 
         if show_header {
+            // `Members::setupHeader`: `infoIconMembers` + uppercase count label + add button.
             let hdr_h = (st::info_members_header.0 as f32).max(40.0);
             let (hdr_rect, _) = ui.allocate_exact_size(Vec2::new(width, hdr_h), Sense::hover());
+            let icon_rect = Rect::from_center_size(
+                Pos2::new(hdr_rect.min.x + 30.0, hdr_rect.center().y),
+                Vec2::splat(24.0),
+            );
+            paint_style_icon(
+                ui.painter(),
+                icon_rect,
+                st::info_icon_members,
+                &ColorsResolver(colors),
+                Some(tg_ui::theme::resolve_color_ref(st::info_icon_fg, colors)),
+            );
             let title = tr::lng_chat_status_members(i64::from(total_count)).to_uppercase();
             ui.painter().text(
-                Pos2::new(hdr_rect.min.x + 20.0, hdr_rect.center().y),
+                Pos2::new(hdr_rect.min.x + MEMBER_TEXT_LEFT, hdr_rect.center().y),
                 Align2::LEFT_CENTER,
                 title,
-                FontId::new(12.0, family_semibold()),
-                colors.color("windowActiveTextFg"),
+                FontId::new(
+                    font_id_from_style(st::semibold_font).size,
+                    family_semibold(),
+                ),
+                colors.color("windowBoldFg"),
             );
             if can_add_members {
                 let add_rect = Rect::from_center_size(
@@ -112,19 +132,22 @@ impl MembersSection {
             }
         }
 
-        // Inline search bar inside members section.
-        ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            InputField::single_line(
-                &format!("{id_salt}_members_search"),
-                search_query,
-                strings::SEARCH_MEMBERS_PH,
-                InputFieldStyle::rounded_search(colors),
-            )
-            .width((width - 32.0).max(120.0))
-            .show(ui);
-        });
-        ui.add_space(6.0);
+        // Inline search bar (`kEnableSearchMembersAfterCount = 20`).
+        let show_search = total_count >= SEARCH_MEMBERS_AFTER_COUNT || !search_query.is_empty();
+        if show_search {
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                InputField::single_line(
+                    &format!("{id_salt}_members_search"),
+                    search_query,
+                    strings::SEARCH_MEMBERS_PH,
+                    InputFieldStyle::rounded_search(colors),
+                )
+                .width((width - 32.0).max(120.0))
+                .show(ui);
+            });
+            ui.add_space(6.0);
+        }
 
         if members.is_empty() {
             ui.add_space(12.0);
@@ -165,7 +188,7 @@ fn member_row(
 ) -> Option<MembersAction> {
     let mut action = None;
     let width = ui.available_width().max(200.0);
-    let row_h = 54.0;
+    let row_h = 54.0 + 2.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
     let row_label = format!("Member: {}", member.name);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, row_label.clone()));
@@ -176,10 +199,10 @@ fn member_row(
             .rect_filled(rect, CornerRadius::ZERO, colors.color("windowBgOver"));
     }
 
-    // Avatar (`38px`).
+    // Avatar (`st::infoMembersList.item.photoPosition`, 42 px).
     let av_rect = Rect::from_min_size(
-        Pos2::new(rect.min.x + 18.0, rect.center().y - 19.0),
-        Vec2::splat(38.0),
+        Pos2::new(rect.min.x + 18.0, rect.min.y + 7.0),
+        Vec2::splat(42.0),
     );
     EmptyUserpic::for_color_index(member.color_index, &member.name, colors)
         .paint_circle(ui.painter(), av_rect);
@@ -193,7 +216,7 @@ fn member_row(
             .circle_filled(dot_c, 4.0, colors.color("dialogsOnlineBadgeFg"));
     }
 
-    let text_left = av_rect.max.x + 12.0;
+    let text_left = rect.min.x + MEMBER_TEXT_LEFT;
 
     // Right side: admin/owner/custom-rank badge OR hover quick-manage buttons.
     let mut right_edge = rect.max.x - 16.0;
@@ -268,7 +291,7 @@ fn member_row(
             .layout_no_wrap(badge.to_owned(), badge_font.clone(), badge_fg);
         let pill_w = galley.size().x + 12.0;
         let pill = Rect::from_min_size(
-            Pos2::new(right_edge - pill_w, rect.min.y + 10.0),
+            Pos2::new(right_edge - pill_w, rect.min.y + 12.0),
             Vec2::new(pill_w, 18.0),
         );
         ui.painter().rect_filled(
@@ -292,7 +315,7 @@ fn member_row(
     );
     let p = ui.painter().with_clip_rect(clip);
     p.text(
-        Pos2::new(text_left, rect.min.y + 9.0),
+        Pos2::new(text_left, rect.min.y + 11.0),
         Align2::LEFT_TOP,
         &member.name,
         font_id_from_style(st::semibold_font),
@@ -304,10 +327,10 @@ fn member_row(
         colors.color("windowSubTextFg")
     };
     p.text(
-        Pos2::new(text_left, rect.min.y + 28.0),
+        Pos2::new(text_left, rect.min.y + 31.0),
         Align2::LEFT_TOP,
         &member.status_text,
-        FontId::new(12.0, family_regular()),
+        FontId::new(font_id_from_style(st::normal_font).size, family_regular()),
         st_fg,
     );
 

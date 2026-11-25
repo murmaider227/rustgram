@@ -40,6 +40,9 @@ pub const DIST_EXE_NAMES: &[&str] = &[DEFAULT_EXE_NAME, UPDATER_EXE_NAME, WIDGET
 /// Filename of the generated third-party license notices bundled in distributions.
 pub const THIRD_PARTY_NOTICES_NAME: &str = "THIRD_PARTY_NOTICES.txt";
 
+/// Filename of the plain-text privacy policy shipped alongside `rustgram.exe` and shown in the installer.
+pub const PRIVACY_NOTICE_NAME: &str = "PRIVACY.txt";
+
 /// FFmpeg shared library prefixes linked by `crates/tg-video/build.rs`.
 pub const REQUIRED_FFMPEG_DLL_PREFIXES: &[&str] = &[
     "avcodec-",
@@ -279,7 +282,7 @@ pub fn generate_inno_setup_script() -> String {
 
 #define MyAppShortName "Rustgram"
 #define MyAppName "Rustgram"
-#define MyAppPublisher "The Rustgram Authors"
+#define MyAppPublisher "Rustgram Authors"
 #define MyAppURL "https://github.com/rustgram/rustgram"
 #define MyAppExeName "rustgram.exe"
 #define MyUpdaterExeName "rustgram-updater.exe"
@@ -336,7 +339,15 @@ Compression=lzma
 SolidCompression=yes
 DisableStartupPrompt=yes
 PrivilegesRequired=lowest
+InfoBeforeFile={{#DistDir}}\PRIVACY.txt
 VersionInfoVersion={{#MyAppNumericVersion}}
+VersionInfoTextVersion={{#MyAppVersion}}
+VersionInfoProductName={{#MyAppName}}
+VersionInfoProductVersion={{#MyAppNumericVersion}}
+VersionInfoProductTextVersion={{#MyAppVersion}}
+VersionInfoCompany={{#MyAppPublisher}}
+VersionInfoDescription={{#MyAppName}} Setup
+VersionInfoCopyright=Copyright (c) {{#CurrentYear}} {{#MyAppPublisher}}
 CloseApplications=force
 DisableDirPage=no
 DisableProgramGroupPage=no
@@ -361,6 +372,7 @@ Name: "ua";      MessagesFile: "compiler:Languages\Ukrainian.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{{cm:CreateDesktopIcon}}"; GroupDescription: "{{cm:AdditionalIcons}}"
+Name: "autoupdate"; Description: "Check for updates automatically"; GroupDescription: "Updates:"; Flags: checkedonce
 Name: "registertg"; Description: "Register tg:// protocol handler"; GroupDescription: "Protocol associations:"; Flags: checkedonce
 
 [Files]
@@ -375,6 +387,7 @@ Source: "{{#DistDir}}\swscale-*.dll"; DestDir: "{{app}}"; Flags: ignoreversion
 Source: "{{#DistDir}}\LICENSE"; DestDir: "{{app}}"; Flags: ignoreversion
 Source: "{{#DistDir}}\LEGAL"; DestDir: "{{app}}"; Flags: ignoreversion
 Source: "{{#DistDir}}\THIRD_PARTY_NOTICES.txt"; DestDir: "{{app}}"; Flags: ignoreversion
+Source: "{{#DistDir}}\PRIVACY.txt"; DestDir: "{{app}}"; Flags: ignoreversion
 
 [Icons]
 Name: "{{group}}\{{#MyAppShortName}}"; Filename: "{{app}}\{{#MyAppExeName}}"; AppUserModelID: "{{#MyAppUserModelId}}"
@@ -420,7 +433,6 @@ Type: files; Name: "{{app}}\log_start8.txt"
 Type: files; Name: "{{app}}\log_start9.txt"
 Type: filesandordirs; Name: "{{app}}\DebugLogs"
 Type: filesandordirs; Name: "{{app}}\tupdates"
-Type: filesandordirs; Name: "{{app}}\tdata"
 Type: filesandordirs; Name: "{{app}}\tcache"
 Type: filesandordirs; Name: "{{app}}\tdumps"
 Type: dirifempty; Name: "{{app}}"
@@ -439,12 +451,63 @@ Type: files; Name: "{{userappdata}}\{{#MyAppName}}\log_start8.txt"
 Type: files; Name: "{{userappdata}}\{{#MyAppName}}\log_start9.txt"
 Type: filesandordirs; Name: "{{userappdata}}\{{#MyAppName}}\DebugLogs"
 Type: filesandordirs; Name: "{{userappdata}}\{{#MyAppName}}\tupdates"
-Type: filesandordirs; Name: "{{userappdata}}\{{#MyAppName}}\tdata"
 Type: filesandordirs; Name: "{{userappdata}}\{{#MyAppName}}\tcache"
 Type: filesandordirs; Name: "{{userappdata}}\{{#MyAppName}}\tdumps"
 Type: dirifempty; Name: "{{userappdata}}\{{#MyAppName}}"
 
 [Code]
+procedure WriteAutoUpdatePref(Enabled: Boolean);
+var
+  PrefsDir: String;
+  PrefsFile: String;
+  RawContent: AnsiString;
+  Text: String;
+  DesiredVal: String;
+  OppositeVal: String;
+begin
+  PrefsDir := ExpandConstant('{{userappdata}}\{{#MyAppName}}\tdata');
+  PrefsFile := PrefsDir + '\startup_prefs.json';
+  if Enabled then
+  begin
+    DesiredVal := 'true';
+    OppositeVal := 'false';
+  end
+  else
+  begin
+    DesiredVal := 'false';
+    OppositeVal := 'true';
+  end;
+
+  if FileExists(PrefsFile) and LoadStringFromFile(PrefsFile, RawContent) then
+  begin
+    Text := String(RawContent);
+    if Pos('"auto_update"', Text) > 0 then
+    begin
+      StringChangeEx(Text, '"auto_update": ' + OppositeVal, '"auto_update": ' + DesiredVal, True);
+      StringChangeEx(Text, '"auto_update":' + OppositeVal, '"auto_update": ' + DesiredVal, True);
+      SaveStringToFile(PrefsFile, AnsiString(Text), False);
+    end
+    else if Trim(Text) = '{{}}' then
+    begin
+      RawContent := '{{' + #13#10 + '  "auto_update": ' + DesiredVal + #13#10 + '}}' + #13#10;
+      SaveStringToFile(PrefsFile, RawContent, False);
+    end;
+  end
+  else if ForceDirectories(PrefsDir) then
+  begin
+    RawContent := '{{' + #13#10 + '  "auto_update": ' + DesiredVal + #13#10 + '}}' + #13#10;
+    SaveStringToFile(PrefsFile, RawContent, False);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    WriteAutoUpdatePref(WizardIsTaskSelected('autoupdate'));
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
@@ -537,9 +600,15 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
 
     let license_src = opts.workspace_root.join("LICENSE");
     let legal_src = opts.workspace_root.join("LEGAL");
+    let privacy_src = opts.workspace_root.join("docs").join("PRIVACY.md");
     if !license_src.is_file() {
         return Err(XtaskError::MissingArtifact(
             license_src.display().to_string(),
+        ));
+    }
+    if !privacy_src.is_file() {
+        return Err(XtaskError::MissingArtifact(
+            privacy_src.display().to_string(),
         ));
     }
 
@@ -586,6 +655,13 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     let staged_notices = portable_dir.join(THIRD_PARTY_NOTICES_NAME);
     fs::write(&staged_notices, generate_third_party_notices())?;
     staged_files.push((THIRD_PARTY_NOTICES_NAME.to_owned(), staged_notices));
+
+    let privacy_raw = fs::read_to_string(&privacy_src)?;
+    let privacy_crlf = privacy_raw.replace("\r\n", "\n").replace('\n', "\r\n");
+    let staged_privacy = portable_dir.join(PRIVACY_NOTICE_NAME);
+    // Prefix UTF-8 BOM so Inno Setup's InfoBeforeFile wizard page renders Unicode characters cleanly.
+    fs::write(&staged_privacy, format!("\u{FEFF}{privacy_crlf}"))?;
+    staged_files.push((PRIVACY_NOTICE_NAME.to_owned(), staged_privacy.clone()));
 
     let suffix = Target::WIN_X64.asset_suffix();
     let version_str = opts.version.to_string();
@@ -668,6 +744,7 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
                 ))
                 .arg(format!("/DDistDir={}", portable_dir.display()))
                 .arg(format!("/DReleasePath={}", release_dir.display()))
+                .arg(format!("/DPrivacyFile={}", staged_privacy.display()))
                 .arg(format!("/DSetupIcon={}", icon_path.display()))
                 .arg(format!("/DOutputDir={}", opts.out_dir.display()))
                 .arg(format!("/DMyOutputBaseFilename={base_name}"))

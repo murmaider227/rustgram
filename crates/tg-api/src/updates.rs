@@ -10,12 +10,12 @@
 //! directly onto [`tg_data::Session`].
 
 use tg_data::{
-    ARCHIVE_FOLDER_ID, BotStatus, BusinessShortcutId, ChannelFlags, ChannelId,
-    ChannelUpdateEnvelope, ChatAdminRights, ChatId, ChatUpdateVersionStatus, CommonUpdateEnvelope,
-    DeletedScheduledInfo, DialogKey, DraftKey, FolderId, FullMsgId, LoadedStatus, Message,
-    MessageContent, MessageFlags, MessageUpdateFlags, MsgId, PeerId, PeerNotifySettings,
-    PeerUpdateFlags, SERVER_MAX_MSG_ID, Session, ShortcutIdChange, TimeId, TopicUpdateFlags,
-    UpdateAction, UpdatesStateMachine, UserId, UserStatusInput, Username,
+    ARCHIVE_FOLDER_ID, BotStatus, BusinessShortcutId, CallId, ChannelFlags, ChannelId,
+    ChannelUpdateEnvelope, ChatAdminRights, ChatFlags, ChatId, ChatUpdateVersionStatus,
+    CommonUpdateEnvelope, DeletedScheduledInfo, DialogKey, DraftKey, FolderId, FullMsgId,
+    LoadedStatus, Message, MessageContent, MessageFlags, MessageUpdateFlags, MsgId, PeerId,
+    PeerNotifySettings, PeerUpdateFlags, SERVER_MAX_MSG_ID, Session, ShortcutIdChange, TimeId,
+    TopicUpdateFlags, UpdateAction, UpdatesStateMachine, UserId, UserStatusInput, Username,
     scheduled_remote_to_local_id,
 };
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
@@ -413,12 +413,25 @@ impl UpdatesHandler {
         now_ms: u64,
     ) -> Result<tl_types::updates::State, ApiError> {
         let state = invoker.updates_get_state().await?;
+        self.initialize_with_state(invoker, session, &state, now_ms)
+            .await?;
+        Ok(state)
+    }
+
+    /// Like [`Self::initialize`] for an `updates.State` the caller already received, so the
+    /// caller does not hold `session` while `updates.getState` is in flight.
+    pub async fn initialize_with_state<I: Invoker>(
+        &mut self,
+        invoker: &I,
+        session: &mut Session,
+        state: &tl_types::updates::State,
+        now_ms: u64,
+    ) -> Result<(), ApiError> {
         let actions = self
             .machine
             .init_state(state.pts, state.date, state.qts, state.seq, now_ms);
         self.process_actions(invoker, session, actions, now_ms)
-            .await?;
-        Ok(state)
+            .await
     }
 
     /// Resumes from a previously persisted [`PersistedUpdatesState`]:
@@ -2194,13 +2207,60 @@ impl UpdatesHandler {
                 }
             }
             // Match `Updates::applyUpdate` (`api/api_updates.cpp:2258-2268`):
-            // forward all 1:1 and group call updates instead of dropping them.
+            // sync `updateGroupCall` onto the owning Chat/Channel in `Session` and forward all
+            // 1:1 and group call updates instead of dropping them.
+            tl_enums::Update::GroupCall(u) => {
+                if let Some(ref tl_peer) = u.peer {
+                    let pid = peer_id_from_tl(tl_peer);
+                    match &u.call {
+                        tl_enums::GroupCall::GroupCall(gc) => {
+                            let call_ref = Some((CallId::from_tl(gc.id), gc.access_hash as u64));
+                            let non_empty = gc.participants_count > 0;
+                            if let Some(cid) = pid.to_chat() {
+                                if let Some(mut chat) = session.chat(cid).cloned() {
+                                    chat.group_call = call_ref;
+                                    chat.flags.insert(ChatFlags::CALL_ACTIVE);
+                                    chat.flags.set(ChatFlags::CALL_NOT_EMPTY, non_empty);
+                                    session.upsert_chat(chat, PeerUpdateFlags::FULL_INFO);
+                                }
+                            } else if let Some(chid) = pid.to_channel()
+                                && let Some(mut ch) = session.channel(chid).cloned()
+                            {
+                                ch.group_call = call_ref;
+                                ch.flags.insert(ChannelFlags::CALL_ACTIVE);
+                                ch.flags.set(ChannelFlags::CALL_NOT_EMPTY, non_empty);
+                                session.upsert_channel(ch, PeerUpdateFlags::FULL_INFO);
+                            }
+                        }
+                        tl_enums::GroupCall::Discarded(_) => {
+                            if let Some(cid) = pid.to_chat() {
+                                if let Some(mut chat) = session.chat(cid).cloned() {
+                                    chat.group_call = None;
+                                    chat.flags
+                                        .remove(ChatFlags::CALL_ACTIVE | ChatFlags::CALL_NOT_EMPTY);
+                                    session.upsert_chat(chat, PeerUpdateFlags::FULL_INFO);
+                                }
+                            } else if let Some(chid) = pid.to_channel()
+                                && let Some(mut ch) = session.channel(chid).cloned()
+                            {
+                                ch.group_call = None;
+                                ch.flags.remove(
+                                    ChannelFlags::CALL_ACTIVE | ChannelFlags::CALL_NOT_EMPTY,
+                                );
+                                session.upsert_channel(ch, PeerUpdateFlags::FULL_INFO);
+                            }
+                        }
+                    }
+                }
+                self.events.push(UpdateEvent::CallUpdate(Box::new(
+                    tl_enums::Update::GroupCall(u),
+                )));
+            }
             update @ (tl_enums::Update::PhoneCall(_)
             | tl_enums::Update::PhoneCallSignalingData(_)
             | tl_enums::Update::GroupCallParticipants(_)
             | tl_enums::Update::GroupCallChainBlocks(_)
             | tl_enums::Update::GroupCallConnection(_)
-            | tl_enums::Update::GroupCall(_)
             | tl_enums::Update::GroupCallMessage(_)
             | tl_enums::Update::GroupCallEncryptedMessage(_)
             | tl_enums::Update::DeleteGroupCallMessages(_)) => {

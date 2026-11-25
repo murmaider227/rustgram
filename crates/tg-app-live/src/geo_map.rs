@@ -247,18 +247,69 @@ pub(super) fn default_location_country_iso2(live: &LiveSession) -> Option<String
     fetched
 }
 
-/// Decodes raw PNG/JPEG static map tile bytes into `(width, height, rgba8)` pixels.
+/// Decodes raw PNG/JPEG static map tile bytes into `(width, height, rgba8)` pixels, enforcing
+/// [`MAX_STATIC_MAP_BYTES`] and [`tg_media::image::READ_MAX_AREA`] before pixel allocation.
 pub fn decode_map_tile_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
-    let img = image::load_from_memory(bytes)
-        .map_err(|e| format!("Failed to decode static map tile image: {e}"))?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
+    if bytes.len() > MAX_STATIC_MAP_BYTES {
+        return Err("Static map tile exceeded maximum allowed size.".to_owned());
+    }
+    let decoded = tg_media::image::read_image(tg_media::image::ReadArgs {
+        content: bytes.to_vec(),
+        ..Default::default()
+    })
+    .map_err(|e| format!("Failed to decode static map tile image: {e}"))?;
+    let (w, h) = decoded.image.dimensions();
     if w == 0 || h == 0 {
         return Err("Decoded static map tile has zero dimensions.".to_owned());
     }
-    Ok((w, h, rgba.into_raw()))
+    Ok((w, h, decoded.image.into_raw()))
 }
 
 pub use tg_app_core::core_types::geo::{
     default_geolocation_provider, mini_app_location_checked_json, mini_app_location_requested_json,
 };
+
+#[cfg(test)]
+mod sec2c_tests {
+    use super::*;
+
+    fn encode_1bit_gray_png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::One);
+            let mut writer = encoder.write_header().expect("png header");
+            let row_bytes = (width as usize).div_ceil(8);
+            let mut stream = writer.stream_writer().expect("png stream writer");
+            let row = vec![0_u8; row_bytes];
+            for _ in 0..height {
+                std::io::Write::write_all(&mut stream, &row).expect("write png row");
+            }
+            stream.finish().expect("finish png");
+        }
+        out
+    }
+
+    #[test]
+    fn sec2c_w3_decode_map_tile_rgba_rejects_oversized_pixel_dimensions() {
+        // 12_100 * 9_100 = 110_110_000 pixels > tg_media::image::READ_MAX_AREA (108_576_768).
+        // As a 1-bit grayscale PNG this compresses to ~15 KiB (< MAX_STATIC_MAP_BYTES) and would
+        // decode cleanly under `image::load_from_memory` (allocating ~440 MiB RGBA) on the old code.
+        let oversized_png = encode_1bit_gray_png(12_100, 9_100);
+        assert!(oversized_png.len() < MAX_STATIC_MAP_BYTES);
+
+        let err = decode_map_tile_rgba(&oversized_png)
+            .expect_err("map tile exceeding READ_MAX_AREA must be rejected before pixel decode");
+        assert!(
+            err.to_ascii_lowercase().contains("limit") || err.contains("area"),
+            "expected area limit error, got: {err}"
+        );
+
+        // Normal small tile still decodes cleanly.
+        let small_png = encode_1bit_gray_png(16, 16);
+        let (w, h, rgba) = decode_map_tile_rgba(&small_png).expect("small map tile must decode");
+        assert_eq!((w, h), (16, 16));
+        assert_eq!(rgba.len(), 16 * 16 * 4);
+    }
+}

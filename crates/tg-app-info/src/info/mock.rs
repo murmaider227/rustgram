@@ -174,6 +174,7 @@ impl MockBackend {
                 gifs: 2,
                 common_groups: 0,
             },
+            group_call: Default::default(),
         });
 
         // 2. Primary User ("Mira Vance") with phone, multiple usernames (1 collectible), bio, birthday, common groups
@@ -235,6 +236,7 @@ impl MockBackend {
                 gifs: 4,
                 common_groups: 2,
             },
+            group_call: Default::default(),
         });
 
         // 3. Additional fictional contacts
@@ -359,6 +361,7 @@ impl MockBackend {
                     gifs: 0,
                     common_groups: 1,
                 },
+                group_call: Default::default(),
             });
         }
 
@@ -410,6 +413,7 @@ impl MockBackend {
                 gifs: 0,
                 common_groups: 1,
             },
+            group_call: Default::default(),
         });
 
         // 5. Supergroup ("Rustgram Core Port")
@@ -581,6 +585,7 @@ impl MockBackend {
                 gifs: 4,
                 common_groups: 0,
             },
+            group_call: Default::default(),
         });
         members.insert(mock_peers::GROUP_CORE, core_members);
 
@@ -663,6 +668,7 @@ impl MockBackend {
                 gifs: 2,
                 common_groups: 0,
             },
+            group_call: Default::default(),
         });
         members.insert(mock_peers::GROUP_DESIGN, design_members);
 
@@ -714,6 +720,7 @@ impl MockBackend {
                 gifs: 2,
                 common_groups: 0,
             },
+            group_call: Default::default(),
         });
         members.insert(
             mock_peers::CHANNEL_RELEASES,
@@ -794,6 +801,7 @@ impl MockBackend {
                 gifs: 0,
                 common_groups: 0,
             },
+            group_call: Default::default(),
         });
 
         // Common groups
@@ -1388,6 +1396,7 @@ impl InfoBackend for MockBackend {
             bot_reads_all_messages: false,
             has_mini_app: false,
             media_counts: SharedMediaCounts::default(),
+            group_call: Default::default(),
         });
         Ok(id)
     }
@@ -1473,6 +1482,7 @@ impl InfoBackend for MockBackend {
             bot_reads_all_messages: false,
             has_mini_app: false,
             media_counts: SharedMediaCounts::default(),
+            group_call: Default::default(),
         });
         Ok(id)
     }
@@ -1559,6 +1569,7 @@ impl InfoBackend for MockBackend {
             bot_reads_all_messages: false,
             has_mini_app: false,
             media_counts: SharedMediaCounts::default(),
+            group_call: Default::default(),
         });
         Ok(id)
     }
@@ -2571,6 +2582,218 @@ impl InfoBackend for MockBackend {
     ) -> Result<bool, String> {
         self.profile_extras
             .toggle_chat_star_gift_notifications(peer_id, enabled)
+    }
+
+    fn channel_management_state(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<crate::info::backend::ChannelManagementState> {
+        self.peer_mgmt.channel_management_state(peer_id)
+    }
+
+    fn toggle_pre_history_hidden(&mut self, peer_id: PeerId, hidden: bool) -> Result<(), String> {
+        self.peer_mgmt.toggle_pre_history_hidden(peer_id, hidden);
+        Ok(())
+    }
+
+    fn groups_for_discussion(
+        &self,
+    ) -> Result<Vec<crate::info::backend::DiscussionGroupCandidate>, String> {
+        Ok(self
+            .peers
+            .iter()
+            .filter(|p| p.kind.is_group())
+            .map(|p| crate::info::backend::DiscussionGroupCandidate {
+                peer_id: p.id,
+                title: p.title.clone(),
+                username: p.primary_username().map(ToOwned::to_owned),
+                members_count: p.members_count,
+                is_megagroup: p.kind == InfoPeerKind::Supergroup,
+                is_public: p.is_public,
+            })
+            .collect())
+    }
+
+    fn convert_to_gigagroup(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.peer_mgmt.convert_to_gigagroup(peer_id);
+        Ok(())
+    }
+
+    fn deactivate_all_channel_usernames(&mut self, peer_id: PeerId) -> Result<(), String> {
+        if let Some(p) = self.peer_mut(peer_id) {
+            for u in &mut p.usernames {
+                if !u.is_editable {
+                    u.is_active = false;
+                }
+            }
+        }
+        self.peer_mgmt.deactivate_all_channel_usernames(peer_id);
+        Ok(())
+    }
+
+    fn toggle_channel_forum(
+        &mut self,
+        peer_id: PeerId,
+        enabled: bool,
+        tabs: bool,
+    ) -> Result<(), String> {
+        if let Some(p) = self.peer_mut(peer_id) {
+            p.is_forum = enabled;
+        }
+        self.peer_mgmt.toggle_channel_forum(peer_id, enabled, tabs);
+        Ok(())
+    }
+
+    fn toggle_participants_hidden(&mut self, peer_id: PeerId, hidden: bool) -> Result<(), String> {
+        self.peer_mgmt.toggle_participants_hidden(peer_id, hidden);
+        Ok(())
+    }
+
+    fn toggle_view_forum_as_messages(
+        &mut self,
+        peer_id: PeerId,
+        as_messages: bool,
+    ) -> Result<(), String> {
+        self.peer_mgmt
+            .toggle_view_forum_as_messages(peer_id, as_messages);
+        Ok(())
+    }
+
+    fn set_boosts_to_unblock_restrictions(
+        &mut self,
+        peer_id: PeerId,
+        boosts: u32,
+    ) -> Result<(), String> {
+        self.peer_mgmt
+            .set_boosts_to_unblock_restrictions(peer_id, boosts);
+        Ok(())
+    }
+
+    fn set_channel_sticker_set(
+        &mut self,
+        peer_id: PeerId,
+        set: crate::info::backend::ChannelStickerSetRef,
+    ) -> Result<(), String> {
+        self.peer_mgmt.set_channel_sticker_set(peer_id, set);
+        Ok(())
+    }
+
+    fn set_channel_emoji_sticker_set(
+        &mut self,
+        peer_id: PeerId,
+        set: crate::info::backend::ChannelStickerSetRef,
+    ) -> Result<(), String> {
+        self.peer_mgmt.set_channel_emoji_sticker_set(peer_id, set);
+        Ok(())
+    }
+
+    fn update_channel_paid_messages_price(
+        &mut self,
+        peer_id: PeerId,
+        broadcast_messages_allowed: bool,
+        stars_per_message: i64,
+    ) -> Result<(), String> {
+        self.peer_mgmt.update_channel_paid_messages_price(
+            peer_id,
+            broadcast_messages_allowed,
+            stars_per_message,
+        );
+        Ok(())
+    }
+
+    fn toggle_channel_autotranslation(
+        &mut self,
+        peer_id: PeerId,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.peer_mgmt
+            .toggle_channel_autotranslation(peer_id, enabled);
+        Ok(())
+    }
+
+    fn delete_basic_chat(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.peer_mgmt.delete_basic_chat(peer_id);
+        self.peers.retain(|p| p.id != peer_id);
+        Ok(())
+    }
+
+    fn admins_with_invites(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Vec<crate::info::backend::AdminWithInvitesEntry>, String> {
+        Ok(self.peer_mgmt.admins_with_invites(peer_id))
+    }
+
+    fn delete_contacts(&mut self, peer_ids: &[PeerId]) -> Result<(), String> {
+        for &pid in peer_ids {
+            if let Some(p) = self.peer_mut(pid) {
+                p.is_contact = false;
+            }
+        }
+        self.peer_mgmt.record_deleted_contacts(peer_ids);
+        Ok(())
+    }
+
+    fn export_contact_token(
+        &self,
+    ) -> Result<tg_app_core::core_types::dto::contacts_extras::ExportedContactTokenInfo, String>
+    {
+        Ok(self.peer_mgmt.export_contact_token())
+    }
+
+    fn import_contact_token(&mut self, token: &str) -> Result<PeerId, String> {
+        self.peer_mgmt
+            .import_contact_token(token, mock_peers::USER_MIRA)
+    }
+
+    fn export_no_paid_messages_token(
+        &self,
+        revoke: bool,
+        temporary: bool,
+    ) -> Result<
+        tg_app_core::core_types::dto::contacts_extras::ExportedNoPaidMessagesTokenInfo,
+        String,
+    > {
+        Ok(self
+            .peer_mgmt
+            .export_no_paid_messages_token(revoke, temporary))
+    }
+
+    fn import_no_paid_messages_token(
+        &mut self,
+        peer_id: PeerId,
+        token: &str,
+    ) -> Result<
+        tg_app_core::core_types::dto::contacts_extras::NoPaidMessagesTokenImportResult,
+        String,
+    > {
+        self.peer_mgmt.import_no_paid_messages_token(peer_id, token)
+    }
+
+    fn contact_note(&self, peer_id: PeerId) -> Option<tg_text::TextWithEntities> {
+        self.peer_mgmt.contact_note(peer_id)
+    }
+
+    fn update_contact_note(
+        &mut self,
+        peer_id: PeerId,
+        note: tg_text::TextWithEntities,
+    ) -> Result<bool, String> {
+        Ok(self.peer_mgmt.update_contact_note(peer_id, note))
+    }
+
+    fn delete_profile_photos(&mut self, photos: &[ProfilePhotoRef]) -> Result<Vec<i64>, String> {
+        Ok(self.peer_mgmt.delete_profile_photos(photos))
+    }
+
+    fn upload_contact_profile_photo(
+        &mut self,
+        peer_id: PeerId,
+        request: tg_app_core::core_types::dto::contacts_extras::ContactProfilePhotoUpload,
+    ) -> Result<i64, String> {
+        Ok(self
+            .peer_mgmt
+            .upload_contact_profile_photo(peer_id, request))
     }
 }
 

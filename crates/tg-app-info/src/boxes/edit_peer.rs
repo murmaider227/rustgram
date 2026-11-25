@@ -27,9 +27,11 @@ use tg_ui::widgets::labels::{FlatLabel, divider_bar};
 use tg_ui::widgets::sliders::SettingsSlider;
 
 use crate::boxes::create_peer::{ChannelVisibility, photo_picker_circle};
+use crate::boxes::edit_peer_extras::format_sticker_set_badge;
 use crate::boxes::strings;
 use crate::info::backend::{
-    InfoBackend, InfoPeerKind, MemberEntry, MemberRole, PeerProfile, UpdatePeerInfoRequest,
+    ChannelManagementState, InfoBackend, InfoPeerKind, MemberEntry, MemberRole, PeerProfile,
+    UpdatePeerInfoRequest,
 };
 use crate::info::values::{
     AUTO_DELETE_TTL_PRESETS, MAX_ADMIN_TITLE_LENGTH, MAX_CHANNEL_DESCRIPTION,
@@ -142,6 +144,14 @@ pub enum EditPeerSubAction {
     OpenWelcomeMessages,
     /// Open linked Community overview or Create Community wizard (`CommunityBox`).
     OpenCommunity,
+    /// Open Chat History Visibility for New Members (`EditPeerHistoryVisibilityBox`).
+    OpenHistoryVisibility,
+    /// Open Group Stickers & Custom Emoji Pack selector (`EditGroupStickersBox`).
+    OpenGroupStickers,
+    /// Open two-step Convert to Broadcast Group confirmation (`channels.convertToGigagroup`).
+    ConvertToGigagroup,
+    /// Open Deactivate All Collectible Usernames confirmation (`channels.deactivateAllUsernames`).
+    DeactivateAllUsernames,
 }
 
 /// State for editing a group, channel, or profile (`EditPeerInfoBox`).
@@ -169,6 +179,14 @@ pub struct EditPeerInfoBoxState {
     pub anti_spam_loaded: bool,
     /// Optional anti-spam notice (e.g. member-count threshold warning).
     pub anti_spam_notice: Option<String>,
+    /// WP-65/WP-69 cached channel & supergroup management flags.
+    pub mgmt: ChannelManagementState,
+    /// Whether `mgmt` has been synced from `InfoBackend::channel_management_state`.
+    pub mgmt_loaded: bool,
+    /// Draft text for Paid Messages price in Telegram Stars (`0..=10000`).
+    pub paid_stars_draft: String,
+    /// Inline status/error message for WP-69 management toggles.
+    pub mgmt_notice: Option<String>,
     /// Whether a custom photo was updated via crop box.
     pub has_custom_photo: bool,
     /// Avatar palette index.
@@ -199,9 +217,164 @@ impl EditPeerInfoBoxState {
             anti_spam_enabled: false,
             anti_spam_loaded: false,
             anti_spam_notice: None,
+            mgmt: ChannelManagementState {
+                is_forum: peer.is_forum,
+                ..ChannelManagementState::default()
+            },
+            mgmt_loaded: false,
+            paid_stars_draft: "0".to_owned(),
+            mgmt_notice: None,
             has_custom_photo: false,
             color_index: peer.color_index,
             error: None,
+        }
+    }
+
+    /// Synchronizes [`Self::mgmt`] from `backend.channel_management_state(self.peer_id)`.
+    pub fn sync_management_state(&mut self, backend: &dyn InfoBackend) {
+        if let Some(st) = backend.channel_management_state(self.peer_id) {
+            self.paid_stars_draft = st.stars_per_message.max(0).to_string();
+            self.mgmt = st;
+        }
+        self.mgmt_loaded = true;
+    }
+
+    /// Toggles forum topics mode (`channels.toggleForum`) and updates cached state.
+    pub fn try_toggle_forum(
+        &mut self,
+        enabled: bool,
+        tabs: bool,
+        has_linked_discussion: bool,
+        backend: &mut dyn InfoBackend,
+    ) -> Result<(), String> {
+        if enabled && has_linked_discussion {
+            let msg = tr::lng_forum_topics_no_discussion();
+            self.mgmt_notice = Some(msg.clone());
+            return Err(msg);
+        }
+        match backend.toggle_channel_forum(self.peer_id, enabled, enabled && tabs) {
+            Ok(()) => {
+                self.mgmt.is_forum = enabled;
+                self.mgmt.forum_tabs = enabled && tabs;
+                if enabled {
+                    self.mgmt.pre_history_hidden = false;
+                }
+                self.mgmt_notice = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.mgmt_notice = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    /// Toggles viewing a forum as flat messages (`channels.toggleViewForumAsMessages`).
+    pub fn try_toggle_view_as_messages(
+        &mut self,
+        as_messages: bool,
+        backend: &mut dyn InfoBackend,
+    ) -> Result<(), String> {
+        match backend.toggle_view_forum_as_messages(self.peer_id, as_messages) {
+            Ok(()) => {
+                self.mgmt.view_forum_as_messages = as_messages;
+                self.mgmt_notice = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.mgmt_notice = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    /// Toggles hiding the group members list (`channels.toggleParticipantsHidden`).
+    pub fn try_toggle_participants_hidden(
+        &mut self,
+        hidden: bool,
+        backend: &mut dyn InfoBackend,
+    ) -> Result<(), String> {
+        match backend.toggle_participants_hidden(self.peer_id, hidden) {
+            Ok(()) => {
+                self.mgmt.participants_hidden = hidden;
+                self.mgmt_notice = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.mgmt_notice = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    /// Updates boosts needed to bypass group restrictions (`channels.setBoostsToUnblockRestrictions`).
+    pub fn try_set_boosts_unrestrict(
+        &mut self,
+        boosts: u32,
+        backend: &mut dyn InfoBackend,
+    ) -> Result<(), String> {
+        let clamped = boosts.min(5);
+        match backend.set_boosts_to_unblock_restrictions(self.peer_id, clamped) {
+            Ok(()) => {
+                self.mgmt.boosts_unrestrict = clamped;
+                self.mgmt_notice = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.mgmt_notice = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    /// Saves Stars-per-message pricing and (for channels) Direct Messages availability
+    /// (`channels.updatePaidMessagesPrice`).
+    pub fn try_apply_paid_messages_price(
+        &mut self,
+        broadcast_messages_allowed: bool,
+        stars_per_message: i64,
+        backend: &mut dyn InfoBackend,
+    ) -> Result<(), String> {
+        if !(0..=10_000).contains(&stars_per_message) {
+            let msg = "Paid message price must be between 0 and 10,000 Stars.".to_owned();
+            self.mgmt_notice = Some(msg.clone());
+            return Err(msg);
+        }
+        match backend.update_channel_paid_messages_price(
+            self.peer_id,
+            broadcast_messages_allowed,
+            stars_per_message,
+        ) {
+            Ok(()) => {
+                self.mgmt.broadcast_messages_allowed = broadcast_messages_allowed;
+                self.mgmt.stars_per_message = stars_per_message;
+                self.paid_stars_draft = stars_per_message.to_string();
+                self.mgmt_notice = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.mgmt_notice = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    /// Toggles channel post auto-translation (`channels.toggleAutotranslation`).
+    pub fn try_toggle_autotranslation(
+        &mut self,
+        enabled: bool,
+        backend: &mut dyn InfoBackend,
+    ) -> Result<(), String> {
+        match backend.toggle_channel_autotranslation(self.peer_id, enabled) {
+            Ok(()) => {
+                self.mgmt.autotranslation = enabled;
+                self.mgmt_notice = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.mgmt_notice = Some(err.clone());
+                Err(err)
+            }
         }
     }
 
@@ -272,10 +445,12 @@ impl EditPeerInfoBoxState {
             InfoPeerKind::Group | InfoPeerKind::Supergroup => tr::lng_edit_group(),
             _ => strings::EDIT_INFO_TITLE.to_owned(),
         };
-        BoxModal::new(id, heading)
+        let mut modal = BoxModal::new(id, heading)
             .width(st::box_wide_width.0 as f32 + 24.0)
             .add_button(BoxButton::default_btn("cancel", tr::lng_cancel()))
-            .add_button(BoxButton::default_btn("save", tr::lng_settings_save()))
+            .add_button(BoxButton::default_btn("save", tr::lng_settings_save()));
+        modal.max_content_height = 500.0;
+        modal
     }
 
     /// Renders the Edit Peer Info body.
@@ -286,6 +461,9 @@ impl EditPeerInfoBoxState {
         backend: &mut dyn InfoBackend,
         colors: &dyn Colors,
     ) -> Option<EditPeerSubAction> {
+        // Reserve right gutter so right-aligned badges and wrapped labels clear the modal scrollbar.
+        let safe_w = (ui.available_width() - 14.0).max(200.0);
+        ui.set_max_width(safe_w);
         let mut sub_action = None;
         let input_st = InputFieldStyle::default_input(colors);
 
@@ -520,7 +698,7 @@ impl EditPeerInfoBoxState {
                     let mut next_antispam = self.anti_spam_enabled;
                     let locked = p.members_count < ANTISPAM_MIN_MEMBERS;
                     let label = if locked {
-                        format!("Aggressive Anti-Spam (requires {ANTISPAM_MIN_MEMBERS}+ members)")
+                        format!("Aggressive Anti-Spam ({ANTISPAM_MIN_MEMBERS}+)")
                     } else {
                         "Aggressive Anti-Spam".to_owned()
                     };
@@ -567,6 +745,266 @@ impl EditPeerInfoBoxState {
                     .unwrap_or_else(|| "None".to_owned());
                 if nav_setting_row(ui, st::menu_icon_groups, "Community", &comm_badge, colors) {
                     sub_action = Some(EditPeerSubAction::OpenCommunity);
+                }
+
+                // -------------------------------------------------------------
+                // WP-69: Channel & Supergroup Management Controls (WP-65 RPCs)
+                // -------------------------------------------------------------
+                if !self.mgmt_loaded {
+                    self.sync_management_state(backend);
+                } else if let Some(fresh) = backend.channel_management_state(p.id) {
+                    self.mgmt.pre_history_hidden = fresh.pre_history_hidden;
+                    self.mgmt.is_gigagroup = fresh.is_gigagroup;
+                    self.mgmt.sticker_set = fresh.sticker_set;
+                    self.mgmt.emoji_set = fresh.emoji_set;
+                }
+
+                ui.add_space(8.0);
+                divider_bar(ui, 6.0, colors);
+                ui.add_space(6.0);
+
+                // A. Chat history for new members (private non-forum groups without linked channel)
+                if p.kind.is_group()
+                    && self.visibility == ChannelVisibility::Private
+                    && !self.mgmt.is_forum
+                    && p.linked_discussion_peer.is_none()
+                {
+                    let vis_badge = if self.mgmt.pre_history_hidden {
+                        tr::lng_manage_history_visibility_hidden()
+                    } else {
+                        tr::lng_manage_history_visibility_shown()
+                    };
+                    if nav_setting_row(
+                        ui,
+                        st::menu_icon_discussion,
+                        &tr::lng_manage_history_visibility_title(),
+                        &vis_badge,
+                        colors,
+                    ) {
+                        sub_action = Some(EditPeerSubAction::OpenHistoryVisibility);
+                    }
+                }
+
+                // B. Forum Topics, Tabbed Layout & View as Messages (`channels.toggleForum` /
+                //    `channels.toggleViewForumAsMessages`)
+                if p.kind.is_group() {
+                    let mut forum_on = self.mgmt.is_forum;
+                    let topics_lbl = tr::lng_forum_topics_switch();
+                    if Toggle::new(&mut forum_on, ToggleStyle::default_toggle(colors))
+                        .with_label(&topics_lbl, colors.color("windowFg"))
+                        .show(ui)
+                        .changed()
+                    {
+                        let _ = self.try_toggle_forum(
+                            forum_on,
+                            self.mgmt.forum_tabs,
+                            p.linked_discussion_peer.is_some(),
+                            backend,
+                        );
+                    }
+                    if self.mgmt.is_forum {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_space(16.0);
+                            let mut tabs_on = self.mgmt.forum_tabs;
+                            if Toggle::new(&mut tabs_on, ToggleStyle::default_toggle(colors))
+                                .with_label("Show Topics as Tabs", colors.color("windowFg"))
+                                .show(ui)
+                                .changed()
+                            {
+                                let _ = self.try_toggle_forum(
+                                    true,
+                                    tabs_on,
+                                    p.linked_discussion_peer.is_some(),
+                                    backend,
+                                );
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_space(16.0);
+                            let mut view_msgs = self.mgmt.view_forum_as_messages;
+                            let view_lbl = tr::lng_forum_view_as_messages();
+                            if Toggle::new(&mut view_msgs, ToggleStyle::default_toggle(colors))
+                                .with_label(&view_lbl, colors.color("windowFg"))
+                                .show(ui)
+                                .changed()
+                            {
+                                let _ = self.try_toggle_view_as_messages(view_msgs, backend);
+                            }
+                        });
+                    }
+
+                    // C. Hide Members (`channels.toggleParticipantsHidden`)
+                    ui.add_space(4.0);
+                    let mut hide_members = self.mgmt.participants_hidden;
+                    let hide_lbl = tr::lng_profile_hide_participants();
+                    if Toggle::new(&mut hide_members, ToggleStyle::default_toggle(colors))
+                        .with_label(&hide_lbl, colors.color("windowFg"))
+                        .show(ui)
+                        .changed()
+                    {
+                        let _ = self.try_toggle_participants_hidden(hide_members, backend);
+                    }
+                    FlatLabel::plain(
+                        &tr::lng_profile_hide_participants_about(),
+                        FlatLabelStyle::sub_text(colors),
+                    )
+                    .id_salt("edit_hide_members_about")
+                    .show(ui);
+
+                    // D. Boosts to Unrestrict (`channels.setBoostsToUnblockRestrictions`)
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("Boosts to Unrestrict")
+                                .font(font_id_from_style(st::semibold_font))
+                                .color(colors.color("windowFg")),
+                        );
+                        let badge = if self.mgmt.boosts_unrestrict == 0 {
+                            "Off".to_owned()
+                        } else {
+                            format!("{} boost(s)", self.mgmt.boosts_unrestrict)
+                        };
+                        ui.label(
+                            egui::RichText::new(badge)
+                                .font(FontId::new(12.0, family_semibold()))
+                                .color(colors.color("windowActiveTextFg")),
+                        );
+                        if ui
+                            .add_enabled(self.mgmt.boosts_unrestrict > 0, egui::Button::new("−"))
+                            .on_hover_text("Decrease required boosts")
+                            .clicked()
+                        {
+                            let next = self.mgmt.boosts_unrestrict.saturating_sub(1);
+                            let _ = self.try_set_boosts_unrestrict(next, backend);
+                        }
+                        if ui
+                            .add_enabled(self.mgmt.boosts_unrestrict < 5, egui::Button::new("+"))
+                            .on_hover_text("Increase required boosts")
+                            .clicked()
+                        {
+                            let next = (self.mgmt.boosts_unrestrict + 1).min(5);
+                            let _ = self.try_set_boosts_unrestrict(next, backend);
+                        }
+                    });
+
+                    // E. Group Stickers & Emoji Pack (`channels.setStickers` / `setEmojiStickers`)
+                    ui.add_space(4.0);
+                    let stickers_badge = format_sticker_set_badge(self.mgmt.sticker_set.as_ref());
+                    if nav_setting_row(
+                        ui,
+                        st::menu_icon_star,
+                        &tr::lng_group_stickers(),
+                        &stickers_badge,
+                        colors,
+                    ) {
+                        sub_action = Some(EditPeerSubAction::OpenGroupStickers);
+                    }
+                }
+
+                // F. Channel Post Auto-Translation (`channels.toggleAutotranslation`)
+                if p.kind.is_channel() {
+                    let mut auto_tr = self.mgmt.autotranslation;
+                    let tr_lbl = tr::lng_edit_autotranslate();
+                    if Toggle::new(&mut auto_tr, ToggleStyle::default_toggle(colors))
+                        .with_label(&tr_lbl, colors.color("windowFg"))
+                        .show(ui)
+                        .changed()
+                    {
+                        let _ = self.try_toggle_autotranslation(auto_tr, backend);
+                    }
+                }
+
+                // G. Paid Messages Price & Channel Direct Messages (`channels.updatePaidMessagesPrice`)
+                ui.add_space(6.0);
+                FlatLabel::plain(
+                    "Paid Messages (Stars)",
+                    FlatLabelStyle::subsection_title(colors),
+                )
+                .id_salt("edit_paid_msgs_hdr")
+                .show(ui);
+                ui.add_space(4.0);
+                if p.kind.is_channel() {
+                    let mut dm_allowed = self.mgmt.broadcast_messages_allowed;
+                    if Toggle::new(&mut dm_allowed, ToggleStyle::default_toggle(colors))
+                        .with_label("Allow Direct Messages to Channel", colors.color("windowFg"))
+                        .show(ui)
+                        .changed()
+                    {
+                        let _ = self.try_apply_paid_messages_price(
+                            dm_allowed,
+                            self.mgmt.stars_per_message,
+                            backend,
+                        );
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Stars per message:")
+                            .font(FontId::new(12.5, family_regular()))
+                            .color(colors.color("windowFg")),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.paid_stars_draft)
+                            .desired_width(68.0)
+                            .hint_text("0"),
+                    );
+                    if ui.button("Apply Price").clicked() {
+                        match self.paid_stars_draft.trim().parse::<i64>() {
+                            Ok(stars) => {
+                                let _ = self.try_apply_paid_messages_price(
+                                    self.mgmt.broadcast_messages_allowed,
+                                    stars,
+                                    backend,
+                                );
+                            }
+                            Err(_) => {
+                                self.mgmt_notice =
+                                    Some("Enter a whole number of Stars (0 to 10,000).".to_owned());
+                            }
+                        }
+                    }
+                });
+
+                // H. Convert to Broadcast Group (`channels.convertToGigagroup`)
+                if p.kind.is_group() && !self.mgmt.is_gigagroup {
+                    ui.add_space(6.0);
+                    if nav_setting_row(
+                        ui,
+                        st::menu_icon_groups,
+                        &tr::lng_rights_gigagroup_convert(),
+                        "200K+",
+                        colors,
+                    ) {
+                        sub_action = Some(EditPeerSubAction::ConvertToGigagroup);
+                    }
+                }
+
+                // I. Deactivate All Collectible Usernames (`channels.deactivateAllUsernames`)
+                let active_collectibles = p
+                    .usernames
+                    .iter()
+                    .filter(|u| !u.is_editable && u.is_active)
+                    .count();
+                if active_collectibles > 0 {
+                    ui.add_space(6.0);
+                    let btn = egui::Button::new(
+                        egui::RichText::new(format!(
+                            "Deactivate All Collectible Usernames ({active_collectibles})"
+                        ))
+                        .color(colors.color("attentionButtonFg")),
+                    );
+                    if ui.add(btn).clicked() {
+                        sub_action = Some(EditPeerSubAction::DeactivateAllUsernames);
+                    }
+                }
+
+                if let Some(ref notice) = self.mgmt_notice {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(notice)
+                            .font(FontId::new(12.0, family_regular()))
+                            .color(colors.color("boxTextFgError")),
+                    );
                 }
             }
         }
@@ -1422,8 +1860,9 @@ fn admin_flag_toggle(
 }
 
 fn nav_setting_row(ui: &mut Ui, icon: Icon, label: &str, value: &str, colors: &dyn Colors) -> bool {
-    let width = ui.available_width().max(180.0);
+    let width = ui.max_rect().width().min(ui.available_width()).max(180.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         ui.painter()
@@ -1440,19 +1879,62 @@ fn nav_setting_row(ui: &mut Ui, icon: Icon, label: &str, value: &str, colors: &d
         &ColorsResolver(colors),
         Some(colors.color("menuIconFg")),
     );
-    ui.painter().text(
+    // The label keeps its full width (tdesktop's `SettingsButton` elides the
+    // right-hand value, never the label); the value is elided to the space left.
+    let label_font = font_id_from_style(st::normal_font);
+    let label_w = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            label_font.clone(),
+            colors.color("windowFg"),
+        )
+        .size()
+        .x;
+    let label_clip = Rect::from_min_max(
+        Pos2::new(rect.min.x + 36.0, rect.min.y),
+        Pos2::new(rect.max.x - 16.0, rect.max.y),
+    );
+    ui.painter().with_clip_rect(label_clip).text(
         Pos2::new(rect.min.x + 36.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        font_id_from_style(st::normal_font),
+        label_font,
         colors.color("windowFg"),
     );
-    ui.painter().text(
-        Pos2::new(rect.max.x - 10.0, rect.center().y),
-        Align2::RIGHT_CENTER,
-        value,
-        FontId::new(12.5, family_regular()),
-        colors.color("windowActiveTextFg"),
-    );
+    if !value.is_empty() {
+        let val_font = FontId::new(12.5, family_regular());
+        let fg = colors.color("windowActiveTextFg");
+        let max_w = (rect.width() - 36.0 - label_w - 12.0 - 16.0).max(0.0);
+        let measure = |s: &str| {
+            ui.painter()
+                .layout_no_wrap(s.to_owned(), val_font.clone(), fg)
+                .size()
+                .x
+        };
+        let shown = if measure(value) <= max_w {
+            value.to_owned()
+        } else {
+            let chars: Vec<char> = value.chars().collect();
+            let (mut lo, mut hi) = (0usize, chars.len());
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+                if measure(&candidate) <= max_w {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            chars[..lo].iter().collect::<String>() + "…"
+        };
+        ui.painter().text(
+            Pos2::new(rect.max.x - 16.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            shown,
+            val_font,
+            fg,
+        );
+    }
     resp.clicked()
 }

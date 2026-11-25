@@ -728,6 +728,35 @@ impl AppBusinessHost {
         state_arc.lock().is_ok_and(|g| g.open)
     }
 
+    /// Opens the overlay directly on the Emoji Status selector (main menu "Set Emoji Status"
+    /// for Premium users, `window_main_menu.cpp` -> `EmojiStatusPanel`).
+    pub fn open_emoji_status(ctx: &Context) {
+        let state_arc = Self::get_or_init_state(ctx);
+        if let Ok(mut guard) = state_arc.lock() {
+            guard.screen_host.back_stack.clear();
+            guard.screen_host.active_screen = BusinessScreen::EmojiStatus;
+            guard.open = true;
+        }
+    }
+
+    /// Returns the overlay's active screen while it is open.
+    #[must_use]
+    pub fn open_screen(ctx: &Context) -> Option<BusinessScreen> {
+        let state_arc = Self::get_or_init_state(ctx);
+        state_arc
+            .lock()
+            .ok()
+            .and_then(|g| g.open.then_some(g.screen_host.active_screen))
+    }
+
+    /// Closes the overlay (passcode lock: `Application::closeAdditionalWindows`).
+    pub fn close(ctx: &Context) {
+        let state_arc = Self::get_or_init_state(ctx);
+        if let Ok(mut guard) = state_arc.lock() {
+            guard.open = false;
+        }
+    }
+
     /// Opens the floating Business & Premium overlay directly on [`PremiumLimitsView`] focused on `kind`.
     pub fn open_premium_limits(ctx: &Context, kind: crate::business::model::PremiumLimitKind) {
         let state_arc = Self::get_or_init_state(ctx);

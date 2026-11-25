@@ -61,9 +61,10 @@ use tg_app_history::history::sections_model::{
 };
 use tg_app_info::dialogs::backend::{
     ArchiveSummary, ChatFolder as DialogChatFolder, DialogDraft, DialogItem, DialogListQuery,
-    DialogPeerKind, DialogSlice, DialogsBackend, FolderIconKind, FolderTagBadge, FolderUnreadState,
-    GlobalPeerResult, HashtagSuggestion, MessageSearchResult, RecentPeerItem, SearchRequest,
-    SearchResults, SearchTab, SearchTagChip, SpecialRowKind, TopPeerItem, TypingState,
+    DialogMediaPreview, DialogMediaPreviewKind, DialogPeerKind, DialogSlice, DialogsBackend,
+    FolderIconKind, FolderTagBadge, FolderUnreadState, GlobalPeerResult, HashtagSuggestion,
+    MessageSearchResult, RecentPeerItem, SearchRequest, SearchResults, SearchTab, SearchTagChip,
+    SpecialRowKind, TopPeerItem, TypingState,
 };
 use tg_app_info::info::backend::{
     CommonGroupEntry, CreateChannelRequest, CreateGroupRequest, DownloadEntry, EmojiUserpicRequest,
@@ -140,6 +141,58 @@ const SESSION_NOW: LocalDateTime = LocalDateTime::new(2026, 11, 22, 14, 30, 0);
 const BASE_UNIX_YESTERDAY: i32 = 1_795_255_200;
 /// Base unix timestamp for today's messages (`2026-11-22 10:00:00 UTC`).
 const BASE_UNIX_TODAY: i32 = BASE_UNIX_YESTERDAY + 86_400;
+
+/// Chat-list preview metadata of a mock message, the same shape `tg-app-live` builds from
+/// `HistoryItem::toPreview` (16 px thumbnail, type icon, blue media / service text).
+fn dialog_media_preview(msg: Option<&HistoryMessage>) -> Option<DialogMediaPreview> {
+    let msg = msg?;
+    let has_caption = !msg.text.text.trim().is_empty();
+    let preview = |kind, stripped_thumb: Option<Vec<u8>>, has_caption: bool| DialogMediaPreview {
+        kind,
+        stripped_thumb,
+        use_service_color: !has_caption,
+        has_caption,
+    };
+    if msg.is_service() {
+        return Some(preview(DialogMediaPreviewKind::Service, None, false));
+    }
+    let media = msg.media.as_ref()?;
+    Some(match media {
+        HistoryMedia::Photo(p) => preview(
+            DialogMediaPreviewKind::Photo,
+            p.stripped_thumb.clone(),
+            has_caption,
+        ),
+        HistoryMedia::Album(items) => preview(
+            DialogMediaPreviewKind::Photo,
+            items.first().and_then(|i| i.stripped_thumb.clone()),
+            has_caption,
+        ),
+        HistoryMedia::Video(v) => preview(
+            if v.is_gif {
+                DialogMediaPreviewKind::Gif
+            } else {
+                DialogMediaPreviewKind::Video
+            },
+            v.stripped_thumb.clone(),
+            has_caption,
+        ),
+        HistoryMedia::Document(_) => preview(DialogMediaPreviewKind::File, None, has_caption),
+        HistoryMedia::Voice(_) => preview(DialogMediaPreviewKind::Voice, None, has_caption),
+        HistoryMedia::Sticker(_) => preview(DialogMediaPreviewKind::Sticker, None, false),
+        HistoryMedia::Poll(_) => preview(DialogMediaPreviewKind::Poll, None, false),
+        HistoryMedia::Location(_) => preview(DialogMediaPreviewKind::Location, None, false),
+        HistoryMedia::Contact(_) => preview(DialogMediaPreviewKind::Contact, None, false),
+        HistoryMedia::RoundVideo(_) => preview(DialogMediaPreviewKind::RoundVideo, None, false),
+        HistoryMedia::Game(_) => preview(DialogMediaPreviewKind::Game, None, false),
+        HistoryMedia::TodoList(_) => preview(DialogMediaPreviewKind::TodoList, None, false),
+        HistoryMedia::Story(_) => preview(DialogMediaPreviewKind::Story, None, false),
+        HistoryMedia::Widget(_)
+        | HistoryMedia::Giveaway(_)
+        | HistoryMedia::GiveawayResults(_)
+        | HistoryMedia::VideoStream(_) => return None,
+    })
+}
 
 /// Unified peer record shared across Dialogs, History, Info, Settings, Notifications, and Stats.
 #[derive(Debug, Clone)]
@@ -318,6 +371,8 @@ struct MockSessionState {
     // WebView + Statistics state
     webview: MockWebViewBackend,
     pending_mini_app_urls: HashMap<u64, String>,
+    /// Bots confirmed for Mini Apps; stands in for the account's stored session settings.
+    trusted_mini_app_bots: std::collections::HashSet<PeerId>,
     webview_requests_log: Vec<WebViewRequest>,
     stats_target_peer: PeerId,
     // Bot chat metadata & attach menu store (`crates/tg-app/src/bots/`)
@@ -352,7 +407,18 @@ struct MockSessionState {
     future_creators:
         HashMap<PeerId, tg_app_core::core_types::dto::engagement::FutureChatCreatorInfo>,
     started_bots: Vec<tg_bots::protocol::StartBotParams>,
+    // WP-78 Mute submenu state: per-peer mute expiry and notification tone.
+    mute_until: HashMap<PeerId, i32>,
+    notify_sounds: HashMap<PeerId, tg_app_core::notifications::settings::NotifySound>,
     confirmed_phone_codes: Vec<(String, String)>,
+    // WP-73 remaining UI triggers state (default empty to preserve baseline snapshots)
+    top_peers_enabled: bool,
+    contact_birthdays: Vec<tg_app_core::core_types::dto::contacts_extras::ContactBirthdayEntry>,
+    sponsored_peers: Vec<tg_app_core::core_types::dto::contacts_extras::SponsoredPeerInfo>,
+    promo_data: Option<tg_app_core::core_types::misc::PromoDataSnapshot>,
+    hidden_promo_peers: Vec<PeerId>,
+    blocked_from_replies:
+        Vec<tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest>,
 }
 
 /// In-memory Layer-233 extras state owned by [`MockSessionState`].
@@ -798,6 +864,7 @@ impl MockSessionState {
             tos,
             webview: MockWebViewBackend::new(),
             pending_mini_app_urls: HashMap::new(),
+            trusted_mini_app_bots: std::collections::HashSet::new(),
             webview_requests_log: Vec::new(),
             stats_target_peer: session_peers::CHANNEL_DEV_LOG,
             bot_info_map: build_initial_bot_infos(),
@@ -840,7 +907,15 @@ impl MockSessionState {
                 },
             )]),
             started_bots: Vec::new(),
+            mute_until: HashMap::new(),
+            notify_sounds: HashMap::new(),
             confirmed_phone_codes: Vec::new(),
+            top_peers_enabled: true,
+            contact_birthdays: Vec::new(),
+            sponsored_peers: Vec::new(),
+            promo_data: None,
+            hidden_promo_peers: Vec::new(),
+            blocked_from_replies: Vec::new(),
         }
     }
 
@@ -987,6 +1062,8 @@ impl MockSessionState {
                 mention: peer.unread_mentions > 0,
                 ..Default::default()
             },
+            is_contact: peer.kind == InfoPeerKind::User && peer.is_contact,
+            media_preview: dialog_media_preview(last_msg),
             has_bot_app_button: peer.kind == InfoPeerKind::Bot && peer.has_mini_app,
         }
     }
@@ -1031,6 +1108,7 @@ impl MockSessionState {
             bot_reads_all_messages: peer.bot_reads_all_messages,
             has_mini_app: peer.has_mini_app,
             media_counts: counts,
+            group_call: Default::default(),
         }
     }
 
@@ -1288,7 +1366,11 @@ impl MockSessionState {
         }
         if let Some(msgs) = self.histories.get_mut(&peer_id) {
             for m in msgs {
-                m.is_read = true;
+                // Reading our own inbox only marks incoming messages as read; outgoing
+                // read checkmarks advance only on outbox read updates from the recipient.
+                if !m.outgoing {
+                    m.is_read = true;
+                }
             }
         }
         self.first_unread.insert(peer_id, None);
@@ -1632,6 +1714,53 @@ impl SharedSessionHandle {
             .unwrap_or_default()
     }
 
+    /// Configures contact birthday entries returned by `DialogsBackend::contact_birthdays`.
+    pub fn set_contact_birthdays(
+        &self,
+        entries: Vec<tg_app_core::core_types::dto::contacts_extras::ContactBirthdayEntry>,
+    ) {
+        if let Ok(mut st) = self.state.lock() {
+            st.contact_birthdays = entries;
+        }
+    }
+
+    /// Configures sponsored peer search results returned by `DialogsBackend::sponsored_peers`.
+    pub fn set_sponsored_peers(
+        &self,
+        peers: Vec<tg_app_core::core_types::dto::contacts_extras::SponsoredPeerInfo>,
+    ) {
+        if let Ok(mut st) = self.state.lock() {
+            st.sponsored_peers = peers;
+        }
+    }
+
+    /// Configures active promoted dialog metadata returned by `DialogsBackend::promo_data`.
+    pub fn set_promo_data(&self, promo: Option<tg_app_core::core_types::misc::PromoDataSnapshot>) {
+        if let Ok(mut st) = self.state.lock() {
+            st.promo_data = promo;
+        }
+    }
+
+    /// Returns peer IDs passed to `DialogsBackend::hide_promo_data`.
+    #[must_use]
+    pub fn hidden_promo_peers(&self) -> Vec<PeerId> {
+        self.state
+            .lock()
+            .map(|st| st.hidden_promo_peers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns requests recorded by `HistoryBackend::block_from_replies`.
+    #[must_use]
+    pub fn blocked_from_replies(
+        &self,
+    ) -> Vec<tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest> {
+        self.state
+            .lock()
+            .map(|st| st.blocked_from_replies.clone())
+            .unwrap_or_default()
+    }
+
     /// Returns the list of visible peer IDs in `list` order (for keyboard chat cycling).
     #[must_use]
     pub fn ordered_peer_ids(&self, list: DialogListQuery) -> Vec<PeerId> {
@@ -1674,6 +1803,21 @@ impl SharedSessionHandle {
             .and_then(|mut st| st.pending_mini_app_urls.remove(&bot_id.bare()))
     }
 
+    /// Whether `bot_id` was confirmed for Mini Apps (`isPeerTrustedOpenWebView`).
+    #[must_use]
+    pub fn is_mini_app_bot_trusted(&self, bot_id: PeerId) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|st| st.trusted_mini_app_bots.contains(&bot_id))
+    }
+
+    /// Records `bot_id` as confirmed for Mini Apps (`markPeerTrustedOpenWebView`).
+    pub fn trust_mini_app_bot(&self, bot_id: PeerId) {
+        if let Ok(mut st) = self.state.lock() {
+            st.trusted_mini_app_bots.insert(bot_id);
+        }
+    }
+
     /// Returns a snapshot of every [`WebViewRequest`] received by `request_web_view`.
     #[must_use]
     pub fn webview_requests_log(&self) -> Vec<WebViewRequest> {
@@ -1681,6 +1825,20 @@ impl SharedSessionHandle {
             .lock()
             .map(|st| st.webview_requests_log.clone())
             .unwrap_or_default()
+    }
+
+    /// Adds an active collectible username to `peer_id` (used by tests for
+    /// `channels.deactivateAllUsernames`).
+    pub fn seed_collectible_username(&self, peer_id: PeerId, username: impl Into<String>) {
+        if let Ok(mut st) = self.state.lock()
+            && let Some(peer) = st.peer_mut(peer_id)
+        {
+            peer.usernames.push(PeerUsername {
+                username: username.into(),
+                is_editable: false,
+                is_active: true,
+            });
+        }
     }
 }
 
@@ -1847,6 +2005,11 @@ impl MockSession {
     #[must_use]
     pub fn handle(&self) -> SharedSessionHandle {
         self.handle.clone()
+    }
+
+    /// Returns mutable access to the embedded [`MockChatHelpersBackend`] (for tests).
+    pub fn chat_helpers_mut(&mut self) -> &mut MockChatHelpersBackend {
+        &mut self.chat_helpers
     }
 
     /// Returns `true` when `peer_id` is a forum supergroup with topics enabled.
@@ -2208,6 +2371,14 @@ impl DialogsBackend for SharedSessionHandle {
         }
     }
 
+    fn is_peer_blocked(&self, peer_id: PeerId) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|st| st.peer(peer_id).map(|p| p.is_blocked))
+            .unwrap_or(false)
+    }
+
     fn dialog_by_peer(&self, peer_id: PeerId) -> Option<DialogItem> {
         let st = self.state.lock().ok()?;
         let peer = st.peer(peer_id)?;
@@ -2473,6 +2644,124 @@ impl DialogsBackend for SharedSessionHandle {
         }
     }
 
+    fn mute_dialog_for(&mut self, peer_id: PeerId, seconds: i32) -> Result<bool, String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        let until = if seconds <= 0 {
+            0
+        } else if seconds == i32::MAX {
+            i32::MAX
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i32::try_from(d.as_secs()).unwrap_or(i32::MAX));
+            now.saturating_add(seconds)
+        };
+        let peer = st
+            .peer_mut(peer_id)
+            .ok_or_else(|| "Chat not found".to_owned())?;
+        peer.muted = until > 0;
+        let muted = peer.muted;
+        if muted {
+            st.mute_until.insert(peer_id, until);
+        } else {
+            st.mute_until.remove(&peer_id);
+        }
+        Ok(muted)
+    }
+
+    fn dialog_mute_until(&self, peer_id: PeerId) -> Option<i32> {
+        let st = self.state.lock().ok()?;
+        let muted = st.peers.iter().any(|p| p.id == peer_id && p.muted);
+        muted.then(|| st.mute_until.get(&peer_id).copied().unwrap_or(i32::MAX))
+    }
+
+    fn dialog_notify_sound(
+        &self,
+        peer_id: PeerId,
+    ) -> tg_app_core::notifications::settings::NotifySound {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|st| st.notify_sounds.get(&peer_id).cloned())
+            .unwrap_or_default()
+    }
+
+    fn set_dialog_sound_enabled(&mut self, peer_id: PeerId, enabled: bool) -> Result<bool, String> {
+        let sound = if enabled {
+            tg_app_core::notifications::settings::NotifySound::default_sound()
+        } else {
+            tg_app_core::notifications::settings::NotifySound::silent()
+        };
+        self.set_dialog_notify_sound(peer_id, sound)?;
+        Ok(enabled)
+    }
+
+    fn set_dialog_notify_sound(
+        &mut self,
+        peer_id: PeerId,
+        sound: tg_app_core::notifications::settings::NotifySound,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.notify_sounds.insert(peer_id, sound);
+        Ok(())
+    }
+
+    fn report_spam_and_block(
+        &mut self,
+        peer_id: PeerId,
+        report_spam: bool,
+        delete_chat: bool,
+    ) -> Result<(), String> {
+        {
+            let mut st = self
+                .state
+                .lock()
+                .map_err(|_| "Session state lock poisoned".to_owned())?;
+            let peer = st
+                .peer_mut(peer_id)
+                .ok_or_else(|| "Chat not found".to_owned())?;
+            peer.is_blocked = true;
+        }
+        if report_spam {
+            HistoryBackend::report_spam(self, peer_id)?;
+        }
+        if delete_chat {
+            DialogsBackend::delete_dialog(self, peer_id);
+        }
+        Ok(())
+    }
+
+    fn delete_chat(&mut self, peer_id: PeerId, _revoke: bool) -> Result<(), String> {
+        DialogsBackend::delete_dialog(self, peer_id);
+        Ok(())
+    }
+
+    fn unblock_and_restart_bot(&mut self, peer_id: PeerId) -> Result<(), String> {
+        let is_bot = {
+            let mut st = self
+                .state
+                .lock()
+                .map_err(|_| "Session state lock poisoned".to_owned())?;
+            let peer = st
+                .peer_mut(peer_id)
+                .ok_or_else(|| "Chat not found".to_owned())?;
+            peer.is_blocked = false;
+            peer.kind == InfoPeerKind::Bot
+        };
+        if is_bot {
+            let bot = tg_bots::stand_in::UserId(peer_id.bare());
+            let params = tg_bots::protocol::StartBotParams::for_private_chat(bot, String::new(), 0);
+            tg_app_core::bots::backend::BotsBackend::start_bot(self, &params)?;
+        }
+        Ok(())
+    }
+
     fn search_dialogs(&self, request: &SearchRequest) -> SearchResults {
         let Ok(st) = self.state.lock() else {
             return SearchResults::default();
@@ -2707,6 +2996,68 @@ impl DialogsBackend for SharedSessionHandle {
                 .toggle_collapsed_in_dialogs(community_id, collapsed);
         }
     }
+
+    fn contact_birthdays(
+        &self,
+        _force: bool,
+    ) -> Result<Vec<tg_app_core::core_types::dto::contacts_extras::ContactBirthdayEntry>, String>
+    {
+        let st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        Ok(st.contact_birthdays.clone())
+    }
+
+    fn sponsored_peers(
+        &self,
+        query: &str,
+    ) -> Result<Vec<tg_app_core::core_types::dto::contacts_extras::SponsoredPeerInfo>, String> {
+        if query.trim().chars().count() < 4 {
+            return Ok(Vec::new());
+        }
+        let st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        Ok(st.sponsored_peers.clone())
+    }
+
+    fn promo_data(&self) -> Option<tg_app_core::core_types::misc::PromoDataSnapshot> {
+        self.state.lock().ok().and_then(|st| st.promo_data.clone())
+    }
+
+    fn hide_promo_data(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.hidden_promo_peers.push(peer_id);
+        if st
+            .promo_data
+            .as_ref()
+            .is_some_and(|p| p.promo_peer == Some(peer_id))
+        {
+            st.promo_data = None;
+        }
+        Ok(true)
+    }
+
+    fn top_peers_enabled(&self) -> bool {
+        self.state
+            .lock()
+            .map(|st| st.top_peers_enabled)
+            .unwrap_or(true)
+    }
+
+    fn toggle_top_peers(&mut self, enabled: bool) -> Result<bool, String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.top_peers_enabled = enabled;
+        Ok(true)
+    }
 }
 
 impl DialogsBackend for MockSession {
@@ -2718,6 +3069,9 @@ impl DialogsBackend for MockSession {
     }
     fn dialog_by_peer(&self, peer_id: PeerId) -> Option<DialogItem> {
         self.handle.dialog_by_peer(peer_id)
+    }
+    fn is_peer_blocked(&self, peer_id: PeerId) -> bool {
+        self.handle.is_peer_blocked(peer_id)
     }
     fn chat_folders(&self) -> Vec<DialogChatFolder> {
         self.handle.chat_folders()
@@ -2775,6 +3129,43 @@ impl DialogsBackend for MockSession {
     fn delete_dialog(&mut self, peer_id: PeerId) {
         self.handle.delete_dialog(peer_id);
     }
+    fn mute_dialog_for(&mut self, peer_id: PeerId, seconds: i32) -> Result<bool, String> {
+        self.handle.mute_dialog_for(peer_id, seconds)
+    }
+    fn dialog_mute_until(&self, peer_id: PeerId) -> Option<i32> {
+        self.handle.dialog_mute_until(peer_id)
+    }
+    fn dialog_notify_sound(
+        &self,
+        peer_id: PeerId,
+    ) -> tg_app_core::notifications::settings::NotifySound {
+        self.handle.dialog_notify_sound(peer_id)
+    }
+    fn set_dialog_sound_enabled(&mut self, peer_id: PeerId, enabled: bool) -> Result<bool, String> {
+        self.handle.set_dialog_sound_enabled(peer_id, enabled)
+    }
+    fn set_dialog_notify_sound(
+        &mut self,
+        peer_id: PeerId,
+        sound: tg_app_core::notifications::settings::NotifySound,
+    ) -> Result<(), String> {
+        self.handle.set_dialog_notify_sound(peer_id, sound)
+    }
+    fn report_spam_and_block(
+        &mut self,
+        peer_id: PeerId,
+        report_spam: bool,
+        delete_chat: bool,
+    ) -> Result<(), String> {
+        self.handle
+            .report_spam_and_block(peer_id, report_spam, delete_chat)
+    }
+    fn delete_chat(&mut self, peer_id: PeerId, revoke: bool) -> Result<(), String> {
+        self.handle.delete_chat(peer_id, revoke)
+    }
+    fn unblock_and_restart_bot(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.handle.unblock_and_restart_bot(peer_id)
+    }
     fn search_dialogs(&self, request: &SearchRequest) -> SearchResults {
         self.handle.search_dialogs(request)
     }
@@ -2814,6 +3205,31 @@ impl DialogsBackend for MockSession {
     fn toggle_community_collapsed(&mut self, community_id: PeerId, collapsed: bool) {
         self.handle
             .toggle_community_collapsed(community_id, collapsed);
+    }
+    fn contact_birthdays(
+        &self,
+        force: bool,
+    ) -> Result<Vec<tg_app_core::core_types::dto::contacts_extras::ContactBirthdayEntry>, String>
+    {
+        self.handle.contact_birthdays(force)
+    }
+    fn sponsored_peers(
+        &self,
+        query: &str,
+    ) -> Result<Vec<tg_app_core::core_types::dto::contacts_extras::SponsoredPeerInfo>, String> {
+        self.handle.sponsored_peers(query)
+    }
+    fn promo_data(&self) -> Option<tg_app_core::core_types::misc::PromoDataSnapshot> {
+        self.handle.promo_data()
+    }
+    fn hide_promo_data(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        self.handle.hide_promo_data(peer_id)
+    }
+    fn top_peers_enabled(&self) -> bool {
+        self.handle.top_peers_enabled()
+    }
+    fn toggle_top_peers(&mut self, enabled: bool) -> Result<bool, String> {
+        self.handle.toggle_top_peers(enabled)
     }
 }
 
@@ -3507,6 +3923,21 @@ impl HistoryBackend for SharedSessionHandle {
             p.is_contact = true;
             p.contact_status = None;
         }
+    }
+
+    fn accept_contact(&mut self, peer_id: PeerId) -> Result<(), String> {
+        HistoryBackend::add_contact(self, peer_id);
+        Ok(())
+    }
+
+    fn report_spam(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        self.dismiss_contact_status(peer_id);
+        Ok(true)
+    }
+
+    fn hide_peer_settings_bar(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        self.dismiss_contact_status(peer_id);
+        Ok(true)
     }
 
     fn toggle_block_peer(&mut self, peer_id: PeerId) {
@@ -4458,6 +4889,36 @@ impl HistoryBackend for SharedSessionHandle {
             .map_err(|_| "Session state lock poisoned".to_owned())?;
         Ok(st.future_creators.get(&peer_id).cloned())
     }
+
+    fn block_from_replies(
+        &mut self,
+        request: tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.blocked_from_replies.push(request);
+        if request.delete_message || request.delete_history {
+            let mut found = None;
+            for (&pid, msgs) in &st.histories {
+                if let Some(m) = msgs.iter().find(|m| m.id == request.msg_id) {
+                    found = Some((pid, m.from_id));
+                    break;
+                }
+            }
+            if let Some((pid, from_id)) = found
+                && let Some(msgs) = st.histories.get_mut(&pid)
+            {
+                if request.delete_history {
+                    msgs.retain(|m| m.from_id != from_id && m.id != request.msg_id);
+                } else {
+                    msgs.retain(|m| m.id != request.msg_id);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl HistoryBackend for MockSession {
@@ -4601,6 +5062,15 @@ impl HistoryBackend for MockSession {
     fn add_contact(&mut self, peer_id: PeerId) {
         HistoryBackend::add_contact(&mut self.handle, peer_id);
     }
+    fn accept_contact(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.handle.accept_contact(peer_id)
+    }
+    fn report_spam(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        self.handle.report_spam(peer_id)
+    }
+    fn hide_peer_settings_bar(&mut self, peer_id: PeerId) -> Result<bool, String> {
+        self.handle.hide_peer_settings_bar(peer_id)
+    }
     fn toggle_block_peer(&mut self, peer_id: PeerId) {
         self.handle.toggle_block_peer(peer_id);
     }
@@ -4672,6 +5142,16 @@ impl HistoryBackend for MockSession {
         Some(self)
     }
     fn as_bots_backend_mut(&mut self) -> Option<&mut dyn BotsBackend> {
+        Some(self)
+    }
+    fn as_chat_helpers_backend(
+        &self,
+    ) -> Option<&dyn tg_app_core::chat_helpers::backend::ChatHelpersBackend> {
+        Some(self)
+    }
+    fn as_chat_helpers_backend_mut(
+        &mut self,
+    ) -> Option<&mut dyn tg_app_core::chat_helpers::backend::ChatHelpersBackend> {
         Some(self)
     }
     fn as_layer233_extras(
@@ -5014,6 +5494,13 @@ impl HistoryBackend for MockSession {
     ) -> Result<Option<tg_app_core::core_types::dto::engagement::FutureChatCreatorInfo>, String>
     {
         HistoryBackend::future_chat_creator_after_leave(&self.handle, peer_id)
+    }
+
+    fn block_from_replies(
+        &mut self,
+        request: tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest,
+    ) -> Result<(), String> {
+        HistoryBackend::block_from_replies(&mut self.handle, request)
     }
 }
 
@@ -6500,6 +6987,35 @@ impl InfoBackend for SharedSessionHandle {
             .lock()
             .map(|st| st.extract_shared_media(peer_id, tab, query))
             .unwrap_or_default()
+    }
+
+    /// Demo `messages.searchGlobal`: the shared media of every chat, newest chats first.
+    fn global_media(
+        &self,
+        tab: SharedMediaTab,
+        query: &str,
+        limit: usize,
+    ) -> tg_app_core::core_types::dto::global_media::GlobalMediaPage {
+        use tg_app_core::core_types::dto::global_media::{GlobalMediaEntry, GlobalMediaPage};
+        let mut entries = Vec::new();
+        for peer in self.all_peers() {
+            for item in self.shared_media(peer.id, tab, query) {
+                entries.push(GlobalMediaEntry {
+                    peer_id: peer.id,
+                    peer_title: peer.title.clone(),
+                    item,
+                });
+            }
+        }
+        let total_count = entries.len();
+        let limit = limit.max(1);
+        entries.truncate(limit);
+        GlobalMediaPage {
+            entries,
+            total_count,
+            next_cursor: None,
+            has_more: total_count > limit,
+        }
     }
 
     fn toggle_notifications(&mut self, peer_id: PeerId) -> bool {
@@ -8087,6 +8603,318 @@ impl InfoBackend for SharedSessionHandle {
             ),
         )
     }
+
+    fn channel_management_state(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<tg_app_core::info::backend::ChannelManagementState> {
+        self.state
+            .lock()
+            .ok()?
+            .peer_mgmt
+            .channel_management_state(peer_id)
+    }
+
+    fn toggle_pre_history_hidden(&mut self, peer_id: PeerId, hidden: bool) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt.toggle_pre_history_hidden(peer_id, hidden);
+        Ok(())
+    }
+
+    fn groups_for_discussion(
+        &self,
+    ) -> Result<Vec<tg_app_core::info::backend::DiscussionGroupCandidate>, String> {
+        Ok(self
+            .all_peers()
+            .into_iter()
+            .filter(|p| p.kind.is_group())
+            .map(|p| tg_app_core::info::backend::DiscussionGroupCandidate {
+                peer_id: p.id,
+                title: p.title.clone(),
+                username: p.primary_username().map(ToOwned::to_owned),
+                members_count: p.members_count,
+                is_megagroup: p.kind == InfoPeerKind::Supergroup,
+                is_public: p.is_public,
+            })
+            .collect())
+    }
+
+    fn convert_to_gigagroup(&mut self, peer_id: PeerId) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt.convert_to_gigagroup(peer_id);
+        Ok(())
+    }
+
+    fn deactivate_all_channel_usernames(&mut self, peer_id: PeerId) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        if let Some(p) = st.peers.iter_mut().find(|p| p.id == peer_id) {
+            for u in &mut p.usernames {
+                if !u.is_editable {
+                    u.is_active = false;
+                }
+            }
+        }
+        st.peer_mgmt.deactivate_all_channel_usernames(peer_id);
+        Ok(())
+    }
+
+    fn toggle_channel_forum(
+        &mut self,
+        peer_id: PeerId,
+        enabled: bool,
+        tabs: bool,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        if let Some(p) = st.peers.iter_mut().find(|p| p.id == peer_id) {
+            p.is_forum = enabled;
+        }
+        st.peer_mgmt.toggle_channel_forum(peer_id, enabled, tabs);
+        Ok(())
+    }
+
+    fn toggle_participants_hidden(&mut self, peer_id: PeerId, hidden: bool) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt.toggle_participants_hidden(peer_id, hidden);
+        Ok(())
+    }
+
+    fn toggle_view_forum_as_messages(
+        &mut self,
+        peer_id: PeerId,
+        as_messages: bool,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt
+            .toggle_view_forum_as_messages(peer_id, as_messages);
+        Ok(())
+    }
+
+    fn set_boosts_to_unblock_restrictions(
+        &mut self,
+        peer_id: PeerId,
+        boosts: u32,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt
+            .set_boosts_to_unblock_restrictions(peer_id, boosts);
+        Ok(())
+    }
+
+    fn set_channel_sticker_set(
+        &mut self,
+        peer_id: PeerId,
+        set: tg_app_core::info::backend::ChannelStickerSetRef,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt.set_channel_sticker_set(peer_id, set);
+        Ok(())
+    }
+
+    fn set_channel_emoji_sticker_set(
+        &mut self,
+        peer_id: PeerId,
+        set: tg_app_core::info::backend::ChannelStickerSetRef,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt.set_channel_emoji_sticker_set(peer_id, set);
+        Ok(())
+    }
+
+    fn update_channel_paid_messages_price(
+        &mut self,
+        peer_id: PeerId,
+        broadcast_messages_allowed: bool,
+        stars_per_message: i64,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt.update_channel_paid_messages_price(
+            peer_id,
+            broadcast_messages_allowed,
+            stars_per_message,
+        );
+        Ok(())
+    }
+
+    fn toggle_channel_autotranslation(
+        &mut self,
+        peer_id: PeerId,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt
+            .toggle_channel_autotranslation(peer_id, enabled);
+        Ok(())
+    }
+
+    fn delete_basic_chat(&mut self, peer_id: PeerId) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt.delete_basic_chat(peer_id);
+        st.peers.retain(|p| p.id != peer_id);
+        Ok(())
+    }
+
+    fn admins_with_invites(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Vec<tg_app_core::info::backend::AdminWithInvitesEntry>, String> {
+        let st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        Ok(st.peer_mgmt.admins_with_invites(peer_id))
+    }
+
+    fn delete_contacts(&mut self, peer_ids: &[PeerId]) -> Result<(), String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        for &pid in peer_ids {
+            if let Some(p) = st.peers.iter_mut().find(|p| p.id == pid) {
+                p.is_contact = false;
+            }
+        }
+        st.peer_mgmt.record_deleted_contacts(peer_ids);
+        Ok(())
+    }
+
+    fn export_contact_token(
+        &self,
+    ) -> Result<tg_app_core::core_types::dto::contacts_extras::ExportedContactTokenInfo, String>
+    {
+        let st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        Ok(st.peer_mgmt.export_contact_token())
+    }
+
+    fn import_contact_token(&mut self, token: &str) -> Result<PeerId, String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt
+            .import_contact_token(token, session_peers::USER_MIRA)
+    }
+
+    fn export_no_paid_messages_token(
+        &self,
+        revoke: bool,
+        temporary: bool,
+    ) -> Result<
+        tg_app_core::core_types::dto::contacts_extras::ExportedNoPaidMessagesTokenInfo,
+        String,
+    > {
+        let st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        Ok(st
+            .peer_mgmt
+            .export_no_paid_messages_token(revoke, temporary))
+    }
+
+    fn import_no_paid_messages_token(
+        &mut self,
+        peer_id: PeerId,
+        token: &str,
+    ) -> Result<
+        tg_app_core::core_types::dto::contacts_extras::NoPaidMessagesTokenImportResult,
+        String,
+    > {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        st.peer_mgmt.import_no_paid_messages_token(peer_id, token)
+    }
+
+    fn contact_note(&self, peer_id: PeerId) -> Option<TextWithEntities> {
+        self.state.lock().ok()?.peer_mgmt.contact_note(peer_id)
+    }
+
+    fn update_contact_note(
+        &mut self,
+        peer_id: PeerId,
+        note: TextWithEntities,
+    ) -> Result<bool, String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        Ok(st.peer_mgmt.update_contact_note(peer_id, note))
+    }
+
+    fn delete_profile_photos(
+        &mut self,
+        photos: &[tg_app_core::info::backend::ProfilePhotoRef],
+    ) -> Result<Vec<i64>, String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        Ok(st.peer_mgmt.delete_profile_photos(photos))
+    }
+
+    fn upload_contact_profile_photo(
+        &mut self,
+        peer_id: PeerId,
+        request: tg_app_core::core_types::dto::contacts_extras::ContactProfilePhotoUpload,
+    ) -> Result<i64, String> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| "Session state lock poisoned".to_owned())?;
+        Ok(st.peer_mgmt.upload_contact_profile_photo(peer_id, request))
+    }
+}
+
+impl MockSession {
+    /// Sets the verified badge of `peer_id` (tests: an unverified bot must confirm Mini Apps).
+    pub fn set_peer_verified(&mut self, peer_id: PeerId, verified: bool) {
+        if let Ok(mut st) = self.handle.state.lock()
+            && let Some(rec) = st.peers.iter_mut().find(|p| p.id == peer_id)
+        {
+            rec.verified = verified;
+        }
+    }
 }
 
 impl InfoBackend for MockSession {
@@ -8112,6 +8940,14 @@ impl InfoBackend for MockSession {
         query: &str,
     ) -> Vec<InfoMediaItem> {
         self.handle.shared_media(peer_id, tab, query)
+    }
+    fn global_media(
+        &self,
+        tab: SharedMediaTab,
+        query: &str,
+        limit: usize,
+    ) -> tg_app_core::core_types::dto::global_media::GlobalMediaPage {
+        self.handle.global_media(tab, query, limit)
     }
     fn toggle_notifications(&mut self, peer_id: PeerId) -> bool {
         self.handle.toggle_notifications(peer_id)
@@ -8676,6 +9512,151 @@ impl InfoBackend for MockSession {
     ) -> Result<tg_app_info::boxes::collectible_info::CollectibleInfoData, String> {
         self.handle.get_collectible_info(peer_id, entity)
     }
+
+    fn channel_management_state(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<tg_app_core::info::backend::ChannelManagementState> {
+        self.handle.channel_management_state(peer_id)
+    }
+    fn toggle_pre_history_hidden(&mut self, peer_id: PeerId, hidden: bool) -> Result<(), String> {
+        self.handle.toggle_pre_history_hidden(peer_id, hidden)
+    }
+    fn groups_for_discussion(
+        &self,
+    ) -> Result<Vec<tg_app_core::info::backend::DiscussionGroupCandidate>, String> {
+        self.handle.groups_for_discussion()
+    }
+    fn convert_to_gigagroup(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.handle.convert_to_gigagroup(peer_id)
+    }
+    fn deactivate_all_channel_usernames(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.handle.deactivate_all_channel_usernames(peer_id)
+    }
+    fn toggle_channel_forum(
+        &mut self,
+        peer_id: PeerId,
+        enabled: bool,
+        tabs: bool,
+    ) -> Result<(), String> {
+        self.handle.toggle_channel_forum(peer_id, enabled, tabs)
+    }
+    fn toggle_participants_hidden(&mut self, peer_id: PeerId, hidden: bool) -> Result<(), String> {
+        self.handle.toggle_participants_hidden(peer_id, hidden)
+    }
+    fn toggle_view_forum_as_messages(
+        &mut self,
+        peer_id: PeerId,
+        as_messages: bool,
+    ) -> Result<(), String> {
+        self.handle
+            .toggle_view_forum_as_messages(peer_id, as_messages)
+    }
+    fn set_boosts_to_unblock_restrictions(
+        &mut self,
+        peer_id: PeerId,
+        boosts: u32,
+    ) -> Result<(), String> {
+        self.handle
+            .set_boosts_to_unblock_restrictions(peer_id, boosts)
+    }
+    fn set_channel_sticker_set(
+        &mut self,
+        peer_id: PeerId,
+        set: tg_app_core::info::backend::ChannelStickerSetRef,
+    ) -> Result<(), String> {
+        self.handle.set_channel_sticker_set(peer_id, set)
+    }
+    fn set_channel_emoji_sticker_set(
+        &mut self,
+        peer_id: PeerId,
+        set: tg_app_core::info::backend::ChannelStickerSetRef,
+    ) -> Result<(), String> {
+        self.handle.set_channel_emoji_sticker_set(peer_id, set)
+    }
+    fn update_channel_paid_messages_price(
+        &mut self,
+        peer_id: PeerId,
+        broadcast_messages_allowed: bool,
+        stars_per_message: i64,
+    ) -> Result<(), String> {
+        self.handle.update_channel_paid_messages_price(
+            peer_id,
+            broadcast_messages_allowed,
+            stars_per_message,
+        )
+    }
+    fn toggle_channel_autotranslation(
+        &mut self,
+        peer_id: PeerId,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.handle.toggle_channel_autotranslation(peer_id, enabled)
+    }
+    fn delete_basic_chat(&mut self, peer_id: PeerId) -> Result<(), String> {
+        self.handle.delete_basic_chat(peer_id)
+    }
+    fn admins_with_invites(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Vec<tg_app_core::info::backend::AdminWithInvitesEntry>, String> {
+        self.handle.admins_with_invites(peer_id)
+    }
+    fn delete_contacts(&mut self, peer_ids: &[PeerId]) -> Result<(), String> {
+        self.handle.delete_contacts(peer_ids)
+    }
+    fn export_contact_token(
+        &self,
+    ) -> Result<tg_app_core::core_types::dto::contacts_extras::ExportedContactTokenInfo, String>
+    {
+        self.handle.export_contact_token()
+    }
+    fn import_contact_token(&mut self, token: &str) -> Result<PeerId, String> {
+        self.handle.import_contact_token(token)
+    }
+    fn export_no_paid_messages_token(
+        &self,
+        revoke: bool,
+        temporary: bool,
+    ) -> Result<
+        tg_app_core::core_types::dto::contacts_extras::ExportedNoPaidMessagesTokenInfo,
+        String,
+    > {
+        self.handle.export_no_paid_messages_token(revoke, temporary)
+    }
+    fn import_no_paid_messages_token(
+        &mut self,
+        peer_id: PeerId,
+        token: &str,
+    ) -> Result<
+        tg_app_core::core_types::dto::contacts_extras::NoPaidMessagesTokenImportResult,
+        String,
+    > {
+        self.handle.import_no_paid_messages_token(peer_id, token)
+    }
+    fn contact_note(&self, peer_id: PeerId) -> Option<TextWithEntities> {
+        self.handle.contact_note(peer_id)
+    }
+    fn update_contact_note(
+        &mut self,
+        peer_id: PeerId,
+        note: TextWithEntities,
+    ) -> Result<bool, String> {
+        self.handle.update_contact_note(peer_id, note)
+    }
+    fn delete_profile_photos(
+        &mut self,
+        photos: &[tg_app_core::info::backend::ProfilePhotoRef],
+    ) -> Result<Vec<i64>, String> {
+        self.handle.delete_profile_photos(photos)
+    }
+    fn upload_contact_profile_photo(
+        &mut self,
+        peer_id: PeerId,
+        request: tg_app_core::core_types::dto::contacts_extras::ContactProfilePhotoUpload,
+    ) -> Result<i64, String> {
+        self.handle.upload_contact_profile_photo(peer_id, request)
+    }
 }
 
 // =============================================================================
@@ -9196,7 +10177,7 @@ impl SettingsBackend for SharedSessionHandle {
 
     fn apply_proxy_settings(&mut self, settings: &tg_core::SettingsProxy) -> Result<(), String> {
         if let Ok(mut st) = self.state.lock() {
-            st.proxy_enabled = settings.is_enabled() || settings.is_system();
+            st.proxy_enabled = settings.is_enabled();
             st.settings_store.apply_proxy_settings(settings)
         } else {
             Ok(())
@@ -9836,6 +10817,9 @@ impl ChatHelpersBackend for MockSession {
     fn is_set_installed(&self, set_id: StickerSetId) -> bool {
         self.chat_helpers.is_set_installed(set_id)
     }
+    fn sticker_set_section(&self, set_id: StickerSetId) -> Option<StickerPanelSection> {
+        self.chat_helpers.sticker_set_section(set_id)
+    }
     fn saved_gifs(&self) -> Vec<GifItem> {
         self.chat_helpers.saved_gifs()
     }
@@ -9892,6 +10876,122 @@ impl ChatHelpersBackend for MockSession {
     }
     fn stickers_for_emoji(&self, emoji: &str) -> Vec<DocumentId> {
         self.chat_helpers.stickers_for_emoji(emoji)
+    }
+    fn get_attached_stickers(
+        &self,
+        media: &tg_app_core::chat_helpers::backend::AttachedStickersMedia,
+    ) -> Result<Vec<tg_app_core::chat_helpers::backend::AttachedStickerSetSummary>, String> {
+        use tg_app_core::chat_helpers::backend::{
+            AttachedStickerSetSummary, AttachedStickersMedia,
+        };
+        let is_empty = matches!(
+            media,
+            AttachedStickersMedia::Photo { id: 0, .. }
+                | AttachedStickersMedia::Document { id: 0, .. }
+        );
+        if is_empty {
+            return Ok(Vec::new());
+        }
+        Ok(vec![
+            AttachedStickerSetSummary {
+                set_id: StickerSetId(9201),
+                access_hash: 77,
+                title: "Aurora Masks".to_owned(),
+                short_name: "aurora_masks".to_owned(),
+                count: 18,
+                is_emoji: false,
+                is_masks: true,
+                cover_doc_ids: vec![DocumentId(501)],
+            },
+            AttachedStickerSetSummary {
+                set_id: StickerSetId(9202),
+                access_hash: 88,
+                title: "Signal Reactions".to_owned(),
+                short_name: "signal_reactions".to_owned(),
+                count: 24,
+                is_emoji: true,
+                is_masks: false,
+                cover_doc_ids: vec![DocumentId(502)],
+            },
+        ])
+    }
+    fn search_stickers_remote(
+        &self,
+        req: &tg_app_core::chat_helpers::backend::SearchStickersRequest,
+    ) -> Result<tg_app_core::chat_helpers::backend::SearchStickersPage, String> {
+        self.chat_helpers.search_stickers_remote(req)
+    }
+    fn search_emoji_sticker_sets(
+        &self,
+        query: &str,
+        exclude_featured: bool,
+    ) -> Result<tg_app_core::chat_helpers::backend::SearchStickerSetsResult, String> {
+        self.chat_helpers
+            .search_emoji_sticker_sets(query, exclude_featured)
+    }
+    fn load_old_featured_stickers(
+        &self,
+        offset: i32,
+        limit: i32,
+    ) -> Result<tg_app_core::chat_helpers::backend::OldFeaturedStickersPage, String> {
+        self.chat_helpers.load_old_featured_stickers(offset, limit)
+    }
+    fn clear_recent_stickers(&mut self, attached: bool) -> Result<bool, String> {
+        self.chat_helpers.clear_recent_stickers(attached)
+    }
+    fn paid_reaction_privacy(
+        &self,
+        force: bool,
+    ) -> Result<tg_app_core::chat_helpers::backend::PaidReactionPrivacy, String> {
+        self.chat_helpers.paid_reaction_privacy(force)
+    }
+    fn toggle_paid_reaction_privacy(
+        &mut self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+        privacy: tg_app_core::chat_helpers::backend::PaidReactionPrivacy,
+    ) -> Result<bool, String> {
+        self.chat_helpers
+            .toggle_paid_reaction_privacy(peer_id, msg_id, privacy)
+    }
+    fn report_reaction(
+        &self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+        reaction_peer_id: PeerId,
+    ) -> Result<bool, String> {
+        self.chat_helpers
+            .report_reaction(peer_id, msg_id, reaction_peer_id)
+    }
+    fn delete_participant_reaction(
+        &mut self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+        participant_id: PeerId,
+    ) -> Result<(), String> {
+        self.chat_helpers
+            .delete_participant_reaction(peer_id, msg_id, participant_id)
+    }
+    fn delete_participant_reactions(
+        &mut self,
+        peer_id: PeerId,
+        participant_id: PeerId,
+    ) -> Result<bool, String> {
+        self.chat_helpers
+            .delete_participant_reactions(peer_id, participant_id)
+    }
+    fn default_emoji_catalog(
+        &self,
+        kind: tg_app_core::chat_helpers::backend::DefaultEmojiCatalogKind,
+        force: bool,
+    ) -> Result<tg_app_core::chat_helpers::backend::DefaultEmojiCatalog, String> {
+        self.chat_helpers.default_emoji_catalog(kind, force)
+    }
+    fn default_tag_reactions(
+        &self,
+        force: bool,
+    ) -> Result<tg_app_core::chat_helpers::backend::DefaultTagReactionsResult, String> {
+        self.chat_helpers.default_tag_reactions(force)
     }
 }
 
@@ -10658,6 +11758,9 @@ impl StoriesBackend for MockSession {
     }
     fn contacts_for_privacy(&self) -> Vec<StoryPeerProfile> {
         self.stories.contacts_for_privacy()
+    }
+    fn save_stories_blocklist(&mut self, peers: &[tg_data::PeerId]) -> Result<bool, String> {
+        self.stories.save_stories_blocklist(peers)
     }
 }
 
@@ -13307,6 +14410,14 @@ impl tg_app_core::session_api::AppSession for MockSession {
 
     fn take_pending_mini_app_url(&mut self, bot_id: PeerId) -> Option<String> {
         MockSession::take_pending_mini_app_url(self, bot_id)
+    }
+
+    fn is_mini_app_bot_trusted(&self, bot_id: PeerId) -> bool {
+        self.handle().is_mini_app_bot_trusted(bot_id)
+    }
+
+    fn trust_mini_app_bot(&mut self, bot_id: PeerId) {
+        self.handle().trust_mini_app_bot(bot_id);
     }
 
     fn take_pending_chat_opens(&self) -> Vec<PendingChatOpen> {

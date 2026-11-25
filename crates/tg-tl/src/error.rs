@@ -33,4 +33,18 @@ pub enum DeserializeError {
     /// Gzip decompression failed or exceeded the configured output limit.
     #[error("gzip error: {0}")]
     GzipError(String),
+    /// Deserialization nesting exceeded the maximum allowed recursion depth.
+    #[error("TL nesting depth exceeded maximum of {limit}")]
+    MaxDepthExceeded {
+        /// Configured maximum recursion depth.
+        limit: usize,
+    },
+    /// Cumulative decoded elements or allocated bytes exceeded the configured budget.
+    #[error("TL decode budget exceeded: {kind} limit of {limit}")]
+    BudgetExceeded {
+        /// Which budget was exceeded (`"elements"` or `"bytes"`).
+        kind: &'static str,
+        /// Configured maximum budget.
+        limit: usize,
+    },
 }

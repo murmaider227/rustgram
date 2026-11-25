@@ -100,9 +100,26 @@ impl GlobalMediaSection {
             return action;
         }
 
+        if let Some(ev) = Self::show_entries(ui, *active_tab, page, selected, colors) {
+            action = Some(ev);
+        }
+        action
+    }
+
+    /// Renders date-grouped global media entries (grid for photos/videos/GIFs, rows for files,
+    /// links, voice and music) and the "Load more" footer. Shared with the chat list search
+    /// media tabs (`dialogs_search_from_controllers.cpp`).
+    pub fn show_entries(
+        ui: &mut Ui,
+        active_tab: SharedMediaTab,
+        page: &GlobalMediaPage,
+        selected: &HashSet<(PeerId, i32)>,
+        colors: &dyn Colors,
+    ) -> Option<GlobalMediaAction> {
+        let mut action = None;
         // 4. Date-grouped entries (grid for Photos/Videos/GIFs, rows for Files/Links/Voice/Music).
         let is_grid = matches!(
-            *active_tab,
+            active_tab,
             SharedMediaTab::PhotosVideos | SharedMediaTab::Gifs
         );
         let mut current_group: Option<&str> = None;
@@ -113,7 +130,7 @@ impl GlobalMediaSection {
             if current_group != Some(group) {
                 if let Some(prev) = current_group {
                     if let Some(ev) =
-                        render_group(ui, prev, &group_buf, *active_tab, is_grid, selected, colors)
+                        render_group(ui, prev, &group_buf, active_tab, is_grid, selected, colors)
                     {
                         action = Some(ev);
                     }
@@ -126,13 +143,7 @@ impl GlobalMediaSection {
         if let Some(last_group) = current_group
             && !group_buf.is_empty()
             && let Some(ev) = render_group(
-                ui,
-                last_group,
-                &group_buf,
-                *active_tab,
-                is_grid,
-                selected,
-                colors,
+                ui, last_group, &group_buf, active_tab, is_grid, selected, colors,
             )
         {
             action = Some(ev);

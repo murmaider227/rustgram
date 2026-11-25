@@ -21,7 +21,7 @@ use crate::bridge::{
     MiniAppEvent, OpenLinkParams, OpenPopupParams, OpenTgLinkParams, PhoneRequestStatus,
     PreparedMessageParams, RequestChatParams, SafeAreaInsets, SecondaryButtonParams,
     SecondaryButtonPosition, SetEmojiStatusParams, ShareToStoryParams, ThemeChangedPayload,
-    origins_match, parse_hex_color, parse_mini_app_event,
+    origins_match, parse_hex_color, parse_mini_app_event_with_shell,
 };
 use crate::dialog::{PopupArgs, PopupButton, PopupButtonType};
 use crate::error::Result;
@@ -221,6 +221,12 @@ pub enum MiniAppAction {
     VerifyAge(i32),
     /// Share HTML5 game score.
     ShareGameScore,
+    /// Query device geolocation availability and per-bot consent (`web_app_check_location`).
+    CheckLocation,
+    /// Request a device geolocation fix after per-bot user consent (`web_app_request_location`).
+    RequestLocation,
+    /// Open OS location privacy settings (`web_app_open_location_settings`).
+    OpenLocationSettings,
 }
 
 /// Stateful controller implementing tdesktop's `Ui::BotWebView::Panel` bridge logic.
@@ -233,6 +239,7 @@ pub struct MiniAppController {
     bottom_bar_color_spec: Option<ColorChangeParams>,
     last_user_interaction: Option<Instant>,
     open_link_interaction: Option<Instant>,
+    external_shell_token: Option<String>,
 }
 
 impl MiniAppController {
@@ -252,7 +259,17 @@ impl MiniAppController {
             bottom_bar_color_spec: None,
             last_user_interaction: None,
             open_link_interaction: None,
+            external_shell_token: None,
         }
+    }
+
+    /// Enables external-shell message envelope verification using `token`
+    /// (`attach_bot_webview.cpp:285-353`).
+    #[must_use]
+    pub fn with_external_shell_token(mut self, token: impl Into<String>) -> Self {
+        let tok = token.into();
+        self.external_shell_token = (!tok.is_empty()).then_some(tok);
+        self
     }
 
     /// Returns the current panel UI state.
@@ -366,7 +383,12 @@ impl MiniAppController {
         if self.state.close_requested {
             return Ok(Vec::new());
         }
-        let (native, event) = parse_mini_app_event(&message.text, &message.source_url)?;
+        let (native, event) = parse_mini_app_event_with_shell(
+            &message.text,
+            &message.source_url,
+            self.external_shell_token.is_some(),
+            self.external_shell_token.as_deref(),
+        )?;
         if self.config.same_origin
             && !self.config.initial_url.is_empty()
             && !origins_match(&native.origin, &self.config.initial_url)
@@ -509,11 +531,10 @@ impl MiniAppController {
                 if path_full.is_empty() {
                     self.state.close_requested = true;
                     vec![MiniAppAction::ClosePanel]
+                } else if let Some(url) = telegram_link_from_path(&path_full) {
+                    vec![MiniAppAction::OpenTgLink { url, force_request }]
                 } else {
-                    vec![MiniAppAction::OpenTgLink {
-                        url: format!("https://t.me{path_full}"),
-                        force_request,
-                    }]
+                    Vec::new()
                 }
             }
             MiniAppEvent::WebAppOpenInvoice(p) => {
@@ -631,16 +652,9 @@ impl MiniAppController {
                     error: "UNSUPPORTED".to_owned(),
                 })]
             }
-            MiniAppEvent::WebAppCheckLocation => {
-                vec![MiniAppAction::PostEvent(HostEvent::LocationChecked {
-                    available: false,
-                })]
-            }
-            MiniAppEvent::WebAppRequestLocation => {
-                vec![MiniAppAction::PostEvent(HostEvent::LocationRequested {
-                    available: false,
-                })]
-            }
+            MiniAppEvent::WebAppCheckLocation => vec![MiniAppAction::CheckLocation],
+            MiniAppEvent::WebAppRequestLocation => vec![MiniAppAction::RequestLocation],
+            MiniAppEvent::WebAppOpenLocationSettings => vec![MiniAppAction::OpenLocationSettings],
             MiniAppEvent::WebAppBiometryGetInfo => vec![MiniAppAction::PostEvent(
                 HostEvent::BiometryInfoReceived(BiometryInfo {
                     available: false,
@@ -726,7 +740,6 @@ impl MiniAppController {
             | MiniAppEvent::WebAppStopAccelerometer
             | MiniAppEvent::WebAppStopDeviceOrientation
             | MiniAppEvent::WebAppStopGyroscope
-            | MiniAppEvent::WebAppOpenLocationSettings
             | MiniAppEvent::WebAppBiometryOpenSettings
             | MiniAppEvent::IframeReady(_)
             | MiniAppEvent::IframeWillReload
@@ -824,4 +837,21 @@ impl MiniAppController {
             },
         }
     }
+}
+
+/// Builds `https://t.me<path_full>` for `web_app_open_tg_link`, or `None` when `path_full` could
+/// make the result point anywhere but `t.me` (`WebViewInstance::botHandleLocalUri` only opens
+/// links that convert to local `tg://` links).
+///
+/// `path_full` must start with exactly one `/` and contain no backslash, whitespace or control
+/// character: `"@evil.example/"` would otherwise give `https://t.me@evil.example/`, whose host is
+/// `evil.example`.
+#[must_use]
+pub fn telegram_link_from_path(path_full: &str) -> Option<String> {
+    let valid = path_full.starts_with('/')
+        && !path_full.starts_with("//")
+        && !path_full
+            .chars()
+            .any(|c| c == '\\' || c.is_whitespace() || c.is_control());
+    valid.then(|| format!("https://t.me{path_full}"))
 }

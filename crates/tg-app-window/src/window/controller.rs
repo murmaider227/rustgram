@@ -7,6 +7,7 @@
 //! `Telegram/SourceFiles/window/main_window.cpp`,
 //! and `Telegram/SourceFiles/mainwindow.cpp`.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -22,9 +23,13 @@ use crate::window::deep_links::{
 };
 use crate::window::layer_stack::{LayerAction, LayerStack, ModalBox};
 use crate::window::lock_widgets::{PasscodeLockAction, PasscodeLockWidget};
-use crate::window::main_menu::{MainMenu, MainMenuAccountItem, MainMenuAction};
+use crate::window::main_menu::{MainMenu, MainMenuAccountItem, MainMenuAction, main_menu_bots};
 use crate::window::main_widget::{MainWidget, MainWidgetAction};
 use crate::window::section::{SectionShow, SettingsPage};
+use crate::window::security_policy::{
+    ExternalLinkAction, build_hidden_link_confirm_box, build_launch_file_confirm_box,
+    classify_launch_warning, evaluate_external_link,
+};
 use crate::window::session_controller::SessionController;
 use tg_app_core::session_api::AppSession;
 use tg_app_core::stand_in::backend::Backend;
@@ -43,6 +48,7 @@ use tg_app_info::boxes::edit_peer::{
     EditPermissionsBoxState,
 };
 use tg_app_info::boxes::language::LanguageBoxState;
+use tg_app_info::boxes::mini_app_confirm::MiniAppOpenConfirmBoxState;
 use tg_app_info::boxes::peer_color::EditPeerColorBoxState;
 use tg_app_info::boxes::peer_list::{PeerListBoxState, PeerListPurpose, PeerSelectionMode};
 use tg_app_info::boxes::photo_crop::PhotoCropBoxState;
@@ -125,12 +131,14 @@ pub struct WindowController {
     main_menu: MainMenu,
     connection_indicator: ConnectionIndicator,
     media_overlay: MediaOverlayWidget,
+    media_fullscreen: crate::window::media_fullscreen::MediaViewerFullscreen,
     pip_window: Option<PipWindow>,
     round_float: RoundVideoFloat,
     pending_webview_requests: Vec<WebViewHostRequest>,
     pending_overlay_requests: Vec<DeepLinkOverlayRequest>,
     pending_login_code: Option<String>,
     pending_open_recent_calls: bool,
+    pending_start_call: Option<(PeerId, bool)>,
     logout_requested: bool,
     menu_accounts: Vec<MainMenuAccountItem>,
     max_accounts: usize,
@@ -144,6 +152,15 @@ pub struct WindowController {
     shell_extras: WindowShellExtras,
     native_hwnd: isize,
     fallback_shortcuts: tg_app_settings::settings::shortcuts::ShortcutManager,
+    no_warning_extensions: BTreeSet<String>,
+    ip_reveal_warning: bool,
+    /// Activations (`tg://` links, `-sendpath`, `-tosettings`) received while the passcode lock
+    /// is shown; replayed after unlock (`Application::checkStartUrls` waits for unlock).
+    queued_activations: Vec<tg_app_core::core_types::startup_types::IncomingActivation>,
+    /// `-tosettings` requested while locked.
+    queued_open_settings: bool,
+    /// Bots whose Mini App the user already confirmed (`isPeerTrustedOpenWebView`).
+    trusted_open_webview: std::collections::HashSet<PeerId>,
 }
 
 impl WindowController {
@@ -238,12 +255,14 @@ impl WindowController {
             main_menu,
             connection_indicator: ConnectionIndicator::new(tg_app_core::clock::now()),
             media_overlay: MediaOverlayWidget::new(),
+            media_fullscreen: crate::window::media_fullscreen::MediaViewerFullscreen::default(),
             pip_window: None,
             round_float: RoundVideoFloat::new(1280, 800),
             pending_webview_requests: Vec::new(),
             pending_overlay_requests: Vec::new(),
             pending_login_code: None,
             pending_open_recent_calls: false,
+            pending_start_call: None,
             logout_requested: false,
             menu_accounts: Vec::new(),
             max_accounts: tg_session::MAX_ACCOUNTS,
@@ -256,6 +275,11 @@ impl WindowController {
             shell_extras: WindowShellExtras::new(),
             native_hwnd: 0,
             fallback_shortcuts: tg_app_settings::settings::shortcuts::ShortcutManager::new(),
+            no_warning_extensions: BTreeSet::new(),
+            ip_reveal_warning: true,
+            queued_activations: Vec::new(),
+            queued_open_settings: false,
+            trusted_open_webview: std::collections::HashSet::new(),
         };
 
         if already_signed_in {
@@ -289,6 +313,11 @@ impl WindowController {
     /// Returns `true` once when the user triggered the Recent Calls entry point (e.g. from Main Menu).
     pub fn take_open_recent_calls_request(&mut self) -> bool {
         std::mem::take(&mut self.pending_open_recent_calls)
+    }
+
+    /// Returns the outgoing 1:1 call `(peer, video)` requested from a profile Call button, once.
+    pub fn take_start_call_request(&mut self) -> Option<(PeerId, bool)> {
+        self.pending_start_call.take()
     }
 
     /// Returns `true` once when the user confirmed logout on a live session.
@@ -554,7 +583,11 @@ impl WindowController {
     /// Drains any pending auxiliary overlay requests (Payments, Passport, Business, Stories, Calls)
     /// queued by deep-link routing.
     pub fn take_deep_link_overlay_requests(&mut self) -> Vec<DeepLinkOverlayRequest> {
-        std::mem::take(&mut self.pending_overlay_requests)
+        let requests = std::mem::take(&mut self.pending_overlay_requests);
+        if self.is_passcode_locked() {
+            return Vec::new();
+        }
+        requests
     }
 
     /// Drains any pending `tg://login?code=<digits>` code captured from a deep link.
@@ -600,7 +633,11 @@ impl WindowController {
 
     /// Drains any outbound [`WebViewHostRequest`]s queued during the last frame.
     pub fn take_webview_requests(&mut self) -> Vec<WebViewHostRequest> {
-        std::mem::take(&mut self.pending_webview_requests)
+        let requests = std::mem::take(&mut self.pending_webview_requests);
+        if self.is_passcode_locked() {
+            return Vec::new();
+        }
+        requests
     }
 
     /// Drains queued [`WebViewHostRequest`]s and dispatches them into `host` with live theme
@@ -700,6 +737,10 @@ impl WindowController {
 
     /// Opens Settings directly (`-tosettings` CLI flag).
     pub fn open_settings(&mut self) {
+        if self.is_passcode_locked() {
+            self.queued_open_settings = true;
+            return;
+        }
         if let Some(session) = self.session.as_mut() {
             session.show_settings(SettingsPage::Main);
         } else {
@@ -709,21 +750,32 @@ impl WindowController {
 
     /// Processes a single-instance IPC activation (initial CLI args or named-pipe message from a
     /// secondary launch): opens `tg://` / `tonsite://` links and opens ShareBox for `-sendpath`.
+    ///
+    /// While the passcode lock is shown nothing is opened: the activation is queued and replayed
+    /// after unlock (`Application::openLocalUrl` / `checkStartUrls` return early when
+    /// `passcodeLocked()`). External `http(s)` URLs from the command line or the pipe always ask
+    /// first, and `-sendpath` accepts only absolute paths to existing files.
     pub fn handle_incoming_activation(
         &mut self,
         activation: tg_app_core::core_types::startup_types::IncomingActivation,
         ctx: &egui::Context,
     ) {
+        if self.is_passcode_locked() {
+            self.queued_activations.push(activation);
+            return;
+        }
         for url in activation.urls {
-            self.open_link(&url);
+            self.open_link_inner(&url, true, true);
         }
 
-        if !activation.send_paths.is_empty() {
-            let paths_display: Vec<String> = activation
-                .send_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
+        let send_paths: Vec<PathBuf> = activation
+            .send_paths
+            .into_iter()
+            .filter(|p| tg_platform::url_policy::is_local_absolute_path(p) && p.is_file())
+            .collect();
+        if !send_paths.is_empty() {
+            let paths_display: Vec<String> =
+                send_paths.iter().map(|p| p.display().to_string()).collect();
             let summary = paths_display.join("\n");
             let mut share = ShareBoxState::new(Vec::new(), Some(paths_display[0].clone()));
             share.comment = if paths_display.len() == 1 {
@@ -779,13 +831,18 @@ impl WindowController {
     pub fn setup_main(&mut self) {
         let mut session =
             SessionController::new(self.settings.columns, self.settings.folders_sidebar_enabled);
-        let initial_dialogs = self.session_backend.dialogs(FilterId::ALL, "");
-        if let Some(preferred) = initial_dialogs.get(1).or_else(|| initial_dialogs.first()) {
-            session.show_peer_history(
-                preferred.peer.id,
-                SectionShow::instant_clear_stack(),
-                MsgId::SHOW_AT_UNREAD,
-            );
+        // A live primary window opens with no chat, as tdesktop's `showByInitialId` clears the
+        // section stack for `SeparateType::Primary` (`window_session_controller.cpp:1606-1608`),
+        // and so it never waits for the chat list. The mock demo still opens a sample chat.
+        if !self.session_backend.is_live_session() {
+            let initial_dialogs = self.session_backend.dialogs(FilterId::ALL, "");
+            if let Some(preferred) = initial_dialogs.get(1).or_else(|| initial_dialogs.first()) {
+                session.show_peer_history(
+                    preferred.peer.id,
+                    SectionShow::instant_clear_stack(),
+                    MsgId::SHOW_AT_UNREAD,
+                );
+            }
         }
         self.session = Some(session);
         self.layer_stack.hide_all();
@@ -807,18 +864,77 @@ impl WindowController {
         self.external_passcode_verifier.is_some() || self.settings.local_passcode.is_some()
     }
 
+    /// Returns `true` while the passcode lock screen is shown (`Core::App().passcodeLocked()`).
+    #[must_use]
+    pub fn is_passcode_locked(&self) -> bool {
+        self.root_screen == RootScreen::PasscodeLock
+    }
+
+    /// Returns the number of activations queued while locked (for tests and the host).
+    #[must_use]
+    pub fn queued_activation_count(&self) -> usize {
+        self.queued_activations.len() + usize::from(self.queued_open_settings)
+    }
+
+    /// Locks this window even when it has no passcode of its own, because another account's
+    /// workspace locked the app (the lock is app-wide in tdesktop, `application.cpp:1433`).
+    pub fn lock_for_app_wide_passcode(&mut self) {
+        if self.is_passcode_locked() {
+            return;
+        }
+        self.enter_passcode_lock();
+    }
+
+    /// Closes every box, layer, viewer and floating window that could show account content over
+    /// the lock screen (`Application::closeAdditionalWindows`, `application.cpp:197-203`).
+    fn close_additional_windows(&mut self) {
+        self.layer_stack.hide_all();
+        self.close_content_windows();
+    }
+
+    /// Everything [`Self::close_additional_windows`] closes except the shell layer stack, which
+    /// hosts the lock screen's own logout confirmation.
+    fn close_content_windows(&mut self) {
+        while !self.box_host.is_empty() {
+            self.box_host.pop_immediate();
+        }
+        self.media_overlay.close();
+        self.pip_window = None;
+        self.round_float.detach();
+        self.shell_extras.chat_preview.close();
+        self.shell_extras.saved_windows.close_all();
+        self.pending_webview_requests.clear();
+        self.pending_overlay_requests.clear();
+    }
+
+    /// Replays activations queued while locked, once the lock is gone.
+    fn replay_queued_activations(&mut self, ctx: &egui::Context) {
+        if self.is_passcode_locked() {
+            return;
+        }
+        if std::mem::take(&mut self.queued_open_settings) {
+            self.open_settings();
+        }
+        for activation in std::mem::take(&mut self.queued_activations) {
+            self.handle_incoming_activation(activation, ctx);
+        }
+    }
+
     /// Locks the window behind `PasscodeLockWidget` (`Controller::setupPasscodeLock`).
     pub fn setup_passcode_lock(&mut self) {
         if !self.has_local_passcode() {
             return;
         }
+        self.enter_passcode_lock();
+    }
+
+    fn enter_passcode_lock(&mut self) {
         if let Some(settings) = self.main_widget.settings_mut() {
             settings.local_passcode.clear_manage_session();
             self.passcode_lock
                 .set_system_unlock_enabled(settings.core_settings.system_unlock_enabled);
         }
-        self.layer_stack.hide_all();
-        self.media_overlay.close();
+        self.close_additional_windows();
         self.passcode_lock.reset_on_lock();
         self.connection_indicator.set_force_hidden(true);
         self.root_screen = RootScreen::PasscodeLock;
@@ -914,14 +1030,69 @@ impl WindowController {
         self.root_screen = RootScreen::Intro;
     }
 
+    /// Validates `url` against the shared URL policy (`tg_platform::url_policy`) before queuing
+    /// [`WebViewHostRequest::OpenExternalUrl`]. Disallowed schemes, local paths, and UNC shares
+    /// show `lng_open_link_unsupported` and are never queued.
+    fn queue_external_url(&mut self, url: &str) {
+        match tg_platform::url_policy::validate_external_url(url) {
+            Ok(validated) => {
+                self.pending_webview_requests
+                    .push(WebViewHostRequest::OpenExternalUrl(validated));
+            }
+            Err(_) => {
+                self.layer_stack
+                    .show_toast(tg_lang::tr::lng_open_link_unsupported());
+            }
+        }
+    }
+
     /// Routes a clicked or IPC-activated link (from messages, profiles, WebView, or OS `tg://`
     /// activations):
     /// 1. Telegram deep links (`tg://`, `t.me/`, `telegram.me/`, `telegram.dog/`, `<user>.t.me/`,
     ///    `@username`, `internal:`, `tonsite://`) are routed through [`crate::window::deep_links`].
-    /// 2. Instant View-capable URLs (`t.me/iv?...` or URLs returning a cached Instant View page
+    /// 2. External URLs are validated against [`tg_platform::url_policy::validate_external_url`];
+    ///    disallowed schemes, `file:`, UNC `\\host`, and local paths are rejected with a toast.
+    /// 3. Instant View-capable URLs (`t.me/iv?...` or URLs returning a cached Instant View page
     ///    from `messages.getWebPage`) queue [`WebViewHostRequest::OpenInstantView`].
-    /// 3. Everything else queues [`WebViewHostRequest::OpenExternalUrl`].
+    /// 4. Everything else queues [`WebViewHostRequest::OpenExternalUrl`].
     pub fn open_link(&mut self, url: &str) {
+        self.open_link_inner(url, false, false);
+    }
+
+    /// Routes a clicked hidden link (`messageEntityTextUrl` / `EntityType::CustomUrl`):
+    /// enforces the shared URL scheme policy and shows tdesktop's `"Open this link?"`
+    /// confirmation box (`HiddenUrlClickHandler::Open`) for non-trusted external destinations.
+    pub fn open_hidden_link(&mut self, url: &str) {
+        self.open_link_inner(url, true, false);
+    }
+
+    /// Routes an external link that unconditionally requires user confirmation (e.g. sandboxed
+    /// widget `LinkPolicyDecision::ConfirmExternal`), after enforcing the shared URL scheme policy.
+    pub fn open_external_link_requiring_confirmation(&mut self, url: &str) {
+        self.open_link_inner(url, true, true);
+    }
+
+    fn open_link_inner(&mut self, url: &str, is_hidden: bool, force_confirm: bool) {
+        self.open_link_routed(url, is_hidden, force_confirm, false);
+    }
+
+    /// Opens a link a Mini App handed back (`web_app_open_tg_link`, local navigation): only
+    /// links that route as Telegram links are opened, anything else is dropped
+    /// (`WebViewInstance::botHandleLocalUri`).
+    pub fn open_bot_local_link(&mut self, url: &str) {
+        self.open_link_routed(url, false, false, true);
+    }
+
+    fn open_link_routed(
+        &mut self,
+        url: &str,
+        is_hidden: bool,
+        force_confirm: bool,
+        telegram_only: bool,
+    ) {
+        if self.is_passcode_locked() {
+            return;
+        }
         let outcome = if let Some(session) = self.session.as_mut() {
             session.route_deep_link(url, &mut *self.session_backend)
         } else {
@@ -929,21 +1100,45 @@ impl WindowController {
         };
 
         match outcome {
+            DeepLinkOutcome::NotTelegram if telegram_only => {}
             DeepLinkOutcome::NotTelegram => {
-                let (base_url, fragment) = split_fragment(url.trim());
-                if matches!(
-                    WebViewBackend::fetch_iv_page(&*self.session_backend, base_url, None),
-                    Ok(Some(_))
-                ) {
-                    self.pending_webview_requests
-                        .push(WebViewHostRequest::OpenInstantView {
-                            url: base_url.to_owned(),
-                            webpage_id: None,
-                            fragment: fragment.map(ToOwned::to_owned),
-                        });
-                } else {
-                    self.pending_webview_requests
-                        .push(WebViewHostRequest::OpenExternalUrl(url.to_owned()));
+                match evaluate_external_link(url, is_hidden, force_confirm) {
+                    ExternalLinkAction::Rejected => {
+                        self.layer_stack
+                            .show_toast(tg_lang::tr::lng_open_link_unsupported());
+                    }
+                    ExternalLinkAction::Confirm {
+                        url: validated,
+                        host_range,
+                        suspicious_ranges,
+                    } => {
+                        self.media_overlay.close();
+                        self.box_host.push_immediate(
+                            BoxKind::HiddenLinkConfirm(build_hidden_link_confirm_box(
+                                validated,
+                                host_range,
+                                suspicious_ranges,
+                            )),
+                            &self.theme_manager,
+                        );
+                    }
+                    ExternalLinkAction::OpenNow(validated) => {
+                        let (base_url, fragment) = split_fragment(validated.trim());
+                        if matches!(
+                            WebViewBackend::fetch_iv_page(&*self.session_backend, base_url, None),
+                            Ok(Some(_))
+                        ) {
+                            self.pending_webview_requests.push(
+                                WebViewHostRequest::OpenInstantView {
+                                    url: base_url.to_owned(),
+                                    webpage_id: None,
+                                    fragment: fragment.map(ToOwned::to_owned),
+                                },
+                            );
+                        } else {
+                            self.queue_external_url(&validated);
+                        }
+                    }
                 }
             }
             DeepLinkOutcome::Handled => {}
@@ -954,6 +1149,25 @@ impl WindowController {
                     .is_some_and(|s| s.active_peer() == peer_id)
                 {
                     self.main_widget.prefill_compose(peer_id, text);
+                }
+            }
+            // `tg://resolve?domain=<bot>&start=<token>` stores the token and opens the bot chat,
+            // which shows the bottom START bar; nothing is sent until the user presses it
+            // (`Window::SessionNavigation::showPeerByLink`, `HistoryWidget::_botStart`).
+            DeepLinkOutcome::StartBot {
+                bot_id,
+                peer_id: None,
+                start_param,
+            } => {
+                self.main_widget
+                    .history_mut()
+                    .set_bot_start_token(bot_id, start_param);
+                if let Some(session) = self.session.as_mut() {
+                    session.show_peer_history(
+                        bot_id,
+                        SectionShow::clear_stack(),
+                        MsgId::SHOW_AT_UNREAD,
+                    );
                 }
             }
             DeepLinkOutcome::StartBot {
@@ -1052,7 +1266,7 @@ impl WindowController {
                 bot_id,
                 start_param,
             } => {
-                self.open_bot_mini_app_with_params(bot_id, None, start_param);
+                self.open_mini_app_from_link(bot_id, None, start_param);
             }
             DeepLinkOutcome::OpenInstantView { url, fragment } => {
                 self.pending_webview_requests
@@ -1063,8 +1277,34 @@ impl WindowController {
                     });
             }
             DeepLinkOutcome::OpenExternalUrl(target) => {
-                self.pending_webview_requests
-                    .push(WebViewHostRequest::OpenExternalUrl(target));
+                if is_hidden || force_confirm {
+                    match evaluate_external_link(&target, is_hidden, force_confirm) {
+                        ExternalLinkAction::Rejected => {
+                            self.layer_stack
+                                .show_toast(tg_lang::tr::lng_open_link_unsupported());
+                        }
+                        ExternalLinkAction::Confirm {
+                            url: validated,
+                            host_range,
+                            suspicious_ranges,
+                        } => {
+                            self.media_overlay.close();
+                            self.box_host.push_immediate(
+                                BoxKind::HiddenLinkConfirm(build_hidden_link_confirm_box(
+                                    validated,
+                                    host_range,
+                                    suspicious_ranges,
+                                )),
+                                &self.theme_manager,
+                            );
+                        }
+                        ExternalLinkAction::OpenNow(validated) => {
+                            self.queue_external_url(&validated);
+                        }
+                    }
+                } else {
+                    self.queue_external_url(&target);
+                }
             }
             DeepLinkOutcome::OpenOverlay(req) => {
                 self.pending_overlay_requests.push(req);
@@ -1253,6 +1493,213 @@ impl WindowController {
             });
     }
 
+    /// Opens a Mini App requested by a link: unless the user already confirmed this bot, shows
+    /// the `confirmOpen` box first (`bot_attach_web_view.cpp:1148-1181`). Like tdesktop's clicked
+    /// links (`botAppForceConfirmation`), being verified does not skip the box.
+    pub fn open_mini_app_from_link(
+        &mut self,
+        bot_id: PeerId,
+        url: Option<String>,
+        start_param: Option<String>,
+    ) {
+        if self.is_passcode_locked() {
+            return;
+        }
+        if self.is_peer_trusted_open_webview(bot_id) {
+            self.open_bot_mini_app_with_params(bot_id, url, start_param);
+            return;
+        }
+        let bot_name = self.peer_display_name(bot_id);
+        self.media_overlay.close();
+        self.box_host.push_immediate(
+            BoxKind::MiniAppOpenConfirm(MiniAppOpenConfirmBoxState::new(
+                bot_id,
+                bot_name,
+                url,
+                start_param,
+            )),
+            &self.theme_manager,
+        );
+    }
+
+    /// Folder tabs for the "Forward to..." box: "All" plus every chat folder with its chats
+    /// (`Ui::AddChatFiltersTabsStrip`, shown only with more than one folder).
+    fn forward_folder_tabs(&self) -> Vec<tg_app_info::boxes::share::ShareFolderTab> {
+        use tg_app_info::dialogs::backend::{DialogListQuery, DialogsBackend};
+        let backend = &*self.session_backend;
+        DialogsBackend::chat_folders(backend)
+            .into_iter()
+            .map(|folder| {
+                let all = folder.id == tg_app_core::stand_in::types::FilterId::ALL;
+                let peers = if all {
+                    Vec::new()
+                } else {
+                    DialogsBackend::dialog_slice(
+                        backend,
+                        DialogListQuery::Filter(folder.id),
+                        0,
+                        usize::MAX / 2,
+                    )
+                    .entries
+                    .into_iter()
+                    .map(|d| d.peer_id)
+                    .collect()
+                };
+                tg_app_info::boxes::share::ShareFolderTab {
+                    id: folder.id.0,
+                    title: if all {
+                        tg_lang::tr::lng_filters_all_short()
+                    } else {
+                        folder.title
+                    },
+                    peers,
+                }
+            })
+            .collect()
+    }
+
+    /// A plain click on a chat in "Forward to..." (`ShowForwardMessagesBox`, `singleChosen`):
+    /// Saved Messages gets the messages at once (`ForwardToSelf`); any other chat opens with
+    /// the forward bar on its composer (`MainWidget::setForwardDraft`).
+    fn apply_forward_single_choice(&mut self, ctx: &egui::Context) {
+        let Some(BoxKind::Share(share)) = self.box_host.top_kind_mut() else {
+            return;
+        };
+        let Some(target) = share.take_chosen_single() else {
+            return;
+        };
+        let Some(from_peer) = share.from_peer else {
+            return;
+        };
+        let msg_ids: Vec<MsgId> = share.message_ids.iter().copied().map(MsgId).collect();
+        let count = msg_ids.len();
+        self.box_host.pop(ctx, &self.theme_manager);
+        if msg_ids.is_empty() {
+            return;
+        }
+        let self_peer =
+            tg_app_core::history::backend::HistoryBackend::self_peer(&*self.session_backend).0;
+        if target == self_peer && from_peer != self_peer {
+            let ids: Vec<i32> = msg_ids.iter().map(|id| id.0).collect();
+            match InfoBackend::forward_messages(&mut *self.session_backend, &[target], &ids, "") {
+                Ok(_) => {
+                    let chat = tg_lang::tr::lng_saved_messages();
+                    let text = if count == 1 {
+                        tg_lang::tr::lng_share_message_to_saved(&chat)
+                    } else {
+                        tg_lang::tr::lng_share_messages_to_saved(&chat)
+                    };
+                    self.layer_stack.show_toast(text.replace("**", ""));
+                }
+                Err(err) => self.layer_stack.show_toast(err),
+            }
+            return;
+        }
+        let source = self.peer_display_name(from_peer);
+        let summary = if count == 1 {
+            format!("1 message from {source}")
+        } else {
+            format!("{count} messages from {source}")
+        };
+        self.main_widget
+            .history_mut()
+            .set_pending_forward_draft(target, from_peer, msg_ids, summary);
+        if let Some(session) = self.session.as_mut() {
+            session.show_peer_history(target, SectionShow::clear_stack(), MsgId::SHOW_AT_UNREAD);
+        }
+    }
+
+    /// Opens a Mini App launched from the chat. Keyboard, bot menu and switch-inline buttons
+    /// (`confirm_open`) go through `WebViewInstance::confirmOpen` (`bot_attach_web_view.cpp`):
+    /// a verified or already trusted bot opens directly, any other bot shows the box first.
+    pub fn open_mini_app_from_chat(
+        &mut self,
+        bot_id: PeerId,
+        url: Option<String>,
+        start_param: Option<String>,
+        confirm_open: bool,
+    ) {
+        let verified =
+            InfoBackend::peer_profile(&*self.session_backend, bot_id).is_some_and(|p| p.verified);
+        if !confirm_open || verified {
+            self.open_bot_mini_app_with_params(bot_id, url, start_param);
+        } else {
+            self.open_mini_app_from_link(bot_id, url, start_param);
+        }
+    }
+
+    /// Returns `true` once the user confirmed opening `bot_id`'s Mini App (this session or a
+    /// previous one).
+    #[must_use]
+    pub fn is_peer_trusted_open_webview(&self, bot_id: PeerId) -> bool {
+        // `isPeerTrustedOpenWebView`: persisted in the account's session settings (WP-74).
+        self.trusted_open_webview.contains(&bot_id)
+            || self.session_backend.is_mini_app_bot_trusted(bot_id)
+    }
+
+    fn peer_display_name(&self, peer_id: PeerId) -> String {
+        InfoBackend::peer_profile(&*self.session_backend, peer_id)
+            .map(|p| p.title)
+            .unwrap_or_default()
+    }
+
+    /// Sends `/start <token>` after the user pressed START (`HistoryWidget::sendBotStartCommand`).
+    /// `PeerMenuUnblockUserWithBotRestart`: unblock the bot, send it /start and open its chat.
+    fn restart_bot(&mut self, bot_id: PeerId) {
+        match tg_app_core::dialogs::backend::DialogsBackend::unblock_and_restart_bot(
+            &mut *self.session_backend,
+            bot_id,
+        ) {
+            Ok(()) => {
+                self.main_widget
+                    .notify_external_message(bot_id, &*self.session_backend);
+                if let Some(session) = self.session.as_mut() {
+                    session.show_peer_history(bot_id, SectionShow::default(), MsgId::SHOW_AT_END);
+                }
+            }
+            Err(err) => self.layer_stack.show_toast(err),
+        }
+    }
+
+    /// The block box's "Block": `report_spam_and_block` (block, then `messages.reportSpam` and
+    /// `deleteConversation` as chosen, `PeerMenuBlockUserBox`), going back from a deleted chat,
+    /// and the "{user} is now blocked" toast.
+    fn block_user_confirmed(&mut self, choice: &tg_app_info::boxes::block_user::BlockUserChoice) {
+        let result = tg_app_core::dialogs::backend::DialogsBackend::report_spam_and_block(
+            &mut *self.session_backend,
+            choice.peer_id,
+            choice.report_spam,
+            choice.delete_chat,
+        );
+        if let Err(err) = result {
+            self.layer_stack.show_toast(err);
+            return;
+        }
+        if choice.delete_chat
+            && let Some(session) = self.session.as_mut()
+            && session.active_peer() == choice.peer_id
+        {
+            session.show_back_from_stack(SectionShow::default());
+        }
+        self.layer_stack
+            .show_toast(tg_lang::tr::lng_new_contact_block_done(&choice.name));
+    }
+
+    fn send_bot_start(&mut self, bot_id: PeerId, start_param: String) {
+        let bot_uid = tg_bots::stand_in::UserId(bot_id.bare());
+        let params = tg_bots::protocol::StartBotParams::for_private_chat(bot_uid, start_param, 0);
+        match tg_app_core::bots::backend::BotsBackend::start_bot(
+            &mut *self.session_backend,
+            &params,
+        ) {
+            Ok(_) => {
+                self.main_widget
+                    .notify_external_message(bot_id, &*self.session_backend);
+            }
+            Err(err) => self.layer_stack.show_toast(err),
+        }
+    }
+
     /// Opens `target_peer` and prefills its compose field with `@bot_username query`
     /// (`api/api_bot.cpp` switch-inline destination handoff).
     pub fn open_peer_with_inline_query(
@@ -1329,7 +1776,7 @@ impl WindowController {
     /// Routes events emitted by [`tg_app_media::webview::AppWebViewHost`] back into the main app.
     pub fn handle_webview_event(&mut self, event: AppWebViewEvent, ctx: &egui::Context) {
         match event {
-            AppWebViewEvent::OpenTelegramLink { uri } => self.open_link(&uri),
+            AppWebViewEvent::OpenTelegramLink { uri } => self.open_bot_local_link(&uri),
             AppWebViewEvent::OpenChannel {
                 username: Some(u), ..
             } => {
@@ -1374,9 +1821,16 @@ impl WindowController {
             AppWebViewEvent::OpenTonSite { uri, .. } => {
                 self.open_link(&uri);
             }
+            AppWebViewEvent::OpenExternalUrl { url }
+                if url == tg_platform::url_policy::WINDOWS_LOCATION_SETTINGS_URI => {}
+            // The webview host already opened the URL through its policy-checked opener
+            // (`UrlClickHandler::Open` runs once in `iv_instance.cpp`); queueing it again here
+            // opened every Instant View / Mini App external link twice.
             AppWebViewEvent::OpenExternalUrl { url } => {
-                self.pending_webview_requests
-                    .push(WebViewHostRequest::OpenExternalUrl(url));
+                if tg_platform::url_policy::validate_external_url(&url).is_err() {
+                    self.layer_stack
+                        .show_toast(tg_lang::tr::lng_open_link_unsupported());
+                }
             }
             AppWebViewEvent::Toast { message } => self.layer_stack.show_toast(message),
             AppWebViewEvent::QuitApp => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -1393,6 +1847,7 @@ impl WindowController {
     /// stories strip at the top of the dialogs column.
     pub fn show_with_stories(&mut self, ui: &mut Ui, stories: Option<&mut AppStoriesHost>) {
         let ctx = ui.ctx().clone();
+        let body_rect = ui.max_rect();
         self.session_backend.sync_cached_user();
         let palette = self.palette();
         let now_ms = self.elapsed_ms();
@@ -1530,9 +1985,12 @@ impl WindowController {
                 }
             }
         }
+        self.replay_queued_activations(&ctx);
+        let locked = self.is_passcode_locked();
 
         // Main menu overlay drawer (`MainWindow::showMainMenu`).
-        if self.layer_stack.is_main_menu_open()
+        if !locked
+            && self.layer_stack.is_main_menu_open()
             && let Some(user) = self.session_backend.current_user().cloned().or_else(|| {
                 self.session_backend.is_live_session().then(|| AuthUser {
                     id: PeerId::ZERO,
@@ -1553,6 +2011,13 @@ impl WindowController {
             };
             let can_add =
                 self.session_backend.is_live_session() && accounts_slice.len() < self.max_accounts;
+            self.main_menu.set_body_rect(Some(body_rect));
+            let menu_bots = self
+                .session_backend
+                .as_bots_backend()
+                .map(|bots| main_menu_bots(&bots.load_attach_menu()))
+                .unwrap_or_default();
+            self.main_menu.set_menu_bots(menu_bots);
             if let Some(menu_act) = self.main_menu.show_with_accounts(
                 &ctx,
                 &user,
@@ -1592,15 +2057,21 @@ impl WindowController {
             proxy_box.sync_check_status(&mut *self.session_backend);
         }
         let screen_rect = ctx.content_rect();
-        let box_events = self.box_host.show(
-            &ctx,
-            screen_rect,
-            &mut *self.session_backend,
-            &self.theme_manager,
-        );
+        // Nothing but the lock screen (and its own logout confirmation) renders while locked.
+        let box_events = if locked {
+            Vec::new()
+        } else {
+            self.box_host.show(
+                &ctx,
+                screen_rect,
+                &mut *self.session_backend,
+                &self.theme_manager,
+            )
+        };
         for bev in box_events {
             self.handle_box_event(bev, &ctx);
         }
+        self.apply_forward_single_choice(&ctx);
 
         // In mock mode (where LiveActiveWorkspace is absent), route queued theme/background
         // deep-link overlay requests straight into AppThemesHost.
@@ -1622,6 +2093,9 @@ impl WindowController {
         }
 
         // Fullscreen media viewer overlay (`Media::View::OverlayWidget`).
+        if locked {
+            self.close_content_windows();
+        }
         if self.media_overlay.is_open() {
             let ov_events =
                 self.media_overlay
@@ -1632,6 +2106,8 @@ impl WindowController {
         }
         self.media_overlay
             .sync_screenshot_protection(self.native_hwnd);
+        self.media_fullscreen
+            .sync(&ctx, self.media_overlay.is_open());
 
         // Floating Picture-in-Picture window (`Media::View::Pip`).
         if let Some(mut pip) = self.pip_window.take() {
@@ -1859,9 +2335,10 @@ impl WindowController {
                 bot_id,
                 url,
                 start_param,
+                confirm_open,
             } = act
             {
-                self.open_bot_mini_app_with_params(bot_id, url, start_param);
+                self.open_mini_app_from_chat(bot_id, url, start_param, confirm_open);
             }
         }
     }
@@ -1936,11 +2413,15 @@ impl WindowController {
                 self.open_history_media(peer_id, msg_id, album_index);
             }
             MainWidgetAction::OpenLink(url) => self.open_link(&url),
+            MainWidgetAction::OpenHiddenLink { url, force_confirm } => {
+                self.open_link_inner(&url, true, force_confirm);
+            }
             MainWidgetAction::OpenMiniApp {
                 bot_id,
                 url,
                 start_param,
-            } => self.open_bot_mini_app_with_params(bot_id, url, start_param),
+                confirm_open,
+            } => self.open_mini_app_from_chat(bot_id, url, start_param, confirm_open),
             MainWidgetAction::SwitchInlineChooseChat {
                 bot_id,
                 bot_username,
@@ -2070,6 +2551,26 @@ impl WindowController {
             MainWidgetAction::Toast(msg) => {
                 self.layer_stack.show_toast(msg);
             }
+            MainWidgetAction::OpenForwardBox { from_peer, msg_ids } => {
+                let ids = msg_ids.iter().map(|id| id.0).collect();
+                let tabs = self.forward_folder_tabs();
+                self.box_host.push(
+                    ctx,
+                    BoxKind::Share(ShareBoxState::for_forward(from_peer, ids, tabs)),
+                    &self.theme_manager,
+                );
+            }
+            MainWidgetAction::OpenInNewWindow(peer_id) => {
+                let title = self
+                    .session_backend
+                    .dialogs(FilterId::ALL, "")
+                    .into_iter()
+                    .find(|d| d.peer.id == peer_id)
+                    .map_or_else(|| format!("Chat {}", peer_id.0), |d| d.peer.title);
+                self.shell_extras.saved_windows.open_window(
+                    crate::window::chat_preview::SavedChatWindow::new(peer_id, title),
+                );
+            }
             MainWidgetAction::PersistSettings => {
                 if let Some(session) = &self.session {
                     self.settings.columns = session.columns().saved();
@@ -2095,6 +2596,16 @@ impl WindowController {
             InfoWrapEvent::OpenStatistics(pid) => self.open_statistics_for_peer(pid, false),
             InfoWrapEvent::OpenBoosts(pid) => self.open_statistics_for_peer(pid, true),
             InfoWrapEvent::OpenBotMiniApp(pid) => self.open_bot_mini_app(pid),
+            InfoWrapEvent::StartCall { peer_id, video } => {
+                self.pending_start_call = Some((peer_id, video));
+            }
+            InfoWrapEvent::OpenSendGift(_) => {
+                self.pending_overlay_requests
+                    .push(DeepLinkOverlayRequest::OpenPayments {
+                        screen: tg_app_info::payments::PaymentsScreen::StarGifts,
+                        slug: None,
+                    });
+            }
             InfoWrapEvent::OpenMedia {
                 peer_id,
                 item_id,
@@ -2217,6 +2728,51 @@ impl WindowController {
                     &self.theme_manager,
                 );
             }
+            InfoWrapEvent::OpenBlockUser { peer_id, name } => {
+                let suggest_report =
+                    tg_app_core::dialogs::backend::DialogsBackend::dialog_suggests_report_spam(
+                        &*self.session_backend,
+                        peer_id,
+                    );
+                self.box_host.push(
+                    ctx,
+                    BoxKind::BlockUser(tg_app_info::boxes::block_user::BlockUserBoxState::new(
+                        peer_id,
+                        name,
+                        suggest_report,
+                    )),
+                    &self.theme_manager,
+                );
+            }
+            InfoWrapEvent::RestartBot(bot_id) => self.restart_bot(bot_id),
+            InfoWrapEvent::JoinGroupCall(peer_id) => {
+                self.pending_overlay_requests
+                    .push(DeepLinkOverlayRequest::JoinCall {
+                        peer_id: Some(peer_id),
+                        slug_or_hash: None,
+                    });
+            }
+            InfoWrapEvent::OpenMuteFor(peer_id) => {
+                self.box_host.push(
+                    ctx,
+                    BoxKind::MuteFor(tg_app_info::boxes::mute::MuteForBoxState::new(peer_id)),
+                    &self.theme_manager,
+                );
+            }
+            InfoWrapEvent::OpenSelectTone(peer_id) => {
+                let silent = tg_app_core::dialogs::backend::DialogsBackend::dialog_notify_sound(
+                    &*self.session_backend,
+                    peer_id,
+                )
+                .none;
+                self.box_host.push(
+                    ctx,
+                    BoxKind::SelectTone(tg_app_info::boxes::mute::SelectToneBoxState::new(
+                        peer_id, silent,
+                    )),
+                    &self.theme_manager,
+                );
+            }
             InfoWrapEvent::OpenReport(pid) => {
                 let title = InfoBackend::peer_profile(&*self.session_backend, pid)
                     .map_or_else(|| "Chat".to_owned(), |p| p.title);
@@ -2333,20 +2889,38 @@ impl WindowController {
                 if let Some(peer) = InfoBackend::peer_profile(&*self.session_backend, pid) {
                     self.box_host.push(
                         ctx,
-                        BoxKind::PeerQr(tg_app_info::boxes::peer_qr::PeerQrBoxState::from_profile(
-                            &peer,
-                        )),
+                        BoxKind::PeerQr(
+                            tg_app_info::boxes::peer_qr::PeerQrBoxState::from_profile_with_backend(
+                                &peer,
+                                &*self.session_backend,
+                            ),
+                        ),
                         &self.theme_manager,
                     );
                 }
             }
             InfoWrapEvent::OpenEmojiUserpic(pid) => {
-                let title = InfoBackend::peer_profile(&*self.session_backend, pid)
-                    .map_or_else(|| "Profile".to_owned(), |p| p.title);
+                let peer = InfoBackend::peer_profile(&*self.session_backend, pid);
+                let title = peer
+                    .as_ref()
+                    .map_or_else(|| "Profile".to_owned(), |p| p.title.clone());
+                let catalog_kind = if peer
+                    .as_ref()
+                    .is_some_and(|p| p.kind.is_group() || p.kind.is_channel())
+                {
+                    tg_app_core::chat_helpers::backend::DefaultEmojiCatalogKind::GroupPhoto
+                } else {
+                    tg_app_core::chat_helpers::backend::DefaultEmojiCatalogKind::ProfilePhoto
+                };
                 self.box_host.push(
                     ctx,
                     BoxKind::EmojiUserpic(
-                        tg_app_info::boxes::emoji_userpic::EmojiUserpicBoxState::new(pid, title),
+                        tg_app_info::boxes::emoji_userpic::EmojiUserpicBoxState::with_default_catalog(
+                            pid,
+                            title,
+                            catalog_kind,
+                            &*self.session_backend,
+                        ),
                     ),
                     &self.theme_manager,
                 );
@@ -2447,6 +3021,53 @@ impl WindowController {
                 };
                 self.layer_stack.show_toast(format!("Opening {label}"));
             }
+            InfoWrapEvent::OpenAttachedStickers { media, media_label } => {
+                self.open_attached_stickers_modal(ctx, &media, &media_label);
+            }
+        }
+    }
+
+    /// Queries `messages.getAttachedStickers` via [`ChatHelpersBackend::get_attached_stickers`]
+    /// and pushes either `StickerSetBox` (single set), `AttachedStickersBox` (multiple sets),
+    /// or shows a `"Sticker set not found."` toast (`api/api_attached_stickers.cpp`).
+    pub fn open_attached_stickers_modal(
+        &mut self,
+        ctx: &egui::Context,
+        media: &tg_app_core::chat_helpers::backend::AttachedStickersMedia,
+        media_label: &str,
+    ) {
+        use tg_app_info::boxes::attached_stickers::{
+            AttachedStickersOutcome, classify_attached_stickers,
+        };
+        let sets = match self.session_backend.get_attached_stickers(media) {
+            Ok(sets) => sets,
+            Err(err) => {
+                self.layer_stack
+                    .show_toast(format!("Could not load attached stickers: {err}"));
+                return;
+            }
+        };
+        let outcome = classify_attached_stickers(sets, media_label, |only| {
+            self.session_backend
+                .resolve_sticker_set(&only.short_name, only.is_emoji)
+                .ok()
+        });
+        match outcome {
+            AttachedStickersOutcome::NotFound => {
+                self.layer_stack
+                    .show_toast(tg_lang::tr::lng_stickers_not_found());
+            }
+            AttachedStickersOutcome::SingleSet(st_box) => {
+                self.box_host
+                    .push(ctx, BoxKind::StickerSet(st_box), &self.theme_manager);
+            }
+            AttachedStickersOutcome::MultipleSets(list_box) => {
+                self.box_host.push(
+                    ctx,
+                    BoxKind::AttachedStickers(list_box),
+                    &self.theme_manager,
+                );
+            }
         }
     }
 
@@ -2529,6 +3150,27 @@ impl WindowController {
                         .notify_external_message(peer_id, &*self.session_backend);
                 }
             }
+            BoxEvent::BlockUserConfirmed(choice) => self.block_user_confirmed(&choice),
+            BoxEvent::MuteDialogFor { peer_id, seconds } => {
+                if let Err(err) = tg_app_core::dialogs::backend::DialogsBackend::mute_dialog_for(
+                    &mut *self.session_backend,
+                    peer_id,
+                    seconds,
+                ) {
+                    self.layer_stack.show_toast(err);
+                }
+            }
+            BoxEvent::DialogToneChosen { peer_id, silent } => {
+                if let Err(err) =
+                    tg_app_core::dialogs::backend::DialogsBackend::set_dialog_sound_enabled(
+                        &mut *self.session_backend,
+                        peer_id,
+                        !silent,
+                    )
+                {
+                    self.layer_stack.show_toast(err);
+                }
+            }
             BoxEvent::LanguageChanged(code) => {
                 self.strings.refresh();
                 self.layer_stack
@@ -2599,7 +3241,11 @@ impl WindowController {
                             .show_toast(format!("Could not redeem gift code: {err}")),
                     }
                 }
-                ConfirmTag::Custom(_) | ConfirmTag::DeclineTerms | ConfirmTag::LeavePeer(_) => {}
+                ConfirmTag::Custom(_)
+                | ConfirmTag::DeclineTerms
+                | ConfirmTag::LeavePeer(_)
+                | ConfirmTag::ConvertToGigagroup(_)
+                | ConfirmTag::DeactivateAllUsernames(_) => {}
             },
             BoxEvent::JoinInviteConfirmed { hash } => {
                 match self.session_backend.import_chat_invite(&hash) {
@@ -2802,8 +3448,7 @@ impl WindowController {
                     choice,
                 ) {
                     tg_app_info::boxes::click_handlers::UrlAuthResolutionEffect::OpenExternalUrl(url) => {
-                        self.pending_webview_requests
-                            .push(WebViewHostRequest::OpenExternalUrl(url));
+                        self.queue_external_url(&url);
                     }
                     tg_app_info::boxes::click_handlers::UrlAuthResolutionEffect::Toast(msg) => {
                         self.layer_stack.show_toast(msg);
@@ -2817,9 +3462,21 @@ impl WindowController {
                 }
             }
             BoxEvent::OpenExternalUrl(url) => {
-                self.pending_webview_requests
-                    .push(WebViewHostRequest::OpenExternalUrl(url));
+                self.queue_external_url(&url);
             }
+            BoxEvent::MiniAppOpenConfirmed {
+                bot_id,
+                url,
+                start_param,
+            } => {
+                self.trusted_open_webview.insert(bot_id);
+                self.session_backend.trust_mini_app_bot(bot_id);
+                self.open_bot_mini_app_with_params(bot_id, url, start_param);
+            }
+            BoxEvent::BotStartConfirmed {
+                bot_id,
+                start_param,
+            } => self.send_bot_start(bot_id, start_param),
             BoxEvent::OverlayRequest(req) => {
                 self.pending_overlay_requests.push(req);
             }
@@ -2861,6 +3518,116 @@ impl WindowController {
                     }
                 }
             },
+            BoxEvent::OpenAttachedStickerSet {
+                set_id,
+                short_name,
+                title,
+                is_emoji,
+            } => {
+                let preview = if !short_name.is_empty() {
+                    self.session_backend
+                        .resolve_sticker_set(&short_name, is_emoji)
+                        .ok()
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| tg_app_core::session_api::StickerSetPreview {
+                    set_id,
+                    access_hash: 0,
+                    title,
+                    short_name,
+                    count: 0,
+                    is_emoji,
+                    installed: false,
+                    archived: false,
+                    official: false,
+                    items: Vec::new(),
+                });
+                let st_box = tg_app_info::boxes::sticker_set::StickerSetBoxState::from_preview(
+                    preview,
+                );
+                self.box_host
+                    .push(ctx, BoxKind::StickerSet(st_box), &self.theme_manager);
+            }
+            BoxEvent::LoadEmojiUserpicCatalog {
+                peer_id,
+                catalog_kind,
+            } => {
+                if let Some(BoxKind::EmojiUserpic(state)) = self.box_host.top_kind_mut()
+                    && state.peer_id == peer_id
+                {
+                    state.catalog_kind = catalog_kind;
+                    state.load_default_catalog(&*self.session_backend, false);
+                }
+            }
+            BoxEvent::LaunchExternalFileConfirmed {
+                item_id,
+                remember_extension,
+                disable_ip_reveal_warning,
+            } => {
+                if let Some(ext) = remember_extension {
+                    self.no_warning_extensions.insert(ext.clone());
+                    if let Some(settings) = self.main_widget.settings_mut() {
+                        settings.core_settings.no_warning_extensions.insert(ext);
+                    }
+                }
+                if disable_ip_reveal_warning {
+                    self.ip_reveal_warning = false;
+                    if let Some(settings) = self.main_widget.settings_mut() {
+                        settings.core_settings.ip_reveal_warning = false;
+                    }
+                }
+                match self.session_backend.open_in_external_app_confirmed(item_id) {
+                    Ok(path) => {
+                        self.layer_stack
+                            .show_toast(format!("Opening {}", path.display()));
+                    }
+                    Err(err) => {
+                        self.layer_stack
+                            .show_toast(format!("Failed to open file: {err}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Requests launching `item_id` (`file_name`) in an external OS application, showing
+    /// tdesktop's executable / unknown / extensionless / IP-reveal confirmation dialog first
+    /// (`Data::LaunchWithWarning` in `data/data_document_resolver.cpp:91`).
+    pub fn request_open_external_item(
+        &mut self,
+        item_id: tg_app_media::media::MediaItemId,
+        file_name: &str,
+    ) {
+        if let Some(settings) = self.main_widget.settings() {
+            for ext in &settings.core_settings.no_warning_extensions {
+                self.no_warning_extensions.insert(ext.clone());
+            }
+            if !settings.core_settings.ip_reveal_warning {
+                self.ip_reveal_warning = false;
+            }
+        }
+        if let Some(kind) = classify_launch_warning(
+            file_name,
+            &self.no_warning_extensions,
+            self.ip_reveal_warning,
+        ) {
+            self.media_overlay.close();
+            self.box_host.push_immediate(
+                BoxKind::LaunchFileConfirm(build_launch_file_confirm_box(item_id, file_name, kind)),
+                &self.theme_manager,
+            );
+            return;
+        }
+        match self.session_backend.open_in_external_app_confirmed(item_id) {
+            Ok(path) => {
+                self.layer_stack
+                    .show_toast(format!("Opening {}", path.display()));
+            }
+            Err(err) => {
+                self.layer_stack
+                    .show_toast(format!("Failed to open file: {err}"));
+            }
         }
     }
 
@@ -2903,6 +3670,9 @@ impl WindowController {
             OverlayEvent::OpenExternal(path) => {
                 self.layer_stack
                     .show_toast(format!("Opening {}", path.display()));
+            }
+            OverlayEvent::ConfirmOpenExternal { item_id, file_name } => {
+                self.request_open_external_item(item_id, &file_name);
             }
             OverlayEvent::EnterPip(pip) => {
                 self.pip_window = Some(*pip);
@@ -2993,6 +3763,10 @@ impl WindowController {
                 self.layer_stack
                     .show_toast(format!("Applied theme: {theme_name}"));
             }
+            OverlayEvent::AttachedStickers { media, media_label } => {
+                self.media_overlay.close();
+                self.open_attached_stickers_modal(ctx, &media, &media_label);
+            }
         }
     }
 
@@ -3055,18 +3829,28 @@ impl WindowController {
                     &self.theme_manager,
                 );
             }
+            // `window_main_menu.cpp`: the Calls row shows only the Recent Calls box
+            // (`Calls::ShowCallsBox`), it does not open Settings.
             MainMenuAction::Calls => {
                 self.layer_stack.close_main_menu();
                 self.pending_open_recent_calls = true;
-                let settings_backend = self.session_backend.create_settings_backend();
-                self.main_widget.open_settings_section(
-                    SettingsSection::Calls,
-                    settings_backend,
-                    self.theme_manager.embedded_type(),
-                    self.theme_manager.accent(),
-                );
-                if let Some(session) = self.session.as_mut() {
-                    session.show_settings(SettingsPage::Main);
+            }
+            // "Set Emoji Status": Premium users get the emoji status selector
+            // (`Info::Profile::EmojiStatusPanel`), others the Premium screen.
+            MainMenuAction::SetEmojiStatus => {
+                self.layer_stack.close_main_menu();
+                if tg_app_core::chat_helpers::backend::ChatHelpersBackend::is_premium(
+                    &*self.session_backend,
+                ) {
+                    tg_app_history::business::AppBusinessHost::open_emoji_status(ctx);
+                } else {
+                    self.handle_main_widget_action(
+                        MainWidgetAction::OpenPayments {
+                            screen: tg_app_info::payments::PaymentsScreen::Premium,
+                            slug: None,
+                        },
+                        ctx,
+                    );
                 }
             }
             MainMenuAction::SavedMessages => {
@@ -3125,6 +3909,10 @@ impl WindowController {
                 self.layer_stack.close_main_menu();
                 self.request_restart_to_update();
             }
+            MainMenuAction::OpenMenuBot(bot_id) => {
+                self.layer_stack.close_main_menu();
+                self.open_mini_app_from_chat(bot_id, None, None, false);
+            }
             MainMenuAction::Logout => {
                 self.layer_stack.show_box(ModalBox::ConfirmLogout);
             }
@@ -3178,6 +3966,11 @@ impl WindowController {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "controller_tests_sec2a.rs"]
+#[cfg(test)]
+mod tests_sec2a;
 
 #[cfg(test)]
 mod tests {

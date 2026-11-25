@@ -9,12 +9,32 @@ use egui::{
     WidgetInfo,
 };
 
+use tg_style::{DefaultPaletteResolver, Icon};
+
 use crate::anim::{SimpleAnimation, Transition, interpolate_f32, with_alpha};
 use crate::effects::{RippleMask, update_and_paint_ripple};
+use crate::icons::paint_style_icon;
 use crate::painter::{BoxShadow, RoundRect};
 use crate::style::{PopupMenuStyle, ToggleStyle};
 use crate::widgets::buttons::{IconKind, paint_icon};
 use crate::widgets::checkbox::paint_toggle_view;
+
+/// `menuWithIcons.itemPadding.left`: label inset when any item has an icon.
+const MENU_WITH_ICONS_LEFT: f32 = 54.0;
+/// `menuWithIcons.itemPadding.bottom`.
+const MENU_WITH_ICONS_BOTTOM: f32 = 8.0;
+/// `menuWithIcons.itemIconPosition`: top-left of the 24 px icon inside the row.
+const MENU_ICON_POSITION: Vec2 = Vec2::new(15.0, 5.0);
+/// Size of the `menu/*` tdesktop icons.
+const MENU_ICON_SIZE: f32 = 24.0;
+
+/// Rect of the leading icon inside a menu row (`menuWithIcons.itemIconPosition`).
+fn menu_icon_rect(item_rect: Rect) -> Rect {
+    Rect::from_min_size(
+        item_rect.min + MENU_ICON_POSITION,
+        Vec2::splat(MENU_ICON_SIZE),
+    )
+}
 
 /// Single item inside a [`PopupMenu`].
 #[derive(Debug, Clone)]
@@ -25,6 +45,8 @@ pub enum MenuItem {
         label: String,
         shortcut: Option<String>,
         icon: Option<IconKind>,
+        /// tdesktop vector icon (`st::menu_icon_*`), painted instead of `icon` when set.
+        style_icon: Option<Icon>,
         enabled: bool,
         attention: bool,
         has_submenu: bool,
@@ -48,9 +70,29 @@ impl MenuItem {
             label: label.into(),
             shortcut: None,
             icon: None,
+            style_icon: None,
             enabled: true,
             attention: false,
             has_submenu: false,
+        }
+    }
+
+    /// Attach a tdesktop vector icon (`st::menu_icon_*` from `menu_icons.style`) to an action,
+    /// drawn at `menuWithIcons.itemIconPosition` and tinted like the label. Ignored on toggles
+    /// and separators.
+    pub fn with_style_icon(mut self, icon: Icon) -> Self {
+        if let Self::Action { style_icon, .. } = &mut self {
+            *style_icon = Some(icon);
+        }
+        self
+    }
+
+    /// The tdesktop vector icon attached with [`Self::with_style_icon`], if any.
+    #[must_use]
+    pub const fn style_icon(&self) -> Option<Icon> {
+        match self {
+            Self::Action { style_icon, .. } => *style_icon,
+            Self::Toggle { .. } | Self::Separator => None,
         }
     }
 
@@ -181,18 +223,23 @@ impl PopupMenuState {
 
         let menu_st = &style.menu;
         let has_any_icon = items.iter().any(|it| match it {
-            MenuItem::Action { icon, .. } | MenuItem::Toggle { icon, .. } => icon.is_some(),
+            MenuItem::Action {
+                icon, style_icon, ..
+            } => icon.is_some() || style_icon.is_some(),
+            MenuItem::Toggle { icon, .. } => icon.is_some(),
             MenuItem::Separator => false,
         });
-        let left_pad = if has_any_icon {
-            46.0
+        // `menuWithIcons`: itemPadding margins(54px, 8px, 17px, 8px).
+        let (left_pad, bottom_pad) = if has_any_icon {
+            (
+                menu_st.item_padding.left.max(MENU_WITH_ICONS_LEFT),
+                menu_st.item_padding.bottom.max(MENU_WITH_ICONS_BOTTOM),
+            )
         } else {
-            menu_st.item_padding.left
+            (menu_st.item_padding.left, menu_st.item_padding.bottom)
         };
         let font_id = menu_st.item_style.font.font_id();
-        let row_h = menu_st.item_padding.top
-            + menu_st.item_style.font.line_height()
-            + menu_st.item_padding.bottom;
+        let row_h = menu_st.item_padding.top + menu_st.item_style.font.line_height() + bottom_pad;
         let sep_h = menu_st.separator.padding.vertical() + menu_st.separator.width;
 
         // Compute natural width clamped to `[width_min, width_max]`.
@@ -291,6 +338,7 @@ impl PopupMenuState {
                             label,
                             shortcut,
                             icon,
+                            style_icon,
                             enabled,
                             attention,
                             has_submenu,
@@ -343,26 +391,30 @@ impl PopupMenuState {
                             };
                             let fg = with_alpha(fg, f64::from(anim_opacity));
 
-                            if let Some(ic) = icon {
-                                let icon_fg = if !*enabled {
-                                    menu_st.item_fg_disabled
-                                } else if *attention {
-                                    menu_st.item_fg_attention
-                                } else if selected {
-                                    menu_st.item_icon_fg_over
-                                } else {
-                                    menu_st.item_icon_fg
-                                };
+                            let icon_fg = if !*enabled {
+                                menu_st.item_fg_disabled
+                            } else if *attention {
+                                menu_st.item_fg_attention
+                            } else if selected {
+                                menu_st.item_icon_fg_over
+                            } else {
+                                menu_st.item_icon_fg
+                            };
+                            let icon_fg = with_alpha(icon_fg, f64::from(anim_opacity));
+                            if let Some(st_icon) = style_icon {
+                                paint_style_icon(
+                                    &clipped,
+                                    menu_icon_rect(item_rect),
+                                    *st_icon,
+                                    &DefaultPaletteResolver,
+                                    Some(icon_fg),
+                                );
+                            } else if let Some(ic) = icon {
                                 let icon_rect = Rect::from_center_size(
-                                    Pos2::new(item_rect.min.x + 24.0, item_rect.center().y),
+                                    menu_icon_rect(item_rect).center(),
                                     Vec2::splat(16.0),
                                 );
-                                paint_icon(
-                                    &clipped,
-                                    icon_rect,
-                                    *ic,
-                                    with_alpha(icon_fg, f64::from(anim_opacity)),
-                                );
+                                paint_icon(&clipped, icon_rect, *ic, icon_fg);
                             }
 
                             clipped.text(
@@ -437,7 +489,7 @@ impl PopupMenuState {
                             }
                             if let Some(ic) = icon {
                                 let icon_rect = Rect::from_center_size(
-                                    Pos2::new(item_rect.min.x + 24.0, item_rect.center().y),
+                                    menu_icon_rect(item_rect).center(),
                                     Vec2::splat(16.0),
                                 );
                                 paint_icon(

@@ -3,7 +3,7 @@
 //! Port origin: `Telegram/SourceFiles/chat_helpers/tabbed_selector.h` and
 //! `Telegram/SourceFiles/chat_helpers/tabbed_selector.cpp`.
 
-use egui::{Align2, CornerRadius, Key, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{CornerRadius, Key, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use tg_chat::{DocumentId, StickerSetId};
 use tg_emoji::EmojiTextureCache;
 use tg_lang::tr;
@@ -11,7 +11,9 @@ use tg_ui::fonts::font_id_from_style;
 use tg_ui::tg_style::st;
 
 use crate::chat_helpers::backend::ChatHelpersBackend;
-use crate::chat_helpers::emoji_list_widget::{EmojiListEvent, EmojiListWidget};
+use crate::chat_helpers::emoji_list_widget::{
+    EmojiListEvent, EmojiListWidget, is_docked_panel, theme_color,
+};
 use crate::chat_helpers::gifs_list_widget::{GifsListEvent, GifsListWidget};
 use crate::chat_helpers::stickers_list_widget::{
     StickerMediaCache, StickersListEvent, StickersListWidget,
@@ -113,6 +115,8 @@ pub enum ChatHelpersEvent {
     StickerSetInstalled(StickerSetId),
     /// User uninstalled a sticker set.
     StickerSetRemoved(StickerSetId),
+    /// User cleared recent stickers (`messages.clearRecentStickers`).
+    RecentStickersCleared,
     /// User requested closing the panel (e.g. via Escape).
     CloseRequested,
 }
@@ -210,6 +214,12 @@ impl TabbedSelector {
     /// Mutable access to the inner [`GifsListWidget`].
     pub fn gifs_list_mut(&mut self) -> &mut GifsListWidget {
         &mut self.gifs_list
+    }
+
+    /// Returns `true` once after the Stickers footer settings button was clicked; the host
+    /// then opens the installed sticker sets box (`StickersBox`).
+    pub fn take_sticker_settings_requested(&mut self) -> bool {
+        self.stickers_list.take_settings_requested()
     }
 
     /// Mutable access to the shared [`StickerMediaCache`] (useful for autocomplete previews).
@@ -366,25 +376,34 @@ impl TabbedSelector {
     }
 
     fn paint_tab_bar(&mut self, ui: &mut Ui, tab_bar_rect: Rect, now: f64, palette: &Palette) {
+        // `emojiTabs` = `defaultTabsSlider`: equal sections, semibold labels at `labelTop`,
+        // `lightButtonFg` for the active label and a `barStroke` bar from `barTop` snapped to
+        // the active label width (`barSnapToLabel`).
+        let slider = &st::default_tabs_slider;
+        let docked = is_docked_panel(ui.ctx());
+        let r = if docked {
+            0
+        } else {
+            st::emoji_pan_radius.0 as u8
+        };
         ui.painter().rect_filled(
             tab_bar_rect,
             CornerRadius {
-                nw: 8,
-                ne: 8,
+                nw: r,
+                ne: r,
                 sw: 0,
                 se: 0,
             },
             palette.window_bg,
         );
-        ui.painter().line_segment(
-            [
-                Pos2::new(tab_bar_rect.left(), tab_bar_rect.bottom()),
-                Pos2::new(tab_bar_rect.right(), tab_bar_rect.bottom()),
-            ],
-            Stroke::new(1.0, palette.divider),
-        );
+
+        let font = font_id_from_style(slider.label_style.font);
+        let label_fg = theme_color(ui.ctx(), "windowSubTextFg", palette.window_sub_text_fg);
+        let label_fg_active = theme_color(ui.ctx(), "lightButtonFg", palette.window_active_text_fg);
+        let bar_fg = theme_color(ui.ctx(), "sliderBgActive", palette.window_bg_active);
 
         let tab_w = tab_bar_rect.width() / SelectorTab::ALL.len() as f32;
+        let mut label_widths = [0.0f32; 3];
         for (idx, tab) in SelectorTab::ALL.iter().copied().enumerate() {
             let slot = Rect::from_min_size(
                 Pos2::new(tab_bar_rect.left() + idx as f32 * tab_w, tab_bar_rect.top()),
@@ -396,44 +415,48 @@ impl TabbedSelector {
                 Sense::click(),
             );
             let active = self.active_tab == tab;
-            if resp.hovered() && !active {
-                ui.painter().rect_filled(
-                    slot.shrink2(Vec2::new(4.0, 4.0)),
-                    CornerRadius::same(6),
-                    palette.window_bg_over,
-                );
-            }
-            let text_color = if active {
-                palette.window_active_text_fg
-            } else if resp.hovered() {
-                palette.window_fg
-            } else {
-                palette.window_sub_text_fg
-            };
-            ui.painter().text(
-                slot.center(),
-                Align2::CENTER_CENTER,
+            let galley = ui.painter().layout_no_wrap(
                 tab.label(),
-                font_id_from_style(st::default_tabs_slider.label_style.font),
-                text_color,
+                font.clone(),
+                if active { label_fg_active } else { label_fg },
+            );
+            label_widths[idx] = galley.size().x;
+            ui.painter().galley(
+                Pos2::new(
+                    slot.center().x - galley.size().x / 2.0,
+                    slot.top() + slider.label_top.0 as f32,
+                ),
+                galley,
+                label_fg,
             );
             if resp.clicked() {
                 self.switch_tab(tab, now);
             }
         }
 
-        // Animated active tab indicator bar along the bottom edge.
-        let ind_pos = self.indicator_position(now);
-        let ind_margin = 16.0f32;
-        let ind_x = tab_bar_rect.left() + ind_pos * tab_w + ind_margin;
-        let ind_w = (tab_w - ind_margin * 2.0).max(20.0);
+        // Animated active bar, interpolated between label positions and widths.
+        let ind_pos = self.indicator_position(now).clamp(0.0, 2.0);
+        let lo = ind_pos.floor() as usize;
+        let hi = (lo + 1).min(2);
+        let t = ind_pos - lo as f32;
+        let width = label_widths[lo] + (label_widths[hi] - label_widths[lo]) * t;
+        let center_x = tab_bar_rect.left() + (ind_pos + 0.5) * tab_w;
+        let bar_top = tab_bar_rect.top() + slider.bar_top.0 as f32;
+        let bar_bottom = (bar_top + slider.bar_stroke.0 as f32).min(tab_bar_rect.bottom());
         ui.painter().rect_filled(
-            Rect::from_min_size(
-                Pos2::new(ind_x, tab_bar_rect.bottom() - 2.5),
-                Vec2::new(ind_w, 2.5),
+            Rect::from_min_max(
+                Pos2::new(center_x - width / 2.0, bar_top),
+                Pos2::new(center_x + width / 2.0, bar_bottom),
             ),
-            CornerRadius::same(1),
-            palette.window_bg_active,
+            CornerRadius::same(slider.bar_radius.0 as u8),
+            bar_fg,
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(tab_bar_rect.left(), tab_bar_rect.bottom()),
+                Pos2::new(tab_bar_rect.right(), tab_bar_rect.bottom()),
+            ],
+            Stroke::new(1.0, theme_color(ui.ctx(), "shadowFg", palette.divider)),
         );
     }
 }
@@ -453,5 +476,6 @@ fn map_sticker_event(ev: StickersListEvent) -> ChatHelpersEvent {
         },
         StickersListEvent::SetInstalled(id) => ChatHelpersEvent::StickerSetInstalled(id),
         StickersListEvent::SetRemoved(id) => ChatHelpersEvent::StickerSetRemoved(id),
+        StickersListEvent::RecentCleared => ChatHelpersEvent::RecentStickersCleared,
     }
 }

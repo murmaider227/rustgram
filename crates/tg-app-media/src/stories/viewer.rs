@@ -68,6 +68,7 @@ pub struct StoryViewerOverlay {
     toast_text: Option<(String, i64)>,
     edit_story_requested: Option<FullStoryId>,
     premium_requested: bool,
+    update_app_requested: bool,
     sibling_slide_offset: f32,
     last_shown_peer: Option<PeerId>,
     views_loaded_limit: usize,
@@ -98,6 +99,7 @@ impl StoryViewerOverlay {
             toast_text: None,
             edit_story_requested: None,
             premium_requested: false,
+            update_app_requested: false,
             sibling_slide_offset: 0.0,
             last_shown_peer: None,
             views_loaded_limit: VIEWS_MENU_ADD_PER_PAGE,
@@ -149,6 +151,13 @@ impl StoryViewerOverlay {
     /// Stealth Mode box when the account lacks Premium).
     pub const fn take_premium_request(&mut self) -> bool {
         std::mem::replace(&mut self.premium_requested, false)
+    }
+
+    /// Consumes a pending request to check for application updates (`Core::UpdateApplication`
+    /// emitted by clicking `"Update Rustgram"` on an unsupported story card, matching
+    /// `Controller::Unsupported` in `media_stories_controller.cpp:287-289`).
+    pub const fn take_update_app_request(&mut self) -> bool {
+        std::mem::replace(&mut self.update_app_requested, false)
     }
 
     /// Opens a peer's stories in `context` starting at `peer_id`'s first unread (or first) story.
@@ -833,26 +842,27 @@ impl StoryViewerOverlay {
     ) {
         let painter = ui.painter();
         let rounding = CornerRadius::same(STORIES_RADIUS as u8);
-        painter.rect_filled(content_rect, rounding, Color32::from_rgb(0x14, 0x1A, 0x22));
+        let bg_color = if story.unsupported() {
+            // `st::storiesComposeBg` (`Controller::Unsupported`, `media_stories_controller.cpp:234`).
+            Color32::from_rgb(0x21, 0x21, 0x21)
+        } else {
+            Color32::from_rgb(0x14, 0x1A, 0x22)
+        };
+        painter.rect_filled(content_rect, rounding, bg_color);
 
         let full_id = story.full_id();
+        let mut unsupported_btn_rect: Option<Rect> = None;
 
         if story.unsupported() {
-            // Unsupported story card (`Controller::Unsupported` in `media_stories_controller.cpp:230-290`).
-            painter.text(
-                Pos2::new(content_rect.center().x, content_rect.center().y - 16.0),
-                Align2::CENTER_CENTER,
-                "This story is not supported yet",
-                FontId::proportional(15.0),
-                Color32::WHITE,
-            );
-            painter.text(
-                Pos2::new(content_rect.center().x, content_rect.center().y + 12.0),
-                Align2::CENTER_CENTER,
-                "Please update Rustgram to view it.",
-                FontId::proportional(12.5),
-                Color32::from_rgb(0x9A, 0xAA, 0xBA),
-            );
+            // Reserve button geometry here so `interact_rect` excludes it from tap-navigation;
+            // the label and interactive button are painted after the scrims/interact layer so
+            // they sit on top and receive pointer clicks cleanly (`Controller::Unsupported` in
+            // `media_stories_controller.cpp:230-290` + `media_view.style:1033-1047`).
+            let text_max_w = (content_rect.width() - 48.0).max(160.0);
+            let label_galley = layout_unsupported_story_label(painter, text_max_w);
+            let (_, btn_rect) =
+                compute_unsupported_story_rects(content_rect, label_galley.size().y);
+            unsupported_btn_rect = Some(btn_rect);
         } else if let Some(vid_tex) = media_cache.active_video_mut_ref_tex(full_id) {
             painter.image(
                 vid_tex.id(),
@@ -990,6 +1000,57 @@ impl StoryViewerOverlay {
             hovered_norm,
         );
 
+        // Paint unsupported-story label and interactive "Update Rustgram" button above the
+        // content interaction layer so clicks hit the button directly (`Controller::Unsupported`,
+        // `media_stories_controller.cpp:253-289`, `media_view.style:1033-1047`).
+        if story.unsupported() {
+            let text_max_w = (content_rect.width() - 48.0).max(160.0);
+            let label_galley = layout_unsupported_story_label(ui.painter(), text_max_w);
+            let (text_pos, btn_rect) =
+                compute_unsupported_story_rects(content_rect, label_galley.size().y);
+            ui.painter().galley(text_pos, label_galley, Color32::WHITE);
+
+            let update_label = tg_lang::tr::lng_update_telegram().replace("Telegram", "Rustgram");
+            let btn_resp = ui.interact(
+                btn_rect,
+                ui.scope_id()
+                    .with(("story_unsupported_update", full_id.story)),
+                Sense::click(),
+            );
+            btn_resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, update_label.clone())
+            });
+            if btn_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let btn_bg = if btn_resp.hovered() {
+                Color32::from_rgb(0x34, 0x97, 0xC9)
+            } else {
+                Color32::from_rgb(0x39, 0xA5, 0xDB)
+            };
+            ui.painter()
+                .rect_filled(btn_rect, CornerRadius::same(6), btn_bg);
+            if btn_resp.has_focus() {
+                ui.painter().rect_stroke(
+                    btn_rect.expand(2.0),
+                    CornerRadius::same(8),
+                    Stroke::new(2.0, Color32::WHITE),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            ui.painter().text(
+                btn_rect.center(),
+                Align2::CENTER_CENTER,
+                update_label,
+                FontId::new(14.0, tg_ui::fonts::family_semibold()),
+                Color32::WHITE,
+            );
+            if btn_resp.clicked() {
+                self.update_app_requested = true;
+                self.show_toast("Checking for Rustgram updates\u{2026}".to_owned(), now_ms);
+            }
+        }
+
         // Dim story canvas when reply composer or expanded caption is active (`kFullContentFade`).
         if self.controller.is_content_faded() {
             painter.rect_filled(
@@ -1015,7 +1076,9 @@ impl StoryViewerOverlay {
                 let was_hold = held_ms >= HOLD_TO_PAUSE_THRESHOLD_MS;
                 self.controller.content_pressed(false, now_ms);
                 if !was_hold && let Some(pos) = self.press_started_pos.take() {
-                    if self.controller.is_caption_expanded() {
+                    if unsupported_btn_rect.is_some_and(|r| r.contains(pos)) {
+                        // Click handled by the "Update Rustgram" CTA button above.
+                    } else if self.controller.is_caption_expanded() {
                         self.controller.caption_closed(now_ms);
                     } else if let Some((nx, ny)) = normalized_in(content_rect, pos)
                         && let Some(hit) = self.controller.hit_test_area(store, nx, ny)
@@ -2120,6 +2183,49 @@ fn paint_vertical_scrim(painter: &Painter, rect: Rect, top_alpha: u8, bottom_alp
     });
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(egui::Shape::mesh(mesh));
+}
+
+fn layout_unsupported_story_label(
+    painter: &Painter,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob {
+        halign: egui::Align::Center,
+        wrap: egui::text::TextWrapping {
+            max_width,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    job.append(
+        "This story is not supported\nby your version of Rustgram.",
+        0.0,
+        egui::text::TextFormat {
+            font_id: FontId::new(14.0, tg_ui::fonts::family_regular()),
+            color: Color32::WHITE,
+            line_height: Some(21.0),
+            ..Default::default()
+        },
+    );
+    painter.layout_job(job)
+}
+
+fn compute_unsupported_story_rects(content_rect: Rect, label_height: f32) -> (Pos2, Rect) {
+    let top_pad = 24.0_f32; // `st::storiesUnsupportedTop`
+    let skip = 18.0_f32; // `st::storiesUnsupportedSkip`
+    let btn_h = 42.0_f32; // `st::storiesUnsupportedUpdate.height`
+    let btn_w = (content_rect.width() - 102.0).clamp(160.0, 260.0);
+    let total_h = top_pad + label_height + skip + btn_h;
+    let block_top = content_rect.top() + (content_rect.height() - total_h) * 0.5;
+    let text_pos = Pos2::new(content_rect.center().x, block_top + top_pad);
+    let btn_rect = Rect::from_min_size(
+        Pos2::new(
+            content_rect.center().x - btn_w * 0.5,
+            block_top + total_h - btn_h,
+        ),
+        Vec2::new(btn_w, btn_h),
+    );
+    (text_pos, btn_rect)
 }
 
 fn paint_header_icon_button(

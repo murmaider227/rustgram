@@ -59,7 +59,8 @@ use crate::dsp::{DEFAULT_VOICE_BITRATE_BPS, VoiceDsp, VoiceDspConfig, VoiceOpusE
 use crate::error::{VoipError, VoipResult};
 use crate::group::broadcast::{BroadcastChunkLoader, BroadcastChunkScale, BroadcastStreamPlayer};
 use crate::group::dtls_srtp::{
-    DtlsIdentity, DtlsSrtpSession, WebRtcPacketKind, classify_webrtc_packet, is_rtcp_packet,
+    DtlsIdentity, DtlsSrtpSession, WebRtcPacketKind, classify_webrtc_packet,
+    has_valid_sha256_fingerprint, is_rtcp_packet,
 };
 use crate::group::ice::{
     IceLiteClient, IceStunOutcome, LocalIceCredentials, build_group_join_payload,
@@ -458,6 +459,11 @@ impl GroupMediaEngine {
             .map_err(|e| VoipError::GroupCall(format!("invalid join response JSON: {e}")))?;
         match parsed {
             ParsedJoinResponse::Rtc { params, .. } => {
+                if !has_valid_sha256_fingerprint(&params.transport.fingerprints) {
+                    return Err(VoipError::Dtls(
+                        "SFU join response missing expected SHA-256 DTLS fingerprint".into(),
+                    ));
+                }
                 self.send_cmd(GroupCommand::ApplyRtcJoinResponse(params));
             }
             ParsedJoinResponse::BroadcastStream { .. } => {
@@ -687,6 +693,23 @@ async fn run_group_loop(
                             .map(|e| e.id as u8)
                             .or(Some(1));
 
+                        let session = match DtlsSrtpSession::new(
+                            &identity,
+                            true,
+                            resp.transport.fingerprints.clone(),
+                            Instant::now(),
+                        ) {
+                            Ok(session) => session,
+                            Err(e) => {
+                                ice = None;
+                                dtls_srtp = None;
+                                dtls_timeout = None;
+                                is_connected = false;
+                                let _ = event_tx.send(GroupMediaEvent::Error(e.to_string()));
+                                continue;
+                            }
+                        };
+
                         match IceLiteClient::from_join_response(creds.clone(), &resp) {
                             Ok(mut ice_client) => {
                                 let checks = ice_client.poll_outgoing_checks(elapsed_ms());
@@ -696,28 +719,20 @@ async fn run_group_loop(
                                 ice = Some(ice_client);
                             }
                             Err(e) => {
+                                ice = None;
+                                dtls_srtp = None;
+                                dtls_timeout = None;
+                                is_connected = false;
                                 let _ = event_tx.send(GroupMediaEvent::Error(e.to_string()));
                                 continue;
                             }
                         }
 
-                        match DtlsSrtpSession::new(
-                            &identity,
-                            true,
-                            resp.transport.fingerprints.clone(),
-                            Instant::now(),
-                        ) {
-                            Ok(session) => {
-                                dtls_srtp = Some(session);
-                                dtls_timeout = None;
-                                rtp_seq = 0;
-                                rtp_ts = 0;
-                                is_connected = false;
-                            }
-                            Err(e) => {
-                                let _ = event_tx.send(GroupMediaEvent::Error(e.to_string()));
-                            }
-                        }
+                        dtls_srtp = Some(session);
+                        dtls_timeout = None;
+                        rtp_seq = 0;
+                        rtp_ts = 0;
+                        is_connected = false;
                     }
                     GroupCommand::StartBroadcastStream => {
                         mode = InstanceMode::Stream;
@@ -1233,6 +1248,51 @@ mod tests {
             seen_ssrc2,
             Some(ssrc2),
             "rejoin must send RTP with regenerated SSRC instead of stale worker SSRC"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sec2c_w2_engine_rejects_empty_dtls_fingerprints() {
+        let mut engine = GroupMediaEngine::with_current_runtime(GroupMediaConfig {
+            audio_backend: AudioBackendKind::Virtual,
+            virtual_ring_capacity: VOIP_SAMPLE_RATE as usize * 4,
+            dsp: VoiceDspConfig::bypass(),
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            initial_muted: true,
+            ..GroupMediaConfig::default()
+        })
+        .unwrap();
+
+        let resp = RtcJoinResponse {
+            transport: JoinResponseTransport {
+                ufrag: "sfu_uf".into(),
+                pwd: "sfu_password_1234567890".into(),
+                fingerprints: Vec::new(),
+                candidates: vec![IceCandidateParam {
+                    port: "45678".into(),
+                    protocol: "udp".into(),
+                    network: "0".into(),
+                    generation: "0".into(),
+                    id: "1".into(),
+                    component: "1".into(),
+                    foundation: "1".into(),
+                    priority: "2130706431".into(),
+                    ip: "127.0.0.1".into(),
+                    kind: "host".into(),
+                }],
+                rtcp_mux: true,
+            },
+            audio: JoinResponseMediaSection::default(),
+            video: JoinResponseMediaSection::default(),
+        };
+        let join_json = serde_json::to_string(&resp).unwrap();
+        let err = engine
+            .set_join_response_payload(&join_json)
+            .expect_err("RTC join response with empty DTLS fingerprints must fail closed");
+        engine.stop_async().await;
+        assert!(
+            err.to_string().contains("fingerprint"),
+            "expected fingerprint rejection error, got: {err}"
         );
     }
 }

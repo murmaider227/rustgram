@@ -36,6 +36,72 @@ pub enum SponsoredBannerAction {
     Dismiss(Vec<u8>),
 }
 
+/// Resolved header bounding boxes for [`paint_sponsored_banner`] (used for narrow-viewport checks).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SponsoredHeaderLayout {
+    /// Clipped title region.
+    pub title_rect: Rect,
+    /// `"Sponsored"` / `"Recommended"` badge rect.
+    pub badge_rect: Rect,
+    /// `"What's this?"` / compact `"?"` info button rect.
+    pub about_rect: Rect,
+    /// Optional `"Report"` button rect.
+    pub report_rect: Option<Rect>,
+    /// `"Hide Ads"` / `"Remove Ads"` (or compact `"Hide"`) button rect.
+    pub hide_rect: Rect,
+}
+
+/// Computes non-overlapping header rects for [`paint_sponsored_banner`].
+#[must_use]
+pub fn compute_sponsored_header_layout(
+    rect: Rect,
+    recommended: bool,
+    can_report: bool,
+) -> SponsoredHeaderLayout {
+    let card_rect = rect.shrink2(Vec2::new(10.0, 4.0));
+    let compact = card_rect.width() < 460.0;
+    let left = card_rect.left() + 12.0;
+    let top = card_rect.top() + 8.0;
+
+    let mut rx = card_rect.right() - 10.0;
+    let hide_w = if compact { 38.0 } else { 70.0 };
+    let hide_rect = Rect::from_min_size(Pos2::new(rx - hide_w, top - 1.0), Vec2::new(hide_w, 19.0));
+    rx -= hide_w + 6.0;
+
+    let report_rect = if can_report {
+        let rep_w = 42.0;
+        let r = Rect::from_min_size(Pos2::new(rx - rep_w, top - 1.0), Vec2::new(rep_w, 19.0));
+        rx -= rep_w + 6.0;
+        Some(r)
+    } else {
+        None
+    };
+
+    let about_w = if compact { 20.0 } else { 68.0 };
+    let about_rect =
+        Rect::from_min_size(Pos2::new(rx - about_w, top - 1.0), Vec2::new(about_w, 19.0));
+    let header_right = (about_rect.left() - 8.0).max(left + 72.0);
+
+    let badge_w = if recommended { 84.0 } else { 64.0 };
+    let max_title_w = (header_right - left - badge_w - 6.0).max(24.0);
+    let title_rect = Rect::from_min_size(Pos2::new(left, top), Vec2::new(max_title_w, 18.0));
+    let badge_rect = Rect::from_min_size(
+        Pos2::new(title_rect.right() + 6.0, top),
+        Vec2::new(
+            badge_w.min((header_right - title_rect.right() - 6.0).max(0.0)),
+            17.0,
+        ),
+    );
+
+    SponsoredHeaderLayout {
+        title_rect,
+        badge_rect,
+        about_rect,
+        report_rect,
+        hide_rect,
+    }
+}
+
 /// Paints a channel/bot sponsored message banner inside `rect`.
 pub fn paint_sponsored_banner(
     ui: &mut Ui,
@@ -46,6 +112,7 @@ pub fn paint_sponsored_banner(
 ) -> Option<SponsoredBannerAction> {
     let mut action = None;
     let card_rect = rect.shrink2(Vec2::new(10.0, 4.0));
+    let compact = card_rect.width() < 460.0;
     ui.painter()
         .rect_filled(card_rect, CornerRadius::same(10), colors.msg_in_bg);
     ui.painter().rect_stroke(
@@ -62,24 +129,42 @@ pub fn paint_sponsored_banner(
 
     let left = card_rect.left() + 12.0;
     let top = card_rect.top() + 8.0;
+    let hdr = compute_sponsored_header_layout(rect, item.recommended, item.can_report);
 
-    // Header: Title + "Sponsored" / "Recommended" pill
-    let title_galley = ui.painter().layout_no_wrap(
-        item.title.clone(),
-        FontId::proportional(13.0),
+    // Header: ellipsized Title + "Sponsored" / "Recommended" pill cleanly bounded left of actions
+    let title_font = FontId::proportional(13.0);
+    let (title_display, title_truncated) = crate::history::bars::ellipsize_to_width(
+        ui.painter(),
+        &item.title,
+        &title_font,
+        hdr.title_rect.width(),
+    );
+    let title_galley = ui
+        .painter()
+        .layout_no_wrap(title_display, title_font, colors.bold_fg);
+    let actual_title_w = title_galley.size().x.min(hdr.title_rect.width());
+    ui.painter().with_clip_rect(hdr.title_rect).galley(
+        hdr.title_rect.min,
+        title_galley,
         colors.bold_fg,
     );
-    let title_w = title_galley.size().x;
-    ui.painter()
-        .galley(Pos2::new(left, top), title_galley, colors.bold_fg);
+    if title_truncated {
+        let _ = ui
+            .interact(
+                hdr.title_rect,
+                Id::unique(("tg_sponsored_title", &item.random_id)),
+                Sense::hover(),
+            )
+            .on_hover_text(&item.title);
+    }
 
-    let badge_rect = Rect::from_min_size(
-        Pos2::new(left + title_w + 8.0, top),
-        Vec2::new(if item.recommended { 88.0 } else { 68.0 }, 17.0),
-    );
+    let badge_w = hdr.badge_rect.width();
+    let badge_x = (left + actual_title_w + 6.0).min(hdr.about_rect.left() - 8.0 - badge_w);
+    let badge_rect =
+        Rect::from_min_size(Pos2::new(badge_x.max(left), top), Vec2::new(badge_w, 17.0));
     ui.painter()
         .rect_filled(badge_rect, CornerRadius::same(5), colors.reaction_in_bg);
-    ui.painter().text(
+    ui.painter().with_clip_rect(badge_rect).text(
         badge_rect.center(),
         Align2::CENTER_CENTER,
         item.badge_label(),
@@ -87,36 +172,33 @@ pub fn paint_sponsored_banner(
         colors.active_text_fg,
     );
 
-    // Top-right small controls: "What's this?", "Report", "Hide Ads"
-    let mut rx = card_rect.right() - 10.0;
-    let hide_label = if is_premium { "Hide Ads" } else { "Remove Ads" };
-    let hide_w = 70.0;
-    let hide_rect = Rect::from_min_size(Pos2::new(rx - hide_w, top - 1.0), Vec2::new(hide_w, 19.0));
+    // Top-right small controls: "What's this?" (compact "?" at narrow), "Report", "Hide/Remove Ads"
+    let full_hide_label = if is_premium { "Hide Ads" } else { "Remove Ads" };
+    let visible_hide_label = if compact { "Hide" } else { full_hide_label };
+    let hide_rect = hdr.hide_rect;
     let hide_resp = ui.interact(
         hide_rect,
         Id::unique(("tg_sponsored_hide", &item.random_id)),
         Sense::click(),
     );
-    hide_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, hide_label));
+    hide_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, full_hide_label));
     if hide_resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        ui.painter()
+            .rect_filled(hide_rect, CornerRadius::same(4), colors.bar_bg_over);
     }
     ui.painter().text(
         hide_rect.center(),
         Align2::CENTER_CENTER,
-        hide_label,
+        visible_hide_label,
         FontId::proportional(11.0),
         colors.sub_text_fg,
     );
-    if hide_resp.clicked() {
+    if hide_resp.on_hover_text(full_hide_label).clicked() {
         action = Some(SponsoredBannerAction::HideAds);
     }
-    rx -= hide_w + 6.0;
 
-    if item.can_report {
-        let rep_w = 46.0;
-        let rep_rect =
-            Rect::from_min_size(Pos2::new(rx - rep_w, top - 1.0), Vec2::new(rep_w, 19.0));
+    if let Some(rep_rect) = hdr.report_rect {
         let rep_resp = ui.interact(
             rep_rect,
             Id::unique(("tg_sponsored_report", &item.random_id)),
@@ -125,6 +207,8 @@ pub fn paint_sponsored_banner(
         rep_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Report Ad"));
         if rep_resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            ui.painter()
+                .rect_filled(rep_rect, CornerRadius::same(4), colors.bar_bg_over);
         }
         ui.painter().text(
             rep_rect.center(),
@@ -133,15 +217,12 @@ pub fn paint_sponsored_banner(
             FontId::proportional(11.0),
             colors.sub_text_fg,
         );
-        if rep_resp.clicked() {
+        if rep_resp.on_hover_text("Report Ad").clicked() {
             action = Some(SponsoredBannerAction::OpenReport(item.random_id.clone()));
         }
-        rx -= rep_w + 6.0;
     }
 
-    let about_w = 68.0;
-    let about_rect =
-        Rect::from_min_size(Pos2::new(rx - about_w, top - 1.0), Vec2::new(about_w, 19.0));
+    let about_rect = hdr.about_rect;
     let about_resp = ui.interact(
         about_rect,
         Id::unique(("tg_sponsored_about", &item.random_id)),
@@ -151,20 +232,33 @@ pub fn paint_sponsored_banner(
         .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "About Sponsored"));
     if about_resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        if compact {
+            ui.painter()
+                .circle_filled(about_rect.center(), 9.5, colors.bar_bg_over);
+        } else {
+            ui.painter()
+                .rect_filled(about_rect, CornerRadius::same(4), colors.bar_bg_over);
+        }
+    } else if compact {
+        ui.painter().circle_stroke(
+            about_rect.center(),
+            8.5,
+            Stroke::new(1.0, colors.active_text_fg),
+        );
     }
     ui.painter().text(
         about_rect.center(),
         Align2::CENTER_CENTER,
-        "What's this?",
+        if compact { "?" } else { "What's this?" },
         FontId::proportional(11.0),
         colors.active_text_fg,
     );
-    if about_resp.clicked() {
+    if about_resp.on_hover_text("What's this?").clicked() {
         action = Some(SponsoredBannerAction::OpenAbout);
     }
 
     // Body snippet + CTA button
-    let cta_w = 112.0;
+    let cta_w = if compact { 92.0 } else { 112.0 };
     let body_w = (card_rect.width() - cta_w - 30.0).max(80.0);
     let body_rect = Rect::from_min_size(Pos2::new(left, top + 22.0), Vec2::new(body_w, 34.0));
     let body_galley = ui.painter().layout(
@@ -177,13 +271,20 @@ pub fn paint_sponsored_banner(
         .with_clip_rect(body_rect)
         .galley(body_rect.min, body_galley, colors.text_fg);
 
-    // Optional sponsor attribution line
+    // Optional sponsor attribution line (clipped cleanly to body_w so it never touches CTA)
     if let Some(ref info) = item.sponsor_info {
-        ui.painter().text(
+        let info_font = FontId::proportional(10.5);
+        let (info_text, _) =
+            crate::history::bars::ellipsize_to_width(ui.painter(), info, &info_font, body_w);
+        let info_clip = Rect::from_min_size(
             Pos2::new(left, card_rect.bottom() - 16.0),
+            Vec2::new(body_w, 15.0),
+        );
+        ui.painter().with_clip_rect(info_clip).text(
+            info_clip.min,
             Align2::LEFT_TOP,
-            info,
-            FontId::proportional(10.5),
+            info_text,
+            info_font,
             colors.sub_text_fg,
         );
     }

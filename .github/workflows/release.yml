@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version without leading 'v' (e.g. 0.1.0 or 0.2.0-beta.1)"
+        description: "Release version without leading 'v' (e.g. 0.1.0-alpha.1 or 0.1.0)"
         required: true
         type: string
 
@@ -20,7 +20,7 @@ env:
 
 jobs:
   release-windows:
-    name: Build & Publish Windows Release
+    name: Build & Stage Windows Release Draft
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -45,12 +45,41 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_PATH -Value $isccDir
 
+      - name: Setup FFmpeg shared development build
+        shell: pwsh
+        run: |
+          $ffmpegArchive = "ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+          $baseUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+          $workDir = Join-Path $env:RUNNER_TEMP "ffmpeg-download"
+          New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+          $zipPath = Join-Path $workDir $ffmpegArchive
+          $sumsPath = Join-Path $workDir "checksums.sha256"
+          Invoke-WebRequest -Uri "$baseUrl/checksums.sha256" -OutFile $sumsPath
+          Invoke-WebRequest -Uri "$baseUrl/$ffmpegArchive" -OutFile $zipPath
+          $expectedLine = Get-Content $sumsPath | Where-Object { $_ -match ([regex]::Escape($ffmpegArchive) + '$') } | Select-Object -First 1
+          if (-not $expectedLine) {
+            throw "Could not find $ffmpegArchive in BtbN checksums.sha256"
+          }
+          $expectedHash = ($expectedLine -split '\s+')[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "FFmpeg SHA-256 mismatch: expected $expectedHash, got $actualHash"
+          }
+          $extractRoot = Join-Path $env:RUNNER_TEMP "ffmpeg-extract"
+          Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+          $ffmpegDir = (Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1).FullName
+          if (-not (Test-Path (Join-Path $ffmpegDir "include\libavcodec\avcodec.h"))) {
+            throw "Extracted FFmpeg directory is missing headers: $ffmpegDir"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "FFMPEG_DIR=$ffmpegDir"
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $ffmpegDir "bin")
+
       - name: Resolve release metadata
         id: meta
         shell: pwsh
         run: |
           if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $version = "${{ inputs.version }}"
+            $version = "${{ inputs.version }}" -replace '^v', ''
             $tag = "v$version"
           } else {
             $tag = $env:GITHUB_REF_NAME
@@ -63,12 +92,18 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "prerelease=$isPrerelease"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "channel=$channel"
 
+      - name: Require the updater public key
+        shell: pwsh
+        run: |
+          if (-not '${{ vars.RUSTGRAM_UPDATE_PUBKEY }}') { throw 'Repository variable RUSTGRAM_UPDATE_PUBKEY is not set' }
+
       - name: Build distribution artifacts (portable zip, installer, update package)
         shell: pwsh
         env:
           RUSTGRAM_API_ID: ${{ secrets.RUSTGRAM_API_ID }}
           RUSTGRAM_API_HASH: ${{ secrets.RUSTGRAM_API_HASH }}
           RUSTGRAM_UPDATER_SIGNING_KEY: ${{ secrets.RUSTGRAM_UPDATER_SIGNING_KEY }}
+          RUSTGRAM_UPDATE_PUBKEY: ${{ vars.RUSTGRAM_UPDATE_PUBKEY }}
         run: |
           cargo run --release -p tg-xtask -- dist `
             --version "${{ steps.meta.outputs.version }}" `
@@ -83,6 +118,7 @@ jobs:
           $required = @(
             "dist/Rustgram-Setup-$v-win-x64.exe",
             "dist/rustgram-$v-win-x64-portable.zip",
+            "dist/rustgram-$v-win-x64.tupdate",
             "dist/SHA256SUMS.txt"
           )
           foreach ($f in $required) {
@@ -92,16 +128,17 @@ jobs:
           }
           Get-ChildItem dist
 
-      - name: Publish GitHub Release
+      - name: Create Draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: Rustgram ${{ steps.meta.outputs.tag }}
+          draft: true
           prerelease: ${{ steps.meta.outputs.prerelease }}
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
           files: |
-            dist/Rustgram-Setup-*-win-x64.exe
-            dist/rustgram-*-win-x64-portable.zip
-            dist/rustgram-*-win-x64.tupdate
+            dist/Rustgram-Setup-${{ steps.meta.outputs.version }}-win-x64.exe
+            dist/rustgram-${{ steps.meta.outputs.version }}-win-x64-portable.zip
+            dist/rustgram-${{ steps.meta.outputs.version }}-win-x64.tupdate
             dist/SHA256SUMS.txt

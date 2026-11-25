@@ -1,7 +1,12 @@
-//! Share / Forward to multiple chats modal box with 4-column avatar grid and comment input.
+//! Share / Forward to multiple chats modal box.
 //!
-//! Port origin: `Telegram/SourceFiles/boxes/share_box.h`
-//! and `Telegram/SourceFiles/boxes/share_box.cpp` (`ShareBox`, `_columnCount = 4`).
+//! Sharing a link or files uses the 4-column avatar grid with a comment input
+//! (`ShareBox`, `_columnCount = 4`); forwarding messages uses the "Forward to..." recipient list
+//! (`ChooseRecipientBoxController` in a `PeerListBox`, `window_peer_menu.cpp`).
+//!
+//! Port origin: `Telegram/SourceFiles/boxes/share_box.h`,
+//! `Telegram/SourceFiles/boxes/share_box.cpp`,
+//! and `Telegram/SourceFiles/boxes/peer_list_controllers.cpp`.
 
 use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use tg_lang::tr;
@@ -18,6 +23,17 @@ use crate::boxes::strings;
 use crate::info::backend::{InfoBackend, InfoPeerKind, PeerProfile};
 use tg_app_core::media::backend::MediaItemId;
 use tg_app_core::stand_in::types::PeerId;
+
+/// One chat folder tab above the "Forward to..." list (`Ui::AddChatFiltersTabsStrip`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareFolderTab {
+    /// Folder id; `0` is the "All" tab that lists every chat.
+    pub id: i32,
+    /// Tab label (`lng_filters_all_short` for the "All" tab).
+    pub title: String,
+    /// Chats in this folder (unused for the "All" tab).
+    pub peers: Vec<PeerId>,
+}
 
 /// State for the Share / Forward modal (`ShareBox`).
 #[derive(Debug, Clone)]
@@ -37,6 +53,15 @@ pub struct ShareBoxState {
     pub comment: String,
     /// Validation error message.
     pub error: Option<String>,
+    /// Chat the forwarded messages come from (set for "Forward to...").
+    pub from_peer: Option<PeerId>,
+    /// Chat folder tabs shown above the forward list when there is more than one.
+    pub folder_tabs: Vec<ShareFolderTab>,
+    /// Active folder tab id (`0` = "All").
+    pub active_folder: i32,
+    /// Chat picked with a plain click while nothing is selected (`singleChosen`): the caller
+    /// opens it with the forward bar instead of sending at once.
+    pub chosen_single: Option<PeerId>,
 }
 
 impl ShareBoxState {
@@ -51,7 +76,31 @@ impl ShareBoxState {
             selected: Vec::new(),
             comment: String::new(),
             error: None,
+            from_peer: None,
+            folder_tabs: Vec::new(),
+            active_folder: 0,
+            chosen_single: None,
         }
+    }
+
+    /// Creates the "Forward to..." box for `message_ids` from `from_peer` with the chat folder
+    /// tabs (`Window::ShowForwardMessagesBox`).
+    #[must_use]
+    pub fn for_forward(
+        from_peer: PeerId,
+        message_ids: Vec<i32>,
+        folder_tabs: Vec<ShareFolderTab>,
+    ) -> Self {
+        Self {
+            from_peer: Some(from_peer),
+            folder_tabs,
+            ..Self::new(message_ids, None)
+        }
+    }
+
+    /// Takes the chat picked with a plain click, if any.
+    pub fn take_chosen_single(&mut self) -> Option<PeerId> {
+        self.chosen_single.take()
     }
 
     /// Creates a [`ShareBoxState`] for forwarding a media viewer item to chosen chats via
@@ -66,6 +115,10 @@ impl ShareBoxState {
             selected: Vec::new(),
             comment: String::new(),
             error: None,
+            from_peer: None,
+            folder_tabs: Vec::new(),
+            active_folder: 0,
+            chosen_single: None,
         }
     }
 
@@ -98,6 +151,13 @@ impl ShareBoxState {
         }
     }
 
+    /// Whether this box forwards messages through the "Forward to..." recipient list
+    /// (no link or files to share).
+    #[must_use]
+    pub fn is_forward_list(&self) -> bool {
+        self.share_link.is_none()
+    }
+
     /// Builds the `tg-ui` [`BoxModal`] descriptor.
     #[must_use]
     pub fn to_modal(&self, id: &str) -> BoxModal {
@@ -107,6 +167,18 @@ impl ShareBoxState {
         } else {
             format!("{send_base} ({})", self.selected.len())
         };
+        if self.is_forward_list() {
+            // Only Cancel until a chat is selected with Ctrl+click (`ShowForwardMessagesBox`
+            // adds Send once `hasSelected()`).
+            let modal = BoxModal::new(id, tr::lng_forward_choose())
+                .width(st::box_wide_width.0 as f32)
+                .add_button(BoxButton::default_btn("cancel", tr::lng_cancel()));
+            return if self.selected.is_empty() {
+                modal
+            } else {
+                modal.add_button(BoxButton::default_btn("send", send_label))
+            };
+        }
         let mut modal = BoxModal::new(id, tr::lng_share_title())
             .width(st::box_wide_width.0 as f32 + 48.0)
             .add_button(BoxButton::default_btn("cancel", tr::lng_cancel()))
@@ -122,6 +194,10 @@ impl ShareBoxState {
 
     /// Renders the search bar, 4-column chat avatar grid (`ShareBox::Inner`), and comment input.
     pub fn show_body(&mut self, ui: &mut Ui, peers: &[PeerProfile], colors: &dyn Colors) {
+        if self.is_forward_list() {
+            self.show_forward_list(ui, peers, colors);
+            return;
+        }
         InputField::single_line(
             "share_box_search",
             &mut self.search_query,
@@ -238,6 +314,267 @@ impl ShareBoxState {
                     .font(font_id_from_style(st::normal_font))
                     .color(colors.color("boxTextFgError")),
             );
+        }
+    }
+}
+
+impl ShareBoxState {
+    /// Renders the "Forward to..." recipient list: search field, then Saved Messages and chats
+    /// as `st::defaultPeerListItem` rows with their status line.
+    fn show_forward_list(&mut self, ui: &mut Ui, peers: &[PeerProfile], colors: &dyn Colors) {
+        InputField::single_line(
+            "share_box_search",
+            &mut self.search_query,
+            &tr::lng_participant_filter(),
+            InputFieldStyle::rounded_search(colors),
+        )
+        .show(ui);
+        ui.add_space(6.0);
+
+        let q = self.search_query.trim().to_lowercase();
+        // A query searches every chat, like `applyFilter(box, hasQuery ? 0 : lastFilterId)`.
+        if self.folder_tabs.len() > 1 && q.is_empty() {
+            if let Some(id) = show_folder_tabs(ui, &self.folder_tabs, self.active_folder, colors) {
+                self.active_folder = id;
+            }
+            ui.add_space(4.0);
+        }
+        let folder_peers = (q.is_empty() && self.active_folder != 0)
+            .then(|| {
+                self.folder_tabs
+                    .iter()
+                    .find(|t| t.id == self.active_folder)
+                    .map(|t| t.peers.as_slice())
+            })
+            .flatten();
+        let mut ordered: Vec<&PeerProfile> = peers
+            .iter()
+            .filter(|p| p.kind == InfoPeerKind::SavedMessages)
+            .chain(
+                peers
+                    .iter()
+                    .filter(|p| p.kind != InfoPeerKind::SavedMessages),
+            )
+            .filter(|p| {
+                q.is_empty()
+                    || p.title.to_lowercase().contains(&q)
+                    || p.primary_username()
+                        .is_some_and(|u| u.to_lowercase().contains(&q))
+            })
+            .filter(|p| folder_peers.is_none_or(|ids| ids.contains(&p.id)))
+            .collect();
+        ordered.dedup_by_key(|p| p.id);
+
+        let width = ui.available_width().max(260.0);
+        let resolver = ColorsResolver(colors);
+        for peer in ordered {
+            let (rect, resp) =
+                ui.allocate_exact_size(Vec2::new(width, FORWARD_ROW_HEIGHT), Sense::click());
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, peer.title.clone())
+            });
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::ZERO,
+                    colors.color("windowBgOver"),
+                );
+            }
+            let selected = self.selected.contains(&peer.id);
+            let av_rect = Rect::from_min_size(
+                Pos2::new(
+                    rect.min.x + FORWARD_PHOTO_LEFT,
+                    rect.min.y + FORWARD_PHOTO_TOP,
+                ),
+                Vec2::splat(FORWARD_PHOTO_SIZE),
+            );
+            if peer.kind == InfoPeerKind::SavedMessages {
+                EmptyUserpic::paint_saved_messages(ui.painter(), av_rect, colors);
+            } else {
+                EmptyUserpic::for_color_index(peer.color_index, &peer.title, colors)
+                    .paint_circle(ui.painter(), av_rect);
+            }
+            if selected {
+                let badge_c = Pos2::new(av_rect.max.x - 4.0, av_rect.max.y - 4.0);
+                ui.painter()
+                    .circle_filled(badge_c, 9.5, colors.color("windowBg"));
+                ui.painter()
+                    .circle_filled(badge_c, 8.0, colors.color("windowBgActive"));
+                paint_style_icon(
+                    ui.painter(),
+                    Rect::from_center_size(badge_c, Vec2::splat(12.0)),
+                    st::default_checkbox_icon,
+                    &resolver,
+                    Some(Color32::WHITE),
+                );
+            }
+            let text_left = rect.min.x + FORWARD_NAME_LEFT;
+            let clip = Rect::from_min_max(
+                Pos2::new(text_left, rect.min.y),
+                Pos2::new(rect.max.x - 12.0, rect.max.y),
+            );
+            let painter = ui.painter().with_clip_rect(clip);
+            let (title, status, status_active) = forward_row_texts(peer);
+            painter.text(
+                Pos2::new(text_left, rect.min.y + FORWARD_NAME_TOP),
+                Align2::LEFT_TOP,
+                title,
+                FontId::new(
+                    font_id_from_style(st::semibold_font).size,
+                    tg_ui::fonts::family_semibold(),
+                ),
+                colors.color("windowBoldFg"),
+            );
+            painter.text(
+                Pos2::new(text_left, rect.min.y + FORWARD_STATUS_TOP),
+                Align2::LEFT_TOP,
+                status,
+                font_id_from_style(st::normal_font),
+                if status_active {
+                    colors.color("windowActiveTextFg")
+                } else {
+                    colors.color("windowSubTextFg")
+                },
+            );
+            if resp.clicked() {
+                // A plain click with nothing selected picks that chat (`singleChosen`); Ctrl+click
+                // or an existing selection toggles multi-selection for "Send".
+                let ctrl = ui.input(|i| i.modifiers.command);
+                if self.selected.is_empty() && !ctrl {
+                    self.chosen_single = Some(peer.id);
+                } else {
+                    self.toggle_target(peer.id);
+                }
+            }
+        }
+
+        if let Some(ref err) = self.error {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(err)
+                    .font(font_id_from_style(st::normal_font))
+                    .color(colors.color("boxTextFgError")),
+            );
+        }
+    }
+}
+
+/// Paints the `st::chatsFiltersTabs` slider (same metrics as `st::dialogsSearchTabs`) and
+/// returns a clicked folder id.
+fn show_folder_tabs(
+    ui: &mut Ui,
+    tabs: &[ShareFolderTab],
+    active: i32,
+    colors: &dyn Colors,
+) -> Option<i32> {
+    const HEIGHT: f32 = 33.0;
+    const PADDING: f32 = 9.0;
+    const SKIP: f32 = 18.0;
+    const LABEL_TOP: f32 = 7.0;
+    const BAR_TOP: f32 = 30.0;
+    let font = FontId::new(
+        font_id_from_style(st::semibold_font).size,
+        tg_ui::fonts::family_semibold(),
+    );
+    let width = ui.available_width();
+    let (bar, _) = ui.allocate_exact_size(Vec2::new(width, HEIGHT), Sense::hover());
+    let painter = ui.painter().with_clip_rect(bar);
+    let mut clicked = None;
+    let mut x = bar.left() + PADDING;
+    for tab in tabs {
+        let galley = painter.layout_no_wrap(tab.title.clone(), font.clone(), Color32::PLACEHOLDER);
+        let w = galley.size().x;
+        let hit = Rect::from_min_size(
+            Pos2::new(x - SKIP * 0.5, bar.top()),
+            Vec2::new(w + SKIP, bar.height()),
+        );
+        let is_active = tab.id == active;
+        let resp = ui.interact(
+            hit.intersect(bar),
+            ui.scope_id().with(("share_folder_tab", tab.id)),
+            Sense::click(),
+        );
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::Tab, true, is_active, tab.title.clone())
+        });
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            clicked = Some(tab.id);
+        }
+        let fg = if is_active {
+            colors.color("lightButtonFg")
+        } else {
+            colors.color("windowSubTextFg")
+        };
+        painter.text(
+            Pos2::new(x, bar.top() + LABEL_TOP),
+            Align2::LEFT_TOP,
+            &tab.title,
+            font.clone(),
+            fg,
+        );
+        if is_active {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x, bar.top() + BAR_TOP),
+                    Pos2::new(x + w, bar.bottom()),
+                ),
+                egui::CornerRadius {
+                    nw: 2,
+                    ne: 2,
+                    sw: 0,
+                    se: 0,
+                },
+                colors.color("lightButtonFg"),
+            );
+        }
+        x += w + SKIP;
+    }
+    painter.line_segment(
+        [
+            Pos2::new(bar.left(), bar.bottom() - 0.5),
+            Pos2::new(bar.right(), bar.bottom() - 0.5),
+        ],
+        Stroke::new(1.0, colors.color("shadowFg")),
+    );
+    clicked
+}
+
+/// Row height of the recipient list (`st::defaultPeerListItem.height`).
+const FORWARD_ROW_HEIGHT: f32 = 56.0;
+/// Userpic diameter (`st::defaultPeerListItem.photoSize`).
+const FORWARD_PHOTO_SIZE: f32 = 42.0;
+const FORWARD_PHOTO_LEFT: f32 = 14.0;
+const FORWARD_PHOTO_TOP: f32 = 7.0;
+const FORWARD_NAME_LEFT: f32 = 70.0;
+const FORWARD_NAME_TOP: f32 = 10.0;
+const FORWARD_STATUS_TOP: f32 = 30.0;
+
+/// Title, status line and whether the status is drawn in the active (online) color
+/// (`ChooseRecipientBoxController::createRow`, `PeerListRow::refreshStatus`).
+fn forward_row_texts(peer: &PeerProfile) -> (String, String, bool) {
+    match peer.kind {
+        InfoPeerKind::SavedMessages => (
+            tr::lng_saved_messages(),
+            tr::lng_saved_forward_here(),
+            false,
+        ),
+        InfoPeerKind::Bot => (peer.title.clone(), tr::lng_status_bot(), false),
+        InfoPeerKind::Channel => (peer.title.clone(), tr::lng_channel_status(), false),
+        InfoPeerKind::Group | InfoPeerKind::Supergroup => (
+            peer.title.clone(),
+            tr::lng_chat_status_members(i64::from(peer.members_count.max(1))),
+            false,
+        ),
+        InfoPeerKind::User => {
+            if peer.is_online {
+                (peer.title.clone(), tr::lng_status_online(), true)
+            } else {
+                (peer.title.clone(), peer.status.clone(), false)
+            }
         }
     }
 }

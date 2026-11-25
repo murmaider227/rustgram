@@ -360,6 +360,58 @@ impl BinlogCache {
         Ok(true)
     }
 
+    /// Re-encrypts every readable live entry and rewrites the binlog under `new_key`, removing any
+    /// old-key encrypted files so no unreadable entries remain on disk.
+    pub fn rekey(&mut self, new_key: StorageEncryptionKey) -> Result<()> {
+        if self.key.as_bytes() == new_key.as_bytes() {
+            return Ok(());
+        }
+        let mut live_entries: Vec<(CacheKey, u8, Vec<u8>)> = Vec::with_capacity(self.entries.len());
+        let keys: Vec<(CacheKey, u8)> = self.entries.iter().map(|(&k, m)| (k, m.tag)).collect();
+        for (k, tag) in keys {
+            if let Ok(Some(payload)) = self.get(k) {
+                live_entries.push((k, tag, payload));
+            }
+        }
+
+        // Rebuild version directory cleanly with a fresh binlog encrypted under `new_key`.
+        let base_path = self.base_path.clone();
+        let track_time = self.track_estimated_time;
+        let version_dir = self.version_dir.clone();
+        // Close our open binlog handle before deleting the directory on Windows by replacing it
+        // with a newly created binlog after clearing files.
+        let temp_dir = base_path.join(".rekey_tmp");
+        if temp_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        let mut fresh = Self::open(&temp_dir, new_key.clone(), track_time)?;
+        for (k, tag, payload) in live_entries {
+            fresh.put(k, &payload, tag)?;
+        }
+        let fresh_version_dir = fresh.version_dir.clone();
+        drop(fresh);
+
+        // Swap `self.binlog` to a dummy handle in temp_dir? Better: swap `self` via drop order!
+        // Open fresh in version_dir after dropping old handle via a helper placeholder is not
+        // needed if we replace version_dir after moving `self.binlog`.
+        let staged_binlog = EncryptedFile::open(
+            &fresh_version_dir.join("binlog"),
+            OpenMode::ReadAppend,
+            &new_key,
+        )?;
+        self.binlog = staged_binlog;
+        if version_dir.exists() {
+            let _ = fs::remove_dir_all(&version_dir);
+        }
+        fs::create_dir_all(&version_dir)?;
+        // Copy all files from fresh_version_dir into version_dir.
+        copy_dir_recursive(&fresh_version_dir, &version_dir)?;
+        let reopened = Self::open(&base_path, new_key, track_time)?;
+        *self = reopened;
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
     fn current_time_point(&self) -> EstimatedTimePoint {
         let now = unix_now_secs();
         let delta = i64::from(now)
@@ -522,6 +574,21 @@ fn write_version_value(base: &Path, version: i32) -> Result<()> {
     Ok(())
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn unix_now_secs() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -581,5 +648,42 @@ mod tests {
         assert_eq!(db.stats().count, 1);
         assert_eq!(db.get(k1).expect("still gone"), None);
         assert!(db.get(k2).expect("still there").is_some());
+    }
+
+    #[test]
+    fn binlog_cache_rekey_reencrypts_entries_and_rejects_old_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let old_key = StorageEncryptionKey::new(vec![0x11u8; 256]).expect("old key");
+        let new_key = StorageEncryptionKey::new(vec![0x22u8; 256]).expect("new key");
+        let k1 = CacheKey::new(0x0100, 1001);
+        let k2 = CacheKey::new(0x0200, 2002);
+
+        {
+            let mut db = BinlogCache::open(dir.path(), old_key.clone(), true).expect("open");
+            db.put(k1, b"alpha-binlog-blob", 1).expect("put k1");
+            db.put(k2, b"beta-binlog-blob", 2).expect("put k2");
+            db.rekey(new_key.clone()).expect("rekey");
+            assert_eq!(db.stats().count, 2);
+            assert_eq!(
+                db.get(k1).expect("get k1").as_deref(),
+                Some(&b"alpha-binlog-blob"[..])
+            );
+        }
+
+        // Reopening with the new key reads all entries.
+        let reopened = BinlogCache::open(dir.path(), new_key, true).expect("reopen new key");
+        assert_eq!(reopened.stats().count, 2);
+        assert_eq!(
+            reopened.get(k1).expect("get k1").as_deref(),
+            Some(&b"alpha-binlog-blob"[..])
+        );
+        assert_eq!(
+            reopened.get(k2).expect("get k2").as_deref(),
+            Some(&b"beta-binlog-blob"[..])
+        );
+        drop(reopened);
+
+        // Old key can no longer open the rekeyed binlog.
+        assert!(BinlogCache::open(dir.path(), old_key, true).is_err());
     }
 }

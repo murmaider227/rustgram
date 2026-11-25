@@ -96,6 +96,12 @@ pub struct MediaItem {
     pub allows_save: bool,
     /// Optional local file path if already cached on disk.
     pub local_path: Option<PathBuf>,
+    /// Real media reference for `messages.getAttachedStickers` when this photo or video has
+    /// attached stickers or masks (`Photo::has_stickers` / `DocumentAttribute::HasStickers`).
+    pub attached_stickers_media: Option<crate::chat_helpers::backend::AttachedStickersMedia>,
+    /// Album grouping identifier when this media item belongs to a multi-item media album
+    /// (`Message::grouped_id`, `media_view_overlay_widget.cpp` `_groupThumbs`).
+    pub grouped_id: Option<i64>,
 }
 
 /// Display metadata for a track managed by [`tg_audio::PlayerInstance`] in the top audio player bar.
@@ -151,6 +157,12 @@ pub trait MediaBackend: Send + Sync {
 
     /// Hook triggered when the user chooses "Open in External App" on `id`.
     fn open_in_external_app(&self, id: MediaItemId) -> anyhow::Result<PathBuf>;
+
+    /// Hook triggered after the user explicitly confirmed launching `id` in an external app
+    /// (for executable, unknown-extension, extensionless, or IP-revealing files).
+    fn open_in_external_app_confirmed(&self, id: MediaItemId) -> anyhow::Result<PathBuf> {
+        self.open_in_external_app(id)
+    }
 
     /// Looks up display metadata for an audio track in the top audio player bar.
     fn audio_track_metadata(&self, id: AudioMsgId) -> Option<AudioTrackMetadata>;

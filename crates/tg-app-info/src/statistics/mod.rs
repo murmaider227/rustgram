@@ -763,6 +763,26 @@ pub struct AppStatisticsHost {
 }
 
 impl AppStatisticsHost {
+    fn existing_state(ctx: &Context) -> Option<Arc<Mutex<Self>>> {
+        ctx.data_mut(|d| d.get_temp::<Arc<Mutex<Self>>>(Id::unique("tg_app_statistics_host")))
+    }
+
+    /// Returns `true` while the floating demo Statistics drawer is open.
+    #[must_use]
+    pub fn is_open(ctx: &Context) -> bool {
+        Self::existing_state(ctx).is_some_and(|s| s.lock().is_ok_and(|g| g.open))
+    }
+
+    /// Closes the floating demo Statistics drawer (passcode lock:
+    /// `Application::closeAdditionalWindows`).
+    pub fn close(ctx: &Context) {
+        if let Some(state) = Self::existing_state(ctx)
+            && let Ok(mut guard) = state.lock()
+        {
+            guard.open = false;
+        }
+    }
+
     /// Drives keyboard toggle (`Ctrl+Shift+T`) and renders the floating Statistics drawer when open.
     pub fn update_and_render(ctx: &Context, palette: &Palette, theme_mode: ThemeMode) {
         let toggle_pressed = ctx.input(|i| {

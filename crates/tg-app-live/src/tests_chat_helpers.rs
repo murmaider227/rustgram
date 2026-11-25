@@ -1577,7 +1577,7 @@ fn test_sticker_media_downloads_tgs_and_static_and_caches() {
     );
     live.refresh_all_stickers(true).expect("load set");
 
-    // 1. Download TGS sticker via upload.getFile
+    // 1. Download TGS sticker asynchronously via upload.getFile (cache miss returns None immediately).
     let tgs_bytes = vec![0x1f, 0x8b, 0x08, 0x00, 0x01, 0x02];
     fake.enqueue_ok(
         tl_fns::upload::GetFile::CONSTRUCTOR_ID,
@@ -1587,18 +1587,34 @@ fn test_sticker_media_downloads_tgs_and_static_and_caches() {
             bytes: tgs_bytes.clone(),
         }),
     );
-    let media_tgs = live.sticker_media(ChatDocId(9101)).expect("tgs media");
+    assert!(
+        live.sticker_media(ChatDocId(9101)).is_none(),
+        "first call on cache miss must return None without blocking UI thread"
+    );
+    let media_tgs = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(m) = live.sticker_media(ChatDocId(9101)) {
+                break m;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for async TGS sticker_media prefetch"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
     match media_tgs {
         StickerMedia::LottieTgs(b) => assert_eq!(b, tgs_bytes),
         other => panic!("expected LottieTgs, got {other:?}"),
     }
 
-    // Second call uses cache (zero RPCs).
+    // Subsequent call uses cache (zero RPCs).
     fake.clear_recorded();
     assert!(live.sticker_media(ChatDocId(9101)).is_some());
     assert!(fake.recorded_ctors().is_empty());
 
-    // 2. Download static sticker image via upload.getFile
+    // 2. Download static sticker image asynchronously via upload.getFile.
     let png_bytes = make_tiny_png(6, 6, [250, 180, 40, 255]);
     fake.enqueue_ok(
         tl_fns::upload::GetFile::CONSTRUCTOR_ID,
@@ -1608,7 +1624,20 @@ fn test_sticker_media_downloads_tgs_and_static_and_caches() {
             bytes: png_bytes,
         }),
     );
-    let media_static = live.sticker_media(ChatDocId(9102)).expect("static media");
+    assert!(live.sticker_media(ChatDocId(9102)).is_none());
+    let media_static = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(m) = live.sticker_media(ChatDocId(9102)) {
+                break m;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for async static sticker_media prefetch"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
     match media_static {
         StickerMedia::StaticRgba {
             width,

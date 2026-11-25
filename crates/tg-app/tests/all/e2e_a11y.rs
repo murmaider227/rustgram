@@ -355,8 +355,8 @@ fn a11y_main_menu_rows_by_label() {
         "Both Dialog row and MainMenu row for 'Saved Messages' must be discoverable via AccessKit"
     );
     assert!(
-        harness.query_by_label("Night Mode  [OFF]").is_some(),
-        "MainMenu 'Night Mode  [OFF]' row must be discoverable via AccessKit"
+        harness.query_by_label("Night Mode").is_some(),
+        "MainMenu 'Night Mode' toggle row must be discoverable via AccessKit"
     );
 
     harness.get_by_label("Settings").click();
@@ -368,15 +368,22 @@ fn a11y_dialogs_rows_by_chat_name_and_unread_count() {
     let mut harness = build_harness(AppTestState::main_workspace(), WORKSPACE_SIZE);
     settle_layout(&mut harness);
 
+    // `AppTestState::main_workspace()` opens `Rustgram Core Port` in a focused window, so
+    // visible unread messages are marked read on settle (tdesktop `HistoryInner::paintEvent` ->
+    // `readInboxTill`). Unopened unread chats keep their `<title> (<N> unread)` labels.
     assert!(
         harness
-            .query_by_label("Rustgram Core Port (2 unread)")
+            .query_by_label("Rustgram Dev Log (3 unread)")
             .is_some(),
         "Dialog row with unread messages must expose '<title> (<N> unread)'"
     );
     assert!(
         harness.query_by_label("Mira Vance (1 unread)").is_some(),
         "Mira Vance dialog row must expose chat name + unread count"
+    );
+    assert!(
+        harness.query_by_label("Rustgram Core Port").is_some(),
+        "Opened active dialog row must clear unread count once visible messages are read"
     );
     assert!(
         harness.query_by_label("Saved Messages").is_some(),
@@ -408,15 +415,21 @@ fn a11y_filters_menu_buttons_and_horizontal_tabs_by_label() {
     settle_layout(&mut harness);
 
     // Vertical FiltersMenuWidget sidebar buttons.
+    // `Rustgram Core Port` is opened and marked read on startup, leaving 3 unread chats in
+    // All Chats (Mira Vance, Rustgram Dev Log, Nightly Builds) and 2 in Work.
     let menu_label = tg_lang::tr::lng_main_menu();
     let edit_label = tg_lang::tr::lng_filters_setup();
     assert!(harness.query_by_label(&menu_label).is_some());
-    assert!(harness.query_by_label("All Chats (4 unread)").is_some());
-    assert!(harness.query_by_label("Work (3 unread)").is_some());
+    assert!(
+        harness
+            .query_by_label(&format!("{} (3 unread)", tg_lang::tr::lng_filters_all()))
+            .is_some()
+    );
+    assert!(harness.query_by_label("Work (2 unread)").is_some());
     assert!(harness.query_by_label(&edit_label).is_some());
 
-    // Click "Work (3 unread)" folder button by AccessKit label.
-    harness.get_by_label("Work (3 unread)").click();
+    // Click "Work (2 unread)" folder button by AccessKit label.
+    harness.get_by_label("Work (2 unread)").click();
     wait_until(
         &mut harness,
         DEFAULT_MAX_FRAMES,
@@ -488,7 +501,8 @@ fn a11y_history_header_and_compose_buttons_by_label() {
             .is_some(),
         "History header peer title button must be discoverable via AccessKit"
     );
-    assert!(harness.query_by_label("Mute").is_some());
+    // 7.4.6 has no Mute button in the top bar; mute lives in the chat menu.
+    assert!(harness.query_by_label("Chat menu").is_some());
     assert!(harness.query_by_label("Search in chat").is_some());
     assert!(harness.query_by_label("Toggle chat info").is_some());
 
@@ -526,8 +540,16 @@ fn a11y_settings_rows_by_label() {
     harness.get_by_label("Settings").click();
     wait_for_label_settled(&mut harness, "Notifications and Sounds");
 
-    // Main settings rows are discoverable and clickable by label.
-    assert!(harness.query_by_label(&back_label).is_some());
+    // Main settings rows are discoverable and clickable by label. Settings opens as a layer at
+    // this width, which (`Info::WrapWidget::willHaveBackButton`) has a close button and no back
+    // button until a section is pushed.
+    assert!(
+        harness
+            .query_all_by_label(&tg_lang::tr::lng_close())
+            .next()
+            .is_some()
+    );
+    assert!(harness.query_by_label(&back_label).is_none());
     harness.get_by_label("Notifications and Sounds").click();
 
     // Wait for slide transition and CheckBox rows inside Notifications settings.

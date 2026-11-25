@@ -61,10 +61,10 @@ use tg_app_core::dialogs::backend::{
     DialogsBackend, RecentPeerItem, SearchRequest, SearchResults, SearchTagChip, TopPeerItem,
 };
 use tg_app_core::history::backend::{
-    AvailableMessageEffect, AvailableReactionItem, DraftMessage, HistoryBackend, HistoryMessage,
-    HistoryPeerInfo, HistorySlice, MediaUploadStatus, MessageReactionsPage, PinnedMessageSummary,
-    PollVotesPage, ReactionCounter, SavedReactionTagItem, SendMessageExtended, SendMessageRequest,
-    ThreadDraft, TypingAction,
+    AvailableMessageEffect, AvailableReactionItem, DraftMessage, HistoryBackend, HistoryLiveUpdate,
+    HistoryMessage, HistoryPeerInfo, HistorySlice, MediaUploadStatus, MessageReactionsPage,
+    PinnedMessageSummary, PollVotesPage, ReactionCounter, SavedReactionTagItem,
+    SendMessageExtended, SendMessageRequest, ThreadDraft, TypingAction,
 };
 use tg_app_core::history::sections_model::{
     AdminLogAdmin, AdminLogEntry, AdminLogFilter, CreatePollRequest, ForumTopic, ForwardOptions,
@@ -114,6 +114,10 @@ pub(super) struct LiveSessionCache {
     active_language: String,
     // Lazy RPC fetch guards so egui's 60fps rendering doesn't spam identical read RPCs.
     dialogs_loaded_folders: HashSet<FolderId>,
+    /// `true` while [`LiveSession::start_chats_list_request`]'s first main-list page is in flight.
+    main_dialogs_pending: bool,
+    /// Requests started together for opened chats ([`crate::open_chat_prefetch`]).
+    pub(super) open_chat: crate::open_chat_prefetch::OpenChatRequests,
     history_loaded_peers: HashSet<DataPeerId>,
     filters_loaded: bool,
     privacy_loaded: HashSet<PrivacyKey>,
@@ -138,10 +142,13 @@ pub(super) struct LiveSessionCache {
     pub(super) notify_events_loaded: bool,
     pub(super) notify_events: NotificationEventsSettings,
     pub(super) auto_download_loaded: bool,
+    /// `true` while an `account.getAutoDownloadSettings` request is in flight.
+    pub(super) auto_download_fetching: bool,
     pub(super) auto_download_from_tdata: bool,
     pub(super) auto_download_presets: Option<crate::settings_sync::ServerAutoDownloadPresets>,
     pub(super) active_auto_download_preset: crate::settings_sync::AutoDownloadPreset,
     pub(super) auto_download: AutoDownloadSettings,
+    pub(super) trusted_mini_app_bots: BTreeSet<i64>,
     pub(super) session_settings_dirty: bool,
     recent_search_peers: Vec<PeerId>,
     removed_top_peers: HashSet<PeerId>,
@@ -161,6 +168,8 @@ impl LiveSessionCache {
             photo_label: None,
             active_language: tg_lang::default_language_id().to_owned(),
             dialogs_loaded_folders: HashSet::new(),
+            main_dialogs_pending: false,
+            open_chat: crate::open_chat_prefetch::OpenChatRequests::default(),
             history_loaded_peers: HashSet::new(),
             filters_loaded: false,
             privacy_loaded: HashSet::new(),
@@ -185,10 +194,12 @@ impl LiveSessionCache {
             notify_events_loaded: false,
             notify_events: NotificationEventsSettings::default(),
             auto_download_loaded: false,
+            auto_download_fetching: false,
             auto_download_from_tdata: false,
             auto_download_presets: None,
             active_auto_download_preset: crate::settings_sync::AutoDownloadPreset::Medium,
             auto_download: AutoDownloadSettings::default(),
+            trusted_mini_app_bots: BTreeSet::new(),
             session_settings_dirty: false,
             recent_search_peers: Vec::new(),
             removed_top_peers: HashSet::new(),
@@ -270,6 +281,7 @@ pub struct LiveSession {
     pub(super) bridge: Arc<LiveRuntimeBridge>,
     pub(super) cache: Arc<Mutex<LiveSessionCache>>,
     media_cache: LiveMediaCache,
+    account_temp_dir: Arc<Mutex<Option<PathBuf>>>,
     cached_auth_user: Option<AuthUser>,
     pub(super) chat_helpers: LiveChatHelpersView,
     pub(super) calls: crate::calls::LiveCallsHandle,
@@ -290,6 +302,7 @@ impl Clone for LiveSession {
             bridge: Arc::clone(&self.bridge),
             cache: Arc::clone(&self.cache),
             media_cache: self.media_cache.clone(),
+            account_temp_dir: Arc::clone(&self.account_temp_dir),
             cached_auth_user: self.cached_auth_user.clone(),
             chat_helpers: self.chat_helpers.clone(),
             calls: self.calls.clone(),
@@ -309,6 +322,7 @@ impl LiveSession {
         let bridge = Arc::new(LiveRuntimeBridge::spawn(&runtime, session_id));
         let cache = Arc::new(Mutex::new(LiveSessionCache::new()));
         let media_cache = LiveMediaCache::open_default_for_session(session_id);
+        let account_temp_dir = Arc::new(Mutex::new(None));
         let calls = crate::calls::LiveCallsHandle::new(Arc::clone(&runtime), &bridge);
         let langpack = crate::langpack::LiveLangPackHandle::new(Arc::clone(&runtime), &bridge);
         let passkeys = crate::passkeys::LivePasskeysHandle::new(Arc::clone(&runtime), &bridge);
@@ -322,6 +336,7 @@ impl LiveSession {
             bridge,
             cache,
             media_cache,
+            account_temp_dir,
             cached_auth_user: None,
             chat_helpers: LiveChatHelpersView::new(),
             calls,
@@ -336,6 +351,7 @@ impl LiveSession {
         crate::chat_l233::attach_chat_l233_listener(&live);
         crate::dice_pack::attach_dice_pack_updates_listener(&live);
         crate::engagement::attach_engagement_listener(&live);
+        crate::contacts_extras::spawn_periodic_contact_statuses_task(&live);
         live
     }
 
@@ -348,6 +364,16 @@ impl LiveSession {
     /// Resolves a TL `InputPeer` for `peer_id` from the loaded session (used by `live/suggestions.rs`).
     pub(crate) fn resolve_input_peer(&self, peer_id: PeerId) -> Option<tl_enums::InputPeer> {
         self.input_peer(peer_id)
+    }
+
+    /// Refreshes contact online/last-seen statuses via `contacts.getStatuses` if at least
+    /// [`crate::contacts_extras::CONTACT_STATUSES_REFRESH_INTERVAL_MS`] has elapsed since the
+    /// last refresh.
+    pub fn poll_contact_statuses_if_due(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<tg_app_core::core_types::dto::contacts_extras::ContactStatusInfo>, String> {
+        crate::contacts_extras::maybe_refresh_contact_statuses(self, now_ms, false)
     }
 
     /// Invalidates cached `help.getPromoData` so the next dialogs query fetches fresh suggestions.
@@ -387,6 +413,61 @@ impl LiveSession {
     /// Reopens the shared [`LiveMediaCache`] at `dir` (affecting all clones of this session).
     pub fn set_media_cache_dir(&self, dir: impl Into<PathBuf>) -> anyhow::Result<()> {
         self.media_cache.reopen_at(dir)
+    }
+
+    /// Reopens the shared [`LiveMediaCache`] at `dir` encrypted with the account's derived
+    /// [`tg_storage::StorageEncryptionKey`] (affecting all clones of this session).
+    pub fn set_media_cache_dir_with_key(
+        &self,
+        dir: impl Into<PathBuf>,
+        key: tg_storage::StorageEncryptionKey,
+    ) -> anyhow::Result<()> {
+        self.media_cache.reopen_at_with_key(dir, key)
+    }
+
+    /// Configures this account's temporary files directory under `tdata` (`tdata/temp_<dataName>`)
+    /// so external-app opens and other transient copies live inside the account folder rather than
+    /// `%TEMP%`.
+    pub fn set_account_temp_dir(&self, dir: impl Into<PathBuf>) {
+        if let Ok(mut guard) = self.account_temp_dir.lock() {
+            *guard = Some(dir.into());
+        }
+    }
+
+    /// Returns the configured per-account temporary directory, if any.
+    #[must_use]
+    pub fn account_temp_dir(&self) -> Option<PathBuf> {
+        self.account_temp_dir.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Resolves the directory where temporary copies for `open_in_external_app*` are written.
+    #[must_use]
+    pub fn external_open_temp_dir(&self) -> PathBuf {
+        if let Some(dir) = self.account_temp_dir() {
+            return dir.join("external");
+        }
+        if self.media_cache.is_persistent() {
+            return self.media_cache.root_dir().join("external_tmp");
+        }
+        std::env::temp_dir().join(format!("rustgram_external_pid_{}", std::process::id()))
+    }
+
+    /// Removes unlocked temporary files inside this account's external-open temp directory
+    /// without failing when an external viewer still holds a file handle open.
+    pub fn cleanup_account_temp_files(&self) {
+        let dir = self.external_open_temp_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = std::fs::remove_file(&path);
+            } else if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// Creates a cheaply cloned shared handle to this live session.
@@ -659,6 +740,44 @@ impl LiveSession {
         })
     }
 
+    /// Requests the first page of the main chat list on the session runtime without blocking the
+    /// caller, like tdesktop's `ApiWrap::requestDialogs` (sent from `Updates::stateDone`,
+    /// `api_updates.cpp:480-489`): the main window shows at once with the list's "Loading..."
+    /// state and `on_loaded` (a repaint request) runs when the page has been applied. Until then
+    /// [`DialogsBackend::chats_list_loaded`] is `false` and list reads do not wait for the page.
+    pub fn start_chats_list_request(&self, on_loaded: impl FnOnce() + Send + 'static) {
+        let Ok(mut c) = self.cache.lock() else {
+            return;
+        };
+        if !c.dialogs_loaded_folders.insert(MAIN_FOLDER_ID) {
+            return;
+        }
+        c.main_dialogs_pending = true;
+        drop(c);
+        let rt = Arc::clone(&self.runtime);
+        let cache = Arc::clone(&self.cache);
+        self.runtime.tokio_handle().spawn(async move {
+            // The runtime's startup sync usually brings the first page itself
+            // (`SessionRuntimeConfig::load_initial_dialogs`); request one only if it did not.
+            let _ = with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.wait_ready()).await;
+            let has_first_page = {
+                let session = rt.session().read().await;
+                !session.main_dialogs().is_empty() || session.main_list().loaded()
+            };
+            if !has_first_page {
+                let res =
+                    with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.load_dialogs_page(MAIN_FOLDER_ID)).await;
+                if let Err(err) = res {
+                    debug!(error = %err, "background load_dialogs_page returned error");
+                }
+            }
+            if let Ok(mut c) = cache.lock() {
+                c.main_dialogs_pending = false;
+            }
+            on_loaded();
+        });
+    }
+
     fn ensure_dialogs_loaded(&self, folder_id: FolderId) {
         let already_tried = self
             .cache
@@ -710,15 +829,25 @@ impl LiveSession {
         }
 
         let rt = Arc::clone(&self.runtime);
-        let data_around = if around_id == MsgId::SHOW_AT_END || around_id == MsgId::SHOW_AT_UNREAD {
-            DataMsgId(0)
+        let (data_around, effective_direction) = if around_id == MsgId::SHOW_AT_END {
+            // Opening at the bottom of history uses `LoadDirection::Before` with `offset_id = 0`
+            // so `parse_history_result` anchors `no_skip_range.till = SERVER_MAX_MSG_ID`
+            // (`loaded_at_bottom() == true`) even on a partial `messagesSlice`.
+            let dir = if matches!(direction, LoadDirection::Around) {
+                LoadDirection::Before
+            } else {
+                direction
+            };
+            (DataMsgId(0), dir)
+        } else if around_id == MsgId::SHOW_AT_UNREAD {
+            (DataMsgId(0), direction)
         } else {
-            to_data_msg(around_id)
+            (to_data_msg(around_id), direction)
         };
         let res = block_on_runtime(self.runtime.tokio_handle(), async move {
             with_rpc_timeout(
                 LIVE_RPC_TIMEOUT,
-                rt.open_history(data_peer, data_around, direction),
+                rt.open_history(data_peer, data_around, effective_direction),
             )
             .await
         });
@@ -1486,8 +1615,9 @@ impl Backend for LiveSession {
 
     fn set_proxy_enabled(&mut self, enabled: bool) {
         self.proxy.set_proxy_enabled(enabled);
+        let active = self.proxy.is_proxy_enabled();
         if let Ok(mut c) = self.cache.lock() {
-            c.proxy_enabled = enabled;
+            c.proxy_enabled = active;
         }
     }
 
@@ -1497,6 +1627,8 @@ impl Backend for LiveSession {
         let _ = block_on_runtime(self.runtime.tokio_handle(), async move {
             with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.trigger_difference()).await
         });
+        let now_ms = u64::try_from(self.ch_now_ms()).unwrap_or(0);
+        let _ = crate::contacts_extras::maybe_refresh_contact_statuses(self, now_ms, true);
     }
 }
 
@@ -1519,6 +1651,10 @@ impl DialogsBackend for LiveSession {
 
     fn current_time(&self) -> LocalDateTime {
         unix_to_local_datetime(now_unix_i32())
+    }
+
+    fn chats_list_loaded(&self) -> bool {
+        self.cache.lock().map_or(true, |c| !c.main_dialogs_pending)
     }
 
     fn dialog_slice(&self, list: DialogListQuery, offset: usize, limit: usize) -> DialogSlice {
@@ -1571,6 +1707,13 @@ impl DialogsBackend for LiveSession {
                 pinned_count,
                 has_more,
             }
+        })
+    }
+
+    fn is_peer_blocked(&self, peer_id: PeerId) -> bool {
+        self.read_session(|s| {
+            s.peer(to_data_peer(peer_id))
+                .is_some_and(|p| p.common().block_status == BlockStatus::Blocked)
         })
     }
 
@@ -1965,27 +2108,42 @@ impl DialogsBackend for LiveSession {
                 .unwrap_or(0)
         });
         let ok = if let Some(ch) = self.input_channel(peer_id) {
-            self.invoke_rpc(tl_fns::channels::DeleteHistory {
+            match self.invoke_rpc(tl_fns::channels::DeleteHistory {
                 for_everyone: false,
                 channel: ch,
                 max_id,
-            })
-            .is_ok()
-        } else if let Some(input_peer) = self.input_peer(peer_id) {
-            match self.invoke_rpc(tl_fns::messages::DeleteHistory {
-                just_clear: true,
-                revoke: false,
-                peer: input_peer,
-                max_id,
-                min_date: None,
-                max_date: None,
             }) {
-                Ok(tl_enums::messages::AffectedHistory::AffectedHistory(aff)) => {
-                    let _ = self.apply_affected_history(Some(peer_id), aff.pts, aff.pts_count);
+                Ok(updates) => {
+                    let _ = self.apply_updates_to_session(&updates);
                     true
                 }
                 Err(_) => false,
             }
+        } else if let Some(input_peer) = self.input_peer(peer_id) {
+            let mut succeeded = false;
+            for _ in 0..tg_api::DELETE_HISTORY_RETRY_LIMIT {
+                match self.invoke_rpc(tl_fns::messages::DeleteHistory {
+                    just_clear: true,
+                    revoke: false,
+                    peer: input_peer.clone(),
+                    max_id,
+                    min_date: None,
+                    max_date: None,
+                }) {
+                    Ok(tl_enums::messages::AffectedHistory::AffectedHistory(aff)) => {
+                        let _ = self.apply_affected_history(Some(peer_id), aff.pts, aff.pts_count);
+                        succeeded = true;
+                        if aff.offset <= 0 {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        succeeded = false;
+                        break;
+                    }
+                }
+            }
+            succeeded
         } else {
             false
         };
@@ -2014,23 +2172,38 @@ impl DialogsBackend for LiveSession {
                 .unwrap_or(0)
         });
         let ok = if let Some(ch) = self.input_channel(peer_id) {
-            self.invoke_rpc(tl_fns::channels::LeaveChannel { channel: ch })
-                .is_ok()
-        } else if let Some(input_peer) = self.input_peer(peer_id) {
-            match self.invoke_rpc(tl_fns::messages::DeleteHistory {
-                just_clear: false,
-                revoke: false,
-                peer: input_peer,
-                max_id,
-                min_date: None,
-                max_date: None,
-            }) {
-                Ok(tl_enums::messages::AffectedHistory::AffectedHistory(aff)) => {
-                    let _ = self.apply_affected_history(Some(peer_id), aff.pts, aff.pts_count);
+            match self.invoke_rpc(tl_fns::channels::LeaveChannel { channel: ch }) {
+                Ok(updates) => {
+                    let _ = self.apply_updates_to_session(&updates);
                     true
                 }
                 Err(_) => false,
             }
+        } else if let Some(input_peer) = self.input_peer(peer_id) {
+            let mut succeeded = false;
+            for _ in 0..tg_api::DELETE_HISTORY_RETRY_LIMIT {
+                match self.invoke_rpc(tl_fns::messages::DeleteHistory {
+                    just_clear: false,
+                    revoke: false,
+                    peer: input_peer.clone(),
+                    max_id,
+                    min_date: None,
+                    max_date: None,
+                }) {
+                    Ok(tl_enums::messages::AffectedHistory::AffectedHistory(aff)) => {
+                        let _ = self.apply_affected_history(Some(peer_id), aff.pts, aff.pts_count);
+                        succeeded = true;
+                        if aff.offset <= 0 {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        succeeded = false;
+                        break;
+                    }
+                }
+            }
+            succeeded
         } else {
             false
         };
@@ -2183,6 +2356,14 @@ impl DialogsBackend for LiveSession {
         crate::contacts_extras::contact_birthdays(self, force)
     }
 
+    fn poll_contact_birthdays(
+        &self,
+    ) -> Option<
+        Result<Vec<tg_app_core::core_types::dto::contacts_extras::ContactBirthdayEntry>, String>,
+    > {
+        crate::contacts_extras::poll_contact_birthdays(self)
+    }
+
     fn toggle_top_peers(&mut self, enabled: bool) -> Result<bool, String> {
         crate::contacts_extras::toggle_top_peers(self, enabled)
     }
@@ -2207,11 +2388,96 @@ impl DialogsBackend for LiveSession {
     fn hide_promo_data(&mut self, peer_id: PeerId) -> Result<bool, String> {
         crate::contacts_extras::hide_promo_data(self, peer_id)
     }
+
+    fn mute_dialog_for(&mut self, peer_id: PeerId, seconds: i32) -> Result<bool, String> {
+        crate::dialogs_actions::mute_dialog_for(self, peer_id, seconds)
+    }
+
+    fn dialog_mute_until(&self, peer_id: PeerId) -> Option<i32> {
+        crate::dialogs_actions::dialog_mute_until(self, peer_id)
+    }
+
+    fn dialog_notify_sound(
+        &self,
+        peer_id: PeerId,
+    ) -> tg_app_core::notifications::settings::NotifySound {
+        crate::dialogs_actions::dialog_notify_sound(self, peer_id)
+    }
+
+    fn set_dialog_sound_enabled(&mut self, peer_id: PeerId, enabled: bool) -> Result<bool, String> {
+        crate::dialogs_actions::set_dialog_sound_enabled(self, peer_id, enabled)
+    }
+
+    fn set_dialog_notify_sound(
+        &mut self,
+        peer_id: PeerId,
+        sound: tg_app_core::notifications::settings::NotifySound,
+    ) -> Result<(), String> {
+        crate::dialogs_actions::set_dialog_notify_sound(self, peer_id, sound)
+    }
+
+    fn dialog_suggests_report_spam(&self, peer_id: PeerId) -> bool {
+        crate::dialogs_actions::dialog_suggests_report_spam(self, peer_id)
+    }
+
+    fn report_spam_and_block(
+        &mut self,
+        peer_id: PeerId,
+        report_spam: bool,
+        delete_chat: bool,
+    ) -> Result<(), String> {
+        crate::dialogs_actions::report_spam_and_block(self, peer_id, report_spam, delete_chat)
+    }
+
+    fn delete_chat(&mut self, peer_id: PeerId, revoke: bool) -> Result<(), String> {
+        crate::dialogs_actions::delete_chat(self, peer_id, revoke)
+    }
+
+    fn unblock_and_restart_bot(&mut self, peer_id: PeerId) -> Result<(), String> {
+        crate::dialogs_actions::unblock_and_restart_bot(self, peer_id)
+    }
 }
 
 // ============================================================================
 // 3. history::backend::HistoryBackend
 // ============================================================================
+
+impl LiveSession {
+    fn poll_visible_slice_reactions(&self, peer_id: PeerId, messages: &mut [HistoryMessage]) {
+        if to_data_peer(peer_id).is_user() {
+            return;
+        }
+        let reacted_ids: Vec<MsgId> = messages
+            .iter()
+            .filter(|m| m.id.0 > 0 && !m.reactions.is_empty())
+            .map(|m| m.id)
+            .collect();
+        if reacted_ids.is_empty() {
+            return;
+        }
+        let Ok(polled) = self.poll_visible_messages_reactions_live(peer_id, &reacted_ids) else {
+            return;
+        };
+        if polled.is_empty() {
+            return;
+        }
+        let data_peer = to_data_peer(peer_id);
+        let media_cache = self.media_cache.clone();
+        self.read_session(|s| {
+            let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
+            for msg in messages.iter_mut() {
+                if !polled.contains(&msg.id) {
+                    continue;
+                }
+                let full_id = DataFullMsgId::new(data_peer, to_data_msg(msg.id));
+                if let Some(updated) = s.message(full_id) {
+                    msg.reactions =
+                        message_to_history_message_with_stickers(s, updated, &resolve).reactions;
+                }
+            }
+        });
+    }
+}
 
 impl HistoryBackend for LiveSession {
     fn self_peer(&self) -> (PeerId, String) {
@@ -2247,6 +2513,9 @@ impl HistoryBackend for LiveSession {
     ) -> HistorySlice {
         self.ensure_history_loaded(peer_id, around_id, LoadDirection::Around);
         let data_peer = to_data_peer(peer_id);
+        // Clear pending deltas right before snapshotting `Session` so events already reflected
+        // in the returned slice are not replayed, while events arriving afterward stay queued.
+        self.bridge.state().clear_history_delta(data_peer);
         let media_cache = self.media_cache.clone();
         let mut slice = self.read_session(|s| {
             build_history_slice(
@@ -2265,6 +2534,7 @@ impl HistoryBackend for LiveSession {
         );
         crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
         crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        self.poll_visible_slice_reactions(peer_id, &mut slice.messages);
         if slice.loaded_at_bottom {
             crate::chat_l233::append_streamed_drafts_to_slice(self, peer_id, &mut slice.messages);
         }
@@ -2306,6 +2576,7 @@ impl HistoryBackend for LiveSession {
         );
         crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
         crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        self.poll_visible_slice_reactions(peer_id, &mut slice.messages);
         slice
     }
 
@@ -2342,7 +2613,88 @@ impl HistoryBackend for LiveSession {
         );
         crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
         crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        self.poll_visible_slice_reactions(peer_id, &mut slice.messages);
         slice
+    }
+
+    fn drain_history_updates(&mut self, peer_id: PeerId) -> Vec<HistoryLiveUpdate> {
+        let data_peer = to_data_peer(peer_id);
+        let Some(delta) = self.bridge.state().take_history_delta(data_peer) else {
+            return Vec::new();
+        };
+        if delta.reload_required {
+            return vec![HistoryLiveUpdate::ReloadRequired];
+        }
+
+        let media_cache = self.media_cache.clone();
+        let (mut added_msgs, mut edited_msgs, outbox_max, unread_state) = self.read_session(|s| {
+            let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
+            let added: Vec<HistoryMessage> = delta
+                .added
+                .iter()
+                .filter_map(|&mid| {
+                    s.message(DataFullMsgId::new(data_peer, mid))
+                        .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
+                })
+                .collect();
+            let edited: Vec<HistoryMessage> = delta
+                .edited
+                .iter()
+                .filter_map(|&mid| {
+                    s.message(DataFullMsgId::new(data_peer, mid))
+                        .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
+                })
+                .collect();
+            let outbox = if delta.outbox_read_changed {
+                s.history(data_peer)
+                    .map(|h| from_data_msg(h.outbox_read_till_id()))
+                    .filter(|id| id.0 > 0)
+            } else {
+                None
+            };
+            let unread = if delta.unread_changed {
+                s.history(data_peer).map(|h| {
+                    (
+                        h.unread_count.unwrap_or(0).max(0) as u32,
+                        from_data_msg(h.inbox_read_till_id()),
+                    )
+                })
+            } else {
+                None
+            };
+            (added, edited, outbox, unread)
+        });
+
+        for batch in [&mut added_msgs, &mut edited_msgs] {
+            if !batch.is_empty() {
+                self.decorate_cached_translations(peer_id, batch);
+                crate::rich_message::attach_cached_rich_messages(self.runtime.session(), batch);
+                crate::widgets::attach_cached_widget_states(self.runtime.session(), batch);
+                crate::dice_pack::attach_and_prefetch_dice_lottie(self, batch);
+            }
+        }
+
+        let mut out = Vec::new();
+        if !delta.deleted.is_empty() {
+            let ids: Vec<MsgId> = delta.deleted.into_iter().map(from_data_msg).collect();
+            out.push(HistoryLiveUpdate::MessagesDeleted(ids));
+        }
+        for msg in added_msgs {
+            out.push(HistoryLiveUpdate::MessageAdded(Box::new(msg)));
+        }
+        for msg in edited_msgs {
+            out.push(HistoryLiveUpdate::MessageEdited(Box::new(msg)));
+        }
+        if let Some(max_id) = outbox_max {
+            out.push(HistoryLiveUpdate::OutboxRead { max_id });
+        }
+        if let Some((unread_count, inbox_read_till)) = unread_state {
+            out.push(HistoryLiveUpdate::UnreadChanged {
+                unread_count,
+                inbox_read_till,
+            });
+        }
+        out
     }
 
     fn send_message(
@@ -2928,6 +3280,18 @@ impl HistoryBackend for LiveSession {
         Some(self)
     }
 
+    fn as_chat_helpers_backend(
+        &self,
+    ) -> Option<&dyn tg_app_core::chat_helpers::backend::ChatHelpersBackend> {
+        Some(self)
+    }
+
+    fn as_chat_helpers_backend_mut(
+        &mut self,
+    ) -> Option<&mut dyn tg_app_core::chat_helpers::backend::ChatHelpersBackend> {
+        Some(self)
+    }
+
     fn send_poll(
         &mut self,
         peer_id: PeerId,
@@ -3399,6 +3763,14 @@ impl HistoryBackend for LiveSession {
         self.available_reactions_live()
     }
 
+    fn top_reactions(&self) -> Vec<String> {
+        self.top_reactions_live()
+    }
+
+    fn reaction_strip_emojis(&self, peer_id: Option<PeerId>) -> Vec<String> {
+        self.reaction_strip_emojis_live(peer_id)
+    }
+
     fn available_effects(&self) -> Vec<AvailableMessageEffect> {
         self.available_effects_live()
     }
@@ -3672,6 +4044,14 @@ impl HistoryBackend for LiveSession {
         crate::engagement::flush_extended_media_polls(self, force)
     }
 
+    fn poll_messages_reactions(
+        &self,
+        peer_id: PeerId,
+        msg_ids: &[MsgId],
+    ) -> Result<Vec<MsgId>, String> {
+        self.poll_visible_messages_reactions_live(peer_id, msg_ids)
+    }
+
     fn load_unread_things_page(
         &mut self,
         scope: tg_app_core::history::backend::UnreadThingsScope,
@@ -3702,6 +4082,14 @@ impl HistoryBackend for LiveSession {
         saved_peer_id: Option<PeerId>,
     ) -> Result<tg_app_core::history::backend::UnreadThingsReadResult, String> {
         crate::engagement::read_unread_reactions(self, peer_id, top_msg_id, saved_peer_id)
+    }
+
+    fn mark_visible_reactions_read(
+        &mut self,
+        peer_id: PeerId,
+        msg_ids: &[MsgId],
+    ) -> Result<Vec<MsgId>, String> {
+        crate::engagement::mark_visible_reactions_read(self, peer_id, msg_ids)
     }
 
     fn read_unread_poll_votes(
@@ -3893,7 +4281,17 @@ impl InfoBackend for LiveSession {
     fn peer_profile(&self, peer_id: PeerId) -> Option<InfoPeerProfile> {
         let data_peer = to_data_peer(peer_id);
         let now = now_unix_i32();
-        self.read_session(|s| peer_to_info_profile(s, data_peer, now))
+        let mut profile = self.read_session(|s| peer_to_info_profile(s, data_peer, now))?;
+        if (profile.kind.is_group() || profile.kind.is_channel())
+            && let Some((call_id, access_hash, can_manage)) = self.known_group_call_for(peer_id)
+        {
+            profile.group_call.active = true;
+            if profile.group_call.call_id.is_none() {
+                profile.group_call.call_id = Some((call_id, access_hash));
+            }
+            profile.group_call.can_manage |= can_manage;
+        }
+        Some(profile)
     }
 
     fn all_peers(&self) -> Vec<InfoPeerProfile> {
@@ -3938,6 +4336,26 @@ impl InfoBackend for LiveSession {
         query: &str,
     ) -> Vec<InfoMediaItem> {
         crate::search_and_info::shared_media(self, peer_id, tab, query)
+    }
+
+    fn shared_media_thumb(
+        &self,
+        peer_id: PeerId,
+        msg_id: i32,
+    ) -> tg_app_core::info::backend::SharedMediaThumb {
+        let data_peer = to_data_peer(peer_id);
+        let data_msg = DataMsgId(i64::from(msg_id));
+        let Some(msg) =
+            self.read_session(|s| s.message(DataFullMsgId::new(data_peer, data_msg)).cloned())
+        else {
+            return tg_app_core::info::backend::SharedMediaThumb::Unavailable;
+        };
+        self.media_cache.shared_media_thumb_for_message(
+            &msg,
+            self.runtime.rpc(),
+            self.runtime.tokio_handle(),
+            self.bridge.state(),
+        )
     }
 
     fn global_media(
@@ -4958,6 +5376,13 @@ impl InfoBackend for LiveSession {
         crate::contacts_extras::update_contact_note(self, peer_id, note)
     }
 
+    fn active_profile_photo_ref(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<tg_app_core::info::backend::ProfilePhotoRef> {
+        crate::profile_info_extras::active_profile_photo_ref(self, peer_id)
+    }
+
     fn delete_profile_photos(
         &mut self,
         photos: &[tg_app_core::info::backend::ProfilePhotoRef],
@@ -5146,6 +5571,13 @@ impl SettingsBackend for LiveSession {
                 if let Ok(mut c) = self.cache.lock() {
                     c.privacy_loaded.insert(key);
                     c.privacy_rules.insert(key, server_rule);
+                }
+                if key == PrivacyKey::LastSeen {
+                    // Port of `UserPrivacy::apply` -> `ApiWrap::updatePrivacyLastSeens`
+                    // (`api/api_user_privacy.cpp:213-215`, `apiwrap.cpp:2182-2230`).
+                    let now_ms = u64::try_from(self.ch_now_ms()).unwrap_or(0);
+                    let _ =
+                        crate::contacts_extras::maybe_refresh_contact_statuses(self, now_ms, true);
                 }
                 self.bridge.state().notify_ui();
             }
@@ -6043,25 +6475,25 @@ impl MediaBackend for LiveSession {
             msg_id: Some(msg_id.0 as i32),
             sticker_set_id: None,
         };
-        let streamed_dir = self.media_cache.root_dir().join("streamed");
-        Ok(Arc::new(
-            TelegramRangeLoader::new(
-                self.runtime.rpc().clone(),
-                self.runtime.tokio_handle().clone(),
-                resolved,
-            )
-            .with_refresh_origin(Arc::clone(self.runtime.session()), origin)
-            .with_storage_dir(streamed_dir),
-        ))
+        let mut loader = TelegramRangeLoader::new(
+            self.runtime.rpc().clone(),
+            self.runtime.tokio_handle().clone(),
+            resolved,
+        )
+        .with_refresh_origin(Arc::clone(self.runtime.session()), origin);
+        if self.media_cache.is_persistent() {
+            let streamed_dir = self.media_cache.root_dir().join("streamed");
+            loader = loader.with_storage_dir(streamed_dir);
+        }
+        Ok(Arc::new(loader))
     }
 
     fn save_to_disk(&self, id: MediaItemId, destination: &Path) -> anyhow::Result<PathBuf> {
         let bytes = self.load_bytes(id)?;
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(destination, &bytes)?;
-        Ok(destination.to_path_buf())
+        let saved = tg_platform::file_safety::write_unique_file_at_destination(destination, &bytes)
+            .map_err(|err| anyhow!("{err}"))?;
+        mark_downloaded_file_zone_identifier(&saved);
+        Ok(saved)
     }
 
     fn copy_item(&self, id: MediaItemId) -> anyhow::Result<()> {
@@ -6110,10 +6542,32 @@ impl MediaBackend for LiveSession {
         } else {
             item.file_name
         };
-        let safe_name = tg_platform::system_info::sanitize_filename(&raw_name);
-        let path = std::env::temp_dir().join(safe_name);
-        let saved = self.save_to_disk(id, &path)?;
+        let bytes = self.load_bytes(id)?;
+        let temp_dir = self.external_open_temp_dir();
+        let saved =
+            tg_platform::file_safety::write_unique_file_in_dir(&temp_dir, &raw_name, &bytes)
+                .map_err(|err| anyhow!("{err}"))?;
+        mark_downloaded_file_zone_identifier(&saved);
         crate::media::launch_external_file(&saved)?;
+        Ok(saved)
+    }
+
+    fn open_in_external_app_confirmed(&self, id: MediaItemId) -> anyhow::Result<PathBuf> {
+        let item = self
+            .get_item(id)
+            .ok_or_else(|| anyhow!("media item {} not found", id.0))?;
+        let raw_name = if item.file_name.is_empty() {
+            format!("rustgram_media_{}", id.0)
+        } else {
+            item.file_name
+        };
+        let bytes = self.load_bytes(id)?;
+        let temp_dir = self.external_open_temp_dir();
+        let saved =
+            tg_platform::file_safety::write_unique_file_in_dir(&temp_dir, &raw_name, &bytes)
+                .map_err(|err| anyhow!("{err}"))?;
+        mark_downloaded_file_zone_identifier(&saved);
+        crate::media::launch_external_file_confirmed(&saved)?;
         Ok(saved)
     }
 
@@ -6283,6 +6737,10 @@ fn live_pending_mini_app_urls() -> &'static Mutex<HashMap<(usize, u64), String>>
 }
 
 impl tg_app_core::session_api::AppSession for LiveSession {
+    fn prepare_open_chat(&self, peer_id: PeerId) {
+        crate::open_chat_prefetch::start(self, to_data_peer(peer_id));
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -6371,6 +6829,21 @@ impl tg_app_core::session_api::AppSession for LiveSession {
             .lock()
             .ok()
             .and_then(|mut guard| guard.remove(&key))
+    }
+
+    fn is_mini_app_bot_trusted(&self, bot_id: PeerId) -> bool {
+        self.cache
+            .lock()
+            .ok()
+            .is_some_and(|c| c.trusted_mini_app_bots.contains(&bot_id.0))
+    }
+
+    fn trust_mini_app_bot(&mut self, bot_id: PeerId) {
+        if let Ok(mut c) = self.cache.lock()
+            && c.trusted_mini_app_bots.insert(bot_id.0)
+        {
+            c.session_settings_dirty = true;
+        }
     }
 
     fn take_pending_chat_opens(&self) -> Vec<PendingChatOpen> {
@@ -6626,5 +7099,204 @@ impl tg_app_core::session_api::AppSession for LiveSession {
         path: &str,
     ) -> Result<Option<tg_app_core::session_api::DeepLinkInfoResult>, String> {
         self.deep_link_request_info(path)
+    }
+}
+
+/// Marks a downloaded file on Windows NTFS with Mark-of-the-Web (`:Zone.Identifier` ADS with
+/// `ZoneId=3`, Internet Zone), porting tdesktop's `Platform::File::PostprocessDownloaded`
+/// (`Telegram/SourceFiles/platform/win/file_utilities_win.cpp:305-326`).
+///
+/// Silently ignores filesystems that do not support Alternate Data Streams (e.g. FAT32/exFAT).
+pub fn mark_downloaded_file_zone_identifier(path: &Path) {
+    #[cfg(windows)]
+    {
+        let mut ads = path.as_os_str().to_os_string();
+        ads.push(":Zone.Identifier");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(PathBuf::from(ads))
+        {
+            use std::io::Write as _;
+            let _ = file.write_all(b"[ZoneTransfer]\r\nZoneId=3\r\n");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
+}
+
+#[cfg(test)]
+mod sec2b_session_tests {
+    use super::*;
+    use tg_api::{DcId, InvocationError, RpcClient};
+    use tg_data::{
+        Message, MessageContent, MessageFlags, MessageMedia, MsgId as DataMsgId,
+        PeerId as DataPeerId, PhotoData, PhotoSize, TextWithEntities as DataText,
+        UserId as DataUserId,
+    };
+    use tg_session::{SessionRuntime, SessionRuntimeConfig};
+    use tg_storage::cache::media_cache::MediaCacheTag;
+    use tg_tl::RemoteCall;
+
+    #[derive(Clone, Default)]
+    struct NoopRpcClient;
+
+    impl RpcClient for NoopRpcClient {
+        type Error = InvocationError;
+
+        async fn invoke<R: RemoteCall + Send + Sync>(
+            &self,
+            _req: &R,
+        ) -> Result<R::Return, Self::Error> {
+            Err(InvocationError::Dropped)
+        }
+
+        async fn invoke_in_dc<R: RemoteCall + Send + Sync>(
+            &self,
+            _dc_id: DcId,
+            _req: &R,
+        ) -> Result<R::Return, Self::Error> {
+            Err(InvocationError::Dropped)
+        }
+
+        fn main_dc_id(&self) -> DcId {
+            2
+        }
+
+        fn set_main_dc_id(&self, _dc_id: DcId) {}
+    }
+
+    fn make_test_session_with_cached_photo() -> (tempfile::TempDir, LiveSession, MediaItemId) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cfg = SessionRuntimeConfig {
+            init_updates_state: false,
+            run_get_difference_on_start: false,
+            load_initial_dialogs: false,
+            fetch_self_user_on_start: false,
+            ..SessionRuntimeConfig::default()
+        };
+        let rt = Arc::new(
+            SessionRuntime::start(DataUserId(100), ErasedRpcClient::new(NoopRpcClient), cfg)
+                .expect("start runtime"),
+        );
+        let live = LiveSession::new(Arc::clone(&rt), 100);
+        live.set_media_cache_dir(dir.path().join("media_cache"))
+            .expect("set media cache");
+
+        let photo_id = 55_501u64;
+        let photo = PhotoData {
+            id: tg_data::PhotoId(photo_id),
+            access_hash: 1,
+            file_reference: vec![1, 2, 3],
+            date: 1_700_000_000,
+            dc_id: 2,
+            sizes: vec![PhotoSize {
+                kind: "y".to_owned(),
+                width: 64,
+                height: 64,
+                size: 21,
+            }],
+            ..PhotoData::default()
+        };
+        let cache_key = photo_cache_key(2, photo_id, "y");
+        live.media_cache()
+            .put_blob(&cache_key, MediaCacheTag::Photo, b"SAVED_PHOTO_BYTES_123")
+            .expect("seed cache");
+
+        let peer = DataPeerId::from_user(DataUserId(200));
+        let mut msg = Message::new_text(
+            peer,
+            DataMsgId(77),
+            Some(peer),
+            1_700_000_000,
+            DataText::plain(String::new()),
+        );
+        msg.flags = MessageFlags::empty();
+        msg.content = MessageContent::Regular {
+            text: DataText::plain(String::new()),
+            media: MessageMedia::Photo(Box::new(photo)),
+        };
+        let session_arc = Arc::clone(rt.session());
+        rt.tokio_handle().block_on(async move {
+            session_arc.write().await.insert_message(msg);
+        });
+
+        let item_id = MediaItemId(photo_id);
+        (dir, live, item_id)
+    }
+
+    #[test]
+    fn d4_save_to_disk_writes_zone_identifier_mark_of_the_web() {
+        let (dir, live, item_id) = make_test_session_with_cached_photo();
+        let dest = dir.path().join("downloads").join("photo.jpg");
+
+        let saved = MediaBackend::save_to_disk(&live, item_id, &dest).expect("save_to_disk");
+        assert_eq!(
+            std::fs::read(&saved).expect("read saved"),
+            b"SAVED_PHOTO_BYTES_123"
+        );
+
+        #[cfg(windows)]
+        {
+            let mut ads = saved.as_os_str().to_os_string();
+            ads.push(":Zone.Identifier");
+            let zone_content = std::fs::read_to_string(PathBuf::from(ads))
+                .expect("Zone.Identifier ADS must exist");
+            assert!(
+                zone_content.contains("[ZoneTransfer]") && zone_content.contains("ZoneId=3"),
+                "saved file must carry Mark-of-the-Web ZoneId=3, got: {zone_content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn d3_external_open_temp_dir_lives_under_account_folder_and_cleans_up() {
+        let (dir, live, _item_id) = make_test_session_with_cached_photo();
+        let acc_temp = dir.path().join("tdata").join("temp_data");
+        live.set_account_temp_dir(&acc_temp);
+
+        let ext_dir = live.external_open_temp_dir();
+        assert_eq!(ext_dir, acc_temp.join("external"));
+        assert!(
+            !ext_dir.starts_with(std::env::temp_dir().join("rustgram_external")),
+            "external temp copy must live under account folder, not %TEMP%\\rustgram_external"
+        );
+
+        std::fs::create_dir_all(&ext_dir).expect("mkdir");
+        let stale = ext_dir.join("opened.pdf");
+        std::fs::write(&stale, b"temp pdf").expect("write");
+        let busy = ext_dir.join("still_open.pdf");
+        std::fs::write(&busy, b"busy pdf").expect("write busy");
+        assert!(stale.is_file());
+
+        #[cfg(windows)]
+        let busy_guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&busy)
+                .expect("lock busy file")
+        };
+
+        live.cleanup_account_temp_files();
+        assert!(
+            !stale.exists(),
+            "cleanup_account_temp_files must delete unlocked external temp copies"
+        );
+        #[cfg(windows)]
+        {
+            assert!(
+                busy.exists(),
+                "cleanup must skip files currently held open by an external app"
+            );
+            drop(busy_guard);
+            live.cleanup_account_temp_files();
+            assert!(!busy.exists(), "once closed, temp copy must be cleaned up");
+        }
     }
 }

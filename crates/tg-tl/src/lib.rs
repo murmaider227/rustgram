@@ -8,7 +8,10 @@ pub mod error;
 pub mod manual;
 pub mod traits;
 
-pub use cursor::Cursor;
+pub use cursor::{
+    Cursor, DEFAULT_MAX_ALLOC_BYTES, DEFAULT_MAX_DEPTH, DEFAULT_MAX_ELEMENTS, DecodeLimits,
+    DepthGuard,
+};
 pub use error::DeserializeError;
 pub use traits::{
     BOOL_FALSE_ID, BOOL_TRUE_ID, BareVec, Boxed, Deserializable, Identifiable, RawObject,

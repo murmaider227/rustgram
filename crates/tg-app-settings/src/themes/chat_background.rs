@@ -49,6 +49,21 @@ use tg_ui::theme::theme_color_to_egui;
 const DEFAULT_RENDER_SIZE: u32 = 384;
 /// Dimension of procedurally generated tileable pattern masks.
 const PATTERN_MASK_SIZE: u32 = 256;
+/// Width / height of Telegram's pattern wallpapers (the 1440x2960 `.tgv` canvas).
+const PATTERN_ASPECT: f32 = 1440.0 / 2960.0;
+/// Largest side a full-size pattern wallpaper texture is rendered at.
+const MAX_PATTERN_RENDER_SIDE: f32 = 2048.0;
+/// Night-mode default chat background (`night.tdesktop-theme` ships a 1x1 `#0e1621`).
+const NIGHT_DEFAULT_BACKGROUND: Color32 = Color32::from_rgb(0x0e, 0x16, 0x21);
+
+/// tdesktop's default "Classic" pattern (`Telegram/Resources/art/background.tgv`, GPL-3.0).
+const CLASSIC_PATTERN_TGV: &[u8] = include_bytes!("assets/background.tgv");
+
+/// Shared bytes of the Classic pattern (one allocation for every default config).
+fn classic_pattern_bytes() -> Arc<Vec<u8>> {
+    static BYTES: std::sync::OnceLock<Arc<Vec<u8>>> = std::sync::OnceLock::new();
+    Arc::clone(BYTES.get_or_init(|| Arc::new(CLASSIC_PATTERN_TGV.to_vec())))
+}
 
 /// Procedural GPL-safe pattern mask styles composited over chat gradients.
 ///
@@ -163,13 +178,14 @@ impl Default for BackgroundConfig {
 }
 
 impl BackgroundConfig {
-    /// Telegram's signature Classic Meadow 4-color patterned wallpaper.
+    /// Telegram's default "Classic" wallpaper: tdesktop's `background.tgv` doodle pattern over
+    /// the 4-color green-yellow gradient (`Data::DefaultWallPaper`, intensity 50).
     #[must_use]
     pub fn classic_meadow() -> Self {
         Self {
             wallpaper: WallPaper::construct_default(),
             pattern: PatternKind::Doodles,
-            pattern_bytes: None,
+            pattern_bytes: Some(classic_pattern_bytes()),
             custom_image: None,
             tiled: true,
             motion: false,
@@ -666,11 +682,11 @@ impl ChatBackground {
             && !raw_pattern.is_empty()
         {
             let tile_dim = PATTERN_MASK_SIZE.min(w.max(h)).max(32);
-            let tile_mode = if config.tiled {
-                PatternTileMode::Centered
-            } else {
-                PatternTileMode::Repeat
-            };
+            let tile_mode = PatternTileMode::Centered;
+            // `CacheBackgroundByRequest`: the pattern is scaled to the area height (keeping its
+            // aspect) and tiled in an odd number of columns centered horizontally.
+            let tile_h = h.max(16);
+            let tile_w = ((tile_h as f32 * PATTERN_ASPECT).round() as u32).max(8);
 
             if rotation_add == 0 || !(config.motion && colors.len() >= 3) {
                 if let Ok(rendered) = render_tiled_pattern_wallpaper(
@@ -680,7 +696,7 @@ impl ChatBackground {
                     &colors,
                     eff_rot,
                     config.wallpaper.intensity,
-                    Some((tile_dim, tile_dim)),
+                    Some((tile_w, tile_h)),
                     tile_mode,
                 ) {
                     return rendered;
@@ -777,6 +793,62 @@ impl ChatBackground {
         handle
     }
 
+    /// Obtains (or renders and uploads) a `width`x`height` texture for `config`; used for
+    /// pattern wallpapers, which tdesktop renders at the real area size.
+    fn texture_for_config_sized(
+        &mut self,
+        ctx: &Context,
+        config: &BackgroundConfig,
+        width: u32,
+        height: u32,
+    ) -> TextureHandle {
+        let key = config.cache_key(0, width, height, self.dark_mode);
+        if let Some(existing) = self.texture_cache.get(&key) {
+            return existing.clone();
+        }
+        let rgba = self.render_image(config, width, height, 0);
+        let name = format!(
+            "tg_chat_bg_{}_{}",
+            self.generation,
+            self.texture_cache.len()
+        );
+        let handle = ctx.load_texture(name, rgba_to_color_image(&rgba), TextureOptions::LINEAR);
+        self.texture_cache.insert(key, handle.clone());
+        self.trim_cache();
+        handle
+    }
+
+    /// Whether `config` is the stock default wallpaper (no user choice was made).
+    fn is_stock_default(config: &BackgroundConfig) -> bool {
+        config.custom_image.is_none()
+            && config.wallpaper.id == tg_theme::DEFAULT_BACKGROUND_ID
+            && config.wallpaper.background_colors
+                == WallPaper::construct_default().background_colors
+    }
+
+    /// Paints a scaled-down preview of the global background (as it looks in a chat area of
+    /// `area_side` x `area_side` points) into `rect` (`BackgroundRow` thumbnail).
+    pub fn paint_thumbnail(&mut self, ui: &mut Ui, rect: Rect, area_side: f32) {
+        let cfg = self.global.clone();
+        if self.dark_mode && Self::is_stock_default(&cfg) {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, NIGHT_DEFAULT_BACKGROUND);
+            return;
+        }
+        if cfg.custom_image.is_none() && cfg.wallpaper.is_pattern() && cfg.has_svg_pattern() {
+            let side = (area_side.clamp(64.0, MAX_PATTERN_RENDER_SIDE) / 16.0).ceil() as u32 * 16;
+            let tex = self.texture_for_config_sized(ui.ctx(), &cfg, side, side);
+            ui.painter().image(
+                tex.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            self.paint_config(ui, rect, &cfg, self.dark_mode);
+        }
+    }
+
     /// Paints the active chat background for `peer_id` into `rect`.
     ///
     /// This is the primary entry point intended for `crates/tg-app/src/history/`.
@@ -784,6 +856,13 @@ impl ChatBackground {
     /// and dark-mode dimming automatically.
     pub fn paint(&mut self, ui: &mut Ui, rect: Rect, peer_id: Option<i64>) {
         let cfg = self.resolve_for_peer(peer_id).clone();
+        if self.dark_mode && Self::is_stock_default(&cfg) {
+            // The built-in Night themes replace the default wallpaper with their own solid
+            // `#0e1621` background (`night.tdesktop-theme`).
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, NIGHT_DEFAULT_BACKGROUND);
+            return;
+        }
         self.paint_config(ui, rect, &cfg, self.dark_mode);
     }
 
@@ -807,6 +886,34 @@ impl ChatBackground {
         {
             let fill = theme_color_to_egui(config.wallpaper.background_colors[0]);
             ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
+            return;
+        }
+
+        // Vector pattern wallpapers render at the real area size (pattern scaled to the area
+        // height), like tdesktop's `CacheBackgroundByRequest`.
+        if config.custom_image.is_none()
+            && config.wallpaper.is_pattern()
+            && config.has_svg_pattern()
+            && !(config.motion && self.motion_rotation_add != 0)
+        {
+            let ppp = ui.ctx().pixels_per_point();
+            let mut px_w = rect.width() * ppp;
+            let mut px_h = rect.height() * ppp;
+            let longest = px_w.max(px_h);
+            if longest > MAX_PATTERN_RENDER_SIDE {
+                let k = MAX_PATTERN_RENDER_SIDE / longest;
+                px_w *= k;
+                px_h *= k;
+            }
+            // Quantize so small resizes reuse the cached texture.
+            let quant = |v: f32| (((v.max(16.0) / 16.0).ceil()) * 16.0) as u32;
+            let tex = self.texture_for_config_sized(ui.ctx(), config, quant(px_w), quant(px_h));
+            ui.painter().image(
+                tex.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
             return;
         }
 

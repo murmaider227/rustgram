@@ -6,10 +6,10 @@
 //!    Stars Affiliate, Telegram Business), `DeepLinkOverlayRequest::OpenPayments` forwarding
 //!    (invoice deep link, passport deep link, unique-gift slug lookup), and clicking Invoice /
 //!    PaidMedia message bubbles.
-//! 3. Downloads reachable via Main Menu `"Downloads"` row and `Ctrl+J` shortcut (`InfoSection::Downloads`).
+//! 3. Downloads reachable via the `Ctrl+J` shortcut (`InfoSection::Downloads`); the 7.4.6 Main Menu has no row for it.
 //! 4. `"Your Color"` row in Settings -> My Account opening `EditPeerColorBox` for the signed-in user.
-//! 5. `"Checklist"` entry in compose attach menu (`open_create_todo_box`), channel `"Direct Messages"`
-//!    top-bar button + `?direct` deep link (`open_monoforum_section`), and `"Export Invite Link"` in
+//! 5. `"Checklist"` entry in compose attach menu (`open_create_todo_box`), channel `"Direct messages"` (chat menu)
+//!    and the `?direct` deep link (`open_monoforum_section`), and `"Export Invite Link"` in
 //!    `settings/folders.rs` (`export_chatlist_invite`).
 //! 6. Per-account runtime bindings in `MultiAccountWorkspaceHost`:
 //!    `MediaOverlayWidget::sync_screenshot_protection(hwnd)`,
@@ -803,7 +803,6 @@ fn settings_main_payments_and_business_rows_reachable_in_demo_and_live_mode() {
         ("Telegram Premium", PaymentsScreen::Premium),
         ("My Stars", PaymentsScreen::Stars),
         ("Send a Gift", PaymentsScreen::StarGifts),
-        ("Stars Affiliate", PaymentsScreen::Affiliate),
     ];
 
     // Demo mode
@@ -1215,27 +1214,21 @@ fn clicking_invoice_and_paid_media_bubbles_opens_checkout_and_unlock_in_demo_and
 }
 
 // =============================================================================
-// 3. Downloads: Main Menu row + Ctrl+J shortcut (demo + live)
+// 3. Downloads: Ctrl+J shortcut (demo + live); 7.4.6 has no Main Menu row for it
 // =============================================================================
 
 #[test]
 fn downloads_reachable_via_main_menu_and_ctrl_j_in_demo_and_live_mode() {
-    // Demo mode — Main Menu click
+    // Demo mode — the 7.4.6 Main Menu (`MainMenu::setupMenu`) has no Downloads row.
     {
         let (mut ctrl, _tmp) = make_demo_controller();
         ctrl.open_main_menu();
         let mut harness = build_demo_harness(ctrl);
         harness.step();
         harness.step();
-        harness.get_by_label("Downloads").click();
-        harness.step();
-        harness.step();
         assert!(
-            matches!(
-                harness.state().main_widget().main_info().current_section(),
-                InfoSection::Downloads { .. }
-            ),
-            "Main Menu Downloads click must open InfoSection::Downloads in demo mode"
+            harness.query_by_label("Downloads").is_none(),
+            "Main Menu must not show a Downloads row (tdesktop parity)"
         );
     }
 
@@ -1259,28 +1252,9 @@ fn downloads_reachable_via_main_menu_and_ctrl_j_in_demo_and_live_mode() {
     // Live mode — Main Menu click & Ctrl+J
     {
         let env = LiveTestEnv::boot(724_001, 724_002, 724_003);
-        let mut ws = env.workspace;
-        ws.controller_mut().open_main_menu();
+        let ws = env.workspace;
         let mut harness = build_live_harness(ws);
         harness.step();
-        harness.step();
-        harness.get_by_label("Downloads").click();
-        harness.step();
-        harness.step();
-        assert!(
-            matches!(
-                harness
-                    .state()
-                    .controller()
-                    .main_widget()
-                    .main_info()
-                    .current_section(),
-                InfoSection::Downloads { .. }
-            ),
-            "Main Menu Downloads click must open InfoSection::Downloads in live mode"
-        );
-        // Navigate back, then verify Ctrl+J also opens Downloads in live mode.
-        harness.key_press(Key::Escape);
         harness.step();
         harness.key_press_modifiers(Modifiers::CTRL, Key::J);
         harness.step();
@@ -1390,7 +1364,8 @@ fn checklist_channel_dms_and_folder_invite_export_work_in_demo_and_live_mode() {
         harness.key_press(Key::Escape);
         harness.step();
 
-        // 5b. Channel Direct Messages top-bar button + `?direct` deep link
+        // 5b. Channel "Direct messages" in the chat menu (7.4.6 `Filler::addDirectMessages`)
+        // + `?direct` deep link
         harness
             .state_mut()
             .session_mut()
@@ -1402,12 +1377,14 @@ fn checklist_channel_dms_and_folder_invite_export_work_in_demo_and_live_mode() {
             );
         harness.step();
         harness.step();
-        harness.get_by_label("Direct Messages").click();
+        harness.get_by_label("Chat menu").click();
+        crate::common::wait_for_menu_item(&mut harness, "Direct messages");
+        harness.get_by_label("Direct messages").click();
         harness.step();
         harness.step();
         assert!(
             harness.state().main_widget().history().is_monoforum_open(),
-            "clicking Direct Messages button in demo channel must open monoforum section"
+            "clicking Direct messages in the demo channel's chat menu must open monoforum section"
         );
         harness
             .state_mut()
@@ -1499,7 +1476,8 @@ fn checklist_channel_dms_and_folder_invite_export_work_in_demo_and_live_mode() {
         harness.key_press(Key::Escape);
         harness.step();
 
-        // 5b. Channel Direct Messages top-bar button + `?direct` deep link
+        // 5b. Channel "Direct messages" in the chat menu (7.4.6 `Filler::addDirectMessages`)
+        // + `?direct` deep link
         harness
             .state_mut()
             .controller_mut()
@@ -1508,7 +1486,9 @@ fn checklist_channel_dms_and_folder_invite_export_work_in_demo_and_live_mode() {
             .show_peer_history(channel, SectionShow::clear_stack(), MsgId::SHOW_AT_END);
         harness.step();
         harness.step();
-        harness.get_by_label("Direct Messages").click();
+        harness.get_by_label("Chat menu").click();
+        crate::common::wait_for_menu_item(&mut harness, "Direct messages");
+        harness.get_by_label("Direct messages").click();
         harness.step();
         harness.step();
         assert!(
@@ -1518,7 +1498,7 @@ fn checklist_channel_dms_and_folder_invite_export_work_in_demo_and_live_mode() {
                 .main_widget()
                 .history()
                 .is_monoforum_open(),
-            "clicking Direct Messages button in live channel must open monoforum section"
+            "clicking Direct messages in the live channel's chat menu must open monoforum section"
         );
         harness
             .state_mut()

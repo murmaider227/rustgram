@@ -460,7 +460,7 @@ fn wp35_mini_app_check_and_request_location_events() {
     let now = Instant::now();
 
     let check_msg = WebMessage {
-        text: r#"{"eventType":"web_app_check_location","eventData":{}}"#.to_owned(),
+        text: r#"["web_app_check_location", {}]"#.to_owned(),
         source_url: "https://miniapp.example.org/app".to_owned(),
     };
     let _ = window.handle_web_message(
@@ -473,7 +473,7 @@ fn wp35_mini_app_check_and_request_location_events() {
     );
 
     let req_msg = WebMessage {
-        text: r#"{"eventType":"web_app_request_location","eventData":{}}"#.to_owned(),
+        text: r#"["web_app_request_location", {}]"#.to_owned(),
         source_url: "https://miniapp.example.org/app".to_owned(),
     };
     // The first request asks for per-bot consent and does not touch the location provider.
@@ -493,7 +493,7 @@ fn wp35_mini_app_check_and_request_location_events() {
     assert_eq!(fake_geo.resolve_call_count(), 1);
 
     let settings_msg = WebMessage {
-        text: r#"{"eventType":"web_app_open_location_settings","eventData":{}}"#.to_owned(),
+        text: r#"["web_app_open_location_settings", {}]"#.to_owned(),
         source_url: "https://miniapp.example.org/app".to_owned(),
     };
     let evs = window.handle_web_message(
@@ -593,7 +593,7 @@ fn wp35_mini_app_location_denied_never_reads_device_location() {
     let clipboard = TestClipboard;
     let now = Instant::now();
     let req_msg = WebMessage {
-        text: r#"{"eventType":"web_app_request_location","eventData":{}}"#.to_owned(),
+        text: r#"["web_app_request_location", {}]"#.to_owned(),
         source_url: "https://miniapp.example.org/denied".to_owned(),
     };
 

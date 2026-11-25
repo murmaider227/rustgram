@@ -606,6 +606,42 @@ pub fn paint_voice_recording_bar(
 // 2. Round Video Recording (real webcam via `tg-voip::video_mf` + `tg-video`, headless-safe)
 // ---------------------------------------------------------------------------
 
+static ACTIVE_ROUND_VIDEO_TEMP_DIR: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Configures the active account's temporary directory for round video captures
+/// (e.g. `<tdata>/temp_<dataName>/round_videos`) so captures never land in `%TEMP%`.
+pub fn set_active_round_video_temp_dir(dir: Option<std::path::PathBuf>) {
+    if let Ok(mut guard) = ACTIVE_ROUND_VIDEO_TEMP_DIR.lock() {
+        *guard = dir;
+    }
+}
+
+/// Returns the currently configured account round-video temp directory, if any.
+#[must_use]
+pub fn active_round_video_temp_dir() -> Option<std::path::PathBuf> {
+    ACTIVE_ROUND_VIDEO_TEMP_DIR
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+/// Removes stale temporary round video files inside `dir` (skipping any file currently held open).
+pub fn cleanup_round_video_temp_dir(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let _ = std::fs::remove_file(&path);
+        } else if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 /// Stateful circular round-video recorder (`ui/controls/round_video_recorder.cpp`).
 ///
 /// Opens a real webcam through `tg-voip::video_mf` when available, renders live circular
@@ -625,6 +661,14 @@ pub struct RoundVideoRecorderState {
     preview_tex: Option<TextureHandle>,
     /// Path to the most recently captured square MP4 file (if exported).
     pub last_captured_mp4: Option<String>,
+    /// Optional explicit output directory overriding the active account temp directory.
+    output_dir: Option<std::path::PathBuf>,
+}
+
+impl Drop for RoundVideoRecorderState {
+    fn drop(&mut self) {
+        self.cleanup_captured_files();
+    }
 }
 
 impl std::fmt::Debug for RoundVideoRecorderState {
@@ -641,13 +685,38 @@ impl std::fmt::Debug for RoundVideoRecorderState {
 }
 
 impl RoundVideoRecorderState {
+    /// Configures an explicit per-account output directory for exported round video MP4s.
+    pub fn set_output_dir(&mut self, dir: std::path::PathBuf) {
+        self.output_dir = Some(dir);
+    }
+
+    /// Resolves the output directory for round video captures: explicit override, then active
+    /// account temp directory, and only as a last resort a PID-scoped fallback.
+    #[must_use]
+    pub fn resolve_output_dir(&self) -> std::path::PathBuf {
+        if let Some(ref dir) = self.output_dir {
+            return dir.clone();
+        }
+        if let Some(dir) = active_round_video_temp_dir() {
+            return dir;
+        }
+        std::env::temp_dir().join(format!("rustgram_round_videos_pid_{}", std::process::id()))
+    }
+
+    /// Deletes the most recently captured temporary MP4 file if present (skipping if busy).
+    pub fn cleanup_captured_files(&mut self) {
+        if let Some(path) = self.last_captured_mp4.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// Starts round video recording at `now_secs`, opening a webcam if available (headless-safe).
     pub fn start(&mut self, now_secs: f64, locked: bool) {
         self.cancel();
+        self.cleanup_captured_files();
         self.active = true;
         self.locked = locked;
         self.started_at = now_secs;
-        self.last_captured_mp4 = None;
         self.webcam =
             tg_app_media::media::round_video_capture::RoundVideoWebcamCapture::try_start_default()
                 .ok()
@@ -672,7 +741,8 @@ impl RoundVideoRecorderState {
         }
         let duration_secs = ((now_secs - self.started_at).round() as u32).clamp(1, 60);
         if let Some(mut cam) = self.webcam.take() {
-            let out_dir = std::env::temp_dir().join("rustgram_round_videos");
+            let out_dir = self.resolve_output_dir();
+            let _ = std::fs::create_dir_all(&out_dir);
             let captured = cam.finish(&out_dir, Some(duration_secs));
             self.last_captured_mp4 = captured
                 .mp4_path
@@ -3259,4 +3329,44 @@ fn paint_translate_cocoon_menu_row(ui: &mut Ui, inner_w: f32, colors: &HistoryCo
     ui.painter().galley(text_pos, galley, colors.sub_text_fg);
 
     resp.clicked()
+}
+
+#[cfg(test)]
+mod d3_temp_tests {
+    use super::*;
+
+    #[test]
+    fn d3_round_video_uses_account_temp_dir_and_cleans_up() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let acc_round_dir = dir.path().join("temp_data").join("round_videos");
+
+        set_active_round_video_temp_dir(Some(acc_round_dir.clone()));
+        let mut recorder = RoundVideoRecorderState::default();
+        assert_eq!(
+            recorder.resolve_output_dir(),
+            acc_round_dir,
+            "round video recorder must write under the active account temp folder, not %TEMP%"
+        );
+
+        std::fs::create_dir_all(&acc_round_dir).expect("mkdir");
+        let captured = acc_round_dir.join("round_1.mp4");
+        std::fs::write(&captured, b"fake round mp4").expect("write");
+        recorder.last_captured_mp4 = Some(captured.to_string_lossy().into_owned());
+        drop(recorder);
+        assert!(
+            !captured.exists(),
+            "dropping RoundVideoRecorderState must clean up captured temporary MP4"
+        );
+
+        // Stale files left in the account round_videos dir are removed on startup/logout/exit cleanup.
+        let stale = acc_round_dir.join("stale_round.mp4");
+        std::fs::write(&stale, b"stale").expect("write stale");
+        cleanup_round_video_temp_dir(&acc_round_dir);
+        assert!(
+            !stale.exists(),
+            "cleanup must delete stale round video temp files"
+        );
+
+        set_active_round_video_temp_dir(None);
+    }
 }

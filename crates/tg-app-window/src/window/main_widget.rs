@@ -3,15 +3,24 @@
 //!
 //! Port origin: `Telegram/SourceFiles/mainwidget.h` and `Telegram/SourceFiles/mainwidget.cpp`.
 
-use egui::{CursorIcon, Id, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, Vec2};
+use egui::{
+    Area, Color32, CornerRadius, CursorIcon, Frame, Id, Order, Pos2, Rect, Sense, Stroke, Ui,
+    UiBuilder, Vec2,
+};
 use tg_audio::AudioMsgId;
 use tg_core::settings::{AutoplaySettings, CoreSettings, PowerSavingFlags};
 use tg_emoji::EmojiTextureCache;
 use tg_text::TextWithEntities;
 use tg_theme::{Color as ThemeColor, EmbeddedType};
+use tg_ui::fonts::font_id_from_style;
+use tg_ui::icons::paint_style_icon;
+use tg_ui::tg_style::{DefaultPaletteResolver, Icon, st};
 use tg_ui::theme::Colors;
 
-use crate::window::adaptive::{HISTORY_RESIZE_WIDTH, WindowLayout, dialogs_drag_to_ratio};
+use crate::window::adaptive::{
+    COLUMN_MIN_WIDTH_MAIN, COLUMN_MIN_WIDTH_THIRD, HISTORY_RESIZE_WIDTH, WindowLayout,
+    dialogs_drag_to_ratio, minimal_three_column_width,
+};
 use crate::window::connecting_widget::{ConnectionIndicator, ConnectionWidgetAction};
 use crate::window::section::{SectionMemento, SectionShow, SettingsPage};
 use crate::window::session_controller::SessionController;
@@ -21,6 +30,7 @@ use tg_app_core::stand_in::strings::Strings;
 use tg_app_core::stand_in::theme::{Palette, ThemeMode};
 use tg_app_core::stand_in::types::{MsgId, PeerId};
 use tg_app_history::history::backend::{HistoryBackend, SendMessageRequest};
+use tg_app_history::history::compose::ComposeMode;
 use tg_app_history::history::inline_media::default_hardware_audio_enabled;
 use tg_app_history::history::sections_ui::HistorySectionKind;
 use tg_app_history::history::{HistoryAction, HistoryWidget};
@@ -35,13 +45,17 @@ use tg_app_settings::chat_helpers::{
 };
 use tg_app_settings::settings::advanced::AdvancedSubPanel;
 use tg_app_settings::settings::backend::SettingsBackend;
+use tg_app_settings::settings::main_page::{set_settings_search_open, settings_search_open};
 use tg_app_settings::settings::{SettingsAction, SettingsController, SettingsSection};
+use tg_app_settings::themes::chat_background::{BackgroundConfig, ChatBackground};
 
 /// High-level actions forwarded from [`MainWidget`] to [`crate::window::controller::WindowController`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MainWidgetAction {
     /// Open the hamburger main menu drawer.
     OpenMainMenu,
+    /// Open a chat in a separate window (`SessionController::showInNewWindow`).
+    OpenInNewWindow(PeerId),
     /// Open proxy/connection modal box.
     OpenProxySettings,
     /// Retry connection immediately.
@@ -76,6 +90,14 @@ pub enum MainWidgetAction {
     },
     /// Route a clicked link (internal `tg://`/`t.me/`, Instant View, or system browser).
     OpenLink(String),
+    /// Route a clicked hidden link (`messageEntityTextUrl`) or widget `ConfirmExternal` link
+    /// through scheme validation and confirmation before opening externally.
+    OpenHiddenLink {
+        /// Target URL.
+        url: String,
+        /// If `true`, always require confirmation even on whitelisted domains (e.g. widget bridge).
+        force_confirm: bool,
+    },
     /// Open a Bot Mini App (or embedded HTML5 Game WebView).
     OpenMiniApp {
         /// Target bot peer id.
@@ -84,6 +106,8 @@ pub enum MainWidgetAction {
         url: Option<String>,
         /// Optional deep-link `start_param` payload.
         start_param: Option<String>,
+        /// Show the `confirmOpen` box first unless the bot is verified or trusted.
+        confirm_open: bool,
     },
     /// Open the peer picker filtered by `peer_types` for a `switch_inline` button (`api_bot.cpp`).
     SwitchInlineChooseChat {
@@ -166,10 +190,56 @@ pub enum MainWidgetAction {
         /// Stream title.
         title: String,
     },
+    /// Open the "Forward to..." `ShareBox` layer for messages chosen in the message menu or the
+    /// selection bar (`Window::ShowForwardMessagesBox`).
+    OpenForwardBox {
+        /// Chat the messages are forwarded from.
+        from_peer: PeerId,
+        /// Messages to forward.
+        msg_ids: Vec<MsgId>,
+    },
     /// Show an informational toast.
     Toast(String),
     /// Column widths changed and should be persisted.
     PersistSettings,
+}
+
+/// Smallest window width that shows Settings as a layer (`Info::LayerWidget::MinimalSupportedWidth`
+/// = `st::infoMinimalWidth` 324 + 2 * `st::infoMinimalLayerMargin` 48).
+pub const SETTINGS_LAYER_MIN_WIDTH: f32 = 324.0 + 2.0 * 48.0;
+/// Settings layer width (`st::infoDesiredWidth`).
+pub const SETTINGS_LAYER_WIDTH: f32 = 392.0;
+/// Settings layer header height (`st::infoLayerTopBarHeight`).
+pub const SETTINGS_LAYER_HEADER_HEIGHT: f32 = 56.0;
+/// Width of the docked Emoji / Stickers / GIFs column (`st::columnMinimalWidthThird`).
+pub const TABBED_DOCK_WIDTH: f32 = COLUMN_MIN_WIDTH_THIRD as f32;
+
+/// Whether the chat header shows its Back arrow (`TopBarWidget::updateControlsVisibility`:
+/// one-column mode or a non-empty section stack). Settings drawn as a layer over the chat is not
+/// part of the chat's navigation: tdesktop shows it as a layer without touching the stack, so the
+/// entry `show_settings` pushed for the covered chat and the Settings main section are ignored.
+#[must_use]
+pub fn history_can_go_back(session: &SessionController, settings_as_layer: bool) -> bool {
+    if !settings_as_layer {
+        return session.can_go_back();
+    }
+    session.stack_len() > 1
+        || (session.adaptive().is_one_column() && !session.active_peer().is_zero())
+}
+
+/// Geometry of the centered Settings layer (`Info::LayerWidget::countGeometry`) inside the
+/// window body `body`: `st::infoDesiredWidth` wide (at least 48 px side margins), starting
+/// `windowHeight / 24` (clamped to 20..40 px) from the top; long content such as Settings runs
+/// to the bottom edge of the window, as in 7.4.6.
+#[must_use]
+pub fn settings_layer_rect(body: Rect) -> Rect {
+    let width = (body.width() - 2.0 * 48.0).clamp(0.0, SETTINGS_LAYER_WIDTH);
+    let top = (body.height() / 24.0).floor().clamp(20.0, 40.0);
+    let height = (body.height() - top).max(0.0);
+    Rect::from_min_size(
+        Pos2::new((body.center().x - width * 0.5).round(), body.top() + top),
+        Vec2::new(width, height),
+    )
 }
 
 /// Main multi-column desktop shell (`MainWidget`) hosting Dialogs, History, Info, Settings,
@@ -177,6 +247,8 @@ pub enum MainWidgetAction {
 pub struct MainWidget {
     dialogs: DialogsPanel,
     history: HistoryWidget,
+    /// The chat last passed to `AppSession::prepare_open_chat`.
+    prepared_chat: PeerId,
     main_info: InfoWrapWidget,
     third_info: InfoWrapWidget,
     settings: Option<SettingsController>,
@@ -199,6 +271,19 @@ pub struct MainWidget {
     last_theme: (EmbeddedType, Option<ThemeColor>),
     dragging_first_splitter: bool,
     dragging_third_splitter: bool,
+    /// Wallpaper painter for the empty chat pane (`HistoryWidget::paintEvent` without a peer).
+    empty_background: ChatBackground,
+    empty_background_dark: Option<bool>,
+    /// Whether this frame renders Settings as a centered layer instead of a main section.
+    settings_as_layer: bool,
+    /// Whether the Settings layer's top-bar menu (`Settings::Main::fillTopBarMenu`) is open.
+    settings_layer_menu_open: bool,
+    /// Whether this frame docks the tabbed selector as a third column (`TabbedSection`).
+    tabbed_docked: bool,
+    /// Screen rect of the docked tabbed selector column in the last frame.
+    docked_tabbed_rect: Option<Rect>,
+    /// Forward requested from the message menu, turned into [`MainWidgetAction::OpenForwardBox`].
+    pending_forward: Option<(PeerId, Vec<MsgId>)>,
 }
 
 impl Default for MainWidget {
@@ -225,6 +310,7 @@ impl MainWidget {
         Self {
             dialogs: DialogsPanel::new(),
             history,
+            prepared_chat: PeerId::ZERO,
             main_info: InfoWrapWidget::for_peer(PeerId::ZERO),
             third_info: InfoWrapWidget::for_peer(PeerId::ZERO),
             settings: None,
@@ -243,7 +329,40 @@ impl MainWidget {
             last_theme: (EmbeddedType::DayBlue, None),
             dragging_first_splitter: false,
             dragging_third_splitter: false,
+            empty_background: ChatBackground::new(),
+            empty_background_dark: None,
+            settings_as_layer: false,
+            settings_layer_menu_open: false,
+            tabbed_docked: false,
+            docked_tabbed_rect: None,
+            pending_forward: None,
         }
+    }
+
+    /// Requests the "Forward to..." box for `msg_ids` of `from_peer`; the next frame emits
+    /// [`MainWidgetAction::OpenForwardBox`].
+    pub fn request_forward_box(&mut self, from_peer: PeerId, msg_ids: Vec<MsgId>) {
+        if !msg_ids.is_empty() {
+            self.pending_forward = Some((from_peer, msg_ids));
+        }
+    }
+
+    /// Returns whether the last frame showed Settings as a centered layer.
+    #[must_use]
+    pub const fn settings_shown_as_layer(&self) -> bool {
+        self.settings_as_layer
+    }
+
+    /// Returns whether the last frame docked the Emoji / Stickers / GIFs panel as a column.
+    #[must_use]
+    pub const fn tabbed_panel_docked(&self) -> bool {
+        self.tabbed_docked
+    }
+
+    /// Returns the docked Emoji / Stickers / GIFs column rect from the last frame, if docked.
+    #[must_use]
+    pub const fn docked_tabbed_rect(&self) -> Option<Rect> {
+        self.docked_tabbed_rect
     }
 
     /// Returns whether real `cpal` hardware audio output is enabled on the shared player bar.
@@ -727,6 +846,13 @@ impl MainWidget {
             *session.search_query_mut() = search_text.to_owned();
         }
         let layout = session.update_layout(window_w);
+        self.settings_as_layer = matches!(
+            session.main_section(),
+            Some(SectionMemento::Settings { .. })
+        ) && full_rect.width() >= SETTINGS_LAYER_MIN_WIDTH;
+        if !self.settings_as_layer {
+            self.settings_layer_menu_open = false;
+        }
 
         let show_vertical_sidebar = layout.filters_width > 0;
         let body_left = full_rect.left() + layout.filters_width as f32;
@@ -753,7 +879,9 @@ impl MainWidget {
         // 2. Column layout dispatch matching `MainWidget::updateControlsGeometry`.
         match layout.window_layout {
             WindowLayout::OneColumn => {
-                if session.is_main_section_shown() {
+                self.tabbed_docked = false;
+                let layer_over_dialogs = self.settings_as_layer && session.active_peer().is_zero();
+                if session.is_main_section_shown() && !layer_over_dialogs {
                     self.render_main_column(
                         ui,
                         body_rect,
@@ -792,7 +920,9 @@ impl MainWidget {
                 } else {
                     0.0
                 };
-                let main_w = (body_rect.width() - dialogs_w - third_w).max(0.0);
+                let dock_w =
+                    self.update_tabbed_dock(session, body_rect.width(), dialogs_w, third_w);
+                let main_w = (body_rect.width() - dialogs_w - third_w - dock_w).max(0.0);
 
                 let dialogs_rect =
                     Rect::from_min_size(body_rect.min, Vec2::new(dialogs_w, body_rect.height()));
@@ -803,6 +933,10 @@ impl MainWidget {
                 let third_rect = Rect::from_min_size(
                     Pos2::new(main_rect.right(), body_rect.top()),
                     Vec2::new(third_w, body_rect.height()),
+                );
+                let dock_rect = Rect::from_min_size(
+                    Pos2::new(main_rect.right(), body_rect.top()),
+                    Vec2::new(dock_w, body_rect.height()),
                 );
 
                 self.render_dialogs_column(
@@ -842,6 +976,17 @@ impl MainWidget {
                         session,
                         session_backend,
                         theme_colors,
+                        &mut actions,
+                    );
+                }
+                if dock_w > 0.0 {
+                    let peer_id = session.active_peer();
+                    self.render_docked_tabbed_panel(
+                        ui,
+                        dock_rect,
+                        peer_id,
+                        session_backend,
+                        palette,
                         &mut actions,
                     );
                 }
@@ -917,6 +1062,26 @@ impl MainWidget {
                 });
         }
 
+        if self.settings_as_layer
+            && let Some(SectionMemento::Settings { page }) = session.main_section().cloned()
+        {
+            self.render_settings_layer(
+                ui,
+                full_rect,
+                page,
+                session,
+                session_backend,
+                embedded_theme,
+                accent_color,
+                palette,
+                &mut actions,
+            );
+        }
+
+        if let Some((from_peer, msg_ids)) = self.pending_forward.take() {
+            actions.push(MainWidgetAction::OpenForwardBox { from_peer, msg_ids });
+        }
+
         if session.columns_mut().take_dirty() {
             actions.push(MainWidgetAction::PersistSettings);
         }
@@ -942,6 +1107,11 @@ impl MainWidget {
     ) {
         self.dialogs.active_filter = session.active_filter();
         let active_peer = session.active_peer();
+        tg_app_info::dialogs::search::sync_global_media(
+            &mut self.dialogs.search_state,
+            &self.dialogs.search_query,
+            &*session_backend,
+        );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             if let Some(stories_host) = stories
@@ -1024,6 +1194,7 @@ impl MainWidget {
                     bot_id: peer_id,
                     url: None,
                     start_param: None,
+                    confirm_open: false,
                 });
             }
             DialogsPanelAction::ActivateSuggestion(suggestion) => {
@@ -1039,6 +1210,51 @@ impl MainWidget {
                 );
             }
             DialogsPanelAction::Toast(msg) => actions.push(MainWidgetAction::Toast(msg)),
+            DialogsPanelAction::OpenInNewWindow(peer_id) => {
+                actions.push(MainWidgetAction::OpenInNewWindow(peer_id));
+            }
+            DialogsPanelAction::OpenMuteFor(peer_id) => {
+                actions.push(MainWidgetAction::InfoEvent(InfoWrapEvent::OpenMuteFor(
+                    peer_id,
+                )));
+            }
+            DialogsPanelAction::OpenSelectTone(peer_id) => {
+                actions.push(MainWidgetAction::InfoEvent(InfoWrapEvent::OpenSelectTone(
+                    peer_id,
+                )));
+            }
+            // `Filler::addBlockUser`: a blocked bot restarts, a user gets `PeerMenuBlockUserBox`,
+            // unblocking and blocking a bot happen directly.
+            DialogsPanelAction::ToggleBlock(peer_id) => {
+                let profile =
+                    tg_app_core::info::backend::InfoBackend::peer_profile(session_backend, peer_id);
+                let kind = profile.as_ref().map(|p| p.kind);
+                let blocked = profile.as_ref().is_some_and(|p| p.is_blocked);
+                if blocked && kind == Some(tg_app_info::info::InfoPeerKind::Bot) {
+                    actions.push(MainWidgetAction::InfoEvent(InfoWrapEvent::RestartBot(
+                        peer_id,
+                    )));
+                } else if !blocked
+                    && let Some(p) =
+                        profile.filter(|p| p.kind == tg_app_info::info::InfoPeerKind::User)
+                {
+                    let name = p
+                        .title
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(&p.title)
+                        .to_owned();
+                    actions.push(MainWidgetAction::InfoEvent(InfoWrapEvent::OpenBlockUser {
+                        peer_id,
+                        name,
+                    }));
+                } else if let Some(toast) = tg_app_info::dialogs::inner::toggle_block_from_chat_list(
+                    session_backend,
+                    peer_id,
+                ) {
+                    actions.push(MainWidgetAction::Toast(toast));
+                }
+            }
         }
     }
 
@@ -1127,6 +1343,17 @@ impl MainWidget {
         ui.scope_builder(UiBuilder::new().max_rect(content_rect), |ui| {
             ui.set_clip_rect(rect);
             match session.main_section().cloned() {
+                Some(SectionMemento::Settings { .. }) if self.settings_as_layer => {
+                    self.render_history_section(
+                        ui,
+                        session,
+                        session_backend,
+                        palette,
+                        strings,
+                        now_ms,
+                        actions,
+                    );
+                }
                 Some(SectionMemento::Settings { page }) => {
                     self.render_settings_section(
                         ui,
@@ -1207,8 +1434,11 @@ impl MainWidget {
             return;
         };
 
+        ctrl.host_top_bar = self.settings_as_layer;
         ctrl.core_settings.chat_filters_horizontal = !session.filters_enabled();
         ctrl.live_theme.update(embedded_theme, accent_color);
+        ctrl.privacy.top_peers_enabled =
+            tg_app_info::dialogs::backend::DialogsBackend::top_peers_enabled(session_backend);
 
         if self.last_settings_page != Some(page) {
             self.last_settings_page = Some(page);
@@ -1277,6 +1507,16 @@ impl MainWidget {
                 SettingsAction::OpenEditSelfColor => {
                     actions.push(MainWidgetAction::OpenEditSelfColor);
                 }
+                SettingsAction::ToggleTopPeers(enabled) => {
+                    let _ = tg_app_info::dialogs::backend::DialogsBackend::toggle_top_peers(
+                        session_backend,
+                        enabled,
+                    );
+                    ctrl.privacy.top_peers_enabled =
+                        tg_app_info::dialogs::backend::DialogsBackend::top_peers_enabled(
+                            session_backend,
+                        );
+                }
                 SettingsAction::RequestLogout => {
                     actions.push(MainWidgetAction::RequestLogout);
                 }
@@ -1331,22 +1571,17 @@ impl MainWidget {
         actions: &mut Vec<MainWidgetAction>,
     ) {
         let peer_id = session.active_peer();
-        let can_go_back = session.can_go_back();
+        let can_go_back = history_can_go_back(session, self.settings_as_layer);
         let info_open = session.third_section().is_some();
         let is_chat_wide = session.adaptive().is_chat_wide();
 
         if peer_id.is_zero() {
-            let _ = self.history.show(
-                ui,
-                None,
-                &[],
-                can_go_back,
-                info_open,
-                is_chat_wide,
-                palette,
-                strings,
-            );
+            self.render_empty_chat_pane(ui, palette, strings);
             return;
+        }
+        if self.prepared_chat != peer_id {
+            self.prepared_chat = peer_id;
+            session_backend.prepare_open_chat(peer_id);
         }
 
         // Populate next unread broadcast channel hint for `PullToNextChannel`.
@@ -1371,6 +1606,7 @@ impl MainWidget {
         );
         self.history.set_next_unread_channel(next_unread_channel);
 
+        let mode_before = self.history.compose_mut().mode.clone();
         let emitted = self.history.show_with_backend(
             ui,
             peer_id,
@@ -1381,6 +1617,7 @@ impl MainWidget {
             palette,
             strings,
         );
+        self.intercept_message_menu_forward(peer_id, mode_before);
 
         let target_msg = session.active_msg_id();
         if target_msg.0 > 0 && self.last_jumped_msg != Some((peer_id, target_msg)) {
@@ -1430,6 +1667,9 @@ impl MainWidget {
                 HistoryAction::OpenLink(url) => {
                     actions.push(MainWidgetAction::OpenLink(url));
                 }
+                HistoryAction::OpenHiddenLink { url, force_confirm } => {
+                    actions.push(MainWidgetAction::OpenHiddenLink { url, force_confirm });
+                }
                 HistoryAction::OpenInvoice { invoice_id, .. } => {
                     actions.push(MainWidgetAction::OpenPayments {
                         screen: tg_app_info::payments::PaymentsScreen::Checkout,
@@ -1454,11 +1694,13 @@ impl MainWidget {
                     bot_id,
                     url,
                     start_param,
+                    confirm_open,
                 } => {
                     actions.push(MainWidgetAction::OpenMiniApp {
                         bot_id,
                         url,
                         start_param,
+                        confirm_open,
                     });
                 }
                 HistoryAction::SwitchInlineChooseChat {
@@ -1663,8 +1905,9 @@ impl MainWidget {
             }
         }
 
-        // 2. Floating Emoji / Stickers / GIFs tabbed panel anchored above compose bar.
-        if self.tabbed_panel.is_rendered() {
+        // 2. Floating Emoji / Stickers / GIFs tabbed panel anchored above compose bar (the docked
+        //    third-column mode renders in `render_docked_tabbed_panel`).
+        if self.tabbed_panel.is_rendered() && !self.tabbed_docked {
             let mut panel_events = Vec::new();
             let _ = self.tabbed_panel.show(
                 ctx,
@@ -1674,6 +1917,27 @@ impl MainWidget {
                 palette,
                 |ev| panel_events.push(ev),
             );
+            self.handle_tabbed_panel_events(
+                panel_events,
+                peer_id,
+                session_backend,
+                now_secs,
+                actions,
+            );
+        }
+    }
+
+    fn handle_tabbed_panel_events(
+        &mut self,
+        panel_events: Vec<ChatHelpersEvent>,
+        peer_id: PeerId,
+        session_backend: &mut dyn AppSession,
+        now_secs: f64,
+        actions: &mut Vec<MainWidgetAction>,
+    ) {
+        let now_ms_u64 = (now_secs.max(0.0) * 1000.0) as u64;
+        let docked = self.tabbed_docked;
+        {
             for ev in panel_events {
                 match ev {
                     ChatHelpersEvent::EmojiChosen { emoji } => {
@@ -1698,7 +1962,9 @@ impl MainWidget {
                                         tg_app_history::history::compose::ComposeMode::Normal;
                                 }
                                 self.history.reload_active_peer(session_backend);
-                                self.tabbed_panel.hide_animated(now_secs);
+                                if !docked {
+                                    self.tabbed_panel.hide_animated(now_secs);
+                                }
                             }
                             Err(err) => {
                                 actions.push(MainWidgetAction::Toast(format!(
@@ -1726,7 +1992,9 @@ impl MainWidget {
                                         tg_app_history::history::compose::ComposeMode::Normal;
                                 }
                                 self.history.reload_active_peer(session_backend);
-                                self.tabbed_panel.hide_animated(now_secs);
+                                if !docked {
+                                    self.tabbed_panel.hide_animated(now_secs);
+                                }
                             }
                             Err(err) => {
                                 actions.push(MainWidgetAction::Toast(format!(
@@ -1744,11 +2012,455 @@ impl MainWidget {
                     ChatHelpersEvent::StickerSetRemoved(_) => {
                         actions.push(MainWidgetAction::Toast("Sticker pack removed".to_owned()));
                     }
+                    ChatHelpersEvent::RecentStickersCleared => {
+                        actions.push(MainWidgetAction::Toast(
+                            "Recent stickers cleared".to_owned(),
+                        ));
+                    }
                     ChatHelpersEvent::CloseRequested => {
                         self.tabbed_panel.hide_animated(now_secs);
                     }
                 }
             }
+        }
+    }
+
+    /// Decides whether the tabbed selector docks as a third column this frame
+    /// (`HistoryWidget::toggleTabbedSelectorMode` with `canShowThirdSection`) and returns the
+    /// column width to reserve (`0.0` keeps the floating panel).
+    fn update_tabbed_dock(
+        &mut self,
+        session: &SessionController,
+        body_w: f32,
+        dialogs_w: f32,
+        third_w: f32,
+    ) -> f32 {
+        let history_shown = !session.active_peer().is_zero()
+            && match session.main_section() {
+                Some(SectionMemento::PeerHistory { .. }) | None => true,
+                Some(SectionMemento::Settings { .. }) => self.settings_as_layer,
+                Some(_) => false,
+            };
+        let eligible = history_shown
+            && third_w <= 0.0
+            && body_w >= minimal_three_column_width(dialogs_w > 0.0) as f32
+            && body_w - dialogs_w - TABBED_DOCK_WIDTH >= COLUMN_MIN_WIDTH_MAIN as f32;
+        if eligible {
+            // A docked section has no show/hide animation.
+            if self.tabbed_panel.is_rendered() && !self.tabbed_panel.is_open() {
+                self.tabbed_panel.hide_fast();
+            } else if self.tabbed_panel.is_open() && self.tabbed_panel.is_animating() {
+                self.tabbed_panel.show_immediate();
+            }
+        }
+        self.tabbed_docked = eligible && self.tabbed_panel.is_open();
+        self.docked_tabbed_rect = None;
+        if self.tabbed_docked {
+            TABBED_DOCK_WIDTH
+        } else {
+            0.0
+        }
+    }
+
+    /// Renders the docked full-height Emoji / Stickers / GIFs column (`ChatHelpers::TabbedSection`)
+    /// through [`TabbedPanel::show_docked`] in the slot reserved by [`Self::update_tabbed_dock`].
+    fn render_docked_tabbed_panel(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        peer_id: PeerId,
+        session_backend: &mut dyn AppSession,
+        palette: &Palette,
+        actions: &mut Vec<MainWidgetAction>,
+    ) {
+        self.docked_tabbed_rect = Some(rect);
+        let now_secs = ui.ctx().input(|i| i.time);
+        let mut events = Vec::new();
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(rect);
+            let _ = self.tabbed_panel.show_docked(
+                ui,
+                rect,
+                session_backend,
+                &mut self.emoji_cache,
+                palette,
+                |ev| events.push(ev),
+            );
+        });
+        self.handle_tabbed_panel_events(events, peer_id, session_backend, now_secs, actions);
+    }
+
+    /// Turns a Forward chosen in the message menu / selection bar this frame (which
+    /// `HistoryWidget` starts as an in-place `ComposeMode::Forward`) into the "Forward to..."
+    /// box, restoring the composer.
+    fn intercept_message_menu_forward(&mut self, peer_id: PeerId, mode_before: ComposeMode) {
+        if matches!(mode_before, ComposeMode::Forward { .. }) {
+            return;
+        }
+        let compose = self.history.compose_mut();
+        let started = match &compose.mode {
+            ComposeMode::Forward {
+                from_peer, msg_ids, ..
+            } if *from_peer == peer_id => Some((*from_peer, msg_ids.clone())),
+            _ => None,
+        };
+        if let Some((from_peer, msg_ids)) = started {
+            compose.mode = mode_before;
+            self.request_forward_box(from_peer, msg_ids);
+        }
+    }
+
+    /// Empty chat pane (`HistoryWidget::paintEvent` without a peer): the chat wallpaper with the
+    /// centered `lng_willbe_history` service pill (`msgServiceFont`, `msgServicePadding`,
+    /// `msgPadding`), raised by the hidden composer height.
+    fn render_empty_chat_pane(&mut self, ui: &mut Ui, palette: &Palette, strings: &dyn Strings) {
+        let rect = ui.max_rect();
+        let dark = is_dark_palette(palette);
+        if self.empty_background_dark != Some(dark) {
+            self.empty_background.set_dark_mode(dark);
+            self.empty_background.set_global(if dark {
+                BackgroundConfig::solid(ThemeColor::rgb(0x0E, 0x16, 0x21))
+            } else {
+                BackgroundConfig::default()
+            });
+            self.empty_background_dark = Some(dark);
+        }
+        self.empty_background.paint(ui, rect, None);
+
+        let fg = Color32::WHITE;
+        let galley = ui.painter().layout_no_wrap(
+            strings.select_chat_prompt().to_owned(),
+            font_id_from_style(st::semibold_font),
+            fg,
+        );
+        let w = galley.size().x + 11.0 + 11.0;
+        let h = galley.size().y + 3.0 + 4.0;
+        let composer_h = 40.0;
+        let top = 7.0 + ((rect.height() - composer_h - h - 7.0 - 7.0) / 2.0).max(0.0);
+        let pill = Rect::from_min_size(
+            Pos2::new(
+                (rect.center().x - w * 0.5).round(),
+                (rect.top() + top).round(),
+            ),
+            Vec2::new(w, h),
+        );
+        let bg = if dark {
+            Color32::from_rgb(0x1C, 0x29, 0x36)
+        } else {
+            Color32::from_black_alpha(0x48)
+        };
+        ui.painter()
+            .rect_filled(pill, CornerRadius::same((h * 0.5).round() as u8), bg);
+        ui.painter()
+            .galley(Pos2::new(pill.left() + 11.0, pill.top() + 3.0), galley, fg);
+    }
+
+    /// Renders Settings as tdesktop's centered `Info::LayerWidget` over a dimmed scrim, with the
+    /// layer top bar (`st::infoLayerTopBar`: title, search, menu and close buttons).
+    #[allow(clippy::too_many_arguments)]
+    fn render_settings_layer(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        page: SettingsPage,
+        session: &mut SessionController,
+        session_backend: &mut dyn AppSession,
+        embedded_theme: EmbeddedType,
+        accent_color: Option<ThemeColor>,
+        palette: &Palette,
+        actions: &mut Vec<MainWidgetAction>,
+    ) {
+        let ctx = ui.ctx().clone();
+        let layer = settings_layer_rect(body);
+        let radius = st::box_radius.0.clamp(0, 32) as u8;
+        let area_id = ui.make_persistent_id("tg_settings_layer");
+        let mut header_event = None;
+        Area::new(area_id)
+            .order(Order::Middle)
+            .fixed_pos(body.min)
+            .constrain(false)
+            .show(&ctx, |ui| {
+                ui.set_clip_rect(body);
+                let scrim = ui.interact(body, area_id.with("scrim"), Sense::click());
+                ui.painter()
+                    .rect_filled(body, CornerRadius::ZERO, palette.layer_backdrop);
+                ui.painter()
+                    .rect_filled(layer, CornerRadius::same(radius), palette.window_bg);
+
+                // Settings body below the layer header, which replaces the controller's own
+                // top bar (one search control, as in `Info::LayerWidget`).
+                let header = Rect::from_min_size(
+                    layer.min,
+                    Vec2::new(layer.width(), SETTINGS_LAYER_HEADER_HEIGHT),
+                );
+                let content =
+                    Rect::from_min_max(Pos2::new(layer.left(), header.bottom()), layer.max);
+                ui.scope_builder(UiBuilder::new().max_rect(content), |ui| {
+                    ui.set_clip_rect(content);
+                    self.render_settings_section(
+                        ui,
+                        page,
+                        session,
+                        session_backend,
+                        embedded_theme,
+                        accent_color,
+                        actions,
+                    );
+                });
+
+                header_event = self.settings_layer_header(ui, header, radius, palette);
+
+                if scrim.clicked()
+                    && ctx
+                        .input(|i| i.pointer.interact_pos())
+                        .is_some_and(|p| !layer.contains(p))
+                {
+                    header_event = Some(SettingsLayerEvent::Close);
+                }
+            });
+
+        if self.settings_layer_menu_open {
+            self.settings_layer_menu(&ctx, layer, palette, &mut header_event);
+        }
+
+        let Some(event) = header_event else {
+            return;
+        };
+        match event {
+            SettingsLayerEvent::Close => {
+                self.settings_layer_menu_open = false;
+                self.last_settings_page = None;
+                set_settings_search_open(&ctx, false);
+                session.show_back_from_stack(SectionShow::forward());
+            }
+            SettingsLayerEvent::Back => {
+                if let Some(ctrl) = self.settings.as_mut() {
+                    ctrl.pop_section();
+                }
+            }
+            SettingsLayerEvent::ToggleMenu => {
+                self.settings_layer_menu_open = !self.settings_layer_menu_open;
+            }
+            SettingsLayerEvent::Search => {
+                if let Some(ctrl) = self.settings.as_mut() {
+                    ctrl.section_stack.truncate(1);
+                }
+                set_settings_search_open(&ctx, true);
+            }
+            SettingsLayerEvent::EditProfile => {
+                self.settings_layer_menu_open = false;
+                if let Some(ctrl) = self.settings.as_mut() {
+                    ctrl.push_section(SettingsSection::Information);
+                }
+            }
+            SettingsLayerEvent::Logout => {
+                self.settings_layer_menu_open = false;
+                actions.push(MainWidgetAction::RequestLogout);
+            }
+        }
+    }
+
+    /// Paints the 56 px layer header (`st::infoLayerTopBar`) and returns the clicked control.
+    fn settings_layer_header(
+        &mut self,
+        ui: &mut Ui,
+        header: Rect,
+        radius: u8,
+        palette: &Palette,
+    ) -> Option<SettingsLayerEvent> {
+        let mut event = None;
+        // Swallow clicks on the header background so the hidden settings top bar never reacts.
+        let _ = ui.interact(
+            header,
+            ui.make_persistent_id("tg_settings_layer_header"),
+            Sense::click(),
+        );
+        ui.painter().rect_filled(
+            header,
+            CornerRadius {
+                nw: radius,
+                ne: radius,
+                sw: 0,
+                se: 0,
+            },
+            palette.window_bg,
+        );
+        let (depth, title) = self.settings.as_ref().map_or_else(
+            || (1, tg_lang::tr::lng_menu_settings()),
+            |ctrl| {
+                let depth = ctrl.section_stack.len().max(1);
+                let title = if depth > 1 {
+                    ctrl.current_section().localized_title()
+                } else {
+                    tg_lang::tr::lng_menu_settings()
+                };
+                (depth, title)
+            },
+        );
+        let center_y = header.top() + 28.0;
+        let mut title_left = header.left() + 24.0;
+        if depth > 1 {
+            if layer_icon_button(
+                ui,
+                Pos2::new(header.left() + 28.0, center_y),
+                st::info_layer_top_bar_back.icon,
+                &tg_lang::tr::lng_go_back(),
+                palette,
+            ) {
+                event = Some(SettingsLayerEvent::Back);
+            }
+            title_left = header.left() + 56.0;
+        }
+
+        // The search field itself is the Settings body's (`settings_search.cpp` pins it under
+        // the top bar); the header only opens it and its × closes it first.
+        let searching = depth == 1
+            && (settings_search_open(ui.ctx())
+                || self
+                    .settings
+                    .as_ref()
+                    .is_some_and(|ctrl| !ctrl.search_query.is_empty()));
+        let galley = ui.painter().layout(
+            title.clone(),
+            font_id_from_style(st::box_title_font),
+            palette.window_bold_fg,
+            (header.right() - 140.0 - title_left).max(40.0),
+        );
+        let title_pos = Pos2::new(title_left, header.top() + 17.0);
+        // The title is a `FlatLabel` in `Info::TopBar`, so screen readers see it.
+        ui.interact(
+            Rect::from_min_size(title_pos, galley.size()),
+            ui.make_persistent_id("tg_settings_layer_title"),
+            Sense::hover(),
+        )
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &title));
+        ui.painter()
+            .galley(title_pos, galley, palette.window_bold_fg);
+
+        let close_c = Pos2::new(header.right() - 27.0, center_y);
+        if depth == 1 {
+            if layer_icon_button(
+                ui,
+                Pos2::new(header.right() - 112.0, center_y),
+                st::info_top_bar_search.icon,
+                &tg_lang::tr::lng_dlg_filter(),
+                palette,
+            ) {
+                event = Some(SettingsLayerEvent::Search);
+            }
+            if layer_icon_button(
+                ui,
+                Pos2::new(header.right() - 67.0, center_y),
+                st::info_layer_top_bar_menu.icon,
+                "More",
+                palette,
+            ) {
+                event = Some(SettingsLayerEvent::ToggleMenu);
+            }
+        }
+        if layer_icon_button(
+            ui,
+            close_c,
+            st::info_layer_top_bar_close.icon,
+            &tg_lang::tr::lng_close(),
+            palette,
+        ) {
+            if searching {
+                if let Some(ctrl) = self.settings.as_mut() {
+                    ctrl.search_query.clear();
+                }
+                set_settings_search_open(ui.ctx(), false);
+            } else {
+                event = Some(SettingsLayerEvent::Close);
+            }
+        }
+        event
+    }
+
+    /// `Settings::Main::fillTopBarMenu`: "Edit profile" and the attention "Log out" item.
+    fn settings_layer_menu(
+        &mut self,
+        ctx: &egui::Context,
+        layer: Rect,
+        palette: &Palette,
+        event: &mut Option<SettingsLayerEvent>,
+    ) {
+        let pos = Pos2::new(layer.right() - 8.0 - 200.0, layer.top() + 44.0);
+        let response = Area::new(Id::unique("tg_settings_layer_menu"))
+            .order(Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(palette.window_bg)
+                    .corner_radius(CornerRadius::same(8))
+                    .shadow(egui::Shadow {
+                        offset: [0, 2],
+                        blur: 10,
+                        spread: 0,
+                        color: Color32::from_black_alpha(48),
+                    })
+                    .inner_margin(egui::Margin::symmetric(0, 6))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let items = [
+                            (
+                                st::menu_icon_edit,
+                                tg_lang::tr::lng_settings_information(),
+                                palette.window_bold_fg,
+                                SettingsLayerEvent::EditProfile,
+                            ),
+                            (
+                                st::menu_icon_leave_attention,
+                                tg_lang::tr::lng_settings_logout(),
+                                palette.attention_fg,
+                                SettingsLayerEvent::Logout,
+                            ),
+                        ];
+                        for (icon, label, color, item_event) in items {
+                            let (rect, resp) =
+                                ui.allocate_exact_size(Vec2::new(200.0, 36.0), Sense::click());
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::Role::MenuItem, true, &label)
+                            });
+                            if resp.hovered() {
+                                ui.painter().rect_filled(rect, 0.0, palette.window_bg_over);
+                            }
+                            let icon_color = if item_event == SettingsLayerEvent::Logout {
+                                palette.attention_fg
+                            } else {
+                                palette.window_sub_text_fg
+                            };
+                            paint_style_icon(
+                                ui.painter(),
+                                Rect::from_center_size(
+                                    Pos2::new(rect.left() + 26.0, rect.center().y),
+                                    Vec2::splat(24.0),
+                                ),
+                                icon,
+                                &DefaultPaletteResolver,
+                                Some(icon_color),
+                            );
+                            ui.painter().text(
+                                Pos2::new(rect.left() + 56.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                &label,
+                                font_id_from_style(st::normal_font),
+                                color,
+                            );
+                            if resp.clicked() {
+                                *event = Some(item_event);
+                            }
+                        }
+                    });
+            })
+            .response;
+        if event.is_none()
+            && ctx.input(|i| i.pointer.any_click())
+            && ctx
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| !response.rect.contains(p))
+        {
+            self.settings_layer_menu_open = false;
         }
     }
 
@@ -1846,6 +2558,55 @@ impl MainWidget {
             actions.push(MainWidgetAction::PersistSettings);
         }
     }
+}
+
+/// Header controls of the Settings layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsLayerEvent {
+    Close,
+    Back,
+    Search,
+    ToggleMenu,
+    EditProfile,
+    Logout,
+}
+
+/// Whether `palette` is a dark (Night) palette, judged by `windowBg` luminance.
+fn is_dark_palette(palette: &Palette) -> bool {
+    let bg = palette.window_bg;
+    u32::from(bg.r()) + u32::from(bg.g()) + u32::from(bg.b()) < 3 * 128
+}
+
+/// A 40 px `IconButton` from the info layer top bar tinted `boxTitleCloseFg`
+/// (`boxTitleCloseFgOver` on hover).
+fn layer_icon_button(
+    ui: &mut Ui,
+    center: Pos2,
+    icon: Icon,
+    label: &str,
+    palette: &Palette,
+) -> bool {
+    let rect = Rect::from_center_size(center, Vec2::splat(40.0));
+    let resp = ui.interact(
+        rect,
+        ui.make_persistent_id(("tg_layer_icon", label)),
+        Sense::click(),
+    );
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    let color = if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        palette.window_fg.gamma_multiply(0.55)
+    } else {
+        palette.window_sub_text_fg
+    };
+    paint_style_icon(
+        ui.painter(),
+        Rect::from_center_size(center, Vec2::splat(24.0)),
+        icon,
+        &DefaultPaletteResolver,
+        Some(color),
+    );
+    resp.clicked()
 }
 
 /// Builds the action that opens the Stars Affiliate join list for the bot shown in

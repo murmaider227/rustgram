@@ -11,7 +11,7 @@
 
 #define MyAppShortName "Rustgram"
 #define MyAppName "Rustgram"
-#define MyAppPublisher "The Rustgram Authors"
+#define MyAppPublisher "Rustgram Authors"
 #define MyAppURL "https://github.com/rustgram/rustgram"
 #define MyAppExeName "rustgram.exe"
 #define MyUpdaterExeName "rustgram-updater.exe"
@@ -68,7 +68,15 @@ Compression=lzma
 SolidCompression=yes
 DisableStartupPrompt=yes
 PrivilegesRequired=lowest
+InfoBeforeFile={#DistDir}\PRIVACY.txt
 VersionInfoVersion={#MyAppNumericVersion}
+VersionInfoTextVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppNumericVersion}
+VersionInfoProductTextVersion={#MyAppVersion}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyAppName} Setup
+VersionInfoCopyright=Copyright (c) {#CurrentYear} {#MyAppPublisher}
 CloseApplications=force
 DisableDirPage=no
 DisableProgramGroupPage=no
@@ -93,6 +101,7 @@ Name: "ua";      MessagesFile: "compiler:Languages\Ukrainian.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "autoupdate"; Description: "Check for updates automatically"; GroupDescription: "Updates:"; Flags: checkedonce
 Name: "registertg"; Description: "Register tg:// protocol handler"; GroupDescription: "Protocol associations:"; Flags: checkedonce
 
 [Files]
@@ -107,6 +116,7 @@ Source: "{#DistDir}\swscale-*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistDir}\LEGAL"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistDir}\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#DistDir}\PRIVACY.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppShortName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppUserModelId}"
@@ -152,7 +162,6 @@ Type: files; Name: "{app}\log_start8.txt"
 Type: files; Name: "{app}\log_start9.txt"
 Type: filesandordirs; Name: "{app}\DebugLogs"
 Type: filesandordirs; Name: "{app}\tupdates"
-Type: filesandordirs; Name: "{app}\tdata"
 Type: filesandordirs; Name: "{app}\tcache"
 Type: filesandordirs; Name: "{app}\tdumps"
 Type: dirifempty; Name: "{app}"
@@ -171,12 +180,63 @@ Type: files; Name: "{userappdata}\{#MyAppName}\log_start8.txt"
 Type: files; Name: "{userappdata}\{#MyAppName}\log_start9.txt"
 Type: filesandordirs; Name: "{userappdata}\{#MyAppName}\DebugLogs"
 Type: filesandordirs; Name: "{userappdata}\{#MyAppName}\tupdates"
-Type: filesandordirs; Name: "{userappdata}\{#MyAppName}\tdata"
 Type: filesandordirs; Name: "{userappdata}\{#MyAppName}\tcache"
 Type: filesandordirs; Name: "{userappdata}\{#MyAppName}\tdumps"
 Type: dirifempty; Name: "{userappdata}\{#MyAppName}"
 
 [Code]
+procedure WriteAutoUpdatePref(Enabled: Boolean);
+var
+  PrefsDir: String;
+  PrefsFile: String;
+  RawContent: AnsiString;
+  Text: String;
+  DesiredVal: String;
+  OppositeVal: String;
+begin
+  PrefsDir := ExpandConstant('{userappdata}\{#MyAppName}\tdata');
+  PrefsFile := PrefsDir + '\startup_prefs.json';
+  if Enabled then
+  begin
+    DesiredVal := 'true';
+    OppositeVal := 'false';
+  end
+  else
+  begin
+    DesiredVal := 'false';
+    OppositeVal := 'true';
+  end;
+
+  if FileExists(PrefsFile) and LoadStringFromFile(PrefsFile, RawContent) then
+  begin
+    Text := String(RawContent);
+    if Pos('"auto_update"', Text) > 0 then
+    begin
+      StringChangeEx(Text, '"auto_update": ' + OppositeVal, '"auto_update": ' + DesiredVal, True);
+      StringChangeEx(Text, '"auto_update":' + OppositeVal, '"auto_update": ' + DesiredVal, True);
+      SaveStringToFile(PrefsFile, AnsiString(Text), False);
+    end
+    else if Trim(Text) = '{}' then
+    begin
+      RawContent := '{' + #13#10 + '  "auto_update": ' + DesiredVal + #13#10 + '}' + #13#10;
+      SaveStringToFile(PrefsFile, RawContent, False);
+    end;
+  end
+  else if ForceDirectories(PrefsDir) then
+  begin
+    RawContent := '{' + #13#10 + '  "auto_update": ' + DesiredVal + #13#10 + '}' + #13#10;
+    SaveStringToFile(PrefsFile, RawContent, False);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    WriteAutoUpdatePref(WizardIsTaskSelected('autoupdate'));
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;

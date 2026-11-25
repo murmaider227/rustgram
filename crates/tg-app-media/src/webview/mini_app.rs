@@ -4,7 +4,7 @@
 //! `Telegram/SourceFiles/inline_bots/bot_attach_web_view.cpp`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -26,12 +26,11 @@ use tg_ui::widgets::buttons::IconKind;
 use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
 use tg_webview::{
     AccessRequestStatus, DEFAULT_CUSTOM_SCHEME, FileDownloadStatus, HostEvent, MiniAppAction,
-    MiniAppButtonState, MiniAppController, MiniAppEvent, MiniAppPanelConfig, OpenLinkParams,
-    PhoneRequestStatus, PopupArgs, PopupButton, PopupButtonType, PopupFloodGuard, SafeAreaInsets,
+    MiniAppButtonState, MiniAppController, MiniAppPanelConfig, OpenLinkParams, PhoneRequestStatus,
+    PopupArgs, PopupButton, PopupButtonType, PopupFloodGuard, SafeAreaInsets,
     SecondaryButtonPosition, ThemeChangedPayload, ViewportParams, WebMessage, WebView,
     WebViewBounds, WebViewCallbacks, WebViewConfig, availability, format_raw_post_event_script,
-    is_allowed_navigation_scheme, parse_mini_app_event, resolve_ripple_color,
-    resolve_user_data_dir,
+    is_allowed_navigation_scheme, resolve_ripple_color, resolve_user_data_dir,
 };
 
 use crate::webview::backend::{
@@ -173,6 +172,8 @@ pub struct MiniAppWindow {
     fullscreen_synced: bool,
     toast: Option<(String, Instant)>,
     user_data_root: PathBuf,
+    /// Unique folder name used as a throwaway WebView2 profile when no account folder is known.
+    ephemeral_profile: String,
     open: bool,
     viewport_frames: u32,
     geo_provider: Arc<dyn tg_platform::geolocation::GeoLocationProvider>,
@@ -196,7 +197,7 @@ impl MiniAppWindow {
         let (tx_events, rx_events) = mpsc::channel();
         let fullscreen_synced = launch.fullscreen;
         let bot = launch.bot.clone();
-        let user_data_root = std::env::temp_dir().join("rustgram-webview");
+        let user_data_root = default_webview_data_root();
 
         Self {
             bot,
@@ -225,6 +226,7 @@ impl MiniAppWindow {
             fullscreen_synced,
             toast: None,
             user_data_root,
+            ephemeral_profile: next_ephemeral_profile_name(),
             open: true,
             viewport_frames: 0,
             geo_provider: tg_app_core::core_types::geo::default_geolocation_provider(),
@@ -290,6 +292,51 @@ impl MiniAppWindow {
     #[must_use]
     pub fn bot_storage_dir(&self) -> Option<&std::path::Path> {
         self.bot_storage_dir.as_deref()
+    }
+
+    /// Overrides the fallback WebView2 user-data root folder when no per-account
+    /// `bot_storage_dir` is attached.
+    pub fn set_user_data_root(&mut self, root: PathBuf) {
+        self.user_data_root = root;
+    }
+
+    /// Resolves the per-account WebView2 user-data profile directory for this bot.
+    ///
+    /// Security invariants: WebView2 profiles live inside the active account's folder under the
+    /// working directory (`<bot_storage_dir>/webview/bot_<id>`), never in `%TEMP%` (B5). When no
+    /// account folder is known the window gets a throwaway profile of its own
+    /// (`<working_dir>/tdata/webview_profiles/ephemeral/webview/<unique>`), deleted on close, so
+    /// cookies and storage are never shared between accounts (SEC2 L9).
+    #[must_use]
+    pub fn webview_user_data_dir(&self) -> PathBuf {
+        match self.bot_storage_dir.as_deref() {
+            Some(base) => resolve_user_data_dir(base, &format!("bot_{}", self.bot.id)),
+            None => resolve_user_data_dir(
+                &self.user_data_root.join("ephemeral"),
+                &self.ephemeral_profile,
+            ),
+        }
+    }
+
+    /// Returns `true` when this window uses a throwaway profile (no account folder known).
+    #[must_use]
+    pub const fn uses_ephemeral_profile(&self) -> bool {
+        self.bot_storage_dir.is_none()
+    }
+
+    /// Returns the per-account downloads directory for Mini App `web_app_request_file_download`.
+    #[must_use]
+    pub fn downloads_dir(&self) -> PathBuf {
+        self.bot_storage_dir
+            .as_deref()
+            .unwrap_or(&self.user_data_root)
+            .join("downloads")
+    }
+
+    /// Returns the active bot downloads manager (for inspection in tests and UI).
+    #[must_use]
+    pub const fn bot_downloads(&self) -> &BotDownloadsManager {
+        &self.bot_downloads
     }
 
     /// Returns the current in-memory [`BotLocalStorage`] cache for this Mini App panel.
@@ -403,6 +450,9 @@ impl MiniAppWindow {
         if let Some(wv) = self.webview.take() {
             wv.close();
         }
+        if self.uses_ephemeral_profile() {
+            let _ = std::fs::remove_dir_all(self.webview_user_data_dir());
+        }
     }
 
     /// Requests closing the panel, honoring `close_needs_confirmation` (`web_app_setup_closing_behavior`).
@@ -468,6 +518,10 @@ impl MiniAppWindow {
     }
 
     /// Processes a raw incoming [`WebMessage`] through [`MiniAppController`] and executes resulting actions.
+    ///
+    /// Security invariant (B1): every event (including geolocation commands) flows through
+    /// [`MiniAppController::handle_web_message`] so close-state, payload-format, and same-origin
+    /// checks are enforced uniformly before any host action runs.
     pub fn handle_web_message(
         &mut self,
         msg: &WebMessage,
@@ -477,30 +531,6 @@ impl MiniAppWindow {
         clipboard: &dyn ClipboardAccess,
         now: Instant,
     ) -> Vec<AppWebViewEvent> {
-        if let Ok((_, event)) = parse_mini_app_event(&msg.text, &msg.source_url) {
-            match event {
-                MiniAppEvent::WebAppCheckLocation => {
-                    let status = self.geo_provider.status();
-                    let payload = tg_app_core::core_types::geo::mini_app_location_checked_json(
-                        status,
-                        self.location_access,
-                    );
-                    self.post_raw_json_event("location_checked", payload);
-                    return Vec::new();
-                }
-                MiniAppEvent::WebAppRequestLocation => {
-                    self.request_location_for_page();
-                    return Vec::new();
-                }
-                MiniAppEvent::WebAppOpenLocationSettings => {
-                    let _ = external.open_url("ms-settings:privacy-location");
-                    return vec![AppWebViewEvent::OpenExternalUrl {
-                        url: "ms-settings:privacy-location".to_owned(),
-                    }];
-                }
-                _ => {}
-            }
-        }
         match self.controller.handle_web_message(msg, palette, now) {
             Ok(actions) => self.handle_actions(actions, backend, external, clipboard, now),
             Err(err) => {
@@ -727,6 +757,24 @@ impl MiniAppWindow {
                         title: self.bot.title.clone(),
                     });
                 }
+                MiniAppAction::CheckLocation => {
+                    let status = self.geo_provider.status();
+                    let payload = tg_app_core::core_types::geo::mini_app_location_checked_json(
+                        status,
+                        self.location_access,
+                    );
+                    self.post_raw_json_event("location_checked", payload);
+                }
+                MiniAppAction::RequestLocation => {
+                    self.request_location_for_page();
+                }
+                MiniAppAction::OpenLocationSettings => {
+                    let uri = tg_platform::url_policy::WINDOWS_LOCATION_SETTINGS_URI;
+                    let _ = external.open_url(uri);
+                    events.push(AppWebViewEvent::OpenExternalUrl {
+                        url: uri.to_owned(),
+                    });
+                }
                 MiniAppAction::ShareToStory(_)
                 | MiniAppAction::RequestChat(_)
                 | MiniAppAction::SetEmojiStatus { .. }
@@ -894,19 +942,31 @@ impl MiniAppWindow {
             }
             ActiveMiniAppModal::ConfirmDownloadFile(prompt) => {
                 if action_id == "download" {
-                    let dest = self
-                        .user_data_root
-                        .join("downloads")
-                        .join(&prompt.file_name);
-                    let _ = self.bot_downloads.start(
-                        self.bot.id,
-                        prompt.url.clone(),
-                        dest.display().to_string(),
-                    );
-                    self.post_host_event(&HostEvent::FileDownloadRequested {
-                        status: FileDownloadStatus::Downloading,
-                    });
-                    self.show_toast(format!("Downloading {}…", prompt.file_name));
+                    let downloads_dir = self.downloads_dir();
+                    match resolve_safe_bot_download_path(&downloads_dir, &prompt.file_name) {
+                        Ok(dest) => {
+                            let safe_display = dest
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("download")
+                                .to_owned();
+                            let _ = self.bot_downloads.start(
+                                self.bot.id,
+                                prompt.url.clone(),
+                                dest.display().to_string(),
+                            );
+                            self.post_host_event(&HostEvent::FileDownloadRequested {
+                                status: FileDownloadStatus::Downloading,
+                            });
+                            self.show_toast(format!("Downloading {safe_display}…"));
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, raw_name = %prompt.file_name, "Rejected unsafe bot download filename");
+                            self.post_host_event(&HostEvent::FileDownloadRequested {
+                                status: FileDownloadStatus::Cancelled,
+                            });
+                        }
+                    }
                 } else {
                     self.post_host_event(&HostEvent::FileDownloadRequested {
                         status: FileDownloadStatus::Cancelled,
@@ -1869,8 +1929,7 @@ impl MiniAppWindow {
         let ctx_nav = ctx.clone();
         let ctx_fail = ctx.clone();
 
-        let user_data_path =
-            resolve_user_data_dir(&self.user_data_root, &format!("bot_{}", self.bot.id));
+        let user_data_path = self.webview_user_data_dir();
         let config = WebViewConfig {
             opaque_bg: palette.window_bg,
             user_data_path: Some(user_data_path),
@@ -1984,6 +2043,69 @@ impl MiniAppWindow {
                     });
             });
     }
+}
+
+/// Default WebView2 user-data root inside the application's working directory
+/// (`<working_dir>/tdata/webview_profiles`), never `%TEMP%`.
+#[must_use]
+pub fn default_webview_data_root() -> PathBuf {
+    let resolved = tg_core::launcher::resolve_working_dir(
+        &tg_core::launcher::ParsedArgs::default(),
+        &tg_core::launcher::WorkDirEnv::from_process(),
+    );
+    resolved.path.join("tdata").join("webview_profiles")
+}
+
+/// Sanitizes a bot-supplied file name (`web_app_request_file_download`) with the shared
+/// [`tg_platform::file_safety::sanitize_filename`]: last path component only, no drive prefix,
+/// illegal Windows or control characters, BiDi overrides (`U+202E`), trailing dots/spaces,
+/// `.lnk`/`.scf`, or reserved DOS device names (including `"CON .txt"`).
+#[must_use]
+pub fn sanitize_bot_download_filename(raw: &str) -> String {
+    tg_platform::file_safety::sanitize_filename(raw)
+}
+
+/// Resolves a safe, non-overwriting destination path strictly inside `downloads_dir` for a
+/// bot-supplied `raw_file_name`, generating `"name (1).ext"` style unique names if a file
+/// already exists.
+pub fn resolve_safe_bot_download_path(
+    downloads_dir: &Path,
+    raw_file_name: &str,
+) -> Result<PathBuf, String> {
+    let safe_name = sanitize_bot_download_filename(raw_file_name);
+    let mut comps = Path::new(&safe_name).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(_)), None) => {}
+        _ => {
+            return Err(format!(
+                "sanitized download filename '{safe_name}' is not a single normal path component"
+            ));
+        }
+    }
+
+    let candidate = downloads_dir.join(&safe_name);
+    if candidate.parent() != Some(downloads_dir) {
+        return Err("resolved download path escaped downloads directory".to_owned());
+    }
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+
+    let (stem, ext) = match safe_name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !e.is_empty() => (s, Some(e)),
+        _ => (safe_name.as_str(), None),
+    };
+    for idx in 1_u32..=10_000 {
+        let numbered = match ext {
+            Some(e) => format!("{stem} ({idx}).{e}"),
+            None => format!("{stem} ({idx})"),
+        };
+        let next = downloads_dir.join(&numbered);
+        if next.parent() == Some(downloads_dir) && !next.exists() {
+            return Ok(next);
+        }
+    }
+    Err("could not allocate unique download filename".to_owned())
 }
 
 /// Returns `true` if `uri` is a local Telegram/TON link that should be handed off to the app.
@@ -2189,4 +2311,15 @@ fn paint_mini_app_button(
     }
 
     resp
+}
+
+/// Returns a process-unique folder name for a throwaway WebView2 profile.
+fn next_ephemeral_profile_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!("p{}_{n}_{nanos}", std::process::id())
 }

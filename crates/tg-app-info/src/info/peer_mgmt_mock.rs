@@ -7,12 +7,19 @@
 //! consistent, realistic synthetic data (strictly fictional names and IDs).
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::info::backend::{
-    DownloadEntry, DownloadStatus, InviteImporterInfo, InviteImportersList, InviteLinkInfo,
-    InviteLinkRequest, InviteLinksList, JoinRequestsSummary, OwnershipTransferCheck,
-    OwnershipTransferError, PeerColorSettings, SimilarChannelEntry, SimilarChannelsResult,
+    AdminWithInvitesEntry, ChannelManagementState, ChannelStickerSetRef, DownloadEntry,
+    DownloadStatus, InviteImporterInfo, InviteImportersList, InviteLinkInfo, InviteLinkRequest,
+    InviteLinksList, JoinRequestsSummary, OwnershipTransferCheck, OwnershipTransferError,
+    PeerColorSettings, ProfilePhotoRef, SimilarChannelEntry, SimilarChannelsResult,
     UpdatePeerColorRequest,
+};
+use tg_app_core::core_types::dto::contacts_extras::{
+    ContactProfilePhotoUpload, ExportedContactTokenInfo, ExportedNoPaidMessagesTokenInfo,
+    NoPaidMessagesTokenImportResult,
 };
 use tg_app_core::stand_in::types::PeerId;
 
@@ -40,6 +47,30 @@ pub struct PeerManagementMockStore {
     pub transfer_password_hint: String,
     /// Audit log of completed ownership transfers `(peer_id, new_owner_id)`.
     pub completed_transfers: Vec<(PeerId, PeerId)>,
+    /// WP-65 cached channel/supergroup management flags per peer.
+    pub channel_mgmt: HashMap<PeerId, ChannelManagementState>,
+    /// WP-65 admins who created invite links per group/channel (`messages.getAdminsWithInvites`).
+    pub admins_with_invites: HashMap<PeerId, Vec<AdminWithInvitesEntry>>,
+    /// WP-65 audit log of deactivated collectible usernames per peer.
+    pub deactivated_usernames_peers: Vec<PeerId>,
+    /// WP-65 audit log of basic chats deleted via `messages.deleteChat`.
+    pub deleted_basic_chats: Vec<PeerId>,
+    /// WP-65 audit log of gigagroup conversions (`channels.convertToGigagroup`).
+    pub gigagroup_conversions: Vec<PeerId>,
+    /// WP-66 private contact notes keyed by user peer ID.
+    pub contact_notes: HashMap<PeerId, tg_text::TextWithEntities>,
+    /// WP-66 audit log of deleted contacts (`contacts.deleteContacts`).
+    pub deleted_contacts: Vec<PeerId>,
+    /// WP-66 audit log of deleted own profile photo IDs (`photos.deletePhotos`).
+    pub deleted_profile_photos: Vec<i64>,
+    /// WP-66 audit log of uploaded/suggested/cleared contact profile photos.
+    pub uploaded_contact_photos: Vec<(PeerId, ContactProfilePhotoUpload)>,
+    /// WP-66 counter for deterministic exported contact tokens.
+    contact_token_seq: Arc<AtomicU32>,
+    /// WP-66 audit log of imported contact tokens (`contacts.importContactToken`).
+    pub imported_contact_tokens: Vec<String>,
+    /// WP-66 audit log of imported no-paid-messages tokens `(peer_id, token)`.
+    pub imported_no_paid_tokens: Vec<(PeerId, String)>,
 }
 
 impl Default for PeerManagementMockStore {
@@ -374,6 +405,96 @@ impl PeerManagementMockStore {
             },
         ];
 
+        let mut channel_mgmt: HashMap<PeerId, ChannelManagementState> = HashMap::new();
+        channel_mgmt.insert(
+            primary_group,
+            ChannelManagementState {
+                pre_history_hidden: true,
+                is_forum: false,
+                forum_tabs: false,
+                view_forum_as_messages: false,
+                participants_hidden: false,
+                is_gigagroup: false,
+                boosts_unrestrict: 2,
+                boosts_applied: 1,
+                stars_per_message: 0,
+                broadcast_messages_allowed: false,
+                autotranslation: false,
+                can_set_stickers: true,
+                sticker_set: Some(ChannelStickerSetRef::ShortName(
+                    "rust_core_stickers".to_owned(),
+                )),
+                emoji_set: None,
+            },
+        );
+        channel_mgmt.insert(
+            primary_channel,
+            ChannelManagementState {
+                pre_history_hidden: false,
+                is_forum: false,
+                forum_tabs: false,
+                view_forum_as_messages: false,
+                participants_hidden: false,
+                is_gigagroup: false,
+                boosts_unrestrict: 0,
+                boosts_applied: 3,
+                stars_per_message: 10,
+                broadcast_messages_allowed: true,
+                autotranslation: true,
+                can_set_stickers: false,
+                sticker_set: None,
+                emoji_set: None,
+            },
+        );
+
+        let mut admins_with_invites: HashMap<PeerId, Vec<AdminWithInvitesEntry>> = HashMap::new();
+        admins_with_invites.insert(
+            primary_group,
+            vec![
+                AdminWithInvitesEntry {
+                    admin_id: self_id,
+                    name: "Taylor Kim".to_owned(),
+                    username: Some("rustgram_tester".to_owned()),
+                    is_self: true,
+                    invites_count: 3,
+                    revoked_invites_count: 1,
+                },
+                AdminWithInvitesEntry {
+                    admin_id: PeerId::from_user(1001),
+                    name: "Mira Vance".to_owned(),
+                    username: Some("mira_vance".to_owned()),
+                    is_self: false,
+                    invites_count: 4,
+                    revoked_invites_count: 1,
+                },
+                AdminWithInvitesEntry {
+                    admin_id: PeerId::from_user(1002),
+                    name: "Kaelen Orlov".to_owned(),
+                    username: Some("kaelen_orlov".to_owned()),
+                    is_self: false,
+                    invites_count: 2,
+                    revoked_invites_count: 0,
+                },
+            ],
+        );
+        admins_with_invites.insert(
+            primary_channel,
+            vec![AdminWithInvitesEntry {
+                admin_id: PeerId::from_user(1001),
+                name: "Mira Vance".to_owned(),
+                username: Some("mira_vance".to_owned()),
+                is_self: false,
+                invites_count: 2,
+                revoked_invites_count: 0,
+            }],
+        );
+
+        let mut contact_notes: HashMap<PeerId, tg_text::TextWithEntities> = HashMap::new();
+        contact_notes.insert(
+            PeerId::from_user(1001),
+            tg_text::TextWithEntities::simple("Met at Rust UI meetup; prefers async code reviews."),
+        );
+
         Self {
             invites,
             importers,
@@ -386,6 +507,18 @@ impl PeerManagementMockStore {
             transfer_password: DEMO_TRANSFER_2FA_PASSWORD.to_owned(),
             transfer_password_hint: "demo hint: rustgram2fa".to_owned(),
             completed_transfers: Vec::new(),
+            channel_mgmt,
+            admins_with_invites,
+            deactivated_usernames_peers: Vec::new(),
+            deleted_basic_chats: Vec::new(),
+            gigagroup_conversions: Vec::new(),
+            contact_notes,
+            deleted_contacts: Vec::new(),
+            deleted_profile_photos: Vec::new(),
+            uploaded_contact_photos: Vec::new(),
+            contact_token_seq: Arc::new(AtomicU32::new(0)),
+            imported_contact_tokens: Vec::new(),
+            imported_no_paid_tokens: Vec::new(),
         }
     }
 
@@ -867,5 +1000,232 @@ impl PeerManagementMockStore {
         let count = self.downloads.len();
         self.downloads.clear();
         count
+    }
+
+    // -------------------------------------------------------------------------
+    // WP-65 & WP-66 mock state helpers
+    // -------------------------------------------------------------------------
+
+    /// Returns cached channel/supergroup management flags for `peer_id`.
+    #[must_use]
+    pub fn channel_management_state(&self, peer_id: PeerId) -> Option<ChannelManagementState> {
+        self.channel_mgmt.get(&peer_id).cloned()
+    }
+
+    /// Toggles `pre_history_hidden` for `peer_id`.
+    pub fn toggle_pre_history_hidden(&mut self, peer_id: PeerId, hidden: bool) {
+        self.channel_mgmt
+            .entry(peer_id)
+            .or_default()
+            .pre_history_hidden = hidden;
+    }
+
+    /// Upgrades `peer_id` to a broadcast gigagroup.
+    pub fn convert_to_gigagroup(&mut self, peer_id: PeerId) {
+        self.channel_mgmt.entry(peer_id).or_default().is_gigagroup = true;
+        self.gigagroup_conversions.push(peer_id);
+    }
+
+    /// Records deactivating all collectible usernames on `peer_id`.
+    pub fn deactivate_all_channel_usernames(&mut self, peer_id: PeerId) {
+        self.deactivated_usernames_peers.push(peer_id);
+    }
+
+    /// Toggles forum mode and tabbed layout for `peer_id`.
+    pub fn toggle_channel_forum(&mut self, peer_id: PeerId, enabled: bool, tabs: bool) {
+        let st = self.channel_mgmt.entry(peer_id).or_default();
+        st.is_forum = enabled;
+        st.forum_tabs = enabled && tabs;
+        if enabled {
+            st.pre_history_hidden = false;
+        }
+    }
+
+    /// Toggles hidden participants for `peer_id`.
+    pub fn toggle_participants_hidden(&mut self, peer_id: PeerId, hidden: bool) {
+        self.channel_mgmt
+            .entry(peer_id)
+            .or_default()
+            .participants_hidden = hidden;
+    }
+
+    /// Toggles viewing a forum as flat messages.
+    pub fn toggle_view_forum_as_messages(&mut self, peer_id: PeerId, as_messages: bool) {
+        self.channel_mgmt
+            .entry(peer_id)
+            .or_default()
+            .view_forum_as_messages = as_messages;
+    }
+
+    /// Sets boosts required to unblock default group restrictions.
+    pub fn set_boosts_to_unblock_restrictions(&mut self, peer_id: PeerId, boosts: u32) {
+        self.channel_mgmt
+            .entry(peer_id)
+            .or_default()
+            .boosts_unrestrict = boosts;
+    }
+
+    /// Assigns or clears the group's official sticker pack.
+    pub fn set_channel_sticker_set(&mut self, peer_id: PeerId, set: ChannelStickerSetRef) {
+        let st = self.channel_mgmt.entry(peer_id).or_default();
+        st.sticker_set = match set {
+            ChannelStickerSetRef::Empty => None,
+            other => Some(other),
+        };
+    }
+
+    /// Assigns or clears the group's official custom emoji pack.
+    pub fn set_channel_emoji_sticker_set(&mut self, peer_id: PeerId, set: ChannelStickerSetRef) {
+        let st = self.channel_mgmt.entry(peer_id).or_default();
+        st.emoji_set = match set {
+            ChannelStickerSetRef::Empty => None,
+            other => Some(other),
+        };
+    }
+
+    /// Updates paid messages price and direct-messages flag.
+    pub fn update_channel_paid_messages_price(
+        &mut self,
+        peer_id: PeerId,
+        broadcast_messages_allowed: bool,
+        stars_per_message: i64,
+    ) {
+        let st = self.channel_mgmt.entry(peer_id).or_default();
+        st.broadcast_messages_allowed = broadcast_messages_allowed;
+        st.stars_per_message = stars_per_message.max(0);
+    }
+
+    /// Toggles channel auto-translation.
+    pub fn toggle_channel_autotranslation(&mut self, peer_id: PeerId, enabled: bool) {
+        self.channel_mgmt
+            .entry(peer_id)
+            .or_default()
+            .autotranslation = enabled;
+    }
+
+    /// Records deleting a basic chat via `messages.deleteChat`.
+    pub fn delete_basic_chat(&mut self, peer_id: PeerId) {
+        self.deleted_basic_chats.push(peer_id);
+    }
+
+    /// Returns admins with invite links for `peer_id`.
+    #[must_use]
+    pub fn admins_with_invites(&self, peer_id: PeerId) -> Vec<AdminWithInvitesEntry> {
+        self.admins_with_invites
+            .get(&peer_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Records deleting contacts via `contacts.deleteContacts`.
+    pub fn record_deleted_contacts(&mut self, peer_ids: &[PeerId]) {
+        self.deleted_contacts.extend_from_slice(peer_ids);
+    }
+
+    /// Exports a deterministic temporary contact QR token.
+    #[must_use]
+    pub fn export_contact_token(&self) -> ExportedContactTokenInfo {
+        let seq = self.contact_token_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(MOCK_NOW_UNIX, |d| d.as_secs().min(i32::MAX as u64) as i32);
+        ExportedContactTokenInfo {
+            url: format!("https://t.me/contact/demo_token_{seq:04}"),
+            expires: now.saturating_add(900),
+        }
+    }
+
+    /// Resolves a contact token (`contacts.importContactToken`).
+    pub fn import_contact_token(
+        &mut self,
+        token: &str,
+        fallback_peer: PeerId,
+    ) -> Result<PeerId, String> {
+        let trimmed = token.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("expired") {
+            return Err("CONTACT_TOKEN_EXPIRED".to_owned());
+        }
+        if trimmed.eq_ignore_ascii_case("flood") {
+            return Err("FLOOD_WAIT_30".to_owned());
+        }
+        self.imported_contact_tokens.push(trimmed.to_owned());
+        Ok(fallback_peer)
+    }
+
+    /// Exports a deterministic paid-message fee-waiver token.
+    #[must_use]
+    pub fn export_no_paid_messages_token(
+        &self,
+        revoke: bool,
+        temporary: bool,
+    ) -> ExportedNoPaidMessagesTokenInfo {
+        let tag = if revoke { "revoked" } else { "active" };
+        let token = format!("free_{tag}_{}", if temporary { "tmp" } else { "perm" });
+        ExportedNoPaidMessagesTokenInfo {
+            url: format!("https://t.me/contact/demo_token_0001?free={token}"),
+            token,
+            expires: temporary.then_some(MOCK_NOW_UNIX + 3_600),
+        }
+    }
+
+    /// Redeems a paid-message fee-waiver token for `peer_id`.
+    pub fn import_no_paid_messages_token(
+        &mut self,
+        peer_id: PeerId,
+        token: &str,
+    ) -> Result<NoPaidMessagesTokenImportResult, String> {
+        let trimmed = token.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("invalid") {
+            return Err("TOKEN_INVALID".to_owned());
+        }
+        self.imported_no_paid_tokens
+            .push((peer_id, trimmed.to_owned()));
+        Ok(NoPaidMessagesTokenImportResult {
+            user_id: peer_id,
+            price_removed: true,
+        })
+    }
+
+    /// Returns the private contact note for `peer_id`.
+    #[must_use]
+    pub fn contact_note(&self, peer_id: PeerId) -> Option<tg_text::TextWithEntities> {
+        self.contact_notes.get(&peer_id).cloned()
+    }
+
+    /// Sets or clears the private contact note for `peer_id`.
+    pub fn update_contact_note(
+        &mut self,
+        peer_id: PeerId,
+        note: tg_text::TextWithEntities,
+    ) -> bool {
+        if note.text.trim().is_empty() {
+            self.contact_notes.remove(&peer_id);
+        } else {
+            self.contact_notes.insert(peer_id, note);
+        }
+        true
+    }
+
+    /// Records deleting own profile photos (`photos.deletePhotos`).
+    pub fn delete_profile_photos(&mut self, photos: &[ProfilePhotoRef]) -> Vec<i64> {
+        let ids: Vec<i64> = photos.iter().map(|p| p.id).collect();
+        self.deleted_profile_photos.extend_from_slice(&ids);
+        ids
+    }
+
+    /// Records uploading, suggesting, or clearing a contact profile photo.
+    pub fn upload_contact_profile_photo(
+        &mut self,
+        peer_id: PeerId,
+        request: ContactProfilePhotoUpload,
+    ) -> i64 {
+        let is_clear =
+            request.image.is_none() && request.video.is_none() && request.emoji_markup.is_none();
+        self.uploaded_contact_photos.push((peer_id, request));
+        if is_clear {
+            0
+        } else {
+            700_000 + self.uploaded_contact_photos.len() as i64
+        }
     }
 }

@@ -9,10 +9,12 @@ pub mod layer_stack;
 pub mod lock_widgets;
 pub mod main_menu;
 pub mod main_widget;
+pub mod media_fullscreen;
 pub use tg_app_core::core_types::platform_call;
 pub mod platform_shell;
 #[cfg(test)]
 mod screenshots;
 pub mod section;
+pub mod security_policy;
 pub mod session_controller;
 pub mod shortcuts_wiring;

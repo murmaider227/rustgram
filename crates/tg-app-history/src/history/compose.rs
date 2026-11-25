@@ -43,7 +43,7 @@ use crate::history::sections_model::{
 };
 use crate::history::text_bridge::parse_compose_markdown;
 use crate::history::theme::HistoryColors;
-use tg_app_core::stand_in::types::{MsgId, PeerId};
+use tg_app_core::stand_in::types::{MsgId, PeerId, PeerKind};
 
 /// Local draft debounce delay after typing stops (`kSaveDraftTimeout = 1000ms` in `history_widget.cpp:239`).
 pub const SAVE_DRAFT_TIMEOUT_MS: u64 = 1_000;
@@ -858,6 +858,21 @@ impl ComposeControls {
         let now_secs = ui.ctx().input(|i| i.time);
         let now_ms = (now_secs * 1000.0).max(0.0) as u64;
 
+        // Broadcast channels use "Broadcast a message..." / "Silent broadcast..."
+        // (`HistoryWidget::updateFieldPlaceholder`).
+        let broadcast_placeholder = (placeholder == tg_lang::tr::lng_message_ph()
+            && backend
+                .and_then(|be| be.peer_info(peer_id))
+                .is_some_and(|info| matches!(info.summary.kind, PeerKind::Channel)))
+        .then(|| {
+            if self.silent_mode {
+                tg_lang::tr::lng_broadcast_silent_ph()
+            } else {
+                tg_lang::tr::lng_broadcast_ph()
+            }
+        });
+        let placeholder = broadcast_placeholder.as_deref().unwrap_or(placeholder);
+
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, colors.bar_bg);
         ui.painter().line_segment(
@@ -1096,16 +1111,25 @@ impl ComposeControls {
             ui.painter()
                 .circle_filled(attach_rect.center(), 17.0, colors.bar_bg_over);
         }
-        paint_icon(
+        // `st::historyAttach` (chat/input_attach) at its own size.
+        let attach_fg = if attach_highlighted {
+            colors.accent
+        } else {
+            colors.sub_text_fg
+        };
+        if !tg_app_core::ui_icons::paint_style_tinted(
             ui.painter(),
-            attach_rect.shrink(8.0),
-            IconKind::Attach,
-            if attach_highlighted {
-                colors.accent
-            } else {
-                colors.sub_text_fg
-            },
-        );
+            Rect::from_center_size(attach_rect.center(), Vec2::splat(40.0)),
+            tg_ui::tg_style::st::history_attach.icon,
+            attach_fg,
+        ) {
+            paint_icon(
+                ui.painter(),
+                attach_rect.shrink(8.0),
+                IconKind::Attach,
+                attach_fg,
+            );
+        }
         if attach_resp
             .on_hover_text("Attach media, poll, location, contact, or Mini App bot")
             .clicked()
@@ -1121,25 +1145,32 @@ impl ComposeControls {
             self.paint_attach_menu(ui, attach_rect.left_top(), colors, &mut events);
         }
 
-        // 5. Right buttons: Send/Mic, Emoji, Effects ✨, Silent 🔇, Slow Mode countdown
+        // 5. Right buttons (`HistoryWidget::updateControlsGeometry`): Send/Mic, Emoji and, for
+        // broadcast channels the user can post in, the silent toggle (`hasSilentToggle`).
+        // Message effects live in the Send menu ("Message Effect...").
+        let is_broadcast = backend
+            .and_then(|be| be.peer_info(peer_id))
+            .is_some_and(|info| matches!(info.summary.kind, PeerKind::Channel));
+        let show_silent_toggle = is_broadcast && can_send;
         let send_rect = Rect::from_center_size(
-            Pos2::new(input_bar.right() - 26.0, input_bar.bottom() - 24.0),
-            Vec2::splat(36.0),
+            Pos2::new(input_bar.right() - 24.0, input_bar.bottom() - 24.0),
+            Vec2::new(44.0, 46.0),
         );
         let emoji_rect = Rect::from_center_size(
             Pos2::new(send_rect.left() - 22.0, input_bar.bottom() - 24.0),
-            Vec2::splat(32.0),
+            Vec2::new(44.0, 46.0),
         );
-        let effects_rect = Rect::from_center_size(
-            Pos2::new(emoji_rect.left() - 20.0, input_bar.bottom() - 24.0),
-            Vec2::splat(28.0),
-        );
+        let effects_rect = emoji_rect;
         let silent_rect = Rect::from_center_size(
-            Pos2::new(effects_rect.left() - 18.0, input_bar.bottom() - 24.0),
-            Vec2::splat(28.0),
+            Pos2::new(emoji_rect.left() - 22.0, input_bar.bottom() - 24.0),
+            Vec2::new(44.0, 46.0),
         );
 
-        let mut right_edge = silent_rect.left() - 4.0;
+        let mut right_edge = if show_silent_toggle {
+            silent_rect.left()
+        } else {
+            emoji_rect.left()
+        } - 4.0;
         if let Some(ref chrome) = bot_chrome
             && chrome.has_reply_keyboard
         {
@@ -1183,70 +1214,47 @@ impl ComposeControls {
             right_edge = sm_rect.left() - 4.0;
         }
 
-        // Silent send toggle button
-        let silent_resp = ui.interact(silent_rect, Id::unique("tg_compose_silent"), Sense::click());
-        silent_resp.widget_info(|| {
-            WidgetInfo::selected(Role::Button, true, self.silent_mode, "Silent send")
-        });
-        if silent_resp.hovered() || self.silent_mode {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            ui.painter()
-                .circle_filled(silent_rect.center(), 14.0, colors.bar_bg_over);
-        }
-        let silent_color = if self.silent_mode {
-            colors.accent
-        } else {
-            colors.sub_text_fg
-        };
-        let silent_icon = if self.silent_mode {
-            tg_ui::tg_style::st::menu_icon_mute
-        } else {
-            tg_ui::tg_style::st::menu_icon_notifications
-        };
-        tg_app_core::ui_icons::paint_style_tinted(
-            ui.painter(),
-            Rect::from_center_size(silent_rect.center(), Vec2::splat(16.0)),
-            silent_icon,
-            silent_color,
-        );
-        if silent_resp
-            .on_hover_text(if self.silent_mode {
-                "Silent send ON (no sound)"
+        // Silent broadcast toggle (`HistoryWidget::_silent`, broadcast channels only).
+        if show_silent_toggle {
+            let silent_resp =
+                ui.interact(silent_rect, Id::unique("tg_compose_silent"), Sense::click());
+            silent_resp.widget_info(|| {
+                WidgetInfo::selected(Role::Button, true, self.silent_mode, "Silent send")
+            });
+            if silent_resp.hovered() || self.silent_mode {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                ui.painter()
+                    .circle_filled(silent_rect.center(), 14.0, colors.bar_bg_over);
+            }
+            let silent_color = if self.silent_mode {
+                colors.accent
             } else {
-                "Toggle silent send"
-            })
-            .clicked()
-        {
-            self.silent_mode = !self.silent_mode;
-        }
-
-        // Message Effects picker button
-        let eff_resp = ui.interact(
-            effects_rect,
-            Id::unique("tg_compose_effects"),
-            Sense::click(),
-        );
-        eff_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Message effects"));
-        if eff_resp.hovered() || self.effects.selected_effect_id.is_some() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            ui.painter()
-                .circle_filled(effects_rect.center(), 14.0, colors.bar_bg_over);
-        }
-        let eff_color = if self.effects.selected_effect_id.is_some() {
-            colors.accent
-        } else {
-            colors.sub_text_fg
-        };
-        tg_app_core::ui_icons::paint_sparkle(ui.painter(), effects_rect.center(), 14.0, eff_color);
-        if eff_resp.on_hover_text("Message effects").clicked() {
-            self.effects.open = !self.effects.open;
-            if self.effects.open
-                && !self.effects.is_catalog_loaded()
-                && let Some(be) = backend
+                colors.sub_text_fg
+            };
+            let silent_icon = if self.silent_mode {
+                tg_ui::tg_style::st::menu_icon_mute
+            } else {
+                tg_ui::tg_style::st::menu_icon_notifications
+            };
+            tg_app_core::ui_icons::paint_style_tinted(
+                ui.painter(),
+                Rect::from_center_size(silent_rect.center(), Vec2::splat(16.0)),
+                silent_icon,
+                silent_color,
+            );
+            if silent_resp
+                .on_hover_text(if self.silent_mode {
+                    "Silent send ON (no sound)"
+                } else {
+                    "Toggle silent send"
+                })
+                .clicked()
             {
-                self.effects.sync_catalog(be.available_effects());
+                self.silent_mode = !self.silent_mode;
             }
         }
+
+        // Message effects picker (opened from the Send menu's "Message Effect...").
         if self.effects.open
             && !self.effects.is_catalog_loaded()
             && let Some(be) = backend
@@ -1426,7 +1434,7 @@ impl ComposeControls {
                             input_id,
                             &mut self.rich_edit,
                             placeholder,
-                            13.5,
+                            13.0,
                             field_rect.width(),
                             &rich_pal,
                             self.focus_requested,

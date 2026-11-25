@@ -15,12 +15,11 @@ use tg_app_core::stand_in::settings::SavedWindowColumns;
 // `dialogs/dialogs.style`, `ui/chat/chat.style`, and `core/core_settings.h`.
 
 pub use tg_app_core::core_types::window_types::{
-    ADAPTIVE_CHAT_WIDE_WIDTH, COLUMN_MAX_WIDTH_LEFT, COLUMN_MAX_WIDTH_THIRD, COLUMN_MIN_WIDTH_LEFT,
-    COLUMN_MIN_WIDTH_MAIN, COLUMN_MIN_WIDTH_THIRD, ChatLayout, Column, ColumnLayout,
-    DEFAULT_DIALOGS_WIDTH_RATIO, DEFAULT_THIRD_COLUMN_WIDTH, DIALOGS_SMALL_COLUMN_WIDTH,
-    HISTORY_RESIZE_WIDTH, WINDOW_BIG_DEFAULT_HEIGHT, WINDOW_BIG_DEFAULT_WIDTH,
-    WINDOW_DEFAULT_HEIGHT, WINDOW_DEFAULT_WIDTH, WINDOW_FILTERS_WIDTH, WINDOW_MIN_HEIGHT,
-    WINDOW_MIN_WIDTH, WindowLayout,
+    ADAPTIVE_CHAT_WIDE_WIDTH, COLUMN_MAX_WIDTH_THIRD, COLUMN_MIN_WIDTH_LEFT, COLUMN_MIN_WIDTH_MAIN,
+    COLUMN_MIN_WIDTH_THIRD, ChatLayout, Column, ColumnLayout, DEFAULT_DIALOGS_WIDTH_RATIO,
+    DEFAULT_THIRD_COLUMN_WIDTH, DIALOGS_SMALL_COLUMN_WIDTH, HISTORY_RESIZE_WIDTH,
+    WINDOW_BIG_DEFAULT_HEIGHT, WINDOW_BIG_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT,
+    WINDOW_DEFAULT_WIDTH, WINDOW_FILTERS_WIDTH, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH, WindowLayout,
 };
 
 /// Reactive holder of the current adaptive window and chat layout (`Window::Adaptive`).
@@ -290,7 +289,9 @@ pub fn count_dialogs_width_from_ratio(
     }
     let ratio = columns.dialogs_width_ratio(nochat);
     let raw = (f64::from(body_width) * ratio).round() as i32;
-    raw.clamp(COLUMN_MIN_WIDTH_LEFT, COLUMN_MAX_WIDTH_LEFT)
+    // tdesktop keeps `accumulate_min(result, st::columnMaximalWidthLeft)` commented out: the
+    // column is only limited by the chat's minimal width (`computeColumnLayout`).
+    raw.max(COLUMN_MIN_WIDTH_LEFT)
 }
 
 /// Port of `SessionController::countThirdColumnWidthFromRatio()`.
@@ -401,8 +402,9 @@ pub fn dialogs_drag_to_ratio(new_width: i32, body_width: i32) -> f64 {
     if new_width < COLUMN_MIN_WIDTH_LEFT / 2 {
         0.0
     } else {
-        let max_allowed = (body_width - COLUMN_MIN_WIDTH_MAIN)
-            .clamp(COLUMN_MIN_WIDTH_LEFT, COLUMN_MAX_WIDTH_LEFT);
+        // `moveFinishedCallback` stores the width the layout actually gave the column, which is
+        // at most the body minus `columnMinimalWidthMain` (no `columnMaximalWidthLeft` cap).
+        let max_allowed = (body_width - COLUMN_MIN_WIDTH_MAIN).max(COLUMN_MIN_WIDTH_LEFT);
         let clamped = new_width.clamp(COLUMN_MIN_WIDTH_LEFT, max_allowed);
         f64::from(clamped) / f64::from(body_width)
     }
@@ -463,8 +465,24 @@ mod tests {
         let wide = compute_column_layout(base_inputs(1400), &cols);
         assert_eq!(wide.window_layout, WindowLayout::Normal);
         assert_eq!(wide.third_width, 0);
-        assert!(wide.dialogs_width <= COLUMN_MAX_WIDTH_LEFT);
+        assert!(wide.dialogs_width <= wide.body_width - COLUMN_MIN_WIDTH_MAIN);
         assert_eq!(wide.chat_layout, ChatLayout::Wide);
+    }
+
+    #[test]
+    fn dialogs_column_resizes_past_540_up_to_the_chat_minimum() {
+        // tdesktop has no `columnMaximalWidthLeft` cap; only the chat keeps 380 px.
+        let body = 1600;
+        let mut cols = WindowColumnsState::default();
+        cols.update_dialogs_width_ratio(dialogs_drag_to_ratio(800, body), false);
+        let layout = compute_column_layout(base_inputs(body), &cols);
+        assert_eq!(layout.dialogs_width, 800);
+        assert_eq!(layout.chat_width, 800);
+
+        cols.update_dialogs_width_ratio(dialogs_drag_to_ratio(1500, body), false);
+        let layout = compute_column_layout(base_inputs(body), &cols);
+        assert_eq!(layout.dialogs_width, body - COLUMN_MIN_WIDTH_MAIN);
+        assert_eq!(layout.chat_width, COLUMN_MIN_WIDTH_MAIN);
     }
 
     #[test]

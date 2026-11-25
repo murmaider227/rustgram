@@ -201,6 +201,11 @@ impl StoriesStrip {
         let mut actions = Vec::new();
 
         let uploads = backend.pending_uploads();
+        // `Dialogs::Stories::List` stays hidden while its content has no elements, so the chat
+        // list search sits directly under the window title when there are no stories.
+        if self.bar_state.content().elements.is_empty() && uploads.is_empty() {
+            return actions;
+        }
         let hidden_count = store.sources(StorySourcesList::Hidden).len();
 
         // Advance expand/collapse animation smoothly.

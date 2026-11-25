@@ -42,6 +42,10 @@ pub enum ConfirmTag {
         /// Subscription duration in days.
         days: i32,
     },
+    /// Confirmed irreversible upgrade to a Broadcast Group (`channels.convertToGigagroup`).
+    ConvertToGigagroup(tg_app_core::stand_in::types::PeerId),
+    /// Confirmed deactivating all collectible usernames (`channels.deactivateAllUsernames`).
+    DeactivateAllUsernames(tg_app_core::stand_in::types::PeerId),
 }
 
 /// State for a reusable confirmation modal (`Ui::ConfirmBox`).

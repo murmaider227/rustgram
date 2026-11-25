@@ -1217,11 +1217,55 @@ pub fn is_shell_namespace_command(command: &str) -> bool {
     command.starts_with("shell_") || command.starts_with("tdesktop_shell_")
 }
 
-/// Parses a raw webview bridge payload (either tdesktop's `[eventType, eventData]` array format
-/// or the `{ "eventType": ..., "eventData": ... }` object format).
+/// Returns `true` if `origin` is the exact trusted external-shell origin
+/// (`https://web.telegram.org` / `https://web.telegram.org:443` with no userinfo, path, query, or fragment).
+///
+/// Exact port of `IsExternalShellOrigin` (`attach_bot_webview.cpp:121-131`).
+#[must_use]
+pub fn is_external_shell_origin(origin: &str) -> bool {
+    let trimmed = origin.trim();
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return false;
+    };
+    if parsed.scheme() != "https"
+        || !parsed
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("web.telegram.org"))
+        || parsed.port().unwrap_or(443) != 443
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    // `url::Url` normalizes empty path on https to "/"; reject any explicit path in the input.
+    let Some(after_scheme) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("HTTPS://"))
+        .or_else(|| {
+            trimmed
+                .get(..8)
+                .filter(|p| p.eq_ignore_ascii_case("https://"))
+                .map(|_| &trimmed[8..])
+        })
+    else {
+        return false;
+    };
+    !after_scheme.contains('/')
+}
+
+/// Parses a raw webview bridge payload in either standard embedded mode (`external_shell = false`)
+/// or external-shell mode (`external_shell = true`, requiring a verified `web.telegram.org` sender
+/// and matching random `shell_token`).
 ///
 /// Port of `ParseNativeMessage` (`attach_bot_webview.cpp:273-388`).
-pub fn parse_native_message(text: &str, source_url: &str) -> Result<NativeMessage> {
+pub fn parse_native_message_with_shell(
+    text: &str,
+    source_url: &str,
+    external_shell: bool,
+    shell_token: Option<&str>,
+) -> Result<NativeMessage> {
     if text.len() > MAX_NATIVE_MESSAGE_BYTES {
         return Err(WebViewError::InvalidBridgeMessage(format!(
             "payload too large ({} bytes)",
@@ -1229,74 +1273,142 @@ pub fn parse_native_message(text: &str, source_url: &str) -> Result<NativeMessag
         )));
     }
     let document: Value = serde_json::from_str(text)?;
-    match document {
-        Value::Array(list) => {
-            let Some(Value::String(command)) = list.first() else {
-                return Err(WebViewError::InvalidBridgeMessage(
-                    "array payload missing string eventType at index 0".to_owned(),
-                ));
-            };
-            if command.is_empty() {
-                return Err(WebViewError::InvalidBridgeMessage(
-                    "empty eventType".to_owned(),
-                ));
-            }
-            if is_shell_namespace_command(command) {
-                return Err(WebViewError::InvalidBridgeMessage(format!(
-                    "shell command '{command}' rejected from webapp"
-                )));
-            }
-            let arguments = match list.get(1) {
-                None | Some(Value::Null) => Map::new(),
-                Some(val) => parse_event_arguments(val)?,
-            };
-            Ok(NativeMessage {
-                origin: origin_from_url(source_url),
-                command: command.clone(),
-                arguments,
-            })
+    if external_shell {
+        let Value::Object(obj) = document else {
+            return Err(WebViewError::InvalidBridgeMessage(
+                "external payload is not an object".to_owned(),
+            ));
+        };
+        if !is_external_shell_origin(&origin_from_url(source_url)) {
+            return Err(WebViewError::InvalidBridgeMessage(
+                "bad external sender".to_owned(),
+            ));
         }
-        Value::Object(obj) => {
-            let Some(Value::String(command)) = obj.get("eventType") else {
-                return Err(WebViewError::InvalidBridgeMessage(
-                    "object payload missing string 'eventType'".to_owned(),
-                ));
-            };
-            if command.is_empty() {
-                return Err(WebViewError::InvalidBridgeMessage(
-                    "empty eventType".to_owned(),
-                ));
-            }
-            if is_shell_namespace_command(command) {
-                return Err(WebViewError::InvalidBridgeMessage(format!(
-                    "shell command '{command}' rejected from webapp"
-                )));
-            }
-            let arguments = match obj.get("eventData") {
-                None | Some(Value::Null) => Map::new(),
-                Some(val) => parse_event_arguments(val)?,
-            };
-            let origin = obj
-                .get("origin")
-                .and_then(Value::as_str)
-                .map(origin_from_url)
-                .filter(|o| !o.is_empty())
-                .unwrap_or_else(|| origin_from_url(source_url));
-            Ok(NativeMessage {
-                origin,
-                command: command.clone(),
-                arguments,
-            })
+        if obj.get("type").and_then(Value::as_str) != Some(EXTERNAL_MESSAGE_TYPE) {
+            return Err(WebViewError::InvalidBridgeMessage(
+                "bad external type".to_owned(),
+            ));
         }
-        _ => Err(WebViewError::InvalidBridgeMessage(
-            "payload must be a JSON array [eventType, eventData] or object".to_owned(),
-        )),
+        let is_shell_source = match obj.get("source").and_then(Value::as_str) {
+            Some("webapp") => false,
+            Some("shell") => true,
+            _ => {
+                return Err(WebViewError::InvalidBridgeMessage(
+                    "bad external source".to_owned(),
+                ));
+            }
+        };
+        let expected_token = shell_token.filter(|t| !t.is_empty());
+        let provided_token = obj.get("token").and_then(Value::as_str);
+        if expected_token.is_none() || provided_token != expected_token {
+            return Err(WebViewError::InvalidBridgeMessage(
+                "bad external token".to_owned(),
+            ));
+        }
+        let origin_str = obj.get("origin").and_then(Value::as_str).ok_or_else(|| {
+            WebViewError::InvalidBridgeMessage("missing external origin".to_owned())
+        })?;
+        let origin = if is_shell_source {
+            if !is_external_shell_origin(origin_str) {
+                return Err(WebViewError::InvalidBridgeMessage(
+                    "bad shell origin".to_owned(),
+                ));
+            }
+            String::new()
+        } else {
+            let normalized = origin_from_url(origin_str);
+            if normalized.is_empty() {
+                return Err(WebViewError::InvalidBridgeMessage(
+                    "bad webapp origin".to_owned(),
+                ));
+            }
+            normalized
+        };
+        let Some(Value::String(command)) = obj.get("eventType") else {
+            return Err(WebViewError::InvalidBridgeMessage(
+                "object payload missing string 'eventType'".to_owned(),
+            ));
+        };
+        if command.is_empty() {
+            return Err(WebViewError::InvalidBridgeMessage(
+                "empty eventType".to_owned(),
+            ));
+        }
+        let arguments = match obj.get("eventData") {
+            None | Some(Value::Null) => Map::new(),
+            Some(val) => parse_event_arguments(val)?,
+        };
+        let shell_cmd = is_shell_namespace_command(command);
+        if is_shell_source && !shell_cmd {
+            return Err(WebViewError::InvalidBridgeMessage(format!(
+                "non-shell command '{command}' rejected from shell"
+            )));
+        }
+        if !is_shell_source && shell_cmd {
+            return Err(WebViewError::InvalidBridgeMessage(format!(
+                "shell command '{command}' rejected from webapp"
+            )));
+        }
+        return Ok(NativeMessage {
+            origin,
+            command: command.clone(),
+            arguments,
+        });
     }
+
+    let Value::Array(list) = document else {
+        return Err(WebViewError::InvalidBridgeMessage(
+            "legacy payload is not an array".to_owned(),
+        ));
+    };
+    let Some(Value::String(command)) = list.first() else {
+        return Err(WebViewError::InvalidBridgeMessage(
+            "array payload missing string eventType at index 0".to_owned(),
+        ));
+    };
+    if command.is_empty() {
+        return Err(WebViewError::InvalidBridgeMessage(
+            "empty eventType".to_owned(),
+        ));
+    }
+    if is_shell_namespace_command(command) {
+        return Err(WebViewError::InvalidBridgeMessage(format!(
+            "shell command '{command}' rejected from webapp"
+        )));
+    }
+    let arguments = match list.get(1) {
+        None | Some(Value::Null) => Map::new(),
+        Some(val) => parse_event_arguments(val)?,
+    };
+    Ok(NativeMessage {
+        origin: origin_from_url(source_url),
+        command: command.clone(),
+        arguments,
+    })
+}
+
+/// Parses a raw webview bridge payload in embedded WebView mode (`[eventType, eventData]` array
+/// format only; sender origin is derived strictly from WebView2's `source_url`).
+///
+/// Port of `ParseNativeMessage` (`attach_bot_webview.cpp:273-388`).
+pub fn parse_native_message(text: &str, source_url: &str) -> Result<NativeMessage> {
+    parse_native_message_with_shell(text, source_url, false, None)
 }
 
 /// Decodes a raw bridge JSON payload directly into a typed [`MiniAppEvent`].
 pub fn parse_mini_app_event(text: &str, source_url: &str) -> Result<(NativeMessage, MiniAppEvent)> {
-    let native = parse_native_message(text, source_url)?;
+    parse_mini_app_event_with_shell(text, source_url, false, None)
+}
+
+/// Decodes a raw bridge JSON payload directly into a typed [`MiniAppEvent`], supporting
+/// external-shell verification when `external_shell` is `true`.
+pub fn parse_mini_app_event_with_shell(
+    text: &str,
+    source_url: &str,
+    external_shell: bool,
+    shell_token: Option<&str>,
+) -> Result<(NativeMessage, MiniAppEvent)> {
+    let native = parse_native_message_with_shell(text, source_url, external_shell, shell_token)?;
     let event = decode_mini_app_event(&native.command, &native.arguments)?;
     Ok((native, event))
 }

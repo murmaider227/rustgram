@@ -19,6 +19,8 @@ pub const BOC_MAGIC: u32 = 0xB5EE_9C72;
 pub const BOC_MAGIC_INDEXED: u32 = 0x68FF_65F3;
 /// Generic BOC magic with index + CRC32C (`0xACC3A728`).
 pub const BOC_MAGIC_INDEXED_CRC32C: u32 = 0xACC3_A728;
+/// Maximum number of cells accepted by [`deserialize_boc`] (prevents untrusted memory/CPU DoS).
+pub const MAX_BOC_CELLS: usize = 65_536;
 
 const SIGNATURE_BYTES: usize = 64;
 const REQUEST_BYTES: usize = SIGNATURE_BYTES + 4 + 4 + 4 + 4 + 32;
@@ -112,24 +114,28 @@ pub fn serialize_boc_with_options(
     root: &Cell,
     opts: BocSerializeOptions,
 ) -> Result<Vec<u8>, WalletError> {
-    // Topological post-order deduplication by cell representation hash, then reverse so parents
-    // strictly precede their children (required by TON BOC spec).
+    // Iterative topological post-order deduplication by cell representation hash, then reverse so
+    // parents strictly precede their children (required by TON BOC spec) without call-stack depth
+    // proportional to cell depth.
     let mut visited: HashSet<[u8; 32]> = HashSet::new();
     let mut post_order: Vec<Arc<Cell>> = Vec::new();
-
-    fn dfs(cell: &Arc<Cell>, visited: &mut HashSet<[u8; 32]>, out: &mut Vec<Arc<Cell>>) {
-        let h = cell.hash();
-        if !visited.insert(h) {
-            return;
-        }
-        for r in cell.refs() {
-            dfs(r, visited, out);
-        }
-        out.push(Arc::clone(cell));
-    }
-
     let root_arc = Arc::new(root.clone());
-    dfs(&root_arc, &mut visited, &mut post_order);
+    let mut stack: Vec<(Arc<Cell>, bool)> = vec![(root_arc, false)];
+    while let Some((cell, expanded)) = stack.pop() {
+        if expanded {
+            post_order.push(cell);
+            continue;
+        }
+        if !visited.insert(cell.hash()) {
+            continue;
+        }
+        stack.push((Arc::clone(&cell), true));
+        for r in cell.refs().iter().rev() {
+            if !visited.contains(&r.hash()) {
+                stack.push((Arc::clone(r), false));
+            }
+        }
+    }
     post_order.reverse();
 
     let mut index_by_hash: HashMap<[u8; 32], usize> = HashMap::with_capacity(post_order.len());
@@ -219,13 +225,47 @@ pub fn deserialize_boc(data: &[u8]) -> Result<Vec<Arc<Cell>>, WalletError> {
                     "invalid offset_size {offset_size}"
                 )));
             }
-            let cells = read_be_uint(data, &mut offset, ref_size)? as usize;
-            let roots = read_be_uint(data, &mut offset, ref_size)? as usize;
-            let absent = read_be_uint(data, &mut offset, ref_size)? as usize;
-            let total_size = read_be_uint(data, &mut offset, offset_size)? as usize;
+            let cells = usize::try_from(read_be_uint(data, &mut offset, ref_size)?)
+                .map_err(|_| WalletError::Boc("BOC cells_count overflow".to_owned()))?;
+            let roots = usize::try_from(read_be_uint(data, &mut offset, ref_size)?)
+                .map_err(|_| WalletError::Boc("BOC roots_count overflow".to_owned()))?;
+            let absent = usize::try_from(read_be_uint(data, &mut offset, ref_size)?)
+                .map_err(|_| WalletError::Boc("BOC absent_count overflow".to_owned()))?;
+            let total_size = usize::try_from(read_be_uint(data, &mut offset, offset_size)?)
+                .map_err(|_| WalletError::Boc("BOC total_cells_size overflow".to_owned()))?;
+            if absent != 0 {
+                return Err(WalletError::Boc("absent cells not supported".to_owned()));
+            }
+            if cells == 0 || roots == 0 || roots > cells {
+                return Err(WalletError::Boc(
+                    "BOC has invalid cells or roots count".to_owned(),
+                ));
+            }
+            if cells > MAX_BOC_CELLS {
+                return Err(WalletError::Boc(format!(
+                    "BOC cells_count {cells} exceeds limit {MAX_BOC_CELLS}"
+                )));
+            }
+            let remaining = data.len().saturating_sub(offset);
+            let roots_bytes = roots
+                .checked_mul(ref_size)
+                .ok_or_else(|| WalletError::Boc("BOC roots table size overflow".to_owned()))?;
+            let min_cells_bytes = cells
+                .checked_mul(2)
+                .ok_or_else(|| WalletError::Boc("BOC cells_count overflow".to_owned()))?;
+            let min_required = roots_bytes
+                .checked_add(min_cells_bytes)
+                .ok_or_else(|| WalletError::Boc("BOC header size overflow".to_owned()))?;
+            if remaining < min_required {
+                return Err(WalletError::Boc(
+                    "BOC counts exceed remaining input bytes".to_owned(),
+                ));
+            }
             let mut root_list = Vec::with_capacity(roots);
             for _ in 0..roots {
-                root_list.push(read_be_uint(data, &mut offset, ref_size)? as usize);
+                let idx = usize::try_from(read_be_uint(data, &mut offset, ref_size)?)
+                    .map_err(|_| WalletError::Boc("BOC root index overflow".to_owned()))?;
+                root_list.push(idx);
             }
             (
                 has_idx,
@@ -251,10 +291,39 @@ pub fn deserialize_boc(data: &[u8]) -> Result<Vec<Arc<Cell>>, WalletError> {
                     "invalid offset_size {offset_size}"
                 )));
             }
-            let cells = read_be_uint(data, &mut offset, ref_size)? as usize;
-            let roots = read_be_uint(data, &mut offset, ref_size)? as usize;
-            let absent = read_be_uint(data, &mut offset, ref_size)? as usize;
-            let total_size = read_be_uint(data, &mut offset, offset_size)? as usize;
+            let cells = usize::try_from(read_be_uint(data, &mut offset, ref_size)?)
+                .map_err(|_| WalletError::Boc("BOC cells_count overflow".to_owned()))?;
+            let roots = usize::try_from(read_be_uint(data, &mut offset, ref_size)?)
+                .map_err(|_| WalletError::Boc("BOC roots_count overflow".to_owned()))?;
+            let absent = usize::try_from(read_be_uint(data, &mut offset, ref_size)?)
+                .map_err(|_| WalletError::Boc("BOC absent_count overflow".to_owned()))?;
+            let total_size = usize::try_from(read_be_uint(data, &mut offset, offset_size)?)
+                .map_err(|_| WalletError::Boc("BOC total_cells_size overflow".to_owned()))?;
+            if absent != 0 {
+                return Err(WalletError::Boc("absent cells not supported".to_owned()));
+            }
+            if cells == 0 || roots == 0 || roots > cells {
+                return Err(WalletError::Boc(
+                    "BOC has invalid cells or roots count".to_owned(),
+                ));
+            }
+            if cells > MAX_BOC_CELLS {
+                return Err(WalletError::Boc(format!(
+                    "BOC cells_count {cells} exceeds limit {MAX_BOC_CELLS}"
+                )));
+            }
+            let remaining = data.len().saturating_sub(offset);
+            let min_per_cell = offset_size
+                .checked_add(2)
+                .ok_or_else(|| WalletError::Boc("BOC cell stride overflow".to_owned()))?;
+            let min_required = cells
+                .checked_mul(min_per_cell)
+                .ok_or_else(|| WalletError::Boc("BOC cells_count overflow".to_owned()))?;
+            if remaining < min_required {
+                return Err(WalletError::Boc(
+                    "BOC counts exceed remaining input bytes".to_owned(),
+                ));
+            }
             let root_list = (0..roots).collect();
             (
                 true,
@@ -277,7 +346,7 @@ pub fn deserialize_boc(data: &[u8]) -> Result<Vec<Arc<Cell>>, WalletError> {
     if absent_count != 0 {
         return Err(WalletError::Boc("absent cells not supported".to_owned()));
     }
-    if cells_count == 0 || roots_count == 0 {
+    if cells_count == 0 || roots_count == 0 || roots_count > cells_count {
         return Err(WalletError::Boc("BOC has no cells or roots".to_owned()));
     }
     for &r in &root_indices {
@@ -293,16 +362,30 @@ pub fn deserialize_boc(data: &[u8]) -> Result<Vec<Arc<Cell>>, WalletError> {
         if data.len().saturating_sub(offset) < index_bytes {
             return Err(WalletError::Boc("truncated index table".to_owned()));
         }
-        offset += index_bytes;
+        offset = offset
+            .checked_add(index_bytes)
+            .ok_or_else(|| WalletError::Boc("index offset overflow".to_owned()))?;
     }
 
-    let crc_tail = if has_crc { 4 } else { 0 };
-    if data.len().saturating_sub(offset) != total_cells_size + crc_tail {
+    let crc_tail = if has_crc { 4_usize } else { 0_usize };
+    let expected_tail = total_cells_size
+        .checked_add(crc_tail)
+        .ok_or_else(|| WalletError::Boc("BOC payload size overflow".to_owned()))?;
+    if data.len().saturating_sub(offset) != expected_tail {
         return Err(WalletError::Boc(format!(
             "BOC payload length mismatch: expected {}, got {}",
-            total_cells_size + crc_tail,
+            expected_tail,
             data.len().saturating_sub(offset)
         )));
+    }
+
+    let min_cells_bytes = cells_count
+        .checked_mul(2)
+        .ok_or_else(|| WalletError::Boc("BOC cells_count overflow".to_owned()))?;
+    if min_cells_bytes > total_cells_size {
+        return Err(WalletError::Boc(
+            "BOC cells_count exceeds total_cells_size".to_owned(),
+        ));
     }
 
     if has_crc {
@@ -328,7 +411,9 @@ pub fn deserialize_boc(data: &[u8]) -> Result<Vec<Arc<Cell>>, WalletError> {
         exotic: bool,
     }
 
-    let cells_end = offset + total_cells_size;
+    let cells_end = offset
+        .checked_add(total_cells_size)
+        .ok_or_else(|| WalletError::Boc("BOC cells_end overflow".to_owned()))?;
     let mut raw_cells = Vec::with_capacity(cells_count);
     for i in 0..cells_count {
         if cells_end.saturating_sub(offset) < 2 {
@@ -382,9 +467,16 @@ pub fn deserialize_boc(data: &[u8]) -> Result<Vec<Arc<Cell>>, WalletError> {
             (clean, bit_len)
         };
 
+        let refs_bytes = refs_count
+            .checked_mul(ref_size)
+            .ok_or_else(|| WalletError::Boc("cell refs size overflow".to_owned()))?;
+        if cells_end.saturating_sub(offset) < refs_bytes {
+            return Err(WalletError::Boc("truncated cell references".to_owned()));
+        }
         let mut refs = Vec::with_capacity(refs_count);
         for _ in 0..refs_count {
-            let r = read_be_uint(data, &mut offset, ref_size)? as usize;
+            let r = usize::try_from(read_be_uint(data, &mut offset, ref_size)?)
+                .map_err(|_| WalletError::Boc("cell ref index overflow".to_owned()))?;
             if r <= i || r >= cells_count {
                 return Err(WalletError::Boc(
                     "invalid cell reference index (cycle or out of order)".to_owned(),
@@ -849,5 +941,96 @@ mod tests {
             );
         }
         assert!(nft_transfer_new_owner(K_COMMENT).is_none());
+    }
+
+    fn build_raw_boc(cells_count: usize, ref_size: usize, cells_data: &[u8]) -> Vec<u8> {
+        let offset_size = bytes_needed_for(cells_data.len().max(1));
+        let flags = ref_size as u8 & 0x07; // no idx, no crc
+        let mut out = Vec::new();
+        out.extend_from_slice(&BOC_MAGIC.to_be_bytes());
+        out.push(flags);
+        out.push(offset_size as u8);
+        write_be_uint(&mut out, cells_count as u64, ref_size);
+        write_be_uint(&mut out, 1, ref_size); // roots = 1
+        write_be_uint(&mut out, 0, ref_size); // absent = 0
+        write_be_uint(&mut out, cells_data.len() as u64, offset_size);
+        write_be_uint(&mut out, 0, ref_size); // root_list[0] = 0
+        out.extend_from_slice(cells_data);
+        out
+    }
+
+    #[test]
+    fn sec2c_w1_diamond_chain_40_cells_hashes_in_milliseconds() {
+        // 40-cell diamond DAG: each cell i < 39 has 4 refs all pointing to cell i + 1 (4^39 paths).
+        let cells_count = 40_usize;
+        let mut cells_data = Vec::new();
+        for i in 0..cells_count {
+            if i + 1 < cells_count {
+                cells_data.push(0x04); // d1: 4 refs, ordinary, level 0
+                cells_data.push(0x00); // d2: 0 bits
+                for _ in 0..4 {
+                    cells_data.push((i + 1) as u8);
+                }
+            } else {
+                cells_data.push(0x00); // leaf: 0 refs
+                cells_data.push(0x00); // 0 bits
+            }
+        }
+        let raw_boc = build_raw_boc(cells_count, 1, &cells_data);
+        assert!(raw_boc.len() < 300, "compact ~250-byte diamond BOC");
+
+        let started = std::time::Instant::now();
+        let roots = deserialize_boc(&raw_boc).expect("40-cell diamond BOC must deserialize");
+        let root = &roots[0];
+        let h1 = root.hash();
+        let depth = root.depth();
+        let lm = root.level_mask();
+        let re_encoded = serialize_boc(root).expect("re-serialize diamond BOC");
+        let rt = deserialize_boc(&re_encoded).expect("roundtrip diamond BOC");
+        let elapsed = started.elapsed();
+
+        assert_eq!(depth, 39);
+        assert_eq!(lm, 0);
+        assert_eq!(rt[0].hash(), h1);
+        assert_eq!(*root, rt[0]);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "40-cell diamond BOC took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn sec2c_w1_2000_deep_chain_rejected_without_stack_overflow() {
+        // 2000-cell linear chain: cell i -> cell i + 1 (depth 1999 > MAX_CELL_DEPTH = 1024).
+        let cells_count = 2000_usize;
+        let mut cells_data = Vec::with_capacity(cells_count * 4);
+        for i in 0..cells_count {
+            if i + 1 < cells_count {
+                cells_data.push(0x01); // d1: 1 ref
+                cells_data.push(0x00); // d2: 0 bits
+                write_be_uint(&mut cells_data, (i + 1) as u64, 2);
+            } else {
+                cells_data.push(0x00);
+                cells_data.push(0x00);
+            }
+        }
+        let raw_boc = build_raw_boc(cells_count, 2, &cells_data);
+        let err = deserialize_boc(&raw_boc)
+            .expect_err("2000-deep BOC chain must be rejected cleanly without stack overflow");
+        assert!(
+            err.to_string().contains("depth"),
+            "expected depth rejection error, got: {err}"
+        );
+
+        // Also verify cell-count cap rejects BOCs exceeding MAX_BOC_CELLS before allocation.
+        let over_cap = MAX_BOC_CELLS + 1;
+        let fake_cells = vec![0_u8; over_cap * 2];
+        let raw_over = build_raw_boc(over_cap, 4, &fake_cells);
+        let cap_err = deserialize_boc(&raw_over)
+            .expect_err("BOC with cells_count > MAX_BOC_CELLS must be rejected");
+        assert!(
+            cap_err.to_string().contains("exceeds limit"),
+            "expected cell count cap error, got: {cap_err}"
+        );
     }
 }

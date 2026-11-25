@@ -10,9 +10,11 @@ use tg_lang::tr;
 use tg_ui::fonts::{family_regular, font_id_from_style};
 use tg_ui::icons::paint_style_icon;
 use tg_ui::layers::{BoxButton, BoxModal};
+use tg_ui::stand_in::PopupMenuStyle;
 use tg_ui::stand_in::{
     CheckboxStyle, Colors, FlatLabelStyle, InputFieldStyle, RadioStyle, ToggleStyle,
 };
+use tg_ui::style::px;
 use tg_ui::tg_style::st;
 use tg_ui::theme::ColorsResolver;
 use tg_ui::userpic::EmptyUserpic;
@@ -22,6 +24,7 @@ use tg_ui::widgets::labels::FlatLabel;
 
 use crate::boxes::peer_list::{PeerListBoxState, PeerListPurpose, PeerSelectionMode};
 use crate::boxes::strings;
+use crate::dialogs::entry_menu::{EntryMenu, EntryMenuRow};
 use crate::info::backend::{CreateChannelRequest, CreateGroupRequest, InfoBackend, PeerProfile};
 use crate::info::values::{
     AUTO_DELETE_TTL_PRESETS, MAX_CHANNEL_DESCRIPTION, MAX_GROUP_CHANNEL_TITLE, MAX_USERNAME_LENGTH,
@@ -60,6 +63,8 @@ pub struct CreateGroupBoxState {
     pub member_picker: PeerListBoxState,
     /// Validation error text.
     pub error: Option<String>,
+    /// Top-right `⋮` menu with the Auto-Delete timer (`GroupInfoBox::prepare`).
+    pub ttl_menu: EntryMenu,
 }
 
 impl Default for CreateGroupBoxState {
@@ -84,6 +89,7 @@ impl CreateGroupBoxState {
                 PeerListPurpose::Generic,
             ),
             error: None,
+            ttl_menu: EntryMenu::default(),
         }
     }
 
@@ -139,11 +145,15 @@ impl CreateGroupBoxState {
     #[must_use]
     pub fn to_modal(&self, id: &str) -> BoxModal {
         match self.step {
-            CreateGroupStep::Details => BoxModal::new(id, tr::lng_create_group_title())
-                .additional_title(strings::STEP_1_OF_2)
-                .width(st::box_wide_width.0 as f32 + 16.0)
-                .add_button(BoxButton::default_btn("cancel", tr::lng_cancel()))
-                .add_button(BoxButton::default_btn("next", tr::lng_create_group_next())),
+            CreateGroupStep::Details => {
+                // `GroupInfoBox` has no title; its only top button is the `⋮` TTL menu.
+                let mut modal = BoxModal::new(id, String::new())
+                    .width(st::box_wide_width.0 as f32)
+                    .add_button(BoxButton::default_btn("cancel", tr::lng_cancel()))
+                    .add_button(BoxButton::default_btn("next", tr::lng_create_group_next()));
+                modal.show_close_button = false;
+                modal
+            }
             CreateGroupStep::AddMembers => {
                 let count = self.member_picker.selected.len();
                 let create_base = tr::lng_create_group_create();
@@ -176,8 +186,10 @@ impl CreateGroupBoxState {
         match self.step {
             CreateGroupStep::Details => {
                 let mut act = None;
-                let input_st = InputFieldStyle::default_input(colors);
+                let input_st = InputFieldStyle::from_tg(&st::default_input_field, colors);
                 let fallback_title = tr::lng_create_group_title();
+                let top = ui.cursor().min;
+                let width = ui.available_width();
 
                 ui.horizontal(|ui| {
                     if photo_picker_circle(
@@ -193,52 +205,105 @@ impl CreateGroupBoxState {
                     ) {
                         act = Some(CreatePeerBodyAction::OpenPhotoCrop);
                     }
-                    ui.add_space(14.0);
+                    ui.add_space(px(st::new_group_name_position.x));
                     ui.vertical(|ui| {
-                        ui.add_space(4.0);
+                        ui.add_space(px(st::new_group_name_position.y));
                         InputField::single_line(
                             "create_group_name",
                             &mut self.name,
-                            strings::GROUP_NAME_PH,
+                            &tr::lng_dlg_new_group_name(),
                             input_st,
                         )
-                        .max_length(MAX_GROUP_CHANNEL_TITLE)
                         .error(self.error.is_some())
+                        .width((ui.available_width() - 34.0).max(120.0))
                         .show(ui);
+                        // `setMaxLength(kMaxGroupChannelTitle)` without a visible counter.
+                        if self.name.chars().count() > MAX_GROUP_CHANNEL_TITLE {
+                            self.name = self.name.chars().take(MAX_GROUP_CHANNEL_TITLE).collect();
+                        }
                     });
                 });
 
-                ui.add_space(14.0);
+                // `⋮` -> "Auto-Delete" submenu (`st::infoTopBarMenu` top button).
+                let dots = Rect::from_center_size(
+                    Pos2::new(top.x + width - 12.0, top.y + 6.0),
+                    Vec2::splat(32.0),
+                );
+                let dots_resp = ui.interact(
+                    dots,
+                    ui.make_persistent_id("create_group_ttl"),
+                    Sense::click(),
+                );
+                dots_resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::Role::Button,
+                        true,
+                        tr::lng_manage_messages_ttl_menu(),
+                    )
+                });
+                if dots_resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                let resolver = ColorsResolver(colors);
+                paint_style_icon(
+                    ui.painter(),
+                    dots,
+                    st::info_top_bar_menu.icon,
+                    &resolver,
+                    Some(colors.color("boxTitleCloseFg")),
+                );
+                if dots_resp.clicked() {
+                    self.ttl_menu
+                        .open_at(ui.ctx(), Pos2::new(dots.max.x - 180.0, dots.max.y));
+                }
+                let presets = [0usize, 1, 7, 10];
+                let options = presets
+                    .iter()
+                    .map(|&idx| {
+                        let secs = AUTO_DELETE_TTL_PRESETS.get(idx).copied().unwrap_or(0);
+                        let label = if secs == 0 {
+                            tr::lng_manage_messages_ttl_disable()
+                        } else {
+                            format_auto_delete_ttl(secs)
+                        };
+                        EntryMenuRow::action(
+                            format!("ttl:{idx}"),
+                            label,
+                            (self.auto_delete_preset_idx == idx)
+                                .then_some(st::media_player_menu_check),
+                        )
+                    })
+                    .collect();
                 let ttl_secs = AUTO_DELETE_TTL_PRESETS
                     .get(self.auto_delete_preset_idx)
                     .copied()
                     .unwrap_or(0);
-                let off_lbl = tr::lng_rights_slowmode_off();
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{}:", tr::lng_manage_messages_ttl_title()))
-                            .font(font_id_from_style(st::normal_font))
-                            .color(colors.color("windowSubTextFg")),
-                    );
-                    for (preset_idx, label) in
-                        [(0usize, off_lbl.as_str()), (1, "1d"), (7, "1w"), (10, "1m")]
-                    {
-                        let selected = self.auto_delete_preset_idx == preset_idx;
-                        if ui.selectable_label(selected, label).clicked() {
-                            self.auto_delete_preset_idx = preset_idx;
-                        }
-                    }
-                });
-                if ttl_secs > 0 {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}.",
-                            strings::AUTO_DELETE_PRESET_NOTE_PREFIX,
-                            format_auto_delete_ttl(ttl_secs)
-                        ))
-                        .font(FontId::new(11.5, family_regular()))
-                        .color(colors.color("windowSubTextFg")),
-                    );
+                let ttl_label = if ttl_secs == 0 {
+                    tr::lng_manage_messages_ttl_menu()
+                } else {
+                    format!(
+                        "{} \u{2022} {}",
+                        tr::lng_manage_messages_ttl_menu(),
+                        format_auto_delete_ttl(ttl_secs)
+                    )
+                };
+                let rows = vec![EntryMenuRow::submenu(
+                    ttl_label,
+                    Some(st::menu_icon_ttl),
+                    options,
+                )];
+                let menu_style = PopupMenuStyle::from_tg(&st::popup_menu_with_icons, colors);
+                if let Some(picked) = self.ttl_menu.show(
+                    ui.ctx(),
+                    ui.make_persistent_id("create_group_ttl_menu"),
+                    &rows,
+                    &menu_style,
+                    &resolver,
+                ) && let Some(idx) = picked
+                    .strip_prefix("ttl:")
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    self.auto_delete_preset_idx = idx;
                 }
 
                 if let Some(ref err) = self.error {
@@ -599,7 +664,10 @@ pub fn photo_picker_circle(
     color_index: u8,
     colors: &dyn Colors,
 ) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(66.0), Sense::click());
+    // `st::defaultUserpicButton` (72 px, `defaultChangeUserpicIcon` on `activeButtonBg`).
+    let size = px(st::default_userpic_button.photo_size);
+    let radius = size * 0.5;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
@@ -607,25 +675,25 @@ pub fn photo_picker_circle(
         EmptyUserpic::for_color_index(color_index, title, colors).paint_circle(ui.painter(), rect);
         ui.painter().circle_stroke(
             rect.center(),
-            33.0,
+            radius,
             Stroke::new(2.0, colors.color("windowBgActive")),
         );
     } else {
         ui.painter()
-            .circle_filled(rect.center(), 33.0, colors.color("windowBgActive"));
-        let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(26.0));
+            .circle_filled(rect.center(), radius, colors.color("activeButtonBg"));
+        let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(30.0));
         paint_style_icon(
             ui.painter(),
             icon_rect,
-            st::menu_icon_photo_set,
+            st::default_userpic_button.change_icon,
             &ColorsResolver(colors),
-            Some(Color32::WHITE),
+            Some(colors.color("activeButtonFg")),
         );
     }
     if resp.hovered() {
         ui.painter().circle_filled(
             rect.center(),
-            33.0,
+            radius,
             Color32::from_rgba_unmultiplied(0, 0, 0, 50),
         );
     }

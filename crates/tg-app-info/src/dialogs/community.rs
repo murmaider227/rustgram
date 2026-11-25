@@ -209,6 +209,8 @@ pub fn synthesize_community_dialog_item(
             poll: false,
             poll_muted: false,
         },
+        is_contact: false,
+        media_preview: None,
         has_bot_app_button: false,
     }
 }

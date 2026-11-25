@@ -1,4 +1,4 @@
-//! GIFs picker widget with mosaic grid layout, inline-bot `@gif` search hook,
+//! GIFs picker widget with mosaic grid layout, inline-bot GIF search hook,
 //! animated multi-frame previews, saved GIFs toggling, and category footer.
 //!
 //! Port origin: `Telegram/SourceFiles/chat_helpers/gifs_list_widget.h`,
@@ -16,11 +16,25 @@ use tg_lang::tr;
 use tg_ui::tg_style::st;
 
 use crate::chat_helpers::backend::{ChatHelpersBackend, GifItem};
-use crate::chat_helpers::emoji_list_widget::{EMOJI_FOOTER_HEIGHT, render_search_bar};
+use crate::chat_helpers::emoji_list_widget::{
+    EMOJI_FOOTER_HEIGHT, EMOJI_MOOD_GROUPS, MoodIconCache, footer_slot_rect,
+    paint_footer_background, paint_footer_icon, paint_footer_selection, render_tabbed_search,
+};
 use crate::chat_helpers::paint_helper_icon;
 use crate::chat_helpers::stickers_list_widget::paint_clock_icon;
 use crate::chat_helpers::strings;
 use tg_app_core::stand_in::theme::Palette;
+
+/// List padding of the GIFs mosaic (`gifsPadding`).
+fn gifs_padding() -> Margin {
+    let p = &st::gifs_padding;
+    Margin {
+        left: p.left.0 as i8,
+        right: p.right.0 as i8,
+        top: p.top.0 as i8,
+        bottom: p.bottom.0 as i8,
+    }
+}
 
 /// Gap between mosaic tiles (`inlineResultsSkip = 2px`).
 pub const MOSAIC_GAP: f32 = 2.0;
@@ -118,6 +132,9 @@ struct GifTextureSlot {
 pub struct GifsListWidget {
     search_query: String,
     active_category_id: String,
+    category_query: String,
+    active_group: Option<usize>,
+    mood_icons: MoodIconCache,
     focused_index: Option<usize>,
     textures: HashMap<DocumentId, GifTextureSlot>,
 }
@@ -146,6 +163,9 @@ impl GifsListWidget {
         Self {
             search_query: String::new(),
             active_category_id: "recent".into(),
+            category_query: String::new(),
+            active_group: None,
+            mood_icons: MoodIconCache::default(),
             focused_index: None,
             textures: HashMap::new(),
         }
@@ -160,24 +180,58 @@ impl GifsListWidget {
     /// Sets the GIF search query programmatically (dispatched through the inline-bot query hook).
     pub fn set_search_query(&mut self, query: impl Into<String>) {
         self.search_query = query.into();
+        self.active_group = None;
         self.focused_index = None;
     }
 
-    /// Selects a footer category by id (and updates the search query if applicable).
+    /// Selects a footer category by id; its query is searched without filling the search field
+    /// (tdesktop's footer sections search by emoji the same way).
     pub fn select_category(&mut self, category_id: &str, query: &str) {
         self.active_category_id = category_id.to_string();
-        self.search_query = query.to_string();
+        self.category_query = query.to_string();
+        self.search_query.clear();
+        self.active_group = None;
         self.focused_index = None;
+    }
+
+    /// Selects (or clears) an emoji group of the search row ([`EMOJI_MOOD_GROUPS`]).
+    pub fn set_active_group(&mut self, group: Option<usize>) {
+        self.active_group = group.filter(|&g| g < EMOJI_MOOD_GROUPS.len());
+        self.search_query.clear();
+        self.category_query.clear();
+        self.active_category_id = if self.active_group.is_some() {
+            "search".into()
+        } else {
+            "recent".into()
+        };
+        self.focused_index = None;
+    }
+
+    /// Returns the active footer category id (`"recent"` for saved GIFs).
+    #[must_use]
+    pub fn active_category_id(&self) -> &str {
+        &self.active_category_id
+    }
+
+    fn effective_query(&self) -> String {
+        let typed = self.search_query.trim();
+        if !typed.is_empty() {
+            return typed.to_owned();
+        }
+        if let Some(group) = self.active_group.and_then(|g| EMOJI_MOOD_GROUPS.get(g)) {
+            return group.icon.to_owned();
+        }
+        self.category_query.trim().to_owned()
     }
 
     /// Resolves the current list of GIFs to render (either saved GIFs or inline-bot search results).
     #[must_use]
     pub fn current_items(&self, backend: &dyn ChatHelpersBackend) -> Vec<GifItem> {
-        let q = self.search_query.trim();
+        let q = self.effective_query();
         if q.is_empty() && self.active_category_id == "recent" {
             backend.saved_gifs()
         } else {
-            backend.search_gifs(q)
+            backend.search_gifs(&q)
         }
     }
 
@@ -190,6 +244,8 @@ impl GifsListWidget {
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             if !self.search_query.is_empty() || self.active_category_id != "recent" {
                 self.search_query.clear();
+                self.category_query.clear();
+                self.active_group = None;
                 self.active_category_id = "recent".into();
                 self.focused_index = None;
                 return (true, None);
@@ -268,236 +324,240 @@ impl GifsListWidget {
 
         let dark = ui.ctx().global_style().visuals.dark_mode;
         ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
-            // 1. Inline-bot `@gif` search bar.
-            let search_ph = tr::lng_dlg_filter();
-            Frame::NONE
-                .inner_margin(Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    if render_search_bar(
-                        ui,
-                        "tg_gifs_search_field",
-                        &mut self.search_query,
-                        &search_ph,
-                        Some(strings::INLINE_GIF_BOT_PREFIX),
-                        palette,
-                    ) {
-                        if self.search_query.is_empty() {
-                            self.active_category_id = "recent".into();
-                        } else {
-                            self.active_category_id = "search".into();
-                        }
-                        self.focused_index = None;
-                    }
-                });
+            // 1. Search row (`TabbedSearch`); queries go to the inline GIF bot.
+            let search = render_tabbed_search(
+                ui,
+                "tg_gifs_search_field",
+                &mut self.search_query,
+                self.active_group,
+                &mut self.mood_icons,
+                palette,
+            );
+            if search.changed {
+                self.active_group = None;
+                self.category_query.clear();
+                if self.search_query.is_empty() {
+                    self.active_category_id = "recent".into();
+                } else {
+                    self.active_category_id = "search".into();
+                }
+                self.focused_index = None;
+            }
+            if let Some(g) = search.group_clicked {
+                let next = (self.active_group != Some(g)).then_some(g);
+                self.set_active_group(next);
+            }
 
             let items = self.current_items(backend);
 
             // 2. Scrollable mosaic grid.
             let scroll_rect = ui.available_rect_before_wrap();
             ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
+                // tdesktop scroll bars overlay the list (`emojiScroll`), they take no width.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
                 ScrollArea::vertical()
                     .id_salt("tg_gifs_list_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        Frame::NONE
-                            .inner_margin(Margin::symmetric(6, 2))
-                            .show(ui, |ui| {
-                                if items.is_empty() {
-                                    ui.add_space(36.0);
-                                    ui.vertical_centered(|ui| {
-                                        let empty_label = if self.search_query.trim().is_empty() {
-                                            tr::lng_gifs_no_saved()
-                                        } else {
-                                            tr::lng_search_messages_none()
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(empty_label)
-                                                .size(13.5)
-                                                .color(palette.window_sub_text_fg),
-                                        );
-                                    });
-                                    return;
+                        Frame::NONE.inner_margin(gifs_padding()).show(ui, |ui| {
+                            if items.is_empty() {
+                                // `GifsListWidget::paintInlineResults`: the empty text is
+                                // centered in the top two thirds of the list.
+                                let empty_label = if self.effective_query().is_empty() {
+                                    tr::lng_gifs_no_saved()
+                                } else {
+                                    tr::lng_inline_bot_no_results()
+                                };
+                                let font = FontId::proportional(13.0);
+                                let area = Rect::from_min_size(
+                                    scroll_rect.min,
+                                    Vec2::new(
+                                        scroll_rect.width(),
+                                        scroll_rect.height() * 2.0 / 3.0 + 13.0,
+                                    ),
+                                );
+                                ui.painter().text(
+                                    area.center(),
+                                    Align2::CENTER_CENTER,
+                                    empty_label,
+                                    font,
+                                    palette.window_sub_text_fg,
+                                );
+                                return;
+                            }
+
+                            let avail_w = ui.available_width().max(120.0);
+                            let (tiles, total_h) =
+                                layout_mosaic_rows(&items, avail_w, MOSAIC_TARGET_ROW_HEIGHT);
+                            let (grid_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(avail_w, total_h.max(60.0)),
+                                Sense::hover(),
+                            );
+                            let clip = ui.clip_rect();
+
+                            for tile in tiles {
+                                let screen_rect = tile.rect.translate(grid_rect.min.to_vec2());
+                                if !screen_rect.intersects(clip) {
+                                    continue;
+                                }
+                                any_visible = true;
+                                let item = &items[tile.index];
+                                let resp = ui.interact(
+                                    screen_rect,
+                                    ui.make_persistent_id(("tg_gif_tile", tile.index, item.id.0)),
+                                    Sense::click(),
+                                );
+
+                                let frame_idx = ((time_secs * f64::from(item.fps)) as usize)
+                                    % item.frame_count.max(1);
+                                if let Some(tex_id) =
+                                    self.frame_texture(ui.ctx(), item.id, frame_idx, backend)
+                                {
+                                    ui.painter().image(
+                                        tex_id,
+                                        screen_rect,
+                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                } else {
+                                    ui.painter().rect_filled(
+                                        screen_rect,
+                                        CornerRadius::same(4),
+                                        palette.input_bg,
+                                    );
                                 }
 
-                                let avail_w = ui.available_width().max(120.0);
-                                let (tiles, total_h) =
-                                    layout_mosaic_rows(&items, avail_w, MOSAIC_TARGET_ROW_HEIGHT);
-                                let (grid_rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(avail_w, total_h.max(60.0)),
-                                    Sense::hover(),
-                                );
-                                let clip = ui.clip_rect();
-
-                                for tile in tiles {
-                                    let screen_rect = tile.rect.translate(grid_rect.min.to_vec2());
-                                    if !screen_rect.intersects(clip) {
-                                        continue;
-                                    }
-                                    any_visible = true;
-                                    let item = &items[tile.index];
-                                    let resp = ui.interact(
+                                // Focus ring or hover tint
+                                let is_focused = self.focused_index == Some(tile.index);
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(
                                         screen_rect,
+                                        CornerRadius::same(3),
+                                        Color32::from_rgba_unmultiplied(0, 0, 0, 48),
+                                    );
+                                }
+                                if is_focused {
+                                    ui.painter().rect_stroke(
+                                        screen_rect.shrink(1.0),
+                                        CornerRadius::same(4),
+                                        Stroke::new(2.0, palette.window_bg_active),
+                                        StrokeKind::Inside,
+                                    );
+                                }
+
+                                // Compact GIF badge / hover title bar
+                                let label_rect = Rect::from_min_max(
+                                    Pos2::new(
+                                        screen_rect.left() + 4.0,
+                                        screen_rect.bottom() - 18.0,
+                                    ),
+                                    Pos2::new(
+                                        screen_rect.right() - 4.0,
+                                        screen_rect.bottom() - 3.0,
+                                    ),
+                                );
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(
+                                        label_rect,
+                                        CornerRadius::same(4),
+                                        Color32::from_rgba_unmultiplied(0, 0, 0, 145),
+                                    );
+                                    ui.painter().text(
+                                        Pos2::new(label_rect.left() + 5.0, label_rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        &item.title,
+                                        FontId::proportional(10.5),
+                                        Color32::WHITE,
+                                    );
+                                } else {
+                                    let badge = Rect::from_min_size(
+                                        Pos2::new(
+                                            screen_rect.left() + 4.0,
+                                            screen_rect.top() + 4.0,
+                                        ),
+                                        Vec2::new(26.0, 14.0),
+                                    );
+                                    ui.painter().rect_filled(
+                                        badge,
+                                        CornerRadius::same(4),
+                                        Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                                    );
+                                    ui.painter().text(
+                                        badge.center(),
+                                        Align2::CENTER_CENTER,
+                                        strings::GIF_BADGE,
+                                        FontId::proportional(9.5),
+                                        Color32::WHITE,
+                                    );
+                                }
+
+                                // Hover Save / Remove button in top-right corner (`st::sticker_pan_delete_icon_fg` / `st::craft_add_icon`).
+                                let mut save_clicked = false;
+                                if resp.hovered() {
+                                    let btn_r = Rect::from_min_size(
+                                        Pos2::new(
+                                            screen_rect.right() - 22.0,
+                                            screen_rect.top() + 4.0,
+                                        ),
+                                        Vec2::splat(18.0),
+                                    );
+                                    let btn_resp = ui.interact(
+                                        btn_r,
                                         ui.make_persistent_id((
-                                            "tg_gif_tile",
+                                            "tg_gif_save_btn",
                                             tile.index,
                                             item.id.0,
                                         )),
                                         Sense::click(),
                                     );
-
-                                    let frame_idx = ((time_secs * f64::from(item.fps)) as usize)
-                                        % item.frame_count.max(1);
-                                    if let Some(tex_id) =
-                                        self.frame_texture(ui.ctx(), item.id, frame_idx, backend)
-                                    {
-                                        ui.painter().image(
-                                            tex_id,
-                                            screen_rect,
-                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                            Color32::WHITE,
-                                        );
-                                    } else {
-                                        ui.painter().rect_filled(
-                                            screen_rect,
-                                            CornerRadius::same(4),
-                                            palette.input_bg,
-                                        );
-                                    }
-
-                                    // Focus ring or hover tint
-                                    let is_focused = self.focused_index == Some(tile.index);
-                                    if resp.hovered() {
-                                        ui.painter().rect_filled(
-                                            screen_rect,
-                                            CornerRadius::same(3),
-                                            Color32::from_rgba_unmultiplied(0, 0, 0, 48),
-                                        );
-                                    }
-                                    if is_focused {
-                                        ui.painter().rect_stroke(
-                                            screen_rect.shrink(1.0),
-                                            CornerRadius::same(4),
-                                            Stroke::new(2.0, palette.window_bg_active),
-                                            StrokeKind::Inside,
-                                        );
-                                    }
-
-                                    // Compact GIF badge / hover title bar
-                                    let label_rect = Rect::from_min_max(
-                                        Pos2::new(
-                                            screen_rect.left() + 4.0,
-                                            screen_rect.bottom() - 18.0,
-                                        ),
-                                        Pos2::new(
-                                            screen_rect.right() - 4.0,
-                                            screen_rect.bottom() - 3.0,
-                                        ),
+                                    let bg_alpha = if btn_resp.hovered() { 180 } else { 125 };
+                                    ui.painter().circle_filled(
+                                        btn_r.center(),
+                                        9.0,
+                                        Color32::from_rgba_unmultiplied(0, 0, 0, bg_alpha),
                                     );
-                                    if resp.hovered() {
-                                        ui.painter().rect_filled(
-                                            label_rect,
-                                            CornerRadius::same(4),
-                                            Color32::from_rgba_unmultiplied(0, 0, 0, 145),
-                                        );
-                                        ui.painter().text(
-                                            Pos2::new(
-                                                label_rect.left() + 5.0,
-                                                label_rect.center().y,
-                                            ),
-                                            Align2::LEFT_CENTER,
-                                            &item.title,
-                                            FontId::proportional(10.5),
-                                            Color32::WHITE,
-                                        );
+                                    let action_icon = if item.saved {
+                                        st::sticker_pan_delete_icon_fg
                                     } else {
-                                        let badge = Rect::from_min_size(
-                                            Pos2::new(
-                                                screen_rect.left() + 4.0,
-                                                screen_rect.top() + 4.0,
-                                            ),
-                                            Vec2::new(26.0, 14.0),
-                                        );
-                                        ui.painter().rect_filled(
-                                            badge,
-                                            CornerRadius::same(4),
-                                            Color32::from_rgba_unmultiplied(0, 0, 0, 120),
-                                        );
+                                        st::craft_add_icon
+                                    };
+                                    if !paint_helper_icon(
+                                        ui.painter(),
+                                        btn_r.shrink(3.0),
+                                        action_icon,
+                                        dark,
+                                        Some(Color32::WHITE),
+                                    ) {
                                         ui.painter().text(
-                                            badge.center(),
+                                            btn_r.center(),
                                             Align2::CENTER_CENTER,
-                                            strings::GIF_BADGE,
-                                            FontId::proportional(9.5),
+                                            if item.saved { "×" } else { "+" },
+                                            FontId::proportional(12.5),
                                             Color32::WHITE,
                                         );
                                     }
-
-                                    // Hover Save / Remove button in top-right corner (`st::sticker_pan_delete_icon_fg` / `st::craft_add_icon`).
-                                    let mut save_clicked = false;
-                                    if resp.hovered() {
-                                        let btn_r = Rect::from_min_size(
-                                            Pos2::new(
-                                                screen_rect.right() - 22.0,
-                                                screen_rect.top() + 4.0,
-                                            ),
-                                            Vec2::splat(18.0),
-                                        );
-                                        let btn_resp = ui.interact(
-                                            btn_r,
-                                            ui.make_persistent_id((
-                                                "tg_gif_save_btn",
-                                                tile.index,
-                                                item.id.0,
-                                            )),
-                                            Sense::click(),
-                                        );
-                                        let bg_alpha = if btn_resp.hovered() { 180 } else { 125 };
-                                        ui.painter().circle_filled(
-                                            btn_r.center(),
-                                            9.0,
-                                            Color32::from_rgba_unmultiplied(0, 0, 0, bg_alpha),
-                                        );
-                                        let action_icon = if item.saved {
-                                            st::sticker_pan_delete_icon_fg
+                                    if btn_resp
+                                        .on_hover_text(if item.saved {
+                                            tr::lng_context_delete_gif()
                                         } else {
-                                            st::craft_add_icon
-                                        };
-                                        if !paint_helper_icon(
-                                            ui.painter(),
-                                            btn_r.shrink(3.0),
-                                            action_icon,
-                                            dark,
-                                            Some(Color32::WHITE),
-                                        ) {
-                                            ui.painter().text(
-                                                btn_r.center(),
-                                                Align2::CENTER_CENTER,
-                                                if item.saved { "×" } else { "+" },
-                                                FontId::proportional(12.5),
-                                                Color32::WHITE,
-                                            );
-                                        }
-                                        if btn_resp
-                                            .on_hover_text(if item.saved {
-                                                tr::lng_context_delete_gif()
-                                            } else {
-                                                tr::lng_context_save_gif()
-                                            })
-                                            .clicked()
-                                        {
-                                            backend.toggle_saved_gif(item.id);
-                                            save_clicked = true;
-                                        }
-                                    }
-
-                                    if !save_clicked && resp.clicked() {
-                                        self.focused_index = Some(tile.index);
-                                        event = Some(GifsListEvent::Chosen {
-                                            gif_id: item.id,
-                                            title: item.title.clone(),
-                                        });
+                                            tr::lng_context_save_gif()
+                                        })
+                                        .clicked()
+                                    {
+                                        backend.toggle_saved_gif(item.id);
+                                        save_clicked = true;
                                     }
                                 }
-                            });
+
+                                if !save_clicked && resp.clicked() {
+                                    self.focused_index = Some(tile.index);
+                                    event = Some(GifsListEvent::Chosen {
+                                        gif_id: item.id,
+                                        title: item.title.clone(),
+                                    });
+                                }
+                            }
+                        });
                     });
             });
         });
@@ -553,72 +613,42 @@ impl GifsListWidget {
         emoji_cache: &mut EmojiTextureCache,
         palette: &Palette,
     ) {
-        ui.painter().rect_filled(
-            footer_rect,
-            CornerRadius {
-                nw: 0,
-                ne: 0,
-                sw: 8,
-                se: 8,
-            },
-            palette.window_bg,
-        );
-        ui.painter().line_segment(
-            [
-                Pos2::new(footer_rect.left(), footer_rect.top()),
-                Pos2::new(footer_rect.right(), footer_rect.top()),
-            ],
-            Stroke::new(1.0, palette.divider),
-        );
-
-        let count = categories.len().max(1);
-        let slot_w = (footer_rect.width() / count as f32).min(46.0);
-        let total_w = slot_w * count as f32;
-        let start_x = footer_rect.left() + (footer_rect.width() - total_w) * 0.5;
-
+        // `StickersListFooter` in GIFs mode: left-aligned `iconWidth` slots, rounded selection.
+        paint_footer_background(ui, footer_rect, palette);
+        let compose = &st::default_compose_icons;
         for (idx, cat) in categories.iter().enumerate() {
-            let slot_rect = Rect::from_min_size(
-                Pos2::new(start_x + idx as f32 * slot_w, footer_rect.top()),
-                Vec2::new(slot_w, footer_rect.height()),
-            );
+            let slot_rect = footer_slot_rect(footer_rect, idx);
+            if slot_rect.right() > footer_rect.right() {
+                break;
+            }
             let resp = ui.interact(
                 slot_rect,
                 ui.make_persistent_id(("tg_gif_footer_cat", idx, &cat.id)),
                 Sense::click(),
             );
-            let active = self.active_category_id == cat.id;
-
-            if resp.hovered() {
-                ui.painter().rect_filled(
-                    slot_rect.shrink(3.0),
-                    CornerRadius::same(6),
-                    palette.window_bg_over,
-                );
-            }
+            let active = self.active_group.is_none()
+                && self.search_query.is_empty()
+                && self.active_category_id == cat.id;
             if active {
-                ui.painter().rect_filled(
-                    Rect::from_min_size(
-                        Pos2::new(slot_rect.left() + 6.0, slot_rect.bottom() - 2.5),
-                        Vec2::new(slot_rect.width() - 12.0, 2.5),
-                    ),
-                    CornerRadius::same(1),
-                    palette.window_bg_active,
-                );
+                paint_footer_selection(ui, footer_rect, idx, idx);
             }
 
             if cat.emoji.is_empty() {
-                paint_clock_icon(
-                    ui.painter(),
-                    slot_rect.center(),
-                    7.5,
-                    if active {
-                        palette.window_bg_active
-                    } else {
-                        palette.window_sub_text_fg
-                    },
-                );
+                let icon = if active {
+                    compose.recent_active
+                } else {
+                    compose.recent
+                };
+                if !paint_footer_icon(ui, slot_rect, icon) {
+                    paint_clock_icon(
+                        ui.painter(),
+                        slot_rect.center(),
+                        7.5,
+                        palette.window_sub_text_fg,
+                    );
+                }
             } else {
-                let icon_rect = Rect::from_center_size(slot_rect.center(), Vec2::splat(19.0));
+                let icon_rect = Rect::from_center_size(slot_rect.center(), Vec2::splat(20.0));
                 emoji_cache.paint_emoji_str(
                     ui.painter(),
                     ui.ctx(),

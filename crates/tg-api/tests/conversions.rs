@@ -1112,3 +1112,122 @@ fn dialog_folder_filter_draft_reply_and_typing_conversions() {
     );
     let _ = ReactionId::Paid;
 }
+
+#[test]
+fn monoforum_disabled_is_only_set_on_monoforums_not_regular_channels() {
+    let mut session = Session::new(UserId(1));
+
+    // 1. Regular broadcast channel without direct messages (`broadcast_messages_allowed = false`):
+    //    must NOT set `MONOFORUM_DISABLED`, so the creator can still post.
+    let mut bc = sample_tl_channel(601, 0x1111, "Broadcast Channel", false);
+    bc.creator = true;
+    bc.broadcast = true;
+    bc.megagroup = false;
+    bc.monoforum = false;
+    bc.broadcast_messages_allowed = false;
+    bc.linked_monoforum_id = None;
+    let bc_pid = apply_tl_chat(&mut session, &tl_enums::Chat::Channel(bc.clone())).unwrap();
+    let bc_ch = session.channel(ChannelId(601)).unwrap();
+    assert!(
+        !bc_ch.monoforum_disabled(),
+        "broadcast channel without direct messages must not set MONOFORUM_DISABLED"
+    );
+    assert!(!bc_ch.broadcast_messages_allowed);
+    assert!(
+        session
+            .peer(bc_pid)
+            .unwrap()
+            .can_write(session.send_context()),
+        "broadcast creator must be able to post without a workaround"
+    );
+
+    // 2. Megagroup with `broadcast_messages_allowed = false` must NOT set `MONOFORUM_DISABLED`.
+    let mut mg = sample_tl_channel(602, 0x2222, "Supergroup", true);
+    mg.creator = true;
+    mg.broadcast_messages_allowed = false;
+    mg.monoforum = false;
+    let mg_pid = apply_tl_chat(&mut session, &tl_enums::Chat::Channel(mg)).unwrap();
+    assert!(
+        !session
+            .channel(ChannelId(602))
+            .unwrap()
+            .monoforum_disabled(),
+        "megagroup must not set MONOFORUM_DISABLED"
+    );
+    assert!(
+        session
+            .peer(mg_pid)
+            .unwrap()
+            .can_write(session.send_context())
+    );
+
+    // 3. Monoforum linked to broadcast channel -> enabled; unlinking marks ONLY the monoforum
+    //    disabled (matching `ChannelData::setMonoforumLink`), and re-linking clears the flag.
+    let mut mf = sample_tl_channel(603, 0x3333, "Direct Messages", false);
+    mf.broadcast = false;
+    mf.megagroup = false;
+    mf.monoforum = true;
+    mf.broadcast_messages_allowed = false;
+    mf.linked_monoforum_id = Some(601);
+    let mf_pid = apply_tl_chat(&mut session, &tl_enums::Chat::Channel(mf.clone())).unwrap();
+    assert!(session.channel(ChannelId(603)).unwrap().is_monoforum());
+    assert!(
+        !session
+            .channel(ChannelId(603))
+            .unwrap()
+            .monoforum_disabled()
+    );
+
+    bc.broadcast_messages_allowed = true;
+    bc.linked_monoforum_id = Some(603);
+    apply_tl_chat(&mut session, &tl_enums::Chat::Channel(bc.clone())).unwrap();
+    assert!(
+        session
+            .channel(ChannelId(601))
+            .unwrap()
+            .broadcast_messages_allowed
+    );
+    assert!(
+        !session
+            .channel(ChannelId(603))
+            .unwrap()
+            .monoforum_disabled()
+    );
+
+    // Unlink broadcast channel from monoforum: monoforum becomes disabled, broadcast stays writable.
+    bc.broadcast_messages_allowed = false;
+    bc.linked_monoforum_id = None;
+    apply_tl_chat(&mut session, &tl_enums::Chat::Channel(bc.clone())).unwrap();
+    assert!(
+        !session
+            .channel(ChannelId(601))
+            .unwrap()
+            .monoforum_disabled()
+    );
+    assert!(
+        session
+            .channel(ChannelId(603))
+            .unwrap()
+            .monoforum_disabled(),
+        "unlinked monoforum must set MONOFORUM_DISABLED"
+    );
+    assert!(
+        !session
+            .peer(mf_pid)
+            .unwrap()
+            .can_write(session.send_context()),
+        "disabled monoforum must not be writable"
+    );
+
+    // Re-linking clears MONOFORUM_DISABLED on the monoforum.
+    bc.broadcast_messages_allowed = true;
+    bc.linked_monoforum_id = Some(603);
+    apply_tl_chat(&mut session, &tl_enums::Chat::Channel(bc)).unwrap();
+    assert!(
+        !session
+            .channel(ChannelId(603))
+            .unwrap()
+            .monoforum_disabled(),
+        "re-linking must clear MONOFORUM_DISABLED on the monoforum"
+    );
+}

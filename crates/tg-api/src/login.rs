@@ -418,6 +418,13 @@ impl LoginStateMachine {
     ) -> Result<tl_types::NearestDc, ApiError> {
         let nearest = invoker.help_get_nearest_dc().await?;
         invoker.set_main_dc_id(nearest.nearest_dc);
+        self.apply_nearest_dc(&nearest);
+        Ok(nearest)
+    }
+
+    /// Stores a `help.getNearestDc` reply that was requested outside the state machine (the Intro
+    /// widget sends it without blocking the UI). Returns `false` once the flow has left `Start`.
+    pub fn apply_nearest_dc(&mut self, nearest: &tl_types::NearestDc) -> bool {
         if let LoginStep::Start {
             nearest_dc,
             country,
@@ -425,8 +432,10 @@ impl LoginStateMachine {
         {
             *country = nearest.country.clone();
             *nearest_dc = Some(nearest.clone());
+            true
+        } else {
+            false
         }
-        Ok(nearest)
     }
 
     /// Submits a phone number (`PhoneWidget::submit`), handling `PHONE_MIGRATE_X` automatically.

@@ -58,6 +58,9 @@ pub struct TopBarConfig<'a> {
     pub menu_items: Vec<MenuItem>,
     /// Number of currently selected shared media items (`> 0` activates selection bar).
     pub selected_count: usize,
+    /// Draw only the buttons over the profile cover (no background, title or shadow), like
+    /// tdesktop's transparent `TopBar` over `Info::Profile::TopBar`.
+    pub overlay: bool,
 }
 
 /// Stateful controller for the Info section top bar (`Info::TopBar`).
@@ -129,8 +132,10 @@ impl InfoTopBar {
         let (bar_rect, _) =
             ui.allocate_exact_size(Vec2::new(width, INFO_TOP_BAR_HEIGHT), Sense::hover());
 
-        ui.painter()
-            .rect_filled(bar_rect, CornerRadius::ZERO, colors.color("windowBg"));
+        if !cfg.overlay {
+            ui.painter()
+                .rect_filled(bar_rect, CornerRadius::ZERO, colors.color("windowBg"));
+        }
 
         let center_y = bar_rect.center().y;
         let title_font = font_id_from_style(st::info_top_bar_title.style.font);
@@ -359,12 +364,13 @@ impl InfoTopBar {
             }
 
             // Title (+ optional subtitle) clipped safely to available center width.
+            let title_text = if cfg.overlay { "" } else { cfg.title };
             let title_clip = Rect::from_min_max(
                 Pos2::new(left_x, bar_rect.min.y),
                 Pos2::new(right_x.max(left_x + 40.0), bar_rect.max.y),
             );
             let p = ui.painter().with_clip_rect(title_clip);
-            if let Some(sub) = cfg.subtitle {
+            if let Some(sub) = cfg.subtitle.filter(|_| !cfg.overlay) {
                 p.text(
                     Pos2::new(left_x, bar_rect.min.y + 10.0),
                     Align2::LEFT_TOP,
@@ -383,7 +389,7 @@ impl InfoTopBar {
                 p.text(
                     Pos2::new(left_x, center_y),
                     Align2::LEFT_CENTER,
-                    cfg.title,
+                    title_text,
                     title_font,
                     title_fg,
                 );
@@ -391,13 +397,15 @@ impl InfoTopBar {
         }
 
         // Bottom 1px hairline shadow (`shadowFg`).
-        ui.painter().line_segment(
-            [
-                Pos2::new(bar_rect.left(), bar_rect.bottom()),
-                Pos2::new(bar_rect.right(), bar_rect.bottom()),
-            ],
-            Stroke::new(1.0, colors.color("shadowFg")),
-        );
+        if !cfg.overlay {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(bar_rect.left(), bar_rect.bottom()),
+                    Pos2::new(bar_rect.right(), bar_rect.bottom()),
+                ],
+                Stroke::new(1.0, colors.color("shadowFg")),
+            );
+        }
 
         // Render floating popup menu when open.
         if !cfg.menu_items.is_empty() {

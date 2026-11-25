@@ -11,8 +11,8 @@ use egui::{
     Color32, CornerRadius, FontId, Id, Key, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, Ui, Vec2,
 };
 use tg_history::consts::{
-    FontMetrics, HISTORY_PHOTO_LEFT, HISTORY_UNREAD_BAR_MARGIN, LINE_WIDTH, MSG_MARGIN,
-    MSG_MAX_WIDTH, MSG_PADDING, MSG_PHOTO_SIZE,
+    FontMetrics, HISTORY_PHOTO_LEFT, HISTORY_UNREAD_BAR_MARGIN, LINE_WIDTH, MSG_DATE_SPACE,
+    MSG_MARGIN, MSG_MAX_WIDTH, MSG_PADDING, MSG_PHOTO_SIZE, MSG_PHOTO_SKIP,
 };
 use tg_history::{
     AttachMetadata, BottomInfoInput, CivilDate, DocumentInput, DocumentKind, ElementChatMode,
@@ -23,7 +23,7 @@ use tg_history::{
     WebPageInput, count_service_date_rect, date_badge_height, layout_message,
     layout_service_message, unread_bar_height,
 };
-use tg_ui::stand_in::{PopupMenuStyle, ToggleStyle};
+use tg_ui::stand_in::PopupMenuStyle;
 use tg_ui::userpic::EmptyUserpic;
 use tg_ui::widgets::buttons::IconKind;
 use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
@@ -34,17 +34,20 @@ use crate::history::backend::{
     MessageSummaryEntry, ServiceAction, to_hist_full, to_hist_peer,
 };
 use crate::history::bubble::{
-    InlineKeyboardRenderCtx, MessagePaintEvent, ServiceCardAction, format_compact_views,
-    hist_rect_to_egui, link_preview_card_height, measure_reactions_size, paint_date_separator,
-    paint_message_element_full, paint_service_message_interactive, paint_unread_bar,
-    parse_paid_media_stars,
+    InlineKeyboardRenderCtx, MessagePaintEvent, ReactionUserpics, ServiceCardAction,
+    format_compact_views, hist_rect_to_egui, link_preview_card_height, measure_reactions_size,
+    paint_date_separator, paint_message_element_full, paint_service_message_interactive,
+    paint_unread_bar, parse_paid_media_stars,
 };
 use crate::history::inline_media::HistoryMediaRuntime;
 use crate::history::media::{
     MediaAssetCache, MediaInteraction, VoicePlaybackState, format_duration, format_file_size,
 };
 use crate::history::sections_model::{CopiedRichText, ReplyQuote, slice_text_with_entities};
-use crate::history::text_bridge::{estimate_text_metrics, measure_rich_text, slice_by_char_range};
+use crate::history::text_bridge::{
+    entities_to_rich_text, estimate_text_metrics, measure_rich_text, message_text_style,
+    slice_by_char_range,
+};
 use crate::history::theme::HistoryColors;
 use tg_app_core::stand_in::theme::{Palette, ThemeMode};
 use tg_app_core::stand_in::types::{FullMsgId, MsgId, PeerId, PeerKind};
@@ -98,6 +101,8 @@ pub enum InnerEvent {
     Copied(String),
     /// User clicked a link / mention / hashtag.
     OpenLink(String),
+    /// User clicked a hidden `messageEntityTextUrl` link requiring scheme check and confirmation.
+    OpenHiddenLink(String),
     /// User clicked a photo/video/sticker media item.
     OpenMedia {
         /// Target message id.
@@ -143,6 +148,13 @@ pub enum InnerEvent {
     },
     /// Report one or more messages.
     Report(Vec<MsgId>),
+    /// Block a sender from the official `@Replies` chat (`contacts.blockFromReplies`).
+    BlockFromReplies {
+        /// Reply message id in the Replies chat.
+        msg_id: MsgId,
+        /// Display name of the offending sender shown in the confirmation modal.
+        sender_name: String,
+    },
     /// Open the full emoji + `tg-lottie` reactions picker for `msg_id`.
     OpenReactionsPicker {
         /// Target message id.
@@ -152,6 +164,17 @@ pub enum InnerEvent {
     },
     /// Open the Who-Reacted peer list for `msg_id` (`messages.getMessageReactionsList`).
     OpenWhoReacted(MsgId),
+    /// Toggle paid-reaction leaderboard privacy on `msg_id` (`messages.togglePaidReactionPrivacy`).
+    TogglePaidReactionPrivacy(MsgId),
+    /// Report a reaction on `msg_id` (`messages.reportReaction`).
+    ReportMessageReaction(MsgId),
+    /// Remove all reactions by `participant_id` across this chat (`messages.deleteParticipantReactions`).
+    RemoveParticipantReactions {
+        /// Context message ID.
+        msg_id: MsgId,
+        /// Participant whose reactions should be removed.
+        participant_id: PeerId,
+    },
     /// Open the "Seen by" group read-receipts modal (`messages.getMessageReadParticipants`).
     OpenSeenBy {
         /// Target message id.
@@ -361,6 +384,8 @@ pub struct HistoryInnerWidget {
     context_menu_pos: Pos2,
     /// Cached WP-53/WP-61 read-receipt and channel-author metadata for the open context menu.
     context_menu_engagement: Option<crate::history::read_receipts::ContextMenuEngagementInfo>,
+    /// Frame on which the context menu opened (its own right-click must not close it).
+    context_menu_opened_frame: u64,
     /// Anchor message id for Shift+click range selection.
     selection_anchor: Option<MsgId>,
     /// Count of items laid out during the most recent frame (exposed for performance tests).
@@ -375,12 +400,21 @@ pub struct HistoryInnerWidget {
     last_painted_bubble_rects: HashMap<MsgId, Rect>,
     /// Per-chat viewport read-metrics visibility tracker (`HistoryView::ReadMetricsTracker`).
     read_metrics: Option<tg_app_core::core_types::read_metrics::ReadMetricsTracker>,
+    /// Messages painted this frame (filled while painting the visible window).
+    painted_msg_ids: Vec<MsgId>,
+    /// The painted set last sent to `mark_visible_reactions_read`, so the backend is only asked
+    /// again when the visible messages change.
+    reactions_read_for: Vec<MsgId>,
+    /// Highest server message id already confirmed/sent as inbox-read for the active peer.
+    last_inbox_read_sent: MsgId,
     /// View-layer interactive emoji burst animation overlays (`HistoryView::EmojiInteractions`).
     emoji_interactions: crate::history::emoji_interactions::HistoryViewEmojiInteractions,
     /// Last painted bubble center & outgoing flag per visible message (for incoming emoji bursts).
     last_bubble_anchors: HashMap<MsgId, (Pos2, bool)>,
     /// Last frame timestamp in ms (used by programmatic highlight triggers).
     last_now_ms: i64,
+    /// Last time downloading inline photos were re-polled (`refresh_loading_media`).
+    last_media_poll_ms: i64,
     /// Last observed AI summary fingerprint `(shown, loading, text_len)` per message for cache invalidation.
     summary_fingerprints: HashMap<MsgId, (bool, bool, usize)>,
     /// Configured double-click quick action (`CoreSettings::chat_quick_action`).
@@ -420,6 +454,9 @@ impl HistoryInnerWidget {
             pending_scroll_to_bottom: true,
             pending_jump_msg: None,
             last_viewport_h: 600.0,
+            painted_msg_ids: Vec::new(),
+            reactions_read_for: Vec::new(),
+            last_inbox_read_sent: MsgId(0),
             scrolled_up: false,
             unread_count: 0,
             assets: MediaAssetCache::new(),
@@ -429,6 +466,7 @@ impl HistoryInnerWidget {
             context_menu_msg: None,
             context_menu_pos: Pos2::ZERO,
             context_menu_engagement: None,
+            context_menu_opened_frame: 0,
             selection_anchor: None,
             last_frame_laid_out_count: 0,
             last_frame_painted_count: 0,
@@ -440,6 +478,7 @@ impl HistoryInnerWidget {
                 crate::history::emoji_interactions::HistoryViewEmojiInteractions::new(),
             last_bubble_anchors: HashMap::new(),
             last_now_ms: 0,
+            last_media_poll_ms: 0,
             summary_fingerprints: HashMap::new(),
             chat_quick_action: tg_core::settings::DoubleClickQuickAction::Reply,
             corner_reply: true,
@@ -879,6 +918,49 @@ impl HistoryInnerWidget {
             .highlight(HighlightTarget::whole_message(full), now_ms);
     }
 
+    /// Re-polls photos that are still downloading so they replace their blurred thumbnail as
+    /// soon as the bytes arrive (tdesktop repaints on `Data::PhotoMedia` load progress); the
+    /// descriptor was otherwise only read when the chat was (re)loaded.
+    fn refresh_loading_media(
+        &mut self,
+        ctx: &egui::Context,
+        backend: &dyn HistoryBackend,
+        now_ms: i64,
+    ) {
+        const POLL_MS: i64 = 250;
+        let loading: Vec<MsgId> = self
+            .messages
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| {
+                matches!(
+                    self.media_runtime
+                        .descriptor(*id)
+                        .and_then(|d| d.photo_load.as_ref()),
+                    Some(
+                        tg_app_core::core_types::dto::inline_media::PhotoLoadState::Loading { .. }
+                    )
+                )
+            })
+            .collect();
+        if loading.is_empty() {
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(POLL_MS as u64));
+        if now_ms - self.last_media_poll_ms < POLL_MS && now_ms >= self.last_media_poll_ms {
+            return;
+        }
+        self.last_media_poll_ms = now_ms;
+        for id in loading {
+            if let Some(state) = backend
+                .inline_media_descriptor(self.peer_id, id)
+                .and_then(|d| d.photo_load)
+            {
+                self.media_runtime.set_photo_load_state(id, state);
+            }
+        }
+    }
+
     /// Loads or reloads a peer's initial slice from `backend`.
     pub fn load_peer(
         &mut self,
@@ -918,8 +1000,25 @@ impl HistoryInnerWidget {
             self.scroll_offset_y = 0.0;
             self.emoji_interactions.clear();
             self.last_bubble_anchors.clear();
+            self.last_inbox_read_sent = MsgId(0);
             self.read_metrics =
                 Some(tg_app_core::core_types::read_metrics::ReadMetricsTracker::new(peer_id));
+        }
+
+        if slice.unread_count == 0 {
+            if let Some(max_loaded) = self
+                .messages
+                .iter()
+                .map(|m| m.id)
+                .filter(|id| id.0 > 0)
+                .max()
+            {
+                self.last_inbox_read_sent = self.last_inbox_read_sent.max(max_loaded);
+            }
+        } else if let Some(first_unread) = slice.first_unread_id
+            && first_unread.0 > 1
+        {
+            self.last_inbox_read_sent = self.last_inbox_read_sent.max(MsgId(first_unread.0 - 1));
         }
 
         let is_group = matches!(peer_kind, PeerKind::Group);
@@ -946,11 +1045,32 @@ impl HistoryInnerWidget {
         }
     }
 
+    /// Removes the `"Unread messages"` divider bar and invalidates the cached layout of the item
+    /// that carried it, matching tdesktop's `History::destroyUnreadBar`.
+    fn clear_unread_bar(&mut self) {
+        if let Some(bar_idx) = self.list.unread_bar_index {
+            if let Some(msg) = self.messages.get(bar_idx) {
+                self.layout_cache.remove(&msg.id);
+            }
+            self.list.set_unread_bar(None);
+            self.update_date_and_unread_heights();
+        }
+    }
+
     /// Appends a newly sent/received message to the bottom if loaded at bottom.
     pub fn append_message(&mut self, msg: HistoryMessage, peer_kind: PeerKind) {
-        if !self.list.loaded_at_bottom {
+        if !self.list.loaded_at_bottom && !self.messages.is_empty() {
             return;
         }
+        if self.messages.iter().any(|m| m.id == msg.id) {
+            self.update_message_in_place(msg);
+            return;
+        }
+        if msg.outgoing {
+            // Matches tdesktop `History::addNewMessage` (`history.cpp:1708`).
+            self.clear_unread_bar();
+        }
+        self.list.loaded_at_bottom = true;
         if let Some(prev_last) = self.messages.last() {
             self.layout_cache.remove(&prev_last.id);
         }
@@ -962,6 +1082,107 @@ impl HistoryInnerWidget {
         self.media_runtime
             .sync_peer_audio_tracks(self.peer_id, &self.messages);
         self.pending_scroll_to_bottom = true;
+    }
+
+    /// Applies a live-arrived message (`updateNewMessage` / `updateNewChannelMessage` /
+    /// `updateShortMessage` / `updateShortChatMessage`) into the already-open history list,
+    /// matching tdesktop's `History::addNewMessage` + `HistoryWidget::newItemAdded`.
+    ///
+    /// Deduplicates existing IDs in place, keeps the user's scroll position when scrolled up,
+    /// and auto-scrolls to bottom only when already at bottom (or for outgoing messages).
+    pub fn apply_live_added_message(&mut self, msg: HistoryMessage, peer_kind: PeerKind) -> bool {
+        if self.messages.iter().any(|m| m.id == msg.id) {
+            self.update_message_in_place(msg);
+            return true;
+        }
+        let is_outgoing = msg.outgoing;
+        let is_unread_incoming = (!msg.outgoing || msg.is_post) && !msg.is_read;
+
+        // If viewing an older jumped-to slice not loaded at bottom, do not splice a gap into
+        // the middle of the list; only update the unread badge counter on the bottom FAB.
+        if !self.list.loaded_at_bottom && !self.messages.is_empty() {
+            if is_unread_incoming {
+                self.unread_count = self.unread_count.saturating_add(1);
+            }
+            return false;
+        }
+
+        self.list.loaded_at_bottom = true;
+        let was_at_bottom = !self.scrolled_up;
+        let is_group = matches!(peer_kind, PeerKind::Group);
+        let inserted_idx = if self.messages.last().is_none_or(|last| msg.id > last.id) {
+            if let Some(prev_last) = self.messages.last() {
+                self.layout_cache.remove(&prev_last.id);
+            }
+            let item = build_list_item(&msg, is_group);
+            let idx = self.messages.len();
+            self.messages.push(msg);
+            self.list.push_back(item);
+            idx
+        } else {
+            let idx = self.messages.partition_point(|m| m.id < msg.id);
+            if idx > 0 {
+                self.layout_cache.remove(&self.messages[idx - 1].id);
+            }
+            if let Some(next_msg) = self.messages.get(idx) {
+                self.layout_cache.remove(&next_msg.id);
+            }
+            let prev_unread_bar = self
+                .list
+                .unread_bar_index
+                .map(|u| if u >= idx { u + 1 } else { u });
+            self.messages.insert(idx, msg);
+            let items: Vec<HistoryListItem> = self
+                .messages
+                .iter()
+                .map(|m| build_list_item(m, is_group))
+                .collect();
+            self.list.set_items(items);
+            self.list.set_unread_bar(prev_unread_bar);
+            idx
+        };
+
+        if is_outgoing || (was_at_bottom && is_unread_incoming) {
+            // Matches tdesktop `History::addNewMessage` (`history.cpp:1708`) and
+            // `HistoryWidget::newItemAdded` (`history_widget.cpp:4726`).
+            self.clear_unread_bar();
+        } else if !was_at_bottom && is_unread_incoming && self.list.unread_bar_index.is_none() {
+            self.list.set_unread_bar(Some(inserted_idx));
+        }
+        if is_unread_incoming {
+            self.unread_count = self.unread_count.max(1);
+        }
+
+        self.update_date_and_unread_heights();
+        self.media_runtime
+            .sync_peer_audio_tracks(self.peer_id, &self.messages);
+
+        if was_at_bottom || is_outgoing {
+            self.pending_scroll_to_bottom = true;
+        }
+        true
+    }
+
+    /// Marks loaded outgoing messages up to `max_id` as read (`updateReadHistoryOutbox` /
+    /// `updateReadChannelOutbox`), refreshing their checkmark glyphs without re-opening.
+    pub fn mark_outbox_read_up_to(&mut self, max_id: MsgId) {
+        for msg in &mut self.messages {
+            if msg.outgoing && msg.id.0 > 0 && msg.id <= max_id && !msg.is_read {
+                msg.is_read = true;
+                self.layout_cache.remove(&msg.id);
+            }
+        }
+    }
+
+    /// Synchronizes unread counter and inbox read watermark from a live `HistoryUpdated` event.
+    ///
+    /// Matches tdesktop's `History::inboxRead` (`history.cpp:2286-2304`): updating the unread
+    /// counter does not destroy an existing `"Unread messages"` divider bar in an open chat.
+    pub fn apply_unread_state(&mut self, unread_count: u32, inbox_read_till: MsgId) {
+        self.unread_count = unread_count;
+        if inbox_read_till.0 > 0 {
+            self.last_inbox_read_sent = self.last_inbox_read_sent.max(inbox_read_till);
+        }
     }
 
     /// Updates an edited or reaction-changed message in place and invalidates its cached layout.
@@ -1188,6 +1409,8 @@ impl HistoryInnerWidget {
         bot_verified: bool,
         backend: &mut dyn HistoryBackend,
     ) -> Vec<InnerEvent> {
+        let wallpaper_colors = colors_for_default_wallpaper(colors);
+        let colors = &wallpaper_colors;
         let mut events = Vec::new();
         let fonts = FontMetrics::default();
         let viewport_w = list_rect.width().round().max(240.0) as i32;
@@ -1196,6 +1419,7 @@ impl HistoryInnerWidget {
 
         let now_ms = (ui.ctx().input(|i| i.time) * 1000.0).max(0.0) as i64;
         self.last_now_ms = now_ms;
+        self.refresh_loading_media(ui.ctx(), &*backend, now_ms);
         self.highlighter.tick(now_ms);
         if self.highlighter.is_animating(now_ms) || self.inline_kb_state.loading_count() > 0 {
             ui.ctx().request_repaint();
@@ -1241,8 +1465,8 @@ impl HistoryInnerWidget {
             self.layout_wide = is_chat_wide;
         }
 
-        // Paint subtle tdesktop-inspired chat wallpaper background.
-        paint_chat_wallpaper(ui.painter(), list_rect, colors);
+        // Active chat background (Classic wallpaper by default, flat Night background).
+        self.paint_chat_wallpaper(ui, list_rect, colors);
 
         let content_pad_bottom = 12;
         let mut laid_out_this_frame = 0usize;
@@ -1356,6 +1580,15 @@ impl HistoryInnerWidget {
         let search_q = search_filter.trim().to_lowercase();
         let show_selection_checks = self.list.selection.has_selected_items();
         let show_sender_in_chat = matches!(peer.summary.kind, PeerKind::Group);
+        let reaction_userpics = (matches!(peer.summary.kind, PeerKind::User)
+            && !peer.summary.is_saved_messages)
+            .then(|| {
+                let (self_id, self_name) = backend.self_peer();
+                ReactionUserpics {
+                    peer: (peer.summary.id, peer.summary.title.clone()),
+                    me: (self_id, self_name),
+                }
+            });
 
         self.last_painted_bubble_rects.clear();
 
@@ -1449,6 +1682,9 @@ impl HistoryInnerWidget {
 
                 // Re-query exact visible items after any height updates.
                 let visible_paint = self.list.visible_items_top_to_bottom(vis_top, vis_bottom);
+                self.painted_msg_ids.clear();
+                self.painted_msg_ids
+                    .extend(visible_paint.iter().map(|v| self.messages[v.index].id));
                 self.media_runtime.begin_frame(now_ms);
                 self.last_bubble_anchors.clear();
 
@@ -1709,9 +1945,11 @@ impl HistoryInnerWidget {
                                         });
                                     }
                                 }
-                                let show_name = show_sender_in_chat
-                                    && !msg.outgoing
-                                    && !item.attach_state.attached_to_previous;
+                                let show_name = shows_from_name(
+                                    msg,
+                                    show_sender_in_chat,
+                                    item.attach_state.attached_to_previous,
+                                );
                                 let summary_entry = backend.message_summary(self.peer_id, msg.id);
                                 let paused_chat_effects =
                                     !self.media_runtime.policy.allows_chat_effects();
@@ -1740,7 +1978,15 @@ impl HistoryInnerWidget {
                                     }),
                                     summary_entry.as_ref(),
                                     paused_chat_effects,
+                                    reaction_userpics.as_ref(),
                                 );
+                                if msg.is_post
+                                    && matches!(peer.summary.kind, PeerKind::Channel)
+                                    && msg_layout.has_bubble
+                                    && paint_fast_share_button(ui, msg.id, bubble_rect, colors)
+                                {
+                                    events.push(InnerEvent::Forward(vec![msg.id]));
+                                }
                                 for ev in paint_events {
                                     match ev {
                                         MessagePaintEvent::JumpToMessage(tid) => {
@@ -1748,6 +1994,9 @@ impl HistoryInnerWidget {
                                         }
                                         MessagePaintEvent::OpenLink(url) => {
                                             events.push(InnerEvent::OpenLink(url));
+                                        }
+                                        MessagePaintEvent::OpenHiddenLink(url) => {
+                                            events.push(InnerEvent::OpenHiddenLink(url));
                                         }
                                         MessagePaintEvent::ToggleReaction { msg_id, emoji } => {
                                             events
@@ -2046,7 +2295,9 @@ impl HistoryInnerWidget {
                             (now_ms as f64) * 0.001,
                             self.reduced_motion,
                         );
-                        if self.bubble_hover_quick_actions.is_animating() {
+                        // Only the hovered row's fade needs frames: a row covered by the
+                        // context menu stops being hovered before its fade finishes.
+                        if row_hovered && self.bubble_hover_quick_actions.is_animating() {
                             ui.ctx().request_repaint();
                         }
                         if qa_opacity > 0.02
@@ -2171,16 +2422,55 @@ impl HistoryInnerWidget {
         self.last_frame_laid_out_count = laid_out_this_frame;
         self.last_frame_painted_count = painted_this_frame;
 
-        // Paint interactive emoji tap burst overlays above the message list.
-        self.emoji_interactions
-            .paint_overlays(ui, list_rect, now_ms.max(0) as u64, colors);
-
-        // Track scroll state & bottom-edge detection.
+        // Track scroll state & bottom-edge detection before read-marking checks so `scrolled_up`
+        // reflects this frame's actual scroll position.
         self.scroll_offset_y = scroll_out.inner.state.clamped_offset().y;
         let vis_top = self.scroll_offset_y.round() as i32;
         let vis_bot = (self.scroll_offset_y + viewport_h).round() as i32;
         let total_h = self.list.total_height();
         self.scrolled_up = (total_h - vis_bot) > 120;
+
+        let window_focused = ui.ctx().input(|i| i.focused);
+
+        // `HistoryInner::paintEvent` marks shown messages with unread reactions as read
+        // (`readContents`), which clears the floating "♥ N" button and the chat-row badge.
+        // Only while the window is active (`markingAsViewed`), and only when the set changed.
+        if self.painted_msg_ids != self.reactions_read_for && window_focused {
+            self.reactions_read_for.clone_from(&self.painted_msg_ids);
+            if !self.painted_msg_ids.is_empty()
+                && let Err(err) =
+                    backend.mark_visible_reactions_read(self.peer_id, &self.painted_msg_ids)
+            {
+                tracing::debug!("mark_visible_reactions_read failed: {err}");
+            }
+        }
+
+        // Mark visible unread messages as read when the window is focused
+        // (`HistoryWidget::newItemAdded` / `HistoryInner::paintEvent` -> `readInboxTill`).
+        // Like tdesktop (`history_inner_widget.cpp:1513-1515`), reading visible messages clears
+        // the unread counter without destroying the `"Unread messages"` divider bar while the
+        // chat remains open (it is cleared on close, send, or new arrival at bottom).
+        if window_focused && (self.unread_count > 0 || peer.unread_count > 0) {
+            let max_visible = self
+                .painted_msg_ids
+                .iter()
+                .copied()
+                .filter(|id| id.0 > 0)
+                .max();
+            if let Some(max_id) = max_visible
+                && max_id > self.last_inbox_read_sent
+            {
+                self.last_inbox_read_sent = max_id;
+                backend.mark_history_read(self.peer_id, max_id);
+                if self.list.loaded_at_bottom && !self.scrolled_up {
+                    self.unread_count = 0;
+                }
+            }
+        }
+
+        // Paint interactive emoji tap burst overlays above the message list.
+        self.emoji_interactions
+            .paint_overlays(ui, list_rect, now_ms.max(0) as u64, colors);
 
         // Automatic preload triggers (`HistoryList::check_preload`).
         let preload = self.list.check_preload(vis_top, vis_bot);
@@ -2204,7 +2494,6 @@ impl HistoryInnerWidget {
         // Right-click context menu (`PopupMenuState` from `tg-ui`).
         let ui_colors = colors.ui_colors();
         let menu_style = PopupMenuStyle::default_popup(&ui_colors);
-        let toggle_style = ToggleStyle::default_toggle(&ui_colors);
         let now_unix_secs = (now_ms / 1000).max(0);
         if let Some((mid, pos)) = open_context_menu_for {
             self.context_menu_msg = Some(mid);
@@ -2218,6 +2507,7 @@ impl HistoryInnerWidget {
                 )
             });
             self.context_menu.open_at(ui.ctx(), pos, &menu_style);
+            self.context_menu_opened_frame = ui.ctx().cumulative_frame_nr();
         }
 
         if let Some(target_id) = self.context_menu_msg
@@ -2232,13 +2522,20 @@ impl HistoryInnerWidget {
             {
                 eng.append_menu_items(&mut items, ref_now_unix);
             }
-            if let Some(triggered) = self.context_menu.show(
-                ui.ctx(),
-                Id::unique(("tg_hist_ctx_menu", self.peer_id.0)),
-                &items,
-                &menu_style,
-                &toggle_style,
-            ) {
+            // `Data::LookupPossibleReactions`: favourite first, then `messages.getTopReactions`,
+            // then the rest of the available reactions allowed in this chat.
+            let strip: Vec<String> = backend
+                .reaction_strip_emojis(Some(self.peer_id))
+                .into_iter()
+                .take(CONTEXT_STRIP_MAX_REACTIONS)
+                .collect();
+            if let Some(triggered) = self.show_message_menu(ui.ctx(), &items, &strip, &menu_style) {
+                if let Some(emoji) = triggered.strip_prefix(CONTEXT_STRIP_REACTION_PREFIX) {
+                    events.push(InnerEvent::ToggleReaction {
+                        msg_id: target_id,
+                        emoji: emoji.to_owned(),
+                    });
+                }
                 match triggered.as_str() {
                     crate::history::read_receipts::MENU_ID_SEEN_BY => {
                         let readers = self
@@ -2269,23 +2566,23 @@ impl HistoryInnerWidget {
                             events.push(InnerEvent::OpenMessageAuthor(author));
                         }
                     }
-                    "react_thumbsup" => events.push(InnerEvent::ToggleReaction {
-                        msg_id: target_id,
-                        emoji: "👍".to_owned(),
-                    }),
-                    "react_fire" => events.push(InnerEvent::ToggleReaction {
-                        msg_id: target_id,
-                        emoji: "🔥".to_owned(),
-                    }),
-                    "react_heart" => events.push(InnerEvent::ToggleReaction {
-                        msg_id: target_id,
-                        emoji: "❤️".to_owned(),
-                    }),
                     "react_more" => events.push(InnerEvent::OpenReactionsPicker {
                         msg_id: target_id,
                         pos: self.context_menu_pos,
                     }),
                     "who_reacted" => events.push(InnerEvent::OpenWhoReacted(target_id)),
+                    "toggle_paid_reaction_privacy" => {
+                        events.push(InnerEvent::TogglePaidReactionPrivacy(target_id));
+                    }
+                    "report_msg_reaction" => {
+                        events.push(InnerEvent::ReportMessageReaction(target_id));
+                    }
+                    "remove_participant_reactions" => {
+                        events.push(InnerEvent::RemoveParticipantReactions {
+                            msg_id: target_id,
+                            participant_id: target_msg.from_id,
+                        });
+                    }
                     "poll_voters" => events.push(InnerEvent::OpenPollVoters(target_id)),
                     "retract_vote" => events.push(InnerEvent::RetractPollVote(target_id)),
                     "stop_poll" => events.push(InnerEvent::StopPoll(target_id)),
@@ -2384,6 +2681,17 @@ impl HistoryInnerWidget {
                             vec![target_id]
                         };
                         events.push(InnerEvent::Moderate(ids));
+                    }
+                    "block_from_replies" => {
+                        let sender_name = if target_msg.sender_name.trim().is_empty() {
+                            "User".to_owned()
+                        } else {
+                            target_msg.sender_name.clone()
+                        };
+                        events.push(InnerEvent::BlockFromReplies {
+                            msg_id: target_id,
+                            sender_name,
+                        });
                     }
                     "delete" => events.push(InnerEvent::Delete(vec![target_id])),
                     _ => {}
@@ -2542,7 +2850,7 @@ fn build_list_item(msg: &HistoryMessage, is_group: bool) -> HistoryListItem {
     ) && msg.text.is_empty();
     let meta = AttachMetadata {
         date: msg.date_unix,
-        date_time: LocalDateTime::from_unix_utc(i64::from(msg.date_unix)),
+        date_time: LocalDateTime::from_unix_local(i64::from(msg.date_unix)),
         from: to_hist_peer(msg.from_id),
         display_from: Some(to_hist_peer(msg.from_id)),
         has_out_layout: msg.outgoing && !msg.is_post,
@@ -2924,7 +3232,7 @@ fn build_media_input(
 }
 
 fn build_bottom_info_input(msg: &HistoryMessage) -> BottomInfoInput {
-    let mut time_chars = msg.formatted_time().len() as i32;
+    let mut time_chars = message_time_text(msg).len() as i32;
     if msg.edited {
         time_chars += 8;
     }
@@ -3015,17 +3323,26 @@ fn compute_item_layout_egui(
                 &input, viewport_w, fonts,
             )));
         }
-        let text = svc.display_text(&msg.sender_name);
+        let text = crate::history::bubble::service_text(msg, svc);
         let max_w = (viewport_w - 60).max(120) as f32;
         let single_w = ui
             .painter()
-            .layout_no_wrap(text.clone(), FontId::proportional(12.5), colors.service_fg)
+            .layout_no_wrap(
+                text.clone(),
+                crate::history::bubble::service_font(),
+                colors.service_fg,
+            )
             .size()
             .x
             .ceil() as i32;
         let wrap_h = ui
             .painter()
-            .layout(text, FontId::proportional(12.5), colors.service_fg, max_w)
+            .layout(
+                text,
+                crate::history::bubble::service_font(),
+                colors.service_fg,
+                max_w,
+            )
             .size()
             .y
             .ceil() as i32;
@@ -3044,7 +3361,9 @@ fn compute_item_layout_egui(
     }
 
     let text_pal = colors.text_palette(msg.outgoing && !msg.is_post);
-    let max_text_wrap = ((viewport_w - 130).min(MSG_MAX_WIDTH) - MSG_PADDING.horizontal()).max(120);
+    let max_text_wrap = (bubble_content_max_width(viewport_w, item.has_from_photo)
+        - MSG_PADDING.horizontal())
+    .max(120);
     let summary_h = crate::history::summary_header::summary_reserved_height(
         msg.extra.summary_from_language.as_deref(),
         summary_entry,
@@ -3100,12 +3419,16 @@ fn compute_item_layout_egui(
         text_real_w = text_real_w.max(min_summary_w);
     }
 
-    let show_name = show_sender_in_chat && !msg.outgoing && !item.attach_state.attached_to_previous;
+    let show_name = shows_from_name(
+        msg,
+        show_sender_in_chat,
+        item.attach_state.attached_to_previous,
+    );
     let from_name_width = show_name.then(|| {
         ui.painter()
             .layout_no_wrap(
                 msg.sender_name.clone(),
-                FontId::proportional(13.0),
+                FontId::new(13.0, tg_ui::fonts::family_semibold()),
                 colors.text_fg,
             )
             .size()
@@ -3163,12 +3486,21 @@ fn compute_item_layout_egui(
     );
 
     // Extra vertical space so bottom-right timestamp never overlaps the final text line or preview card.
+    // tdesktop appends a skip block for the date to the last text line (`Ui::Text::String`
+    // `updateSkipBlock`): the time drops to its own line only when that line is full.
     let needs_date_line_room = has_body_text && msg.reactions.is_empty();
+    let time_fits_last_line = || {
+        let line_h = message_text_style().line_height.round() as i32;
+        let (last_w, row_w) = if text_wrapped_h <= line_h + 1 {
+            (text_max_w, max_text_wrap)
+        } else {
+            let last = last_line_width(ui, active_text, &text_pal, colors.text_fg, max_text_wrap);
+            (last, text_real_w)
+        };
+        last_w + MSG_DATE_SPACE + bottom_info_w <= row_w
+    };
     let adjusted_text_h = if needs_date_line_room
-        && (has_rich_body
-            || has_lp
-            || summary_h > 0
-            || text_max_w + bottom_info_w + 18 > max_text_wrap)
+        && (has_rich_body || has_lp || summary_h > 0 || !time_fits_last_line())
     {
         text_wrapped_h + summary_h + lp_extra_h + 18 + factcheck_extra_h
     } else {
@@ -3193,7 +3525,7 @@ fn compute_item_layout_egui(
                         .ceil() as i32
                 },
             );
-            let kb_max_w = (viewport_w - 130).clamp(200, MSG_MAX_WIDTH);
+            let kb_max_w = bubble_content_max_width(viewport_w, item.has_from_photo).max(200);
             let kb_w = kb_layout.natural_width().clamp(200, kb_max_w);
             let kb_h = kb_layout.natural_height();
             kb_layout.resize(kb_w, kb_h);
@@ -3229,7 +3561,10 @@ fn compute_item_layout_egui(
             )
         ),
         bottom_info,
-        reactions_size: measure_reactions_size(&msg.reactions),
+        reactions_size: measure_reactions_size(
+            &msg.reactions,
+            matches!(msg.peer_id.kind(), PeerKind::User),
+        ),
         reactions_in_bubble: true,
         has_comments_button: msg.is_post && msg.extra.replies_count.is_some(),
         comments_text_width: msg.extra.replies_count.map_or(0, |c| {
@@ -3304,7 +3639,7 @@ fn compute_item_layout_headless(
                 &input, viewport_w, fonts,
             )));
         }
-        let text = svc.display_text(&msg.sender_name);
+        let text = crate::history::bubble::service_text(msg, svc);
         let (w, h) = estimate_text_metrics(&text, (viewport_w - 60).max(120));
         let input = ServiceInput {
             chat_mode,
@@ -3319,7 +3654,9 @@ fn compute_item_layout_headless(
             &input, viewport_w, fonts,
         )));
     }
-    let max_text_wrap = ((viewport_w - 130).min(MSG_MAX_WIDTH) - MSG_PADDING.horizontal()).max(120);
+    let max_text_wrap = (bubble_content_max_width(viewport_w, item.has_from_photo)
+        - MSG_PADDING.horizontal())
+    .max(120);
     let has_rich_body = msg.extra.rich_message.is_some();
     let (tw, th) = if let Some(ref rich_payload) = msg.extra.rich_message {
         let sz = tg_app_media::webview::rich_page_view::estimate_rich_page_size(
@@ -3334,7 +3671,11 @@ fn compute_item_layout_headless(
     } else {
         estimate_text_metrics(&msg.text.text, max_text_wrap)
     };
-    let show_name = show_sender_in_chat && !msg.outgoing && !item.attach_state.attached_to_previous;
+    let show_name = shows_from_name(
+        msg,
+        show_sender_in_chat,
+        item.attach_state.attached_to_previous,
+    );
     let from_name_width = show_name.then(|| (msg.sender_name.chars().count() as i32) * 8);
     let forwarded_width = msg
         .forward
@@ -3376,7 +3717,7 @@ fn compute_item_layout_headless(
                 tg_bots::keyboard_layout::BotKeyboardMetrics::INLINE,
                 |text| (text.chars().count() as i32) * 8,
             );
-            let kb_max_w = (viewport_w - 130).clamp(200, MSG_MAX_WIDTH);
+            let kb_max_w = bubble_content_max_width(viewport_w, item.has_from_photo).max(200);
             let kb_w = kb_layout.natural_width().clamp(200, kb_max_w);
             let kb_h = kb_layout.natural_height();
             kb_layout.resize(kb_w, kb_h);
@@ -3412,7 +3753,10 @@ fn compute_item_layout_headless(
             )
         ),
         bottom_info,
-        reactions_size: measure_reactions_size(&msg.reactions),
+        reactions_size: measure_reactions_size(
+            &msg.reactions,
+            matches!(msg.peer_id.kind(), PeerKind::User),
+        ),
         reactions_in_bubble: true,
         has_comments_button: msg.is_post && msg.extra.replies_count.is_some(),
         comments_text_width: msg.extra.replies_count.map_or(0, |c| {
@@ -3440,32 +3784,477 @@ pub fn can_moderate_message(msg: &HistoryMessage, peer: &HistoryPeerInfo) -> boo
         && msg.from_id != peer.summary.id
 }
 
+/// Official production `@Replies` bot user id (`PeerData::isRepliesChat`, `tg-data/src/peer.rs`).
+pub const REPLIES_PEER_ID_PROD: u64 = 1_271_266_957;
+
+/// Official test-DC `@Replies` bot user id (`PeerData::isRepliesChat`, `tg-data/src/peer.rs`).
+pub const REPLIES_PEER_ID_TEST: u64 = 708_513;
+
+/// Returns `true` when `peer` is the official `@Replies` chat where incoming comment replies
+/// can be blocked via `contacts.blockFromReplies` (`window/window_peer_menu.cpp:2770-2855`).
+#[must_use]
+pub fn is_replies_chat_peer(peer: &HistoryPeerInfo) -> bool {
+    (peer.summary.kind == PeerKind::User
+        && matches!(
+            peer.summary.id.bare(),
+            REPLIES_PEER_ID_PROD | REPLIES_PEER_ID_TEST
+        ))
+        || peer.summary.title == "Replies"
+}
+
+/// `st::reactStripHeight`, `st::reactStripSize`, `st::reactStripImage`, `st::reactStripSkip`.
+const CONTEXT_STRIP_HEIGHT: f32 = 40.0;
+const CONTEXT_STRIP_SIZE: f32 = 32.0;
+const CONTEXT_STRIP_IMAGE: f32 = 26.0;
+const CONTEXT_STRIP_SKIP: f32 = 7.0;
+/// Reactions shown in the strip before the expand button (Telegram Desktop 7.4.6 shows six).
+const CONTEXT_STRIP_MAX_REACTIONS: usize = 6;
+/// Strip offset relative to the menu (measured from Telegram Desktop 7.4.6).
+const CONTEXT_STRIP_LEFT_SHIFT: f32 = 37.0;
+const CONTEXT_STRIP_GAP: f32 = 13.0;
+/// Triggered id prefix for a reaction chosen in the strip.
+const CONTEXT_STRIP_REACTION_PREFIX: &str = "react:";
+/// `st::menuWithIcons`: icon position and text left padding.
+const CONTEXT_MENU_ICON_LEFT: f32 = 15.0;
+const CONTEXT_MENU_TEXT_LEFT: f32 = 54.0;
+const CONTEXT_MENU_PADDING_RIGHT: f32 = 17.0;
+const CONTEXT_MENU_PADDING_V: f32 = 8.0;
+
+/// tdesktop menu icon for a message context menu action (`st::menuIcon*`).
+fn context_menu_icon(id: &str, fallback: Option<IconKind>) -> Option<tg_ui::tg_style::Icon> {
+    use tg_ui::tg_style::st;
+    Some(match id {
+        "reply" | "reply_quote" => st::menu_icon_reply,
+        "edit" => st::menu_icon_edit,
+        "pin" => st::menu_icon_pin,
+        "copy_text" => st::menu_icon_copy,
+        "copy_link" => st::menu_icon_link,
+        "translate" => st::menu_icon_translate,
+        "forward" => st::menu_icon_forward,
+        "delete" | "moderate" | "remove_participant_reactions" | "stop_poll" => {
+            st::menu_icon_delete
+        }
+        "select" => st::menu_icon_select,
+        "report" | "report_msg_reaction" => st::menu_icon_report,
+        "save_as" => st::menu_icon_download,
+        "draw_to_reply" => st::menu_icon_draw,
+        "save_gif" => st::menu_icon_gif,
+        "fave_sticker" => st::menu_icon_stickers,
+        "block_from_replies" => st::menu_icon_block,
+        "who_reacted" => st::menu_icon_reactions,
+        "open_comments" => st::menu_icon_show_in_chat,
+        _ => return fallback.and_then(tg_ui::icons::style_icon_for_kind),
+    })
+}
+
+/// Geometry of the open message context menu and its reaction strip.
+struct ContextMenuGeometry {
+    menu: Rect,
+    strip: Rect,
+    row_h: f32,
+    sep_h: f32,
+}
+
+fn context_menu_geometry(
+    ctx: &egui::Context,
+    anchor: Pos2,
+    items: &[MenuItem],
+    reaction_count: usize,
+    style: &PopupMenuStyle,
+) -> ContextMenuGeometry {
+    let menu_st = &style.menu;
+    let font = menu_st.item_style.font.font_id();
+    let row_h = CONTEXT_MENU_PADDING_V * 2.0 + menu_st.item_style.font.line_height();
+    let sep_h = menu_st.separator.padding.vertical() + menu_st.separator.width;
+    let mut width = menu_st.width_min;
+    let mut height = style.scroll_padding.vertical();
+    for item in items {
+        match item {
+            MenuItem::Separator => height += sep_h,
+            MenuItem::Action { label, .. } | MenuItem::Toggle { label, .. } => {
+                height += row_h;
+                let w = ctx.fonts_mut(|f| {
+                    f.layout_no_wrap(label.clone(), font.clone(), Color32::WHITE)
+                        .size()
+                        .x
+                });
+                width = width.max(CONTEXT_MENU_TEXT_LEFT + w + CONTEXT_MENU_PADDING_RIGHT);
+            }
+        }
+    }
+    width = width.clamp(menu_st.width_min, menu_st.width_max);
+    let (strip_w, strip_room) = if reaction_count == 0 {
+        (0.0, 0.0)
+    } else {
+        (
+            CONTEXT_STRIP_SKIP * 2.0 + (reaction_count as f32 + 1.0) * CONTEXT_STRIP_SIZE,
+            CONTEXT_STRIP_HEIGHT + CONTEXT_STRIP_GAP,
+        )
+    };
+    let screen = ctx.viewport_rect();
+    let x = anchor
+        .x
+        .min(screen.max.x - width - 8.0)
+        .max(screen.min.x + 8.0);
+    let y = anchor
+        .y
+        .min(screen.max.y - height - 8.0)
+        .max(screen.min.y + 8.0 + strip_room);
+    let menu = Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, height));
+    let strip = Rect::from_min_size(
+        Pos2::new(
+            (x - CONTEXT_STRIP_LEFT_SHIFT)
+                .min(screen.max.x - strip_w - 8.0)
+                .max(screen.min.x + 8.0),
+            y - CONTEXT_STRIP_GAP - CONTEXT_STRIP_HEIGHT,
+        ),
+        Vec2::new(strip_w, CONTEXT_STRIP_HEIGHT),
+    );
+    ContextMenuGeometry {
+        menu,
+        strip,
+        row_h,
+        sep_h,
+    }
+}
+
+/// Paints the reaction strip (`HistoryView::Reactions::Selector`); returns the clicked id.
+fn paint_reaction_strip(
+    ui: &mut Ui,
+    base_id: Id,
+    strip_rect: Rect,
+    reactions: &[String],
+    style: &PopupMenuStyle,
+    assets: &mut MediaAssetCache,
+) -> Option<String> {
+    let ctx = ui.ctx().clone();
+    let painter = ui.painter().clone();
+    let menu_st = &style.menu;
+    let mut triggered = None;
+    tg_ui::painter::BoxShadow::new(style.shadow).paint_with_opacity(
+        &ctx,
+        &painter,
+        strip_rect,
+        CONTEXT_STRIP_HEIGHT * 0.5,
+        style.shadow.opacity,
+    );
+    painter.rect_filled(
+        strip_rect,
+        CornerRadius::same((CONTEXT_STRIP_HEIGHT * 0.5) as u8),
+        menu_st.item_bg,
+    );
+    let cell_y = strip_rect.center().y - CONTEXT_STRIP_SIZE * 0.5;
+    let cell_at = |i: usize| {
+        Rect::from_min_size(
+            Pos2::new(
+                strip_rect.left() + CONTEXT_STRIP_SKIP + i as f32 * CONTEXT_STRIP_SIZE,
+                cell_y,
+            ),
+            Vec2::splat(CONTEXT_STRIP_SIZE),
+        )
+    };
+    for (i, emoji) in reactions.iter().enumerate() {
+        let cell = cell_at(i);
+        let resp = ui.interact(cell, base_id.with(("react", i)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, emoji.as_str()));
+        if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            painter.circle_filled(
+                cell.center(),
+                CONTEXT_STRIP_SIZE * 0.5,
+                menu_st.item_bg_over,
+            );
+        }
+        let _ = assets.emoji().paint_emoji_str(
+            &painter,
+            &ctx,
+            emoji,
+            Rect::from_center_size(cell.center(), Vec2::splat(CONTEXT_STRIP_IMAGE)),
+            Color32::WHITE,
+        );
+        if resp.clicked() {
+            triggered = Some(format!("{CONTEXT_STRIP_REACTION_PREFIX}{emoji}"));
+        }
+    }
+    let expand = cell_at(reactions.len());
+    let resp = ui.interact(expand, base_id.with("react_more"), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "More reactions"));
+    if resp.hovered() {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    painter.circle_filled(expand.center(), 11.0, menu_st.item_bg_over);
+    let c = expand.center();
+    painter.add(egui::Shape::line(
+        vec![
+            Pos2::new(c.x - 4.0, c.y - 1.5),
+            Pos2::new(c.x, c.y + 2.5),
+            Pos2::new(c.x + 4.0, c.y - 1.5),
+        ],
+        Stroke::new(1.5, menu_st.item_icon_fg),
+    ));
+    if resp.clicked() {
+        triggered = Some("react_more".to_owned());
+    }
+    triggered
+}
+
+/// Paints the menu card (`Ui::PopupMenu` with `st::menuWithIcons`); returns the clicked id.
+fn paint_context_menu_card(
+    ui: &mut Ui,
+    base_id: Id,
+    geo: &ContextMenuGeometry,
+    items: &[MenuItem],
+    style: &PopupMenuStyle,
+) -> Option<String> {
+    let ctx = ui.ctx().clone();
+    let painter = ui.painter().clone();
+    let menu_st = &style.menu;
+    let font = menu_st.item_style.font.font_id();
+    let menu_rect = geo.menu;
+    let mut triggered = None;
+    tg_ui::painter::BoxShadow::new(style.shadow).paint_with_opacity(
+        &ctx,
+        &painter,
+        menu_rect,
+        style.radius,
+        style.shadow.opacity,
+    );
+    painter.rect_filled(
+        menu_rect,
+        CornerRadius::same(style.radius as u8),
+        menu_st.item_bg,
+    );
+    let clipped = painter.with_clip_rect(menu_rect);
+    let mut cursor_y = menu_rect.top() + style.scroll_padding.top;
+    for (idx, item) in items.iter().enumerate() {
+        let (id, label, icon, attention) = match item {
+            MenuItem::Separator => {
+                let sep_y = cursor_y + menu_st.separator.padding.top;
+                clipped.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(menu_rect.left(), sep_y),
+                        Vec2::new(menu_rect.width(), menu_st.separator.width),
+                    ),
+                    CornerRadius::ZERO,
+                    menu_st.separator.fg,
+                );
+                cursor_y += geo.sep_h;
+                continue;
+            }
+            MenuItem::Action {
+                id,
+                label,
+                icon,
+                attention,
+                ..
+            } => (id, label, *icon, *attention),
+            MenuItem::Toggle {
+                id, label, icon, ..
+            } => (id, label, *icon, false),
+        };
+        let row = Rect::from_min_size(
+            Pos2::new(menu_rect.left(), cursor_y),
+            Vec2::new(menu_rect.width(), geo.row_h),
+        );
+        cursor_y += geo.row_h;
+        let resp = ui.interact(row, base_id.with(("item", idx)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label.as_str()));
+        let hovered = resp.hovered();
+        if hovered {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            clipped.rect_filled(row, CornerRadius::ZERO, menu_st.item_bg_over);
+        }
+        let (fg, icon_fg) = if attention {
+            (menu_st.item_fg_attention, menu_st.item_fg_attention)
+        } else if hovered {
+            (menu_st.item_fg_over, menu_st.item_icon_fg_over)
+        } else {
+            (menu_st.item_fg, menu_st.item_icon_fg)
+        };
+        if let Some(style_icon) = context_menu_icon(id, icon) {
+            let icon_rect = Rect::from_min_size(
+                Pos2::new(row.left() + CONTEXT_MENU_ICON_LEFT, row.top() + 5.0),
+                Vec2::splat(24.0),
+            );
+            tg_app_core::ui_icons::paint_style_tinted(&clipped, icon_rect, style_icon, icon_fg);
+        }
+        clipped.text(
+            Pos2::new(row.left() + CONTEXT_MENU_TEXT_LEFT, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            fg,
+        );
+        if resp.clicked() {
+            triggered = Some(id.clone());
+        }
+    }
+    triggered
+}
+
+impl HistoryInnerWidget {
+    /// Paints the open message context menu and the reaction strip above it. Returns the
+    /// triggered item id; a strip reaction comes back as `"react:<emoji>"`, the expand button as
+    /// `"react_more"`.
+    fn show_message_menu(
+        &mut self,
+        ctx: &egui::Context,
+        items: &[MenuItem],
+        reactions: &[String],
+        style: &PopupMenuStyle,
+    ) -> Option<String> {
+        if !self.context_menu.is_open() {
+            return None;
+        }
+        let geo = context_menu_geometry(ctx, self.context_menu_pos, items, reactions.len(), style);
+        let bounds = if reactions.is_empty() {
+            geo.menu
+        } else {
+            geo.menu.union(geo.strip)
+        };
+        let base_id = Id::unique(("tg_hist_msg_menu", self.peer_id.0));
+        let assets = &mut self.assets;
+        let area = egui::Area::new(base_id.with("area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(bounds.min)
+            .show(ctx, |ui| {
+                ui.allocate_exact_size(bounds.size(), Sense::hover());
+                let from_strip = if reactions.is_empty() {
+                    None
+                } else {
+                    paint_reaction_strip(ui, base_id, geo.strip, reactions, style, assets)
+                };
+                let from_menu = paint_context_menu_card(ui, base_id, &geo, items, style);
+                from_strip.or(from_menu)
+            });
+        let triggered = area.inner;
+        let outside_click = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| !area.response.rect.contains(p))
+        });
+        let escape = ctx.input(|i| i.key_pressed(Key::Escape));
+        if triggered.is_some()
+            || escape
+            || (outside_click && ctx.cumulative_frame_nr() > self.context_menu_opened_frame)
+        {
+            self.context_menu.close();
+        }
+        triggered
+    }
+}
+
+/// Whether a message bubble shows the sender name header: group messages from others that
+/// start a new block, and broadcast channel posts (Telegram Desktop 7.4.6 titles each post).
+fn shows_from_name(msg: &HistoryMessage, show_sender_in_chat: bool, attached: bool) -> bool {
+    if msg.is_service() {
+        return false;
+    }
+    let channel_post = msg.is_post && matches!(msg.peer_id.kind(), PeerKind::Channel);
+    channel_post || (show_sender_in_chat && !msg.outgoing && !attached)
+}
+
+/// Paints the round fast-share button right of a channel post (`HistoryView::Message`
+/// `drawRightAction`, `st::historyFastShareSize` / `Left` / `Bottom`). Returns `true` on click.
+fn paint_fast_share_button(
+    ui: &mut Ui,
+    msg_id: MsgId,
+    bubble_rect: Rect,
+    colors: &HistoryColors,
+) -> bool {
+    use tg_ui::tg_style::st;
+    let size = 31.0;
+    let rect = Rect::from_min_size(
+        Pos2::new(
+            bubble_rect.right() + 13.0,
+            bubble_rect.bottom() - 5.0 - size,
+        ),
+        Vec2::splat(size),
+    );
+    let resp = ui.interact(
+        rect,
+        Id::unique(("tg_fast_share", msg_id.0)),
+        Sense::click(),
+    );
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::Role::Button,
+            true,
+            tg_lang::tr::lng_context_forward_msg(),
+        )
+    });
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter()
+        .circle_filled(rect.center(), size * 0.5, colors.service_bg);
+    tg_app_core::ui_icons::paint_style_tinted(
+        ui.painter(),
+        rect,
+        st::history_fast_share_icon,
+        colors.service_fg,
+    );
+    resp.clicked()
+}
+
+/// Builds the message context menu in Telegram Desktop 7.4.6 order
+/// (`HistoryInner::showContextMenu`): Reply, Edit, Pin, Copy Text, Copy Link, media actions,
+/// Forward, Delete, Report, Select. Reactions are chosen from the strip above the menu.
 fn build_context_menu_items(
     msg: &HistoryMessage,
     peer: &HistoryPeerInfo,
     has_quote_selection: bool,
 ) -> Vec<MenuItem> {
-    let mut items = vec![
-        MenuItem::action("react_thumbsup", "React with Thumbs Up").with_icon(IconKind::Star),
-        MenuItem::action("react_fire", "React with Fire").with_icon(IconKind::Star),
-        MenuItem::action("react_heart", "React with Heart").with_icon(IconKind::Star),
-        MenuItem::action("react_more", "More Reactions...").with_icon(IconKind::Plus),
-    ];
+    let mut items = Vec::new();
+    let is_group_like = matches!(peer.summary.kind, PeerKind::Group | PeerKind::Channel);
 
-    if !msg.reactions.is_empty() {
+    if !msg.reactions.is_empty() && is_group_like {
         let total_reacts: u32 = msg.reactions.iter().map(|r| r.count).sum();
         items.push(
             MenuItem::action("who_reacted", format!("Who Reacted ({total_reacts})..."))
                 .with_icon(IconKind::Info),
         );
+        if msg
+            .reactions
+            .iter()
+            .any(|r| r.emoji == "⭐" || r.emoji == "★")
+        {
+            items.push(
+                MenuItem::action(
+                    "toggle_paid_reaction_privacy",
+                    format!(
+                        "{} (Toggle Anonymous)",
+                        tg_lang::tr::lng_paid_react_show_in_top()
+                    ),
+                )
+                .with_icon(IconKind::Star),
+            );
+        }
+        items.push(
+            MenuItem::action("report_msg_reaction", tg_lang::tr::lng_report_reaction())
+                .with_icon(IconKind::Info),
+        );
+        if peer.can_delete && !msg.outgoing && msg.from_id != peer.summary.id {
+            items.push(
+                MenuItem::action(
+                    "remove_participant_reactions",
+                    "Remove Participant Reactions",
+                )
+                .with_icon(IconKind::Trash)
+                .attention(),
+            );
+        }
+        items.push(MenuItem::Separator);
     }
 
-    items.push(MenuItem::Separator);
-    items.push(
-        MenuItem::action("reply", "Reply")
-            .with_icon(IconKind::Back)
-            .with_shortcut("Double-click"),
-    );
+    items.push(MenuItem::action(
+        "reply",
+        tg_lang::tr::lng_context_reply_msg(),
+    ));
+    if has_quote_selection {
+        items.push(MenuItem::action("reply_quote", "Reply with Quote"));
+    }
 
     if let Some(HistoryMedia::Poll(ref poll)) = msg.media {
         if !poll.is_anonymous && poll.total_voters > 0 {
@@ -3485,10 +4274,6 @@ fn build_context_menu_items(
         }
     }
 
-    if has_quote_selection {
-        items.push(MenuItem::action("reply_quote", "Reply with Quote").with_icon(IconKind::Back));
-    }
-
     if msg.extra.replies_count.is_some() && msg.is_post {
         items.push(MenuItem::action("open_comments", "Open Comments").with_icon(IconKind::Info));
     }
@@ -3497,73 +4282,65 @@ fn build_context_menu_items(
         && (!msg.text.is_empty() || msg.extra.rich_message.is_some())
         && peer.summary.can_send
     {
-        items.push(MenuItem::action("edit", "Edit").with_icon(IconKind::Edit));
+        items.push(MenuItem::action(
+            "edit",
+            tg_lang::tr::lng_context_edit_msg(),
+        ));
     }
-
-    items.push(
-        MenuItem::action("copy_text", "Copy Text")
-            .with_icon(IconKind::Bookmark)
-            .with_shortcut("Ctrl+C"),
-    );
-    let copy_link_label = if msg.is_post {
-        tg_lang::tr::lng_context_copy_post_link()
-    } else {
-        tg_lang::tr::lng_context_copy_message_link()
-    };
-    items.push(MenuItem::action("copy_link", copy_link_label).with_icon(IconKind::Info));
-
-    if !msg.text.is_empty() {
-        let tr_label = if msg.extra.translated_text.is_some() {
-            "Show Original"
-        } else {
-            "Translate"
-        };
-        items.push(MenuItem::action("translate", tr_label).with_icon(IconKind::Info));
-    }
-
-    items.push(MenuItem::action("forward", "Forward").with_icon(IconKind::ChevronRight));
 
     if peer.can_pin {
-        items.push(
-            MenuItem::action("pin", if msg.is_pinned { "Unpin" } else { "Pin" })
-                .with_icon(IconKind::Star),
-        );
+        items.push(MenuItem::action(
+            "pin",
+            if msg.is_pinned {
+                tg_lang::tr::lng_context_unpin_msg()
+            } else {
+                tg_lang::tr::lng_context_pin_msg()
+            },
+        ));
     }
 
-    items.push(MenuItem::action("select", "Select (Shift+Click range)").with_icon(IconKind::Check));
-
-    if matches!(msg.media, Some(HistoryMedia::Video(ref v)) if v.is_gif) {
-        items.push(MenuItem::action("save_gif", "Save GIF").with_icon(IconKind::Star));
+    if !msg.text.is_empty() || msg.extra.rich_message.is_some() {
+        items.push(MenuItem::action(
+            "copy_text",
+            tg_lang::tr::lng_context_copy_text(),
+        ));
     }
-
-    if matches!(msg.media, Some(HistoryMedia::Sticker(_))) {
-        items.push(
-            MenuItem::action("fave_sticker", "Add Sticker to Favorites").with_icon(IconKind::Star),
-        );
+    if msg.extra.translated_text.is_some() {
+        items.push(MenuItem::action("translate", "Show Original"));
     }
-
-    if matches!(msg.media, Some(HistoryMedia::Voice(_)))
-        || matches!(msg.media, Some(HistoryMedia::Document(ref d)) if d.mime_type.starts_with("audio/"))
-    {
-        items.push(
-            MenuItem::action("save_ringtone", "Save for Notifications").with_icon(IconKind::Star),
-        );
-    }
-
-    if matches!(msg.media, Some(HistoryMedia::Photo(_))) && peer.summary.can_send {
-        items.push(MenuItem::action("draw_to_reply", "Draw to Reply").with_icon(IconKind::Edit));
+    if is_group_like {
+        let copy_link_label = if msg.is_post {
+            tg_lang::tr::lng_context_copy_post_link()
+        } else {
+            tg_lang::tr::lng_context_copy_message_link()
+        };
+        items.push(MenuItem::action("copy_link", copy_link_label));
     }
 
     if msg.media.is_some() {
-        items.push(MenuItem::action("save_as", "Save As...").with_icon(IconKind::Attach));
+        items.push(MenuItem::action("save_as", "Save As..."));
+    }
+    if matches!(msg.media, Some(HistoryMedia::Photo(_))) && peer.summary.can_send {
+        items.push(MenuItem::action("draw_to_reply", "Draw to Reply"));
+    }
+    if matches!(msg.media, Some(HistoryMedia::Video(ref v)) if v.is_gif) {
+        items.push(MenuItem::action("save_gif", "Save GIF"));
+    }
+    if matches!(msg.media, Some(HistoryMedia::Sticker(_))) {
+        items.push(MenuItem::action("fave_sticker", "Add Sticker to Favorites"));
+    }
+    if matches!(msg.media, Some(HistoryMedia::Voice(_)))
+        || matches!(msg.media, Some(HistoryMedia::Document(ref d)) if d.mime_type.starts_with("audio/"))
+    {
+        items.push(MenuItem::action("save_ringtone", "Save for Notifications"));
     }
 
-    if !msg.outgoing {
-        items.push(MenuItem::action("report", "Report").with_icon(IconKind::Info));
-    }
+    items.push(MenuItem::action(
+        "forward",
+        tg_lang::tr::lng_context_forward_msg(),
+    ));
 
     if peer.can_delete {
-        items.push(MenuItem::Separator);
         if can_moderate_message(msg, peer) {
             items.push(
                 MenuItem::action("moderate", "Moderate...")
@@ -3571,13 +4348,30 @@ fn build_context_menu_items(
                     .attention(),
             );
         }
+        items.push(MenuItem::action(
+            "delete",
+            tg_lang::tr::lng_context_delete_msg(),
+        ));
+    }
+
+    if !msg.outgoing && is_group_like {
+        items.push(MenuItem::action(
+            "report",
+            tg_lang::tr::lng_context_report_msg(),
+        ));
+    }
+    if !msg.outgoing && !msg.is_service() && is_replies_chat_peer(peer) {
         items.push(
-            MenuItem::action("delete", "Delete")
+            MenuItem::action("block_from_replies", "Block User...")
                 .with_icon(IconKind::Trash)
                 .attention(),
         );
     }
 
+    items.push(MenuItem::action(
+        "select",
+        tg_lang::tr::lng_context_select_msg(),
+    ));
     items
 }
 
@@ -3593,6 +4387,31 @@ fn suggested_save_name(msg: &HistoryMessage) -> String {
         Some(HistoryMedia::Sticker(s)) => format!("sticker_{}.tgs", s.sticker_id),
         _ => format!("message_{}.txt", msg.id.0),
     }
+}
+
+/// Width of the last wrapped line of a message body at `max_wrap` (where the date skip block
+/// goes in `Ui::Text::String`).
+fn last_line_width(
+    ui: &Ui,
+    text: &tg_text::TextWithEntities,
+    palette: &tg_ui::stand_in::TextPalette,
+    base_color: Color32,
+    max_wrap: i32,
+) -> i32 {
+    let rich = entities_to_rich_text(text);
+    let job = tg_ui::text::build_layout_job(
+        &rich,
+        &message_text_style(),
+        palette,
+        base_color,
+        (max_wrap as f32).max(40.0),
+        None,
+        true,
+    );
+    let galley = ui.painter().layout_job(job);
+    galley.rows.last().map_or(0, |row| {
+        row.rect_without_leading_space().width().ceil() as i32
+    })
 }
 
 fn paint_selection_checkbox(
@@ -3618,30 +4437,53 @@ fn paint_selection_checkbox(
     }
 }
 
-fn paint_chat_wallpaper(painter: &egui::Painter, rect: Rect, colors: &HistoryColors) {
-    painter.rect_filled(rect, CornerRadius::ZERO, colors.canvas_bg);
-    // Subtle repeating geometric pattern evoking tdesktop's classic wallpaper texture.
-    let step = 44.0;
-    let start_x = rect.left() + 22.0;
-    let start_y = rect.top() + 22.0;
-    let mut row = 0usize;
-    let mut y = start_y;
-    while y < rect.bottom() {
-        let mut x = start_x + if row % 2 == 1 { step * 0.5 } else { 0.0 };
-        while x < rect.right() {
-            painter.circle_filled(Pos2::new(x, y), 1.6, colors.canvas_pattern);
-            x += step;
-        }
-        y += step;
-        row += 1;
+/// Service bubble background over the Classic wallpaper (`msgServiceBg` adjusted to the
+/// wallpaper average color, measured from Telegram Desktop 7.4.6).
+const CLASSIC_SERVICE_BG: Color32 = Color32::from_rgb(0x82, 0x9F, 0x67);
+/// Night service bubble background (`msgServiceBg`, Night theme).
+const NIGHT_SERVICE_BG: Color32 = Color32::from_rgb(0x1E, 0x2C, 0x3A);
+
+/// Returns `colors` with service bubbles adjusted to the default chat background
+/// (`Window::Theme::Background::adjustPaletteUsingBackground`).
+#[must_use]
+pub fn colors_for_default_wallpaper(colors: &HistoryColors) -> HistoryColors {
+    let mut out = *colors;
+    if colors.is_night {
+        out.service_bg = NIGHT_SERVICE_BG;
+    } else {
+        out.service_bg = CLASSIC_SERVICE_BG;
+    }
+    out.service_fg = Color32::WHITE;
+    out
+}
+
+impl HistoryInnerWidget {
+    /// Paints the active chat background (`tg_app_settings::themes::active_chat_background`):
+    /// the Classic pattern wallpaper by default in Day, flat `#0E1621` in Night.
+    fn paint_chat_wallpaper(&mut self, ui: &mut Ui, rect: Rect, colors: &HistoryColors) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, colors.canvas_bg);
+        let background = tg_app_settings::themes::active_chat_background(ui.ctx());
+        if let Ok(mut bg) = background.lock() {
+            bg.set_dark_mode(colors.is_night);
+            bg.paint(ui, rect, Some(self.peer_id.0));
+        };
     }
 }
 
 /// Formats a Unix timestamp as a Telegram-style centered date separator (`"November 21"`, `"November 22"`).
 #[must_use]
 pub fn format_date_separator(unix_secs: i32) -> String {
-    let dt = LocalDateTime::from_unix_utc(i64::from(unix_secs));
+    let dt = LocalDateTime::from_unix_local(i64::from(unix_secs));
     format_civil_date(dt.date)
+}
+
+/// Message bottom-info time in the local time zone (`HistoryView::BottomInfo`, `"H:mm"`).
+#[must_use]
+pub fn message_time_text(msg: &HistoryMessage) -> String {
+    tg_history::datetime::format_time_short(LocalDateTime::from_unix_local(i64::from(
+        msg.date_unix,
+    )))
 }
 
 fn format_civil_date(date: CivilDate) -> String {
@@ -3664,4 +4506,12 @@ fn format_civil_date(date: CivilDate) -> String {
         .copied()
         .unwrap_or("Unknown");
     format!("{month} {}", date.day)
+}
+
+/// Widest bubble content for a `viewport_w` chat (`Message::resizeGetHeight`): the width minus
+/// `st::msgMargin` left/right, minus `st::msgPhotoSkip` when the sender userpic is shown, capped
+/// at `st::msgMaxWidth`.
+fn bubble_content_max_width(viewport_w: i32, has_from_photo: bool) -> i32 {
+    let photo_skip = if has_from_photo { MSG_PHOTO_SKIP } else { 0 };
+    (viewport_w - MSG_MARGIN.left - MSG_MARGIN.right - photo_skip).min(MSG_MAX_WIDTH)
 }

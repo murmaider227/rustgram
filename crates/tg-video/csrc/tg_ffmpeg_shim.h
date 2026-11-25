@@ -10,6 +10,23 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/*
+ * Container and decoder whitelists restricting FFmpeg to the media formats and codecs
+ * Telegram Desktop's minimal FFmpeg build enables (mp4/mov/m4a, webm/matroska, gif, mp3,
+ * ogg/opus, aac, wav; h264, hevc, vp8, vp9, av1, mpeg4, gif, aac, mp3, opus, vorbis, pcm).
+ */
+#define TG_FORMAT_WHITELIST "mov,mp4,m4a,matroska,webm,gif,mp3,ogg,aac,wav"
+#define TG_CODEC_WHITELIST \
+    "h264,libopenh264,hevc,vp8,libvpx,vp9,libvpx-vp9,av1,libdav1d,libaom-av1,mpeg4,gif," \
+    "aac,aac_fixed,aac_latm,mp3,mp3float,mp3adu,mp3adufloat,mp3on4,mp3on4float," \
+    "opus,libopus,vorbis,libvorbis," \
+    "pcm_s16le,pcm_s16be,pcm_s16le_planar,pcm_s16be_planar," \
+    "pcm_s24le,pcm_s24be,pcm_s24le_planar," \
+    "pcm_s32le,pcm_s32be,pcm_s32le_planar," \
+    "pcm_s8,pcm_s8_planar,pcm_u8," \
+    "pcm_u16le,pcm_u16be,pcm_u24le,pcm_u24be,pcm_u32le,pcm_u32be," \
+    "pcm_f32le,pcm_f32be,pcm_f64le,pcm_f64be,pcm_alaw,pcm_mulaw"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

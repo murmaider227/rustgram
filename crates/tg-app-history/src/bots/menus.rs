@@ -400,7 +400,8 @@ pub enum BotInfoHeaderEvent {
 
 /// Renders the centered empty-chat bot intro card (`history_view_empty_list_bubble.cpp` /
 /// `history_view_about_view.cpp`): description photo banner, "What can this bot do?" heading,
-/// bot description, monthly active users & privacy policy link, and "Start" button.
+/// bot description, monthly active users and privacy policy link. The START button is the
+/// history's bottom bar ([`crate::history::bars::paint_bot_start_bar`]).
 pub fn show_bot_info_header(
     ui: &mut Ui,
     bot_name: &str,
@@ -503,21 +504,9 @@ pub fn show_bot_info_header(
                             );
                         }
 
-                        ui.add_space(12.0);
+                        // START lives in the bottom bar in place of the composer
+                        // (`HistoryWidget::_botStart`), not inside this card.
                         let inner_w = ui.available_width();
-                        if box_action_button(
-                            ui,
-                            "START",
-                            palette.window_bg_active,
-                            palette.window_fg_active,
-                            inner_w,
-                            36.0,
-                        )
-                        .clicked()
-                        {
-                            emitted = Some(BotInfoHeaderEvent::StartBot);
-                        }
-
                         if bot_info.has_main_app {
                             ui.add_space(6.0);
                             if box_action_button(

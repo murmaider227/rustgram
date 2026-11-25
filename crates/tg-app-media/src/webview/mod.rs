@@ -24,6 +24,10 @@ pub mod theme;
 pub mod widget_host;
 
 #[cfg(test)]
+mod tests_sec2a;
+#[cfg(test)]
+mod tests_sec_b;
+#[cfg(test)]
 mod tests_wire2;
 
 use std::path::PathBuf;
@@ -57,6 +61,7 @@ pub struct AppWebViewHost {
     bot_storage_dir: Option<PathBuf>,
     iv_cache_dir: Option<PathBuf>,
     recent_events: Vec<AppWebViewEvent>,
+    passcode_locked: bool,
 }
 
 impl Default for AppWebViewHost {
@@ -97,6 +102,7 @@ impl AppWebViewHost {
             bot_storage_dir: None,
             iv_cache_dir: None,
             recent_events: Vec::new(),
+            passcode_locked: false,
         }
     }
 
@@ -160,6 +166,9 @@ impl AppWebViewHost {
         webpage_id: Option<i64>,
         fragment: Option<&str>,
     ) {
+        if self.passcode_locked {
+            return;
+        }
         if let Some(iv) = &mut self.instant_view
             && iv.is_open()
         {
@@ -228,8 +237,27 @@ impl AppWebViewHost {
         ));
     }
 
+    /// Follows the app-wide passcode lock: locking closes the Instant View and Mini App windows
+    /// (`Application::closeAdditionalWindows`) and, until unlocked, no window opens or renders.
+    pub fn set_passcode_locked(&mut self, locked: bool) {
+        if locked {
+            self.close_instant_view();
+            self.close_mini_app();
+        }
+        self.passcode_locked = locked;
+    }
+
+    /// Returns `true` while the app is locked behind the passcode screen.
+    #[must_use]
+    pub const fn is_passcode_locked(&self) -> bool {
+        self.passcode_locked
+    }
+
     /// Requests and opens a Bot Mini App panel for `request`.
     pub fn open_mini_app(&mut self, request: WebViewRequest) {
+        if self.passcode_locked {
+            return;
+        }
         if let Some(existing) = self.mini_app.take() {
             let mut ex = existing;
             ex.close_immediately();
@@ -302,6 +330,11 @@ impl AppWebViewHost {
     /// Drives one frame in `TgforkApp::ui`: checks shortcuts (`Ctrl+Shift+I` for sample Instant
     /// View, `Ctrl+Shift+M` for sample Mini App), syncs theme, and renders both secondary viewports.
     pub fn update_and_render(&mut self, ctx: &egui::Context, theme_mode: ThemeMode) {
+        if self.passcode_locked {
+            self.close_instant_view();
+            self.close_mini_app();
+            return;
+        }
         self.sync_theme(theme_mode);
 
         // Developer / preview shortcuts from the main window:

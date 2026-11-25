@@ -179,6 +179,20 @@ pub trait BotsBackend: Send {
     /// Returns the currently loaded [`AttachMenuStore`].
     fn load_attach_menu(&self) -> AttachMenuStore;
 
+    /// Fetches a single bot's attach-menu metadata via `messages.getAttachMenuBot`
+    /// (`inline_bots/bot_attach_web_view.cpp:2769-2787`).
+    ///
+    /// Default implementation falls back to looking up `bot_id` in [`Self::load_attach_menu`].
+    fn load_attach_menu_bot(
+        &self,
+        bot_id: UserId,
+    ) -> Result<tg_bots::mini_app::AttachMenuBot, String> {
+        self.load_attach_menu()
+            .find(bot_id)
+            .cloned()
+            .ok_or_else(|| format!("Attach-menu bot {} not found.", bot_id.0))
+    }
+
     /// Lists candidate peers eligible for `RequestPeer` and `ShareGameScore` choosers.
     fn candidate_peers(&self) -> Vec<BotPeerCandidate>;
 

@@ -28,8 +28,12 @@ fn open_main_menu(harness: &mut egui_kittest::Harness<'_, AppTestState>) {
 /// Computes the vertical center of row index `idx` after the separator in `MainMenu`:
 /// Cover (134px) + space (6px) + My Profile (42px) + Separator (8px) + rows (42px each):
 /// 0=New Group, 1=New Channel, 2=Contacts, 3=Calls, 4=Saved Messages, 5=Downloads, 6=Settings, 7=Night Mode.
+/// The mock session's two side-menu bots ("Catalog Shop", "Quick Wallet") sit between
+/// My Profile and the separator (`SetupMenuBots`), 40 px each.
+const MOCK_SIDE_MENU_BOTS_H: f32 = 2.0 * 40.0;
+
 fn main_menu_item_pos(row_after_sep: usize) -> Pos2 {
-    let base_y = MAIN_MENU_COVER_HEIGHT + 6.0 + 42.0 + 8.0;
+    let base_y = MAIN_MENU_COVER_HEIGHT + 6.0 + 42.0 + MOCK_SIDE_MENU_BOTS_H + 8.0;
     Pos2::new(120.0, base_y + (row_after_sep as f32 + 0.5) * 42.0)
 }
 
@@ -133,7 +137,15 @@ fn settings_change_interface_scale_and_open_privacy_and_notifications() {
         },
     );
 
-    // 2. Open Privacy and Security via Settings Search input (found via AccessKit!).
+    // 2. Open Privacy and Security via Settings Search: the header search icon (7.4.6 has no
+    // always-visible search field on Settings Main) opens the search input.
+    let search_label = tg_lang::tr::lng_dlg_filter();
+    let header_search = harness
+        .get_all_by_label(&search_label)
+        .find(|n| n.rect().center().x > main_left && n.rect().center().y < 80.0)
+        .expect("Settings header search icon button should be discoverable via AccessKit");
+    header_search.click();
+    settle_animations(&mut harness);
     let search_box = harness
         .get_all_by_role(egui::accesskit::Role::TextInput)
         .find(|n| n.rect().center().x > main_left)
