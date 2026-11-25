@@ -51,6 +51,8 @@ pub struct DeleteMessagesBoxState {
     /// Optional future chat/channel creator who will inherit ownership if the current owner leaves
     /// (`messages.getFutureChatCreatorAfterLeave`, `window_peer_menu.cpp:4367-4389`).
     pub future_creator: Option<FutureChatCreatorInfo>,
+    /// The user's first name for "Also delete for {user}" (`UserData::firstName`).
+    pub first_name: Option<String>,
 }
 
 impl DeleteMessagesBoxState {
@@ -68,6 +70,7 @@ impl DeleteMessagesBoxState {
             revoke_for_everyone: can_revoke,
             remember_choice: false,
             future_creator: None,
+            first_name: None,
         }
     }
 
@@ -89,7 +92,35 @@ impl DeleteMessagesBoxState {
             revoke_for_everyone: false,
             remember_choice: false,
             future_creator: None,
+            first_name: None,
         }
+    }
+
+    /// Sets the "Also delete for {user}" / "Delete for all members" checkbox from
+    /// `PeerData::canRevokeFullHistory` (`DeleteMessagesBox::revokeText`). A broadcast channel's
+    /// "Clear history" never has it (`_revokeJustClearForChannel`).
+    #[must_use]
+    pub fn with_revoke_full_history(
+        mut self,
+        can_revoke: bool,
+        first_name: Option<String>,
+    ) -> Self {
+        let channel_clear =
+            self.mode == DeleteMode::ClearHistory && self.peer_kind == InfoPeerKind::Channel;
+        self.can_revoke_for_everyone = can_revoke && !channel_clear;
+        self.revoke_for_everyone = false;
+        self.default_revoke = false;
+        self.first_name = first_name;
+        self
+    }
+
+    /// Whether this box wipes a whole chat ("Clear history" / "Delete chat" / "Leave").
+    #[must_use]
+    pub fn wipes_history(&self) -> bool {
+        matches!(
+            self.mode,
+            DeleteMode::ClearHistory | DeleteMode::DeleteAndLeave
+        )
     }
 
     /// Attaches the future owner candidate returned by `messages.getFutureChatCreatorAfterLeave`.
@@ -129,13 +160,34 @@ impl DeleteMessagesBoxState {
                     )
                 }
             }
-            DeleteMode::ClearHistory => tr::lng_sure_delete_group_history(&self.peer_title),
+            // `DeleteMessagesBox::prepare`, `_wipeHistoryJustClear`.
+            DeleteMode::ClearHistory => {
+                let text = match self.peer_kind {
+                    InfoPeerKind::Channel => {
+                        tr::lng_sure_delete_channel_history(&self.peer_title).replace("**", "")
+                    }
+                    InfoPeerKind::SavedMessages => tr::lng_sure_delete_saved_messages(),
+                    InfoPeerKind::User | InfoPeerKind::Bot => {
+                        tr::lng_sure_delete_history(&self.peer_title)
+                    }
+                    InfoPeerKind::Group | InfoPeerKind::Supergroup => {
+                        tr::lng_sure_delete_group_history(&self.peer_title)
+                    }
+                };
+                // Groups without the revoke checkbox explain that only your copy is cleared.
+                if !self.can_revoke_for_everyone && self.peer_kind.is_group() {
+                    format!("{text}\n\n{}", tr::lng_delete_clear_for_me())
+                } else {
+                    text
+                }
+            }
             DeleteMode::DeleteAndLeave => match self.peer_kind {
                 InfoPeerKind::SavedMessages => tr::lng_sure_delete_saved_messages(),
                 InfoPeerKind::User | InfoPeerKind::Bot => {
                     tr::lng_sure_delete_history(&self.peer_title)
                 }
-                InfoPeerKind::Group | InfoPeerKind::Supergroup => tr::lng_sure_leave_group(),
+                InfoPeerKind::Group => tr::lng_sure_delete_and_exit(&self.peer_title),
+                InfoPeerKind::Supergroup => tr::lng_sure_leave_group(),
                 InfoPeerKind::Channel => tr::lng_sure_leave_channel(),
             },
         }
@@ -145,14 +197,9 @@ impl DeleteMessagesBoxState {
     #[must_use]
     pub fn revoke_checkbox_label(&self) -> String {
         match self.peer_kind {
-            InfoPeerKind::User => tr::lng_delete_for_other_check(&self.peer_title),
-            InfoPeerKind::Group | InfoPeerKind::Supergroup => {
-                if matches!(self.mode, DeleteMode::DeleteAndLeave) {
-                    strings::DELETE_GROUP_ALL_MEMBERS.to_owned()
-                } else {
-                    tr::lng_delete_for_everyone_check()
-                }
-            }
+            InfoPeerKind::User => tr::lng_delete_for_other_check(
+                self.first_name.as_deref().unwrap_or(&self.peer_title),
+            ),
             _ => tr::lng_delete_for_everyone_check(),
         }
     }
@@ -200,10 +247,17 @@ impl DeleteMessagesBoxState {
                 }
             }
         };
-        BoxModal::new(id, title)
+        // `DeleteMessagesBox` has no title and no close button when it wipes a whole chat;
+        // the future-owner variant is `SelectFutureOwnerbox`, which has a title.
+        let untitled = self.wipes_history() && self.future_creator.is_none();
+        let mut modal = BoxModal::new(id, if untitled { String::new() } else { title })
             .width(st::box_width.0 as f32 + 28.0)
             .add_button(BoxButton::default_btn("cancel", tr::lng_cancel()))
-            .add_button(BoxButton::attention("delete", self.confirm_label()))
+            .add_button(BoxButton::attention("delete", self.confirm_label()));
+        if untitled {
+            modal.show_close_button = false;
+        }
+        modal
     }
 
     /// Renders the confirmation copy, optional future-owner transfer callout, and delete-for-everyone
@@ -304,5 +358,108 @@ impl DeleteMessagesBoxState {
                 .show(ui);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(kind: InfoPeerKind, title: &str) -> PeerProfile {
+        let mut p = crate::info::mock::MockBackend::new()
+            .peer_profile(crate::info::mock::mock_peers::USER_MIRA)
+            .expect("mock profile");
+        p.kind = kind;
+        p.title = title.to_owned();
+        p
+    }
+
+    #[test]
+    fn clear_history_texts_follow_delete_messages_box_prepare() {
+        let user = DeleteMessagesBoxState::for_delete_or_leave(
+            &profile(InfoPeerKind::User, "Sample Friend"),
+            true,
+        )
+        .with_revoke_full_history(true, Some("Sample".to_owned()));
+        assert_eq!(
+            user.prompt_text(),
+            tr::lng_sure_delete_history("Sample Friend")
+        );
+        assert_eq!(
+            user.revoke_checkbox_label(),
+            tr::lng_delete_for_other_check("Sample")
+        );
+        assert!(user.can_revoke_for_everyone && !user.revoke_for_everyone);
+        assert_eq!(user.confirm_label(), tr::lng_box_delete());
+        let modal = user.to_modal("x");
+        assert!(modal.title.is_empty() && !modal.show_close_button);
+
+        let channel = DeleteMessagesBoxState::for_delete_or_leave(
+            &profile(InfoPeerKind::Channel, "Sample Channel"),
+            true,
+        )
+        .with_revoke_full_history(true, None);
+        assert!(
+            !channel.can_revoke_for_everyone,
+            "_revokeJustClearForChannel"
+        );
+        assert!(
+            channel
+                .prompt_text()
+                .starts_with("Are you sure you want to delete all messages in")
+        );
+        assert!(!channel.prompt_text().contains("**"));
+
+        let group = DeleteMessagesBoxState::for_delete_or_leave(
+            &profile(InfoPeerKind::Supergroup, "Sample Group"),
+            true,
+        )
+        .with_revoke_full_history(false, None);
+        assert!(
+            group
+                .prompt_text()
+                .ends_with(&tr::lng_delete_clear_for_me())
+        );
+
+        let saved = DeleteMessagesBoxState::for_delete_or_leave(
+            &profile(InfoPeerKind::SavedMessages, "Saved Messages"),
+            true,
+        );
+        assert_eq!(saved.prompt_text(), tr::lng_sure_delete_saved_messages());
+    }
+
+    #[test]
+    fn delete_and_leave_texts_follow_delete_messages_box_prepare() {
+        let basic = DeleteMessagesBoxState::for_delete_or_leave(
+            &profile(InfoPeerKind::Group, "Sample Group"),
+            false,
+        )
+        .with_revoke_full_history(true, None);
+        assert_eq!(
+            basic.prompt_text(),
+            tr::lng_sure_delete_and_exit("Sample Group")
+        );
+        assert_eq!(
+            basic.revoke_checkbox_label(),
+            tr::lng_delete_for_everyone_check()
+        );
+        assert_eq!(basic.confirm_label(), tr::lng_box_leave());
+
+        let mut mega = DeleteMessagesBoxState::for_delete_or_leave(
+            &profile(InfoPeerKind::Supergroup, "Sample Group"),
+            false,
+        )
+        .with_revoke_full_history(true, None);
+        assert_eq!(mega.prompt_text(), tr::lng_sure_leave_group());
+        mega.revoke_for_everyone = true;
+        assert_eq!(mega.confirm_label(), tr::lng_box_delete());
+
+        let channel = DeleteMessagesBoxState::for_delete_or_leave(
+            &profile(InfoPeerKind::Channel, "Sample Channel"),
+            false,
+        )
+        .with_revoke_full_history(false, None);
+        assert_eq!(channel.prompt_text(), tr::lng_sure_leave_channel());
+        assert!(!channel.can_revoke_for_everyone);
     }
 }

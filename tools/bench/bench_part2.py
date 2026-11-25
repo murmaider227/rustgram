@@ -242,7 +242,9 @@ def wait_for_chat_list_ready(
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
+    wm.ensure_outside_git_repo(args.scratch_dir, label="--scratch-dir")
     diag = args.diag_dir or (args.scratch_dir / "probe_diag")
+    wm.ensure_outside_git_repo(diag, label="--diag-dir")
     diag.mkdir(parents=True, exist_ok=True)
 
     targets: list[tuple[str, Path, Path]] = [
@@ -256,11 +258,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
     for label, exe, src_wd in targets:
         client = "official" if label.startswith("official") else "rustgram"
-        wd = args.scratch_dir / f"probe_{label}"
         print(f"[probe] Copying workdir for {label}...", flush=True)
-        wm.copy_workdir_safely(src_wd, wd)
-        proc, t_launch = launch_client(client, exe, wd, args.api_creds_doc)
-        try:
+        with wm.ScratchSession(args.scratch_dir, graceful_timeout_s=5.0, post_stop_delay_s=1.5) as sess:
+            wd = sess.copy_workdir(src_wd, f"probe_{label}")
+            proc, t_launch = launch_client(client, exe, wd, args.api_creds_doc)
+            sess.track_process(proc)
             hwnd = None
             deadline = t_launch + 30.0
             while time.perf_counter() < deadline:
@@ -287,14 +289,13 @@ def cmd_probe(args: argparse.Namespace) -> int:
                 )
             else:
                 print(f"[probe] {label}: PrintWindow returned None", flush=True)
-        finally:
-            wm.stop_process_by_pid(proc.pid, graceful_timeout_s=5.0)
-            time.sleep(1.5)
-            shutil.rmtree(wd, ignore_errors=True)
     return 0
 
 
 def cmd_cold_start(args: argparse.Namespace) -> int:
+    wm.ensure_outside_git_repo(args.scratch_dir, label="--scratch-dir")
+    if args.diag_dir is not None:
+        wm.ensure_outside_git_repo(args.diag_dir, label="--diag-dir")
     args.scratch_dir.mkdir(parents=True, exist_ok=True)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
 
@@ -340,11 +341,11 @@ def cmd_cold_start(args: argparse.Namespace) -> int:
                 continue
             src_wd = args.official_workdir if cl == "official" else args.rustgram_workdir
             exe = args.official_exe if cl == "official" else args.rustgram_exe
-            wd = args.scratch_dir / f"p2_cold_{cl}_{run_num}"
-            wm.copy_workdir_safely(src_wd, wd)
             diag_png = (args.diag_dir / f"part2_cold_{cl}_run{run_num}.png") if (args.diag_dir and run_num == 1) else None
-            proc, t_launch = launch_client(cl, exe, wd, args.api_creds_doc)
-            try:
+            with wm.ScratchSession(args.scratch_dir, graceful_timeout_s=5.0, post_stop_delay_s=2.0) as sess:
+                wd = sess.copy_workdir(src_wd, f"p2_cold_{cl}_{run_num}")
+                proc, t_launch = launch_client(cl, exe, wd, args.api_creds_doc)
+                sess.track_process(proc)
                 _hwnd, res = wait_for_chat_list_ready(
                     proc.pid,
                     t_launch,
@@ -369,10 +370,6 @@ def cmd_cold_start(args: argparse.Namespace) -> int:
                 data["runs"][cl].append(rec)
                 data["runs"][cl].sort(key=lambda r: r["run"])
                 save()
-            finally:
-                wm.stop_process_by_pid(proc.pid, graceful_timeout_s=5.0)
-                time.sleep(2.0)
-                shutil.rmtree(wd, ignore_errors=True)
 
     return 0
 
@@ -571,6 +568,9 @@ def measure_scroll_10s(
 
 
 def cmd_interactive(args: argparse.Namespace) -> int:
+    wm.ensure_outside_git_repo(args.scratch_dir, label="--scratch-dir")
+    if args.diag_dir is not None:
+        wm.ensure_outside_git_repo(args.diag_dir, label="--diag-dir")
     layout = json.loads(args.layout_json.read_text(encoding="utf-8"))
     args.scratch_dir.mkdir(parents=True, exist_ok=True)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -633,10 +633,10 @@ def cmd_interactive(args: argparse.Namespace) -> int:
 
         # 1. open_chat + scroll (can run inside a clean fresh-copy session per run or one session for open/scroll)
         if "open_chat" in args.tests or "scroll" in args.tests:
-            wd = args.scratch_dir / f"p2_ui_{cl}"
-            wm.copy_workdir_safely(src_wd, wd)
-            proc, t_launch = launch_client(cl, exe, wd, args.api_creds_doc)
-            try:
+            with wm.ScratchSession(args.scratch_dir, graceful_timeout_s=5.0, post_stop_delay_s=2.0) as sess:
+                wd = sess.copy_workdir(src_wd, f"p2_ui_{cl}")
+                proc, t_launch = launch_client(cl, exe, wd, args.api_creds_doc)
+                sess.track_process(proc)
                 hwnd, _ = wait_for_chat_list_ready(proc.pid, t_launch, timeout_s=60.0)
                 if hwnd is None:
                     raise RuntimeError(f"Could not find window for {cl}")
@@ -705,19 +705,15 @@ def cmd_interactive(args: argparse.Namespace) -> int:
                         data["scroll"][cl].append(rec)
                         save()
                         time.sleep(2.0)
-            finally:
-                wm.stop_process_by_pid(proc.pid, graceful_timeout_s=5.0)
-                time.sleep(2.0)
-                shutil.rmtree(wd, ignore_errors=True)
 
         # 2. memory after opening up to 10 chats (fresh process per run!)
         if "mem_10_chats" in args.tests and len(data["mem_10_chats"][cl]) < args.runs:
             ten_rows: list[list[int]] = cfg.get("ten_chat_rows", chat_rows[:10])
             for run_num in range(len(data["mem_10_chats"][cl]) + 1, args.runs + 1):
-                wd = args.scratch_dir / f"p2_m10_{cl}_{run_num}"
-                wm.copy_workdir_safely(src_wd, wd)
-                proc, t_launch = launch_client(cl, exe, wd, args.api_creds_doc)
-                try:
+                with wm.ScratchSession(args.scratch_dir, graceful_timeout_s=5.0, post_stop_delay_s=2.0) as sess:
+                    wd = sess.copy_workdir(src_wd, f"p2_m10_{cl}_{run_num}")
+                    proc, t_launch = launch_client(cl, exe, wd, args.api_creds_doc)
+                    sess.track_process(proc)
                     hwnd, _ = wait_for_chat_list_ready(proc.pid, t_launch, timeout_s=60.0)
                     if hwnd is None:
                         raise RuntimeError(f"Could not find window for {cl}")
@@ -766,15 +762,14 @@ def cmd_interactive(args: argparse.Namespace) -> int:
                     )
                     data["mem_10_chats"][cl].append(rec)
                     save()
-                finally:
-                    wm.stop_process_by_pid(proc.pid, graceful_timeout_s=5.0)
-                    time.sleep(2.0)
-                    shutil.rmtree(wd, ignore_errors=True)
 
     return 0
 
 
 def cmd_delivery(args: argparse.Namespace) -> int:
+    wm.ensure_outside_git_repo(args.scratch_dir, label="--scratch-dir")
+    if args.diag_dir is not None:
+        wm.ensure_outside_git_repo(args.diag_dir, label="--diag-dir")
     layout = json.loads(args.layout_json.read_text(encoding="utf-8"))
     cl = args.client
     dcfg = layout[f"delivery_{cl}"]
@@ -790,16 +785,17 @@ def cmd_delivery(args: argparse.Namespace) -> int:
     exe = args.official_exe if cl == "official" else args.rustgram_exe
     src_a = args.official_workdir if cl == "official" else args.rustgram_workdir
     src_b = args.workdir_b
-    wd_a = args.scratch_dir / f"p2_deliv_{cl}_a"
-    wd_b = args.scratch_dir / f"p2_deliv_{cl}_b"
-    wm.copy_workdir_safely(src_a, wd_a)
-    wm.copy_workdir_safely(src_b, wd_b)
-
-    proc_a, ta = launch_client(cl, exe, wd_a, args.api_creds_doc)
-    time.sleep(2.0)
-    proc_b, tb = launch_client(cl, exe, wd_b, args.api_creds_doc)
     runs_out: list[dict[str, Any]] = []
-    try:
+    with wm.ScratchSession(args.scratch_dir, graceful_timeout_s=5.0, post_stop_delay_s=2.0) as sess:
+        wd_a = sess.copy_workdir(src_a, f"p2_deliv_{cl}_a")
+        wd_b = sess.copy_workdir(src_b, f"p2_deliv_{cl}_b")
+
+        proc_a, ta = launch_client(cl, exe, wd_a, args.api_creds_doc)
+        sess.track_process(proc_a)
+        time.sleep(2.0)
+        proc_b, tb = launch_client(cl, exe, wd_b, args.api_creds_doc)
+        sess.track_process(proc_b)
+
         hwnd_a, _ = wait_for_chat_list_ready(proc_a.pid, ta, timeout_s=60.0)
         hwnd_b, _ = wait_for_chat_list_ready(proc_b.pid, tb, timeout_s=60.0)
         if hwnd_a is None or hwnd_b is None:
@@ -889,24 +885,25 @@ def cmd_delivery(args: argparse.Namespace) -> int:
         }
         args.out_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
         return 0
-    finally:
-        wm.stop_process_by_pid(proc_a.pid, graceful_timeout_s=5.0)
-        wm.stop_process_by_pid(proc_b.pid, graceful_timeout_s=5.0)
-        time.sleep(2.0)
-        shutil.rmtree(wd_a, ignore_errors=True)
-        shutil.rmtree(wd_b, ignore_errors=True)
 
 
 def main() -> int:
     args = parse_args()
-    if args.cmd == "probe":
-        return cmd_probe(args)
-    if args.cmd == "cold-start":
-        return cmd_cold_start(args)
-    if args.cmd == "interactive":
-        return cmd_interactive(args)
-    if args.cmd == "delivery":
-        return cmd_delivery(args)
+    try:
+        if args.cmd == "probe":
+            return cmd_probe(args)
+        if args.cmd == "cold-start":
+            return cmd_cold_start(args)
+        if args.cmd == "interactive":
+            return cmd_interactive(args)
+        if args.cmd == "delivery":
+            return cmd_delivery(args)
+    except ValueError as exc:
+        sys.stderr.write(f"[part2] {exc}\n")
+        return 2
+    except wm.WorkdirCleanupError as exc:
+        sys.stderr.write(f"[part2] {exc}\n")
+        return 4
     return 1
 
 

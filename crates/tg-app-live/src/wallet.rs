@@ -1103,10 +1103,24 @@ impl LiveWalletBackend {
             for ev in events {
                 // Persist `last_event_id` BEFORE decrypting/parsing/emulating this event so a
                 // poison payload that crashes or aborts processing is never re-delivered forever.
+                // If the cursor cannot be saved (vault locked, disk error), the event is left
+                // unprocessed with the old cursor, and the bridge delivers it again later.
                 if let Some(id) = ev.id {
-                    self.sessions[idx].session.last_event_id = Some(id);
-                    if self.vault.is_unlocked() {
-                        let _ = self.persist_ton_connect_sessions();
+                    let previous = self.sessions[idx].session.last_event_id.replace(id);
+                    let saved = if self.vault.is_unlocked() {
+                        self.persist_ton_connect_sessions()
+                    } else {
+                        Err("wallet vault is locked".to_owned())
+                    };
+                    if let Err(err) = saved {
+                        self.sessions[idx].session.last_event_id = previous;
+                        // The vault may already hold the new cursor in memory: seal the old one
+                        // again so a later save or unlock cannot skip the deferred event.
+                        if self.vault.is_unlocked() {
+                            let _ = self.seal_ton_connect_sessions();
+                        }
+                        warn!(error = %err, "TON Connect event cursor not saved; event deferred");
+                        break;
                     }
                 }
                 if !ev
@@ -1354,6 +1368,14 @@ impl LiveWalletBackend {
         if !self.vault.is_unlocked() {
             return Ok(());
         }
+        self.seal_ton_connect_sessions()?;
+        self.vault
+            .save_to_dir(&self.wallet_dir)
+            .map_err(|e| format!("persist wallet vault: {e}"))
+    }
+
+    /// Seals the current TON Connect sessions into the unlocked vault in memory (not saved).
+    fn seal_ton_connect_sessions(&mut self) -> Result<(), String> {
         let bundle = PersistedTonConnectBundle {
             next_session_id: self.next_session_id,
             sessions: self
@@ -1374,10 +1396,7 @@ impl LiveWalletBackend {
             .map_err(|e| format!("serialize TON Connect sessions: {e}"))?;
         self.vault
             .store_secret(VAULT_SECRET_TON_CONNECT, &bytes)
-            .map_err(|e| format!("seal TON Connect sessions: {e}"))?;
-        self.vault
-            .save_to_dir(&self.wallet_dir)
-            .map_err(|e| format!("persist wallet vault: {e}"))
+            .map_err(|e| format!("seal TON Connect sessions: {e}"))
     }
 
     fn load_ton_connect_sessions_from_vault(&mut self) {
@@ -3351,6 +3370,106 @@ mod sec2c_tests {
             polled.last().cloned().flatten().as_deref(),
             Some("ev-w1-poison-42"),
             "reloaded session must poll with persisted last_event_id so poison event is not re-delivered"
+        );
+    }
+
+    #[test]
+    fn sec3_d3_ton_connect_event_is_deferred_when_cursor_cannot_be_saved() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wallet_dir = tmp.path().join("wallet");
+        let passcode = "test-passcode-123";
+        let toncenter = Arc::new(InspectVaultToncenter {
+            wallet_dir: wallet_dir.clone(),
+            passcode: passcode.to_owned(),
+            seen_on_disk_last_event_id: Mutex::new(None),
+        });
+        let manifest = DappManifest {
+            url: "https://demoswap.example".to_owned(),
+            name: "Demo Swap".to_owned(),
+            icon_url: String::new(),
+        };
+        let bridge = Arc::new(RecordingFakeBridge {
+            manifest: manifest.clone(),
+            inbox: Mutex::new(Vec::new()),
+            polled_last_ids: Mutex::new(Vec::new()),
+        });
+        let mut backend = LiveWalletBackend::with_dependencies(
+            1,
+            wallet_dir.clone(),
+            rt.handle().clone(),
+            WalletAppConfig::default(),
+            Some(Arc::clone(&toncenter) as Arc<dyn ToncenterApi>),
+            Some(Arc::clone(&bridge) as Arc<dyn TonConnectBridge>),
+            Arc::new(FakeWalletKeyProtector::new()),
+            PasscodeKdf::fast_test_kdf(),
+        );
+        let words = generate_mnemonic("").expect("synthetic test mnemonic");
+        backend
+            .create_wallet(&words, WalletVersion::V5R1, passcode)
+            .expect("create synthetic wallet");
+        let dapp_kp = TonConnectKeypair::generate();
+        let connect_url = format!(
+            "tc://?v=2&id={}&r=%7B%22manifestUrl%22%3A%22https%3A%2F%2Fdemoswap.example%2Ftonconnect-manifest.json%22%2C%22items%22%3A%5B%7B%22name%22%3A%22ton_addr%22%7D%5D%7D",
+            dapp_kp.client_id()
+        );
+        backend
+            .handle_ton_connect_link(&connect_url)
+            .expect("begin connect");
+        backend
+            .approve_ton_connect()
+            .expect("approve synthetic connect");
+        let wallet_cid = backend.sessions[0].session.wallet_client_id();
+        let dapp_session = TonConnectSession::new(dapp_kp, &wallet_cid, manifest).unwrap();
+        let dest = TonAddress::new(0, [0x33_u8; 32]).to_friendly(true, false);
+        let tx_req = json!({
+            "id": "d3-tx",
+            "method": "sendTransaction",
+            "params": [json!({
+                "valid_until": now_unix_u64() + 600,
+                "network": "-239",
+                "messages": [{ "address": dest, "amount": "100000000" }]
+            }).to_string()]
+        })
+        .to_string();
+        let event = || BridgeEvent {
+            id: Some("ev-d3-7".to_owned()),
+            from: dapp_session.wallet_client_id(),
+            message: dapp_session.encrypt_message(tx_req.as_bytes()).unwrap(),
+        };
+
+        // 1. The wallet folder cannot be written: the event is not processed and the cursor
+        //    stays where it was.
+        std::fs::remove_dir_all(&wallet_dir).expect("remove wallet dir");
+        std::fs::write(&wallet_dir, b"not a folder").expect("block wallet dir");
+        bridge.inbox.lock().unwrap().push(event());
+        assert_eq!(backend.poll_ton_connect_events().unwrap(), 0);
+        assert!(backend.pending_tx_queue.is_empty());
+        assert_eq!(backend.sessions[0].session.last_event_id, None);
+
+        // 2. A locked vault cannot save the cursor either.
+        std::fs::remove_file(&wallet_dir).expect("unblock wallet dir");
+        backend.vault.lock();
+        bridge.inbox.lock().unwrap().push(event());
+        assert_eq!(backend.poll_ton_connect_events().unwrap(), 0);
+        assert!(backend.pending_tx_queue.is_empty());
+        assert_eq!(backend.sessions[0].session.last_event_id, None);
+
+        // 3. Once the cursor can be saved, the re-delivered event is processed.
+        backend.unlock_vault(passcode).expect("unlock");
+        bridge.inbox.lock().unwrap().push(event());
+        assert_eq!(backend.poll_ton_connect_events().unwrap(), 1);
+        assert_eq!(
+            backend.sessions[0].session.last_event_id.as_deref(),
+            Some("ev-d3-7")
+        );
+        let polled = bridge.polled_last_ids.lock().unwrap();
+        assert!(
+            polled.iter().all(Option::is_none),
+            "every retry polls from the old cursor: {polled:?}"
         );
     }
 }

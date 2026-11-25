@@ -37,6 +37,19 @@ pub enum MembersAction {
 const SEARCH_MEMBERS_AFTER_COUNT: u32 = 20;
 /// Name / status left edge (`st::infoMembersList.item.namePosition.x`).
 const MEMBER_TEXT_LEFT: f32 = 79.0;
+/// `st::infoMembersHeader`.
+const MEMBERS_HEADER_HEIGHT: f32 = 56.0;
+/// `st::infoMembersList.item`: `defaultPeerListItem.height`, `photoSize`, `photoPosition`,
+/// `namePosition.y`, `statusPosition.y`.
+const MEMBER_ROW_HEIGHT: f32 = 58.0;
+const MEMBER_PHOTO_SIZE: f32 = 46.0;
+const MEMBER_PHOTO_LEFT: f32 = 18.0;
+const MEMBER_PHOTO_TOP: f32 = 6.0;
+const MEMBER_NAME_TOP: f32 = 11.0;
+const MEMBER_STATUS_TOP: f32 = 31.0;
+/// `defaultPeerListItem.photoPosition.x` + `contactsCheckPosition.x`: the tag's right margin
+/// (`MemberListRow::elementGeometry`).
+const MEMBER_TAG_RIGHT: f32 = 20.0;
 
 /// Renders a group's members list with inline search, admin badges, and quick actions.
 pub struct MembersSection;
@@ -88,13 +101,13 @@ impl MembersSection {
         let width = ui.available_width().max(200.0);
 
         if show_header {
-            // `Members::setupHeader`: `infoIconMembers` + uppercase count label + add button.
-            let hdr_h = (st::info_members_header.0 as f32).max(40.0);
-            let (hdr_rect, _) = ui.allocate_exact_size(Vec2::new(width, hdr_h), Sense::hover());
-            let icon_rect = Rect::from_center_size(
-                Pos2::new(hdr_rect.min.x + 30.0, hdr_rect.center().y),
-                Vec2::splat(24.0),
-            );
+            // `Members::setupHeader`: `infoIconMembers` at `infoGroupMembersIconPosition`, the
+            // uppercase `infoBlockHeaderLabel` at `infoBlockHeaderPosition` and the 38 px add
+            // button at `infoMembersButtonPosition` inside the `infoProfileSkip`-shifted row.
+            let (hdr_rect, _) =
+                ui.allocate_exact_size(Vec2::new(width, MEMBERS_HEADER_HEIGHT), Sense::hover());
+            let icon_rect =
+                Rect::from_min_size(hdr_rect.min + Vec2::new(20.0, 10.0), Vec2::splat(32.0));
             paint_style_icon(
                 ui.painter(),
                 icon_rect,
@@ -104,8 +117,8 @@ impl MembersSection {
             );
             let title = tr::lng_chat_status_members(i64::from(total_count)).to_uppercase();
             ui.painter().text(
-                Pos2::new(hdr_rect.min.x + MEMBER_TEXT_LEFT, hdr_rect.center().y),
-                Align2::LEFT_CENTER,
+                Pos2::new(hdr_rect.min.x + MEMBER_TEXT_LEFT, hdr_rect.min.y + 17.0),
+                Align2::LEFT_TOP,
                 title,
                 FontId::new(
                     font_id_from_style(st::semibold_font).size,
@@ -114,9 +127,9 @@ impl MembersSection {
                 colors.color("windowBoldFg"),
             );
             if can_add_members {
-                let add_rect = Rect::from_center_size(
-                    Pos2::new(hdr_rect.max.x - 26.0, hdr_rect.center().y),
-                    Vec2::splat(34.0),
+                let add_rect = Rect::from_min_size(
+                    Pos2::new(hdr_rect.max.x - 12.0 - 38.0, hdr_rect.min.y + 7.0),
+                    Vec2::splat(38.0),
                 );
                 if member_icon_btn(
                     ui,
@@ -188,8 +201,7 @@ fn member_row(
 ) -> Option<MembersAction> {
     let mut action = None;
     let width = ui.available_width().max(200.0);
-    let row_h = 54.0 + 2.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, MEMBER_ROW_HEIGHT), Sense::click());
     let row_label = format!("Member: {}", member.name);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, row_label.clone()));
     let hovered = resp.hovered();
@@ -199,22 +211,14 @@ fn member_row(
             .rect_filled(rect, CornerRadius::ZERO, colors.color("windowBgOver"));
     }
 
-    // Avatar (`st::infoMembersList.item.photoPosition`, 42 px).
+    // Photo (`st::infoMembersList.item.photoPosition`, `photoSize`). Peer list rows have no
+    // online dot in tdesktop: only the blue "online" status says so.
     let av_rect = Rect::from_min_size(
-        Pos2::new(rect.min.x + 18.0, rect.min.y + 7.0),
-        Vec2::splat(42.0),
+        rect.min + Vec2::new(MEMBER_PHOTO_LEFT, MEMBER_PHOTO_TOP),
+        Vec2::splat(MEMBER_PHOTO_SIZE),
     );
     EmptyUserpic::for_color_index(member.color_index, &member.name, colors)
         .paint_circle(ui.painter(), av_rect);
-
-    // Online green dot indicator when online.
-    if member.is_online {
-        let dot_c = Pos2::new(av_rect.max.x - 5.0, av_rect.max.y - 5.0);
-        ui.painter()
-            .circle_filled(dot_c, 5.5, colors.color("windowBg"));
-        ui.painter()
-            .circle_filled(dot_c, 4.0, colors.color("dialogsOnlineBadgeFg"));
-    }
 
     let text_left = rect.min.x + MEMBER_TEXT_LEFT;
 
@@ -278,35 +282,7 @@ fn member_row(
         }
         right_edge = cursor_x - 34.0;
     } else if let Some(badge) = effective_badge {
-        let badge_fg = match member.role {
-            MemberRole::Owner { .. } | MemberRole::Admin { .. } => {
-                colors.color("windowActiveTextFg")
-            }
-            MemberRole::Restricted { .. } => colors.color("attentionButtonFg"),
-            MemberRole::Member => colors.color("windowSubTextFg"),
-        };
-        let badge_font = FontId::new(11.0, family_semibold());
-        let galley = ui
-            .painter()
-            .layout_no_wrap(badge.to_owned(), badge_font.clone(), badge_fg);
-        let pill_w = galley.size().x + 12.0;
-        let pill = Rect::from_min_size(
-            Pos2::new(right_edge - pill_w, rect.min.y + 12.0),
-            Vec2::new(pill_w, 18.0),
-        );
-        ui.painter().rect_filled(
-            pill,
-            CornerRadius::same(4),
-            colors.color("lightButtonBgOver"),
-        );
-        ui.painter().text(
-            pill.center(),
-            Align2::CENTER_CENTER,
-            badge,
-            badge_font,
-            badge_fg,
-        );
-        right_edge = pill.min.x - 8.0;
+        right_edge = paint_member_tag(ui, rect, badge, &member.role, colors) - 8.0;
     }
 
     let clip = Rect::from_min_max(
@@ -314,12 +290,18 @@ fn member_row(
         Pos2::new(right_edge.max(text_left + 40.0), rect.max.y),
     );
     let p = ui.painter().with_clip_rect(clip);
-    p.text(
-        Pos2::new(text_left, rect.min.y + 11.0),
-        Align2::LEFT_TOP,
-        &member.name,
+    // `PeerListRow::paintNameIcon` / `Text::drawLeftElided`: the name ends in "…".
+    let name_fg = colors.color("windowBoldFg");
+    let mut name_job = egui::text::LayoutJob::simple_singleline(
+        member.name.clone(),
         font_id_from_style(st::semibold_font),
-        colors.color("windowBoldFg"),
+        name_fg,
+    );
+    name_job.wrap = egui::text::TextWrapping::truncate_at_width(clip.width());
+    p.galley(
+        Pos2::new(text_left, rect.min.y + MEMBER_NAME_TOP),
+        ui.fonts_mut(|f| f.layout_job(name_job)),
+        name_fg,
     );
     let st_fg = if member.is_online {
         colors.color("windowActiveTextFg")
@@ -327,7 +309,7 @@ fn member_row(
         colors.color("windowSubTextFg")
     };
     p.text(
-        Pos2::new(text_left, rect.min.y + 31.0),
+        Pos2::new(text_left, rect.min.y + MEMBER_STATUS_TOP),
         Align2::LEFT_TOP,
         &member.status_text,
         FontId::new(font_id_from_style(st::normal_font).size, family_regular()),
@@ -340,6 +322,52 @@ fn member_row(
         action = Some(MembersAction::OpenMemberProfile(member.peer_id));
     }
     action
+}
+
+/// Paints a member's tag at the row's right edge (`MemberListRow::paintTag`) and returns its
+/// left edge. Owners and admins get the `AdminPill`: `rankOwnerFg` / `rankAdminFg` text on the
+/// same colour at 12% in a fully rounded `memberTagPillPadding` pill; other tags are plain
+/// `rankUserFg` text. Restricted members keep `attentionButtonFg` text.
+fn paint_member_tag(ui: &Ui, rect: Rect, tag: &str, role: &MemberRole, colors: &dyn Colors) -> f32 {
+    let font = font_id_from_style(st::normal_font);
+    let (fg, pill) = match role {
+        MemberRole::Owner { .. } => (colors.color("rankOwnerFg"), true),
+        MemberRole::Admin { .. } => (colors.color("rankAdminFg"), true),
+        MemberRole::Restricted { .. } => (colors.color("attentionButtonFg"), false),
+        MemberRole::Member => (colors.color("rankUserFg"), false),
+    };
+    let galley = ui.painter().layout_no_wrap(tag.to_owned(), font, fg);
+    let text = galley.size();
+    // `memberTagPillPadding` = (5, -1, 5, 0) around a `normalFont` line.
+    let (w, h) = if pill {
+        let h = text.y - 1.0;
+        ((5.0 + text.x + 5.0).max(h), h)
+    } else {
+        (text.x, text.y)
+    };
+    let tag_rect = Rect::from_min_size(
+        Pos2::new(
+            rect.max.x - MEMBER_TAG_RIGHT - w,
+            rect.min.y + ((MEMBER_ROW_HEIGHT - h) * 0.5).round(),
+        ),
+        Vec2::new(w, h),
+    );
+    if pill {
+        ui.painter().rect_filled(
+            tag_rect,
+            CornerRadius::same((h * 0.5).floor() as u8),
+            fg.gamma_multiply(0.12),
+        );
+    }
+    ui.painter().galley(
+        Pos2::new(
+            tag_rect.center().x - text.x * 0.5,
+            tag_rect.min.y + if pill { -1.0 } else { 0.0 },
+        ),
+        galley,
+        fg,
+    );
+    tag_rect.min.x
 }
 
 fn member_icon_btn<H: std::hash::Hash + std::fmt::Debug>(
@@ -368,14 +396,8 @@ fn member_icon_btn<H: std::hash::Hash + std::fmt::Debug>(
     } else {
         icon
     };
-    let ic_rect = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
-    paint_style_icon(
-        ui.painter(),
-        ic_rect,
-        *active,
-        &ColorsResolver(colors),
-        None,
-    );
+    // `IconButton` icons at their natural size, centered (`iconPosition` = (-1, -1)).
+    paint_style_icon(ui.painter(), rect, *active, &ColorsResolver(colors), None);
     let resp = if !tooltip.is_empty() {
         resp.on_hover_text(tooltip)
     } else {

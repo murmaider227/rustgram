@@ -613,20 +613,20 @@ impl VideoEditorModalState {
     }
 
     /// Resolves the temporary output directory for exported video files: explicit override,
-    /// then the active account's temp folder, then the draft directory's `tmp_exports`, and only
-    /// as a last resort a PID-scoped fallback.
+    /// then the active account's temp folder, then the draft directory's `tmp_exports`. `None`
+    /// when none is known: an export is never written to `%TEMP%`.
     #[must_use]
-    pub fn resolve_export_temp_dir(&self) -> PathBuf {
+    pub fn resolve_export_temp_dir(&self) -> Option<PathBuf> {
         if let Some(ref dir) = self.export_temp_dir {
-            return dir.clone();
+            return Some(dir.clone());
         }
         if let Some(dir) = active_video_editor_temp_dir() {
-            return dir;
+            return Some(dir);
         }
-        if let Some(parent) = self.draft_path.as_ref().and_then(|p| p.parent()) {
-            return parent.join("tmp_exports");
-        }
-        std::env::temp_dir().join(format!("rustgram_video_edit_pid_{}", std::process::id()))
+        self.draft_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|parent| parent.join("tmp_exports"))
     }
 
     /// Runs an FFmpeg export to a temporary MP4 file under the account temp directory if a real
@@ -635,8 +635,10 @@ impl VideoEditorModalState {
         let mods = self.model.collect();
         let mut exported_path = None;
         let mut cover_jpeg = None;
-        if self.model.source_path.is_some() && tg_editor::video::is_ffmpeg_available() {
-            let out_dir = self.resolve_export_temp_dir();
+        if self.model.source_path.is_some()
+            && tg_editor::video::is_ffmpeg_available()
+            && let Some(out_dir) = self.resolve_export_temp_dir()
+        {
             let _ = std::fs::create_dir_all(&out_dir);
             let seq = NEXT_VIDEO_EDIT_EXPORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let out_path = out_dir.join(format!(
@@ -1751,7 +1753,7 @@ mod tests {
             VideoEditorModalState::open_for_file(0, "clip.mp4", 1280, 720, 5_000, 500_000, None, 1);
         assert_eq!(
             modal.resolve_export_temp_dir(),
-            acc_edit_dir,
+            Some(acc_edit_dir.clone()),
             "video editor temp export must use account temp folder, not %TEMP%"
         );
 
@@ -1765,5 +1767,13 @@ mod tests {
         );
 
         set_active_video_editor_temp_dir(None);
+
+        // SEC3-B1: with no account temp folder and no draft folder there is no export directory
+        // (older builds fell back to a PID-named folder in `%TEMP%`).
+        assert_eq!(
+            modal.resolve_export_temp_dir(),
+            None,
+            "video editor must not fall back to %TEMP%"
+        );
     }
 }

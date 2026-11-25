@@ -10,9 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import verify_report_privacy as vrp  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -301,7 +305,19 @@ def main() -> int:
     lines.append("")
 
     args.out_md.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[report] Wrote {args.out_json} and {args.out_md}", flush=True)
+
+    written = [args.out_json, args.out_md]
+    rc = vrp.verify_files(written)
+    if rc != 0:
+        for fp in written:
+            try:
+                fp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        sys.stderr.write("[report] Aborted: privacy verification failed; removed unsafe output files.\n")
+        return rc
+
+    print(f"[report] Wrote and verified {args.out_json} and {args.out_md}", flush=True)
     return 0
 
 

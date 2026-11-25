@@ -500,11 +500,13 @@ impl ProfileActionsView {
     }
 }
 
-/// `st::infoProfileButton`: padding (79, 10, 8, 8) around a 20 px text line, the 24 px icon at
-/// `iconLeft` = 22 drawn at its natural size.
+/// `st::infoProfileButton`: padding (79, 10, 8, 8) around a 20 px text line. The row icons are
+/// `FloatingIcon`s at `infoSharedMediaButtonIconPosition` = (20, 3), drawn at their natural
+/// 32 px size (an 18-20 px glyph).
 const PROFILE_BUTTON_HEIGHT: f32 = 38.0;
-const PROFILE_BUTTON_ICON_LEFT: f32 = 22.0;
-const PROFILE_BUTTON_ICON_SIZE: f32 = 24.0;
+const PROFILE_BUTTON_ICON_LEFT: f32 = 20.0;
+const PROFILE_BUTTON_ICON_TOP: f32 = 3.0;
+const PROFILE_BUTTON_ICON_SIZE: f32 = 32.0;
 const PROFILE_BUTTON_TEXT_LEFT: f32 = 79.0;
 
 /// `PhoneOrHiddenValue` (`info_profile_values.cpp`): a user (or bot) with no visible phone,
@@ -516,8 +518,9 @@ fn phone_is_hidden(peer: &PeerProfile) -> bool {
         && peer.bio.is_empty()
 }
 
-/// `defaultVerticalListSkip`, around the info blocks and dividers of the profile.
-pub(crate) const INFO_SECTION_SKIP: f32 = 6.0;
+/// `st::infoProfileSkip`: the `VerticalBlocks` skip above the first block, around every
+/// divider and after the last block of the profile.
+pub(crate) const INFO_SECTION_SKIP: f32 = 7.0;
 
 /// `st::infoProfileLabeledPadding` = (23, 9, 20, 7): the labeled info lines
 /// (`DetailsFiller::addInfoLine`) have no icon in 7.4.6; the text starts at 23 px.
@@ -629,10 +632,12 @@ fn info_value_row_with_qr(
     (clicked && !resp.clicked(), resp.clicked())
 }
 
-/// Uppercase semibold `lightButtonFg` button (`st::infoMainButton`, `AddMainButton`).
+/// Uppercase semibold `lightButtonFg` button (`st::infoMainButton`, `AddMainButton`): the
+/// `infoProfileButton` height with the text at 23 px.
 fn main_button(ui: &mut Ui, label: &str, colors: &dyn Colors) -> bool {
     let width = ui.available_width().max(180.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::click());
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(width, PROFILE_BUTTON_HEIGHT), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, label));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -740,7 +745,8 @@ fn action_row_enabled(
     } else if accent {
         colors.color("windowActiveTextFg")
     } else {
-        colors.color("windowFg")
+        // `defaultSettingsButton.textFg`.
+        colors.color("windowBoldFg")
     };
     let icon_fg = if !enabled {
         colors.color("windowSubTextFg")
@@ -754,7 +760,7 @@ fn action_row_enabled(
     let icon_rect = Rect::from_min_size(
         Pos2::new(
             rect.min.x + PROFILE_BUTTON_ICON_LEFT,
-            rect.center().y - PROFILE_BUTTON_ICON_SIZE * 0.5,
+            rect.min.y + PROFILE_BUTTON_ICON_TOP,
         ),
         Vec2::splat(PROFILE_BUTTON_ICON_SIZE),
     );

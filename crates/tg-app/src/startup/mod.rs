@@ -184,15 +184,19 @@ pub fn run_from_cli() -> anyhow::Result<()> {
                 return Ok(());
             }
             Err(err) => {
-                tracing::warn!(
+                tracing::error!(
                     %err,
-                    "Single-instance coordination failed; continuing without single-instance lock"
+                    "Single-instance coordination failed; not starting a second instance"
                 );
-                if plan.parsed_args.quit {
-                    log_manager.finish();
-                    return Ok(());
+                let refused = refuse_without_single_instance(&err, plan.parsed_args.quit);
+                if let Err(refusal) = &refused {
+                    tg_platform::single_instance::show_startup_error(
+                        "Rustgram",
+                        &refusal.to_string(),
+                    );
                 }
-                (None, ActivationQueue::new())
+                log_manager.finish();
+                return refused;
             }
         }
     } else {
@@ -312,6 +316,26 @@ fn init_tracing_with_file_logger(log_manager: Arc<LogManager>, debug: bool) {
         .with(TdLogLayer::new(log_manager))
         .try_init();
 }
+
+/// A launch that could neither take nor reach the single-instance lock must not open the same
+/// `tdata` a second time (a pre-created pipe name would otherwise disable the lock): with
+/// `-quit` there is nothing to stop, otherwise startup is refused.
+fn refuse_without_single_instance(
+    err: &tg_platform::PlatformError,
+    quit: bool,
+) -> anyhow::Result<()> {
+    if quit {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "Rustgram could not check whether it is already running for this data folder, so it \
+         will not start a second copy. Close other Rustgram windows and try again. ({err})"
+    ))
+}
+
+#[cfg(test)]
+#[path = "sec3_single_instance_tests.rs"]
+mod sec3_single_instance_tests;
 
 #[cfg(test)]
 mod tests {

@@ -16,7 +16,15 @@ working-directory, and output paths via CLI flags or environment variables.
 - `bench_part2.py` — Part 2 (test account): `probe` (layout discovery), `cold-start` (start to
   chat list loaded), `interactive` (open chat latency, 10 s wheel scroll CPU & frame pacing,
   memory after opening chats), and `delivery` (A → B message delivery latency).
-- `report.py` — Merges Part 1 and Part 2 JSON outputs into `results.json` and `BENCHMARKS.md`.
+- `report.py` — Merges Part 1 and Part 2 JSON outputs into `results.json` and `BENCHMARKS.md`,
+  and runs `verify_report_privacy.py` on every file it writes (deleting unsafe outputs on failure).
+- `workdir_safety.py` — Shared `ScratchSession` lifecycle guard: refuses scratch/diag directories
+  inside any git working tree, terminates full process trees via Win32 Job Objects + descendant
+  snapshots, retries `rmtree` and exits non-zero naming any leftover directory.
+- `ab_chat_ops.py` — Seeds and cleans up A↔B scroll-benchmark messages. Reads `BENCH_TARGET_LINK`
+  from `--target-link-file` / `BENCH_TARGET_LINK_FILE` or env (never passed on CLI or client argv),
+  locates the target chat by `--target-title` and verifies the open header, and verifies the
+  `DeleteMessagesBox` confirmation dialog before confirming deletion.
 - `bench_startup_fair.py` — Startup and open-chat comparison that measures both clients the same
   way (test account): start → first window visible, start → chat list drawn and stable, open a
   chat → history stable. See "Interactive desktop" below.

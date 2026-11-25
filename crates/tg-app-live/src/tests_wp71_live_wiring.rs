@@ -8,7 +8,7 @@
 //! 3. Live / background hook wiring for:
 //!    - `account.getSavedMusicIds` (triggered on `peer_saved_music`, respecting 30 s throttle)
 //!    - `messages.getAttachMenuBot` (via `BotsBackend::load_attach_menu_bot` & add hydration)
-//!    - `help.saveAppLog` (via `PaymentsBackend::log_premium_promo_event`, `peer == 0`)
+//!    - no `help.saveAppLog` (Premium promo events are not sent)
 //!    - `contacts.getStatuses` (periodic throttle, reconnect, and `PrivacyKey::LastSeen` change)
 //!    - `messages.getEmojiKeywordsLanguages` (triggered on live emoji keyword search with 1 h TTL)
 //!    - `messages.getMessagesReactions` (triggered on visible reacted group/channel messages with
@@ -1054,41 +1054,26 @@ fn wp71_bots_single_attach_menu_bot_lookup_triggers_get_attach_menu_bot() {
 }
 
 #[test]
-fn wp71_payments_premium_promo_event_triggers_help_save_app_log() {
+fn wp71_payments_premium_promo_event_sends_no_app_log() {
     let (_rt, rpc, live) = make_live_session();
 
-    rpc.enqueue_bool(tl_fns::help::SaveAppLog::CONSTRUCTOR_ID, true);
-    let ok_show = PaymentsBackend::log_premium_promo_event(
+    let shown = PaymentsBackend::log_premium_promo_event(
         &live,
         &PremiumPromoLogEvent::ScreenShow {
-            order: vec!["stories".to_owned(), "double_limits".to_owned()],
-            source: String::new(),
+            order: vec!["limits".to_owned()],
+            source: "settings".to_owned(),
         },
     )
-    .expect("log screen show");
-    assert!(ok_show);
-
-    rpc.enqueue_bool(tl_fns::help::SaveAppLog::CONSTRUCTOR_ID, true);
-    let ok_accept =
+    .expect("show");
+    let accepted =
         PaymentsBackend::log_premium_promo_event(&live, &PremiumPromoLogEvent::ScreenAccept)
-            .expect("log screen accept");
-    assert!(ok_accept);
-
-    let recorded = rpc.recorded_of(tl_fns::help::SaveAppLog::CONSTRUCTOR_ID);
-    assert_eq!(recorded.len(), 2);
-
-    let req0 = tl_fns::help::SaveAppLog::from_bytes(&recorded[0]).expect("decode show");
-    assert_eq!(req0.events.len(), 1);
-    let tl_enums::InputAppEvent::InputAppEvent(ref ev0) = req0.events[0];
-    assert_eq!(ev0.r#type, "premium.promo_screen_show");
-    assert_eq!(ev0.peer, 0);
-
-    let req1 = tl_fns::help::SaveAppLog::from_bytes(&recorded[1]).expect("decode accept");
-    assert_eq!(req1.events.len(), 1);
-    let tl_enums::InputAppEvent::InputAppEvent(ref ev1) = req1.events[0];
-    assert_eq!(ev1.r#type, "premium.promo_screen_accept");
-    assert_eq!(ev1.peer, 0);
-    assert_eq!(ev1.data, tl_enums::JSONValue::JsonNull);
+            .expect("accept");
+    assert!(!shown && !accepted, "Rustgram sends no app logs");
+    assert!(
+        rpc.recorded_of(tl_fns::help::SaveAppLog::CONSTRUCTOR_ID)
+            .is_empty(),
+        "help.saveAppLog must never be sent"
+    );
 }
 
 #[test]

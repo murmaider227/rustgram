@@ -9,7 +9,9 @@
 //! callers (such as CLI tools and tests), exposing a channel/async command API plus a
 //! live [`tg_data::ChangeEvent`] broadcast stream.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,7 +60,9 @@ pub struct SessionRuntimeConfig {
     /// (default: `true`).
     pub fetch_self_user_on_start: bool,
     /// The account's own user as saved in local storage, applied before the startup sync, so
-    /// `users.getUsers(Self)` is not needed (tdesktop reads it from local storage as well).
+    /// `users.getUsers(Self)` is not needed before the chat list (tdesktop reads it from local
+    /// storage as well). It is ignored unless it is the authorized user, and refreshed once in
+    /// the background after the startup sync.
     pub initial_self_user: Option<tg_tl::types::User>,
     /// Capacity of `tg_data::Session`'s [`ChangeEvent`] broadcast channel.
     pub changes_capacity: usize,
@@ -557,6 +561,8 @@ impl<C: RpcClient + Clone + 'static> SessionRuntime<C> {
             last_persisted_state: None,
             ready_result: None,
             ready_waiters: Vec::new(),
+            refresh_self_after_startup: false,
+            self_refresh: None,
         };
 
         handle.spawn(actor.run());
@@ -1334,9 +1340,21 @@ struct SessionActor<C: RpcClient> {
     last_persisted_state: Option<PersistedUpdatesState>,
     ready_result: Option<std::result::Result<(), String>>,
     ready_waiters: Vec<oneshot::Sender<Result<()>>>,
+    /// Set when the self user came from local storage: it is refreshed once from the server
+    /// after the startup sync, like `Main::Session` requesting the full self peer
+    /// (`main_session.cpp:195`), without delaying the first chat list.
+    refresh_self_after_startup: bool,
+    self_refresh: Option<SelfRefreshFuture>,
 }
 
-impl<C: RpcClient> SessionActor<C> {
+type SelfRefreshFuture = Pin<
+    Box<
+        dyn Future<Output = std::result::Result<Vec<tl_enums::User>, tg_api::InvocationError>>
+            + Send,
+    >,
+>;
+
+impl<C: RpcClient + Clone + 'static> SessionActor<C> {
     async fn run(mut self) {
         let startup_res = self.run_startup().await;
         match &startup_res {
@@ -1344,6 +1362,16 @@ impl<C: RpcClient> SessionActor<C> {
                 self.ready.store(true, Ordering::Release);
                 self.ready_result = Some(Ok(()));
                 let _ = self.session_events_tx.send(SessionEvent::Ready);
+                if self.refresh_self_after_startup {
+                    let rpc = self.rpc.clone();
+                    self.self_refresh = Some(Box::pin(async move {
+                        rpc.invoke(&tl_fns::users::GetUsers {
+                            id: vec![tl_enums::InputUser::Self_],
+                        })
+                        .await
+                        .map_err(Into::into)
+                    }));
+                }
             }
             Err(err) => {
                 let msg = err.to_string();
@@ -1499,7 +1527,28 @@ impl<C: RpcClient> SessionActor<C> {
                 _ = tick.tick() => {
                     self.handle_tick().await;
                 }
+                refreshed = poll_optional(&mut self.self_refresh), if self.self_refresh.is_some() => {
+                    self.self_refresh = None;
+                    self.apply_self_refresh(refreshed).await;
+                }
             }
+        }
+    }
+
+    async fn apply_self_refresh(
+        &mut self,
+        res: Option<std::result::Result<Vec<tl_enums::User>, tg_api::InvocationError>>,
+    ) {
+        match res {
+            Some(Ok(users)) => {
+                let mut session = self.session.write().await;
+                apply_tl_users_and_chats(&mut session, &users, &[]);
+                drop(session);
+                self.dialogs.register_peers_from_tl(&users, &[]);
+                self.drain_update_events().await;
+            }
+            Some(Err(err)) => debug!(error = %err, "background users.getUsers(Self) failed"),
+            None => {}
         }
     }
 
@@ -1510,12 +1559,20 @@ impl<C: RpcClient> SessionActor<C> {
         //    A copy saved in local storage is applied first; otherwise it is requested together
         //    with the updates state and the first dialogs page below (one round trip for all of
         //    them) and applied before the dialogs page.
-        if let Some(user) = self.config.initial_self_user.clone() {
+        //    A stored copy of another user is ignored (`storage_account.cpp:3363`).
+        let self_user_id = self.session.read().await.self_user_id();
+        let stored_self = self
+            .config
+            .initial_self_user
+            .clone()
+            .filter(|user| UserId::from_tl(user.id) == self_user_id);
+        if let Some(user) = stored_self {
             let users = vec![tl_enums::User::User(user)];
             let mut session = self.session.write().await;
             apply_tl_users_and_chats(&mut session, &users, &[]);
             drop(session);
             self.dialogs.register_peers_from_tl(&users, &[]);
+            self.refresh_self_after_startup = self.config.fetch_self_user_on_start;
         }
         let need_self = self.config.fetch_self_user_on_start && {
             let session = self.session.read().await;
@@ -2601,6 +2658,13 @@ impl<C: RpcClient> SessionActor<C> {
 
     fn now_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
+    }
+}
+
+async fn poll_optional<F: Future + Unpin>(fut: &mut Option<F>) -> Option<F::Output> {
+    match fut {
+        Some(f) => Some(f.await),
+        None => None,
     }
 }
 

@@ -37,6 +37,9 @@ pub enum EntryMenuRow {
     Item(EntryMenuItem),
     /// Horizontal separator.
     Separator,
+    /// `AddSeparatorAndShiftUp`: the full-width `expandedMenuSeparator` band. The menu opens
+    /// shifted up so the middle of this band is at the click point.
+    ExpandedSeparator,
 }
 
 impl EntryMenuRow {
@@ -86,7 +89,7 @@ impl EntryMenuRow {
     pub fn label(&self) -> Option<&str> {
         match self {
             Self::Item(item) => Some(&item.label),
-            Self::Separator => None,
+            Self::Separator | Self::ExpandedSeparator => None,
         }
     }
 
@@ -95,7 +98,7 @@ impl EntryMenuRow {
     pub fn id(&self) -> Option<&str> {
         match self {
             Self::Item(item) => Some(&item.id),
-            Self::Separator => None,
+            Self::Separator | Self::ExpandedSeparator => None,
         }
     }
 }
@@ -111,11 +114,24 @@ pub struct EntryMenu {
     opened_frame: u64,
 }
 
+/// `expandedMenuSeparator` (`ui/chat/chat.style`): 4 px padding above and below a 6 px band.
+const EXPANDED_SEPARATOR_PADDING: f32 = 4.0;
+const EXPANDED_SEPARATOR_WIDTH: f32 = 6.0;
+
 struct Metrics {
     row_h: f32,
     sep_h: f32,
     width: f32,
     height: f32,
+    /// `addTopShift` of `AddSeparatorAndShiftUp` (0 without an expanded separator).
+    top_shift: f32,
+}
+
+/// Width of `menuIconSubmenuArrow` (24 px at 100%).
+fn submenu_arrow_width() -> f32 {
+    st::menu_icon_submenu_arrow
+        .scaled_size()
+        .map_or(24.0, |size| size.width as f32)
 }
 
 fn measure(ctx: &egui::Context, rows: &[EntryMenuRow], style: &PopupMenuStyle) -> Metrics {
@@ -126,20 +142,28 @@ fn measure(ctx: &egui::Context, rows: &[EntryMenuRow], style: &PopupMenuStyle) -
     let sep_h = menu.separator.padding.vertical() + menu.separator.width;
     let painter = ctx.layer_painter(egui::LayerId::background());
     let mut width = menu.width_min;
-    let mut height = style.scroll_padding.vertical();
+    let mut y = style.scroll_padding.top;
+    let mut top_shift = None;
     for row in rows {
         match row {
-            EntryMenuRow::Separator => height += sep_h,
+            EntryMenuRow::Separator => y += sep_h,
+            EntryMenuRow::ExpandedSeparator => {
+                top_shift.get_or_insert(
+                    y + EXPANDED_SEPARATOR_PADDING + (EXPANDED_SEPARATOR_WIDTH / 2.0).floor(),
+                );
+                y += 2.0 * EXPANDED_SEPARATOR_PADDING + EXPANDED_SEPARATOR_WIDTH;
+            }
             EntryMenuRow::Item(item) => {
-                height += row_h;
+                y += row_h;
                 let text_w = painter
                     .layout_no_wrap(item.label.clone(), font.clone(), egui::Color32::WHITE)
                     .size()
                     .x;
+                // `Action::setMarkedText`: `itemRightSkip + arrow.width()` for submenu rows.
                 let arrow = if item.submenu.is_empty() {
                     0.0
                 } else {
-                    menu.item_right_skip + 8.0
+                    menu.item_right_skip + submenu_arrow_width()
                 };
                 width =
                     width.max(menu.item_padding.left + text_w + arrow + menu.item_padding.right);
@@ -150,7 +174,8 @@ fn measure(ctx: &egui::Context, rows: &[EntryMenuRow], style: &PopupMenuStyle) -
         row_h,
         sep_h,
         width: width.clamp(menu.width_min, menu.width_max).ceil(),
-        height,
+        height: y + style.scroll_padding.bottom,
+        top_shift: top_shift.unwrap_or(0.0),
     }
 }
 
@@ -215,6 +240,17 @@ fn paint_rows(
                         );
                         y += metrics.sep_h;
                     }
+                    EntryMenuRow::ExpandedSeparator => {
+                        painter.rect_filled(
+                            Rect::from_min_size(
+                                Pos2::new(rect.min.x, y + EXPANDED_SEPARATOR_PADDING),
+                                Vec2::new(rect.width(), EXPANDED_SEPARATOR_WIDTH),
+                            ),
+                            CornerRadius::ZERO,
+                            menu.separator.fg,
+                        );
+                        y += 2.0 * EXPANDED_SEPARATOR_PADDING + EXPANDED_SEPARATOR_WIDTH;
+                    }
                     EntryMenuRow::Item(item) => {
                         let item_rect = Rect::from_min_size(
                             Pos2::new(rect.min.x, y),
@@ -240,24 +276,24 @@ fn paint_rows(
                             menu.item_fg
                         };
                         if let Some(icon) = item.icon {
-                            let icon_fg = if item.attention {
-                                menu.item_fg_attention
-                            } else if active {
-                                menu.item_icon_fg_over
-                            } else {
-                                menu.item_icon_fg
-                            };
+                            // `icon->paint(p, itemIconPosition)` in the icon's own colour
+                            // (`menuIconColor`, i.e. `windowBoldFg`); attention rows use
+                            // `menuIconAttentionColor`.
+                            let icon_fg = item.attention.then_some(menu.item_fg_attention);
                             let icon_pos = item_rect.min
                                 + Vec2::new(
                                     px(st::menu_with_icons.item_icon_position.x),
                                     px(st::menu_with_icons.item_icon_position.y),
                                 );
+                            let icon_size = icon.scaled_size().map_or(Vec2::splat(24.0), |sz| {
+                                Vec2::new(sz.width as f32, sz.height as f32)
+                            });
                             paint_style_icon(
                                 &painter,
-                                Rect::from_min_size(icon_pos, Vec2::splat(26.0)),
+                                Rect::from_min_size(icon_pos, icon_size),
                                 icon,
                                 colors,
-                                Some(icon_fg),
+                                icon_fg,
                             );
                         }
                         painter.text(
@@ -271,12 +307,14 @@ fn paint_rows(
                             fg,
                         );
                         if !item.submenu.is_empty() {
-                            let arrow = Rect::from_center_size(
+                            // `Action::paint`: `width() - itemRightSkip - arrow.width()`.
+                            let aw = submenu_arrow_width();
+                            let arrow = Rect::from_min_size(
                                 Pos2::new(
-                                    item_rect.max.x - menu.item_padding.right + 4.0,
-                                    item_rect.center().y,
+                                    item_rect.max.x - menu.item_right_skip - aw,
+                                    item_rect.center().y - aw * 0.5,
                                 ),
-                                Vec2::splat(16.0),
+                                Vec2::splat(aw),
                             );
                             paint_style_icon(
                                 &painter,
@@ -370,8 +408,7 @@ impl EntryMenu {
                 .x
                 .min(screen.max.x - metrics.width - 4.0)
                 .max(screen.min.x + 4.0),
-            self.anchor
-                .y
+            (self.anchor.y - metrics.top_shift)
                 .min(screen.max.y - metrics.height - 4.0)
                 .max(screen.min.y + 4.0),
         );

@@ -19,7 +19,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
 import win_capture as wc  # noqa: E402
+import workdir_safety as ws  # noqa: E402
 
 
 def wait_ui(sec: float = 0.5) -> None:
@@ -88,7 +90,7 @@ def toggle_night_mode(hwnd: int) -> None:
     wait_ui(0.45)
     wc.click_client(hwnd, *MENU_NIGHT_MODE)
     wait_ui(0.8)
-    wc.send_hotkey("ESC")
+    wc.send_hotkey(hwnd, "ESC")
     wait_ui(0.3)
 
 
@@ -103,12 +105,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Capture 30 UI parity screens from Rustgram.")
     ap.add_argument("--exe", default=os.environ.get("UIPARITY_RUSTGRAM_EXE", ""))
     ap.add_argument("--workdir", default=os.environ.get("UIPARITY_RUSTGRAM_WORKDIR", ""))
+    ap.add_argument("--scratch-dir", default=os.environ.get("UIPARITY_SCRATCH_DIR", ""),
+                    help="Private directory outside the git repo for temporary workdir copies (required when launching)")
     ap.add_argument("--snap-dir", default=os.environ.get("UIPARITY_SNAP_DIR", ""))
     ap.add_argument("--credentials-doc", default=os.environ.get("UIPARITY_CREDS_DOC", ""))
     ap.add_argument("--ffmpeg-bin", default=os.environ.get("UIPARITY_FFMPEG_BIN", ""))
     ap.add_argument("--desktop", default="Default")
     ap.add_argument("--attach-pid", type=int, default=0,
                     help="Drive an already running Rustgram (live, test DC) instead of launching one")
+    ap.add_argument("--test-account", action="store_true",
+                    help="Confirm the target Rustgram window/workdir belongs to a disposable test account (required)")
     ap.add_argument("--pos", default="1980,60")
     ap.add_argument("--row-dm", type=int, default=0)
     ap.add_argument("--row-group", type=int, default=1)
@@ -121,42 +127,70 @@ def main() -> int:
     ap.add_argument("--photo-y", type=int, default=560)
     args = ap.parse_args()
 
+    try:
+        wc.require_test_account_confirmation(args.test_account, "capture_rustgram.py")
+    except PermissionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     if not args.snap_dir or not (args.attach_pid or (args.exe and args.workdir)):
         print("Pass --snap-dir and either --attach-pid or --exe with --workdir", file=sys.stderr)
         return 2
 
-    snap_dir = Path(args.snap_dir)
+    launched = not args.attach_pid
+    if launched and not args.scratch_dir:
+        print("Pass --scratch-dir (or set UIPARITY_SCRATCH_DIR) outside the git repo when launching Rustgram", file=sys.stderr)
+        return 2
+
+    try:
+        snap_dir = ws.ensure_outside_git_repo(Path(args.snap_dir), label="--snap-dir")
+        if launched:
+            scratch_dir = ws.ensure_outside_git_repo(Path(args.scratch_dir), label="--scratch-dir")
+        else:
+            scratch_dir = None
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     snap_dir.mkdir(parents=True, exist_ok=True)
     pos_x, pos_y = (int(v) for v in args.pos.split(","))
 
-    launched = not args.attach_pid
-    if launched:
-        for stale in [Path(args.workdir) / "tdata" / "working", Path(args.workdir) / "shell_state.json"]:
-            if stale.exists():
-                stale.unlink()
-
-        api_id, api_hash = load_credentials(args.credentials_doc)
-        env = os.environ.copy()
-        env["RUSTGRAM_API_ID"] = api_id
-        env["RUSTGRAM_API_HASH"] = api_hash
-        env["RUSTGRAM_LIVE"] = "1"
-        env["TGFORK_HEADLESS_AUDIO"] = "1"
-        if args.ffmpeg_bin:
-            env["PATH"] = args.ffmpeg_bin + os.pathsep + env.get("PATH", "")
-
-        desktop_arg = rf"WinSta0\{args.desktop}" if args.desktop.lower() != "current" else ""
-        pid = wc.launch_on_desktop(
-            args.exe,
-            ["--live", "-testmode", "-many", "-noupdate", "-workdir", args.workdir],
-            env,
-            desktop=desktop_arg,
-        )
-        print(f"Launched Rustgram PID={pid}")
-    else:
-        pid = args.attach_pid
-        print(f"Attaching to Rustgram PID={pid}")
-    hdesk = wc.attach_desktop(args.desktop) if args.desktop.lower() != "current" else None
+    session_cm = (
+        ws.ScratchSession(scratch_dir, graceful_timeout_s=5.0, post_stop_delay_s=1.5)
+        if launched and scratch_dir is not None
+        else None
+    )
+    hdesk = None
     try:
+        if session_cm is not None:
+            session_cm.__enter__()
+            wd_copy = session_cm.copy_workdir(Path(args.workdir), "uiparity_rustgram_wd")
+            for stale in [wd_copy / "tdata" / "working", wd_copy / "shell_state.json"]:
+                if stale.exists():
+                    stale.unlink()
+
+            api_id, api_hash = load_credentials(args.credentials_doc)
+            env = os.environ.copy()
+            env["RUSTGRAM_API_ID"] = api_id
+            env["RUSTGRAM_API_HASH"] = api_hash
+            env["RUSTGRAM_LIVE"] = "1"
+            env["TGFORK_HEADLESS_AUDIO"] = "1"
+            if args.ffmpeg_bin:
+                env["PATH"] = args.ffmpeg_bin + os.pathsep + env.get("PATH", "")
+
+            desktop_arg = rf"WinSta0\{args.desktop}" if args.desktop.lower() != "current" else ""
+            pid = wc.launch_on_desktop(
+                args.exe,
+                ["--live", "-testmode", "-many", "-noupdate", "-workdir", str(wd_copy)],
+                env,
+                desktop=desktop_arg,
+            )
+            session_cm.track_process(pid)
+            print(f"Launched Rustgram PID={pid}")
+        else:
+            pid = args.attach_pid
+            print(f"Attaching to Rustgram PID={pid}")
+        hdesk = wc.attach_desktop(args.desktop) if args.desktop.lower() != "current" else None
         win = None
         for _ in range(50):
             time.sleep(0.4)
@@ -173,7 +207,7 @@ def main() -> int:
         # 01. Chat list (all chats) with folders bar (no active chat selected)
         wc.click_client(hwnd, 36, 110)  # All chats folder
         wait_ui(0.3)
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.5)
         snap(hwnd, snap_dir, "01_chat_list_folders")
 
@@ -185,11 +219,11 @@ def main() -> int:
         # 05. Composer focused with text
         wc.click_client(hwnd, *COMPOSER)
         wait_ui(0.25)
-        wc.send_text("Checking composer focus, caret, and send button styling")
+        wc.send_text(hwnd, "Checking composer focus, caret, and send button styling")
         wait_ui(0.35)
         snap(hwnd, snap_dir, "05_composer_text")
-        wc.send_hotkey("CTRL", "A")
-        wc.send_hotkey("BACK")
+        wc.send_hotkey(hwnd, "CTRL", "A")
+        wc.send_hotkey(hwnd, "BACK")
         wait_ui(0.25)
 
         # 06-08. Emoji / Stickers / GIFs in the docked third column
@@ -216,14 +250,14 @@ def main() -> int:
         wc.click_client(hwnd, args.msg_x + FORWARD_OFFSET[0], args.msg_y + FORWARD_OFFSET[1])
         wait_ui(0.8)
         snap(hwnd, snap_dir, "20_forward_box")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.4)
 
         # 10. Chat list context menu (right-click DM row)
         wc.click_client(hwnd, ROW_X, row_y(args.row_dm), button="right")
         wait_ui(0.6)
         snap(hwnd, snap_dir, "10_chat_list_context_menu")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.4)
 
         # 11. User profile (third column)
@@ -237,7 +271,7 @@ def main() -> int:
         wc.click_client(hwnd, args.photo_x, args.photo_y)
         wait_ui(1.2)
         snap(hwnd, snap_dir, "19_media_viewer_photo")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.5)
 
         # 03. Group chat & 12. Group info
@@ -263,10 +297,10 @@ def main() -> int:
         # 18. Search (global, with results)
         wc.click_client(hwnd, *SEARCH)
         wait_ui(0.3)
-        wc.send_text(args.search_query)
+        wc.send_text(hwnd, args.search_query)
         wait_ui(2.0)
         snap(hwnd, snap_dir, "18_search_global")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.4)
 
         # 22. Main menu
@@ -278,7 +312,7 @@ def main() -> int:
         wc.click_client(hwnd, *MENU_NEW_GROUP)
         wait_ui(0.8)
         snap(hwnd, snap_dir, "21_new_group_box")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.4)
 
         # 13-17. Settings layer + sub-pages
@@ -304,7 +338,7 @@ def main() -> int:
         ensure_size(hwnd, 390, 844, pos_x, pos_y)
         wait_ui(0.8)
         snap(hwnd, snap_dir, "30_narrow_chat", "390x844")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.6)
         snap(hwnd, snap_dir, "29_narrow_chat_list", "390x844")
 
@@ -312,7 +346,7 @@ def main() -> int:
         ensure_size(hwnd, 1440, 900, pos_x, pos_y)
         wait_ui(0.5)
         toggle_night_mode(hwnd)
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.5)
         snap(hwnd, snap_dir, "24_night_chat_list")
 
@@ -348,12 +382,19 @@ def main() -> int:
         wc.user32.PostMessageW(hwnd, 0x0010, 0, 0)
         wait_ui(1.0)
         return 0
+    except wc.ForegroundWindowError as exc:
+        print(f"[capture_rustgram] {exc}", file=sys.stderr)
+        return 3
     finally:
-        if launched:
-            wc.kill_pid(pid)
         if hdesk:
             wc.user32.CloseDesktop(hdesk)
+        if session_cm is not None:
+            session_cm.__exit__(None, None, None)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except ws.WorkdirCleanupError as exc:
+        print(f"[capture_rustgram] {exc}", file=sys.stderr)
+        raise SystemExit(4)

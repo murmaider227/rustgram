@@ -52,6 +52,15 @@ pub enum InnerAction {
     OpenMuteFor(PeerId),
     /// Mute submenu "Select tone" (`RingtonesBox`).
     OpenSelectTone(PeerId),
+    /// "Clear history" (`just_clear`) or "Delete chat" / "Delete and leave" / "Leave": opens
+    /// `DeleteMessagesBox` (`ClearHistoryHandler` / `DeleteAndLeaveHandler`); nothing is sent
+    /// before the box is confirmed.
+    ConfirmDelete {
+        /// Chat to clear, delete or leave.
+        peer_id: PeerId,
+        /// `true` for "Clear history".
+        just_clear: bool,
+    },
 }
 
 /// Runs the chat-list block row for `peer_id`: blocks or unblocks through the same
@@ -116,6 +125,11 @@ pub fn mute_submenu_rows(silent: bool) -> Vec<EntryMenuRow> {
 
 /// Menu id of the chat-list block / unblock row.
 pub const BLOCK_USER_ACTION: &str = "block_user";
+/// Menu id of "Clear history" (opens the confirmation box).
+pub const CLEAR_HISTORY_ACTION: &str = "clear_history";
+/// Menu id of "Delete chat" / "Delete and leave" / "Leave group" / "Leave channel" (opens the
+/// confirmation box).
+pub const DELETE_CHAT_ACTION: &str = "delete_chat";
 
 /// The chat-list `"Block user"` row (`Filler::fillContextMenuActions` adds it only for users who
 /// are not contacts; `Filler::addBlockUser` skips self, Replies and Verification Codes). The label
@@ -902,12 +916,19 @@ impl DialogsInnerWidget {
             backend.reorder_pinned(list, from, to);
         }
 
-        // Execute any swipe / hover-pill / middle-click dialog quick action.
-        if let Some(peer_id) = pending_quick_action
-            && let Some(toast) =
+        // Execute any swipe / hover-pill / middle-click dialog quick action. "Delete" opens the
+        // same confirmation box as the menu (`DeleteAndLeaveHandler`).
+        if let Some(peer_id) = pending_quick_action {
+            if self.quick_dialog_action == QuickDialogAction::Delete {
+                action = Some(InnerAction::ConfirmDelete {
+                    peer_id,
+                    just_clear: false,
+                });
+            } else if let Some(toast) =
                 perform_quick_dialog_action(backend, peer_id, self.quick_dialog_action, list)
-        {
-            action = Some(InnerAction::Toast(toast));
+            {
+                action = Some(InnerAction::Toast(toast));
+            }
         }
 
         // Grow pagination window when user scrolls near the bottom.
@@ -947,6 +968,15 @@ impl DialogsInnerWidget {
                     (target, triggered.as_str())
                 {
                     action = Some(InnerAction::OpenSelectTone(peer_id));
+                } else if let (
+                    ContextTarget::Dialog(peer_id),
+                    CLEAR_HISTORY_ACTION | DELETE_CHAT_ACTION,
+                ) = (target, triggered.as_str())
+                {
+                    action = Some(InnerAction::ConfirmDelete {
+                        peer_id,
+                        just_clear: triggered == CLEAR_HISTORY_ACTION,
+                    });
                 } else if let Some(toast) =
                     execute_context_action(&triggered, target, backend, list)
                 {
@@ -995,7 +1025,9 @@ pub fn dialog_context_menu_items(
     fn flatten(rows: &[EntryMenuRow], out: &mut Vec<MenuItem>) {
         for row in rows {
             match row {
-                EntryMenuRow::Separator => out.push(MenuItem::Separator),
+                EntryMenuRow::Separator | EntryMenuRow::ExpandedSeparator => {
+                    out.push(MenuItem::Separator);
+                }
                 EntryMenuRow::Item(item) => {
                     let mut entry = MenuItem::action(item.id.clone(), item.label.clone());
                     if let Some(icon) = item.icon {
@@ -1077,7 +1109,7 @@ fn build_context_menu_rows(
                 tg_lang::tr::lng_context_new_window(),
                 Some(st::menu_icon_new_window),
             ));
-            rows.push(EntryMenuRow::Separator);
+            rows.push(EntryMenuRow::ExpandedSeparator);
 
             if is_promoted {
                 rows.push(EntryMenuRow::action(
@@ -1137,7 +1169,11 @@ fn build_context_menu_rows(
                     let silent = backend.dialog_notify_sound(peer_id).none;
                     rows.push(EntryMenuRow::submenu(
                         tg_lang::tr::lng_context_mute(),
-                        Some(st::menu_icon_mute),
+                        Some(if silent {
+                            st::menu_icon_silent
+                        } else {
+                            st::menu_icon_mute
+                        }),
                         mute_submenu_rows(silent),
                     ));
                 }
@@ -1192,35 +1228,37 @@ fn build_context_menu_rows(
             // `addClearHistory` (channels only when the user can delete messages).
             if item.kind != DialogPeerKind::Channel {
                 rows.push(EntryMenuRow::action(
-                    "clear_history",
+                    CLEAR_HISTORY_ACTION,
                     tg_lang::tr::lng_profile_clear_history(),
                     Some(st::menu_icon_clear),
                 ));
             }
-            // `addDeleteChat` / `addLeaveChat`.
-            match item.kind {
-                DialogPeerKind::User | DialogPeerKind::Bot => {
-                    rows.push(EntryMenuRow::attention(
-                        "delete_chat",
-                        tg_lang::tr::lng_profile_delete_conversation(),
-                        Some(st::menu_icon_delete_attention),
-                    ));
-                }
-                DialogPeerKind::Group | DialogPeerKind::Forum => {
-                    rows.push(EntryMenuRow::attention(
-                        "delete_chat",
-                        tg_lang::tr::lng_profile_leave_group(),
-                        Some(st::menu_icon_leave_attention),
-                    ));
-                }
-                DialogPeerKind::Channel => {
-                    rows.push(EntryMenuRow::attention(
-                        "delete_chat",
-                        tg_lang::tr::lng_profile_leave_channel(),
-                        Some(st::menu_icon_leave_attention),
-                    ));
-                }
-            }
+            // `addDeleteChat` (users: "Delete chat", basic groups: "Delete and leave") /
+            // `addLeaveChat` (supergroups and channels).
+            let basic_group = peer_id.kind() == tg_app_core::stand_in::types::PeerKind::Group;
+            let (label, icon) = match item.kind {
+                DialogPeerKind::User | DialogPeerKind::Bot => (
+                    tg_lang::tr::lng_profile_delete_conversation(),
+                    st::menu_icon_delete_attention,
+                ),
+                DialogPeerKind::Group | DialogPeerKind::Forum if basic_group => (
+                    tg_lang::tr::lng_profile_clear_and_exit(),
+                    st::menu_icon_delete_attention,
+                ),
+                DialogPeerKind::Group | DialogPeerKind::Forum => (
+                    tg_lang::tr::lng_profile_leave_group(),
+                    st::menu_icon_leave_attention,
+                ),
+                DialogPeerKind::Channel => (
+                    tg_lang::tr::lng_profile_leave_channel(),
+                    st::menu_icon_leave_attention,
+                ),
+            };
+            rows.push(EntryMenuRow::attention(
+                DELETE_CHAT_ACTION,
+                label,
+                Some(icon),
+            ));
             rows
         }
     }
@@ -1323,14 +1361,6 @@ fn execute_context_action(
                         backend.mark_dialog_unread(peer_id);
                         Some(strings::TOAST_MARKED_UNREAD.to_owned())
                     }
-                }
-                "clear_history" => {
-                    backend.clear_history(peer_id);
-                    Some(strings::TOAST_HISTORY_CLEARED.to_owned())
-                }
-                "delete_chat" => {
-                    backend.delete_dialog(peer_id);
-                    Some(strings::TOAST_CHAT_REMOVED.to_owned())
                 }
                 _ => None,
             }

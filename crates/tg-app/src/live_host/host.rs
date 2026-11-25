@@ -518,6 +518,8 @@ impl LiveActiveWorkspace {
         if !self.controller.is_passcode_locked() {
             self.dispatch_deep_link_overlay_requests(ctx);
         }
+        self.calls_host
+            .set_passcode_locked(self.controller.is_passcode_locked());
         self.calls_host.update_and_render(ui);
 
         // 3b. Feed freshly decoded live RTMP/HLS stream frames into the viewer before painting.
@@ -531,13 +533,24 @@ impl LiveActiveWorkspace {
             );
         }
 
-        // 4. Render the unified WindowController + MainWidget + embedded StoriesStrip.
+        // 4. Render the unified WindowController + MainWidget + embedded StoriesStrip. Nothing is
+        //    marked read while a host overlay covers the chat (SEC3-A A2).
+        let host_overlay_open = self.stories_host.has_open_window()
+            || self.business_open
+            || self.payments_open
+            || crate::wallet::AppWalletHost::is_open(ctx);
+        self.controller
+            .main_widget_mut()
+            .history_mut()
+            .inner_mut()
+            .set_host_overlay_open(host_overlay_open);
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
             self.controller
                 .show_with_stories(ui, Some(&mut self.stories_host));
         });
 
         let locked = self.controller.is_passcode_locked();
+        self.calls_host.set_passcode_locked(locked);
         if locked {
             self.close_for_passcode_lock(ctx);
         } else {

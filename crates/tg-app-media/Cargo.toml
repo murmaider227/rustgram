@@ -23,6 +23,7 @@ tg-iv = { path = "../tg-iv" }
 tg-lang = { path = "../tg-lang" }
 tg-media = { path = "../tg-media" }
 tg-platform = { path = "../tg-platform" }
+tg-storage = { path = "../tg-storage" }
 tg-stories = { path = "../tg-stories" }
 tg-text = { path = "../tg-text" }
 tg-tgw = { path = "../tg-tgw" }

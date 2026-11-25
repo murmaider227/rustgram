@@ -252,6 +252,31 @@ where
     }
 }
 
+/// Shows a blocking error message box (Windows) or prints `message` to stderr (elsewhere), for
+/// startup failures that happen before any window exists.
+pub fn show_startup_error(title: &str, message: &str) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        use windows::core::PCWSTR;
+        let title_w = crate::app_id::win_impl::to_wide(title);
+        let message_w = crate::app_id::win_impl::to_wide(message);
+        // SAFETY: Both strings are valid null-terminated UTF-16 buffers alive for the call.
+        let _ = unsafe {
+            MessageBoxW(
+                None,
+                PCWSTR(message_w.as_ptr()),
+                PCWSTR(title_w.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            )
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("{title}: {message}");
+    }
+}
+
 /// Activate a window belonging to another running process (`specific_win.cpp` `ActivateOtherProcess`).
 ///
 /// If `window_id` is `0`, picks the highest-priority top-level window belonging to `process_id`
@@ -295,7 +320,7 @@ mod win_ipc {
         GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_EVENT, WAIT_OBJECT_0,
     };
     use windows::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, GetLengthSid,
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, EqualSid, GetLengthSid,
         GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR,
         PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_QUERY,
         TOKEN_USER, TokenUser,
@@ -303,19 +328,19 @@ mod win_ipc {
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
         FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, FlushFileBuffers, OPEN_EXISTING,
-        PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
     };
     use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-        PIPE_WAIT, WaitNamedPipeW,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+        NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
     };
     use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
     use windows::Win32::System::Threading::{
         CreateEventW, CreateMutexW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken,
-        PROCESS_SYNCHRONIZE, ReleaseMutex, ResetEvent, SetEvent, WaitForMultipleObjects,
-        WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ReleaseMutex, ResetEvent, SetEvent,
+        WaitForMultipleObjects, WaitForSingleObject,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -399,6 +424,11 @@ mod win_ipc {
         }
     }
 
+    /// Client open flags: security quality of service at identification level only.
+    pub(crate) fn client_pipe_flags() -> FILE_FLAGS_AND_ATTRIBUTES {
+        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+    }
+
     pub(crate) fn pipe_mode() -> NAMED_PIPE_MODE {
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS
     }
@@ -413,19 +443,16 @@ mod win_ipc {
         }
     }
 
-    /// Owns the backing buffers for a Windows `SECURITY_DESCRIPTOR` with an explicit DACL
-    /// granting access solely to the current process user's SID.
-    pub(crate) struct CurrentUserSecurityDescriptor {
-        _token_user_buf: Vec<u8>,
-        _acl_buf: Vec<u32>,
-        sd: SECURITY_DESCRIPTOR,
-    }
+    /// `TOKEN_USER` of a process token in 8-byte aligned storage (`TOKEN_USER` holds a pointer,
+    /// and the SID it points to lives in the same buffer).
+    pub(crate) struct TokenUserBuf(Vec<u64>);
 
-    impl CurrentUserSecurityDescriptor {
-        pub(crate) fn new() -> Result<Self> {
+    impl TokenUserBuf {
+        /// Reads the user of `process`'s primary token.
+        pub(crate) fn of_process(process: HANDLE) -> Result<Self> {
             let mut token = HANDLE::default();
-            // SAFETY: Opening current process token with TOKEN_QUERY right.
-            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+            // SAFETY: Opening the process token with TOKEN_QUERY right.
+            unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
                 .map_err(|e| PlatformError::from_win("OpenProcessToken", e))?;
             let _token_guard = OwnedHandle(token);
 
@@ -443,27 +470,70 @@ mod win_ipc {
                 return Err(PlatformError::last_win32("GetTokenInformation(probe)"));
             }
 
-            let mut token_user_buf = vec![0u8; needed as usize];
-            // SAFETY: Filling caller-allocated buffer of exact queried size with TOKEN_USER.
+            let words = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+            let mut buf = vec![0u64; words];
+            let len = (words * std::mem::size_of::<u64>()) as u32;
+            // SAFETY: Filling an 8-byte aligned caller buffer of at least the queried size.
             unsafe {
                 GetTokenInformation(
                     token,
                     TokenUser,
-                    Some(token_user_buf.as_mut_ptr().cast()),
-                    needed,
+                    Some(buf.as_mut_ptr().cast()),
+                    len,
                     &mut needed,
                 )
             }
             .map_err(|e| PlatformError::from_win("GetTokenInformation(TokenUser)", e))?;
-
-            // SAFETY: `token_user_buf` was populated by GetTokenInformation(TokenUser).
-            let user_sid: PSID =
-                unsafe { (*(token_user_buf.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-            if user_sid.0.is_null() {
+            let this = Self(buf);
+            if this.sid().0.is_null() {
                 return Err(PlatformError::Ipc(
-                    "current process token returned null user SID".into(),
+                    "process token returned null user SID".into(),
                 ));
             }
+            Ok(this)
+        }
+
+        /// The user SID (valid while `self` lives).
+        pub(crate) fn sid(&self) -> PSID {
+            // SAFETY: The buffer was filled by GetTokenInformation(TokenUser), is aligned for
+            // TOKEN_USER (u64 storage) and at least `size_of::<TOKEN_USER>()` bytes long.
+            unsafe { (*(self.0.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+        }
+    }
+
+    /// Checks that the process serving the connected client pipe `pipe` runs as the current
+    /// user, so activations (links, arguments) never go to another user's squatting process.
+    pub(crate) fn verify_pipe_server_user(pipe: HANDLE) -> Result<()> {
+        let mut server_pid: u32 = 0;
+        // SAFETY: `pipe` is a connected client end of a named pipe.
+        unsafe { GetNamedPipeServerProcessId(pipe, &mut server_pid) }
+            .map_err(|e| PlatformError::from_win("GetNamedPipeServerProcessId", e))?;
+        // SAFETY: Opening the server process for a limited token query only.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, server_pid) }
+            .map_err(|e| PlatformError::from_win("OpenProcess(pipe server)", e))?;
+        let _process_guard = OwnedHandle(process);
+        let server_user = TokenUserBuf::of_process(process)?;
+        // SAFETY: Pseudo-handle of the current process.
+        let own_user = TokenUserBuf::of_process(unsafe { GetCurrentProcess() })?;
+        // SAFETY: Both SIDs are valid while their buffers live.
+        unsafe { EqualSid(server_user.sid(), own_user.sid()) }.map_err(|_| {
+            PlatformError::Ipc("single-instance pipe is served by another user's process".into())
+        })
+    }
+
+    /// Owns the backing buffers for a Windows `SECURITY_DESCRIPTOR` with an explicit DACL
+    /// granting access solely to the current process user's SID.
+    pub(crate) struct CurrentUserSecurityDescriptor {
+        _token_user: TokenUserBuf,
+        _acl_buf: Vec<u32>,
+        sd: SECURITY_DESCRIPTOR,
+    }
+
+    impl CurrentUserSecurityDescriptor {
+        pub(crate) fn new() -> Result<Self> {
+            // SAFETY: Pseudo-handle of the current process.
+            let token_user = TokenUserBuf::of_process(unsafe { GetCurrentProcess() })?;
+            let user_sid: PSID = token_user.sid();
 
             // SAFETY: `user_sid` is a valid SID returned by GetTokenInformation.
             let sid_len = unsafe { GetLengthSid(user_sid) } as usize;
@@ -493,7 +563,7 @@ mod win_ipc {
                 .map_err(|e| PlatformError::from_win("SetSecurityDescriptorDacl", e))?;
 
             Ok(Self {
-                _token_user_buf: token_user_buf,
+                _token_user: token_user,
                 _acl_buf: acl_buf,
                 sd,
             })
@@ -637,7 +707,10 @@ mod win_ipc {
                     let _ = ReleaseMutex(mutex);
                     let _ = CloseHandle(mutex);
                 }
-                return Err(e);
+                return Err(PlatformError::Ipc(format!(
+                    "single-instance pipe '{p_path}' could not be created (held by another \
+                     process?): {e}"
+                )));
             }
         };
 
@@ -841,7 +914,8 @@ mod win_ipc {
     ) -> Result<Option<InstanceResponse>> {
         let pipe_w = to_wide(pipe_path);
         let handle = loop {
-            // SAFETY: Opening existing named pipe hosted by the primary instance.
+            // SAFETY: Opening existing named pipe hosted by the primary instance. The server may
+            // only identify this client, never impersonate it.
             let res = unsafe {
                 CreateFileW(
                     PCWSTR(pipe_w.as_ptr()),
@@ -849,7 +923,7 @@ mod win_ipc {
                     FILE_SHARE_NONE,
                     None,
                     OPEN_EXISTING,
-                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    client_pipe_flags(),
                     None,
                 )
             };
@@ -871,6 +945,12 @@ mod win_ipc {
                 }
             }
         };
+
+        if let Err(err) = verify_pipe_server_user(handle) {
+            // SAFETY: Closing the client pipe handle without sending anything.
+            let _ = unsafe { CloseHandle(handle) };
+            return Err(err);
+        }
 
         let payload = encode_activation_commands(activation);
         let mut written: u32 = 0;
@@ -1077,6 +1157,123 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].urls, vec!["tg://resolve?domain=rustgram"]);
         assert_eq!(got[0].args, vec!["--demo"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sec3_d5_client_end_allows_identification_only_and_checks_server_user() {
+        use crate::app_id::win_impl::to_wide;
+        use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+        use windows::Win32::Security::{
+            GetTokenInformation, RevertToSelf, SECURITY_IMPERSONATION_LEVEL,
+            SecurityIdentification, TOKEN_QUERY, TokenImpersonationLevel,
+        };
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        };
+        use windows::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
+            PIPE_TYPE_BYTE, PIPE_WAIT,
+        };
+        use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        use windows::core::PCWSTR;
+
+        let pipe_path = format!(
+            "\\\\.\\pipe\\RustgramSec3D5Sqos_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let pipe_w = to_wide(&pipe_path);
+        // SAFETY: Valid null-terminated pipe name; plain blocking test server.
+        let server = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(pipe_w.as_ptr()),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                512,
+                512,
+                0,
+                None,
+            )
+        };
+        assert!(!server.is_invalid(), "create test pipe server");
+        let server_raw = server.0 as usize;
+        let server_thread = std::thread::spawn(move || -> Option<i32> {
+            let server = HANDLE(server_raw as *mut _);
+            // SAFETY: Test-owned pipe handle; the client may already be connected.
+            let _ = unsafe { ConnectNamedPipe(server, None) };
+            let mut buf = [0u8; 1];
+            let mut read = 0u32;
+            // SAFETY: Reading one byte so the client's token is available for impersonation.
+            unsafe { ReadFile(server, Some(&mut buf), Some(&mut read), None) }.ok()?;
+            // SAFETY: Impersonating the connected client on this test thread.
+            unsafe { ImpersonateNamedPipeClient(server) }.ok()?;
+            let mut token = HANDLE::default();
+            let mut level = SECURITY_IMPERSONATION_LEVEL(-1);
+            // SAFETY: Querying this thread's impersonation token.
+            if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token) }.is_ok()
+            {
+                let mut len = 0u32;
+                // SAFETY: Output buffer is a SECURITY_IMPERSONATION_LEVEL.
+                let _ = unsafe {
+                    GetTokenInformation(
+                        token,
+                        TokenImpersonationLevel,
+                        Some((&mut level as *mut SECURITY_IMPERSONATION_LEVEL).cast()),
+                        std::mem::size_of::<SECURITY_IMPERSONATION_LEVEL>() as u32,
+                        &mut len,
+                    )
+                };
+                // SAFETY: Closing the token opened above.
+                let _ = unsafe { CloseHandle(token) };
+            }
+            // SAFETY: Ending impersonation on this test thread.
+            let _ = unsafe { RevertToSelf() };
+            Some(level.0)
+        });
+
+        // SAFETY: Opening the test pipe with the production client flags.
+        let client = unsafe {
+            CreateFileW(
+                PCWSTR(pipe_w.as_ptr()),
+                GENERIC_READ.0 | GENERIC_WRITE.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                win_ipc::client_pipe_flags(),
+                None,
+            )
+        }
+        .expect("open client end");
+        win_ipc::verify_pipe_server_user(client).expect("a same-user server is accepted");
+        let mut written = 0u32;
+        // SAFETY: Writing one byte to the connected client end.
+        unsafe { WriteFile(client, Some(b"x"), Some(&mut written), None) }.expect("write");
+        let level = server_thread.join().expect("join server thread");
+        // SAFETY: Closing test-owned handles.
+        unsafe {
+            let _ = CloseHandle(client);
+            let _ = CloseHandle(server);
+        }
+        assert_eq!(
+            level,
+            Some(SecurityIdentification.0),
+            "the pipe server may identify the client but never impersonate it"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sec3_d5_token_user_reads_current_user_sid() {
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: Pseudo-handle of the current process.
+        let user =
+            win_ipc::TokenUserBuf::of_process(unsafe { GetCurrentProcess() }).expect("token user");
+        assert!(!user.sid().0.is_null());
     }
 
     #[cfg(windows)]

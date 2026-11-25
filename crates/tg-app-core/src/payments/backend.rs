@@ -393,8 +393,9 @@ pub trait PaymentsBackend: Send {
     /// Loads Telegram Premium promo data, tiers, limits, and features.
     fn load_premium_promo(&self) -> Result<PremiumPromoBundle, String>;
 
-    /// Sends a non-personal Premium promo telemetry event via `help.saveAppLog` (`peer = 0`),
-    /// matching `SendScreenShow` / `SendScreenAccept` (`settings/sections/settings_premium.cpp`).
+    /// Premium promo screen event hook (`SendScreenShow` / `SendScreenAccept` in tdesktop's
+    /// `settings/sections/settings_premium.cpp`). Rustgram sends no app logs, so no backend
+    /// overrides this; it always returns `Ok(false)` without a request.
     fn log_premium_promo_event(&self, _event: &PremiumPromoLogEvent) -> Result<bool, String> {
         Ok(false)
     }

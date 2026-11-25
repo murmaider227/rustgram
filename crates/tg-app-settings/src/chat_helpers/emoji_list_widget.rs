@@ -24,8 +24,8 @@ use tg_app_core::stand_in::theme::Palette;
 pub const EMOJI_COLUMNS: usize = 8;
 /// Target emoji cell size (`st::defaultEmojiPan.desiredSize`).
 pub const EMOJI_CELL_SIZE: f32 = st::default_emoji_pan.desired_size.0 as f32;
-/// Emoji sprite draw size inside each cell.
-pub const EMOJI_DRAW_SIZE: f32 = 26.0;
+/// Emoji sprite draw size inside each cell (`Ui::Emoji::GetSizeLarge()`: `18 * 4 / 3` at 100%).
+pub const EMOJI_DRAW_SIZE: f32 = 24.0;
 /// Section header height (`st::defaultEmojiPan.header`).
 pub const EMOJI_HEADER_HEIGHT: f32 = st::default_emoji_pan.header.0 as f32;
 /// Category footer height (`st::defaultEmojiPan.footer`).
@@ -477,7 +477,7 @@ impl EmojiListWidget {
             }
 
             // 2. Scrollable emoji grid body.
-            let scroll_avail = ui.available_rect_before_wrap();
+            let scroll_avail = list_rect_below_search(body_rect, &search);
             ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_avail), |ui| {
                 // tdesktop scroll bars overlay the list (`emojiScroll`), they take no width.
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
@@ -488,6 +488,8 @@ impl EmojiListWidget {
                         Frame::NONE
                             .inner_margin(emoji_list_margin())
                             .show(ui, |ui| {
+                                // Headers and rows are stacked with no gaps (`sectionInfo`).
+                                ui.spacing_mut().item_spacing.y = 0.0;
                                 let now = ui.input(|i| i.time);
                                 if self.search_query.trim().is_empty()
                                     && let Some(refs) = self.group_emojis()
@@ -697,6 +699,23 @@ impl EmojiListWidget {
         rect
     }
 
+    /// Grid geometry of `EmojiListWidget::countDesiredHeight` for a list content width
+    /// `avail_w` (the panel width minus `margin` and `padding` on both sides): returns the column
+    /// count, the cell size and the x offset of the first column from the content's left edge.
+    fn grid_geometry(avail_w: f32) -> (usize, Vec2, f32) {
+        let pan = &st::default_emoji_pan;
+        let desired = pan.desired_size.0.max(1);
+        // tdesktop's `innerWidth` is the panel width minus `padding` only.
+        let inner_w = (avail_w.max(0.0) as i32) + pan.margin.left.0 + pan.margin.right.0;
+        let cols = (inner_w / desired).max(1);
+        let single = inner_w / cols;
+        // `_rowsLeft` is measured from the inner widget, which starts `margin.left` in; the
+        // content here starts `margin.left + padding.left` in.
+        let left = (inner_w - cols * single) / 2 - pan.margin.left.0;
+        let size = Vec2::new(single as f32, (single - 2 * pan.vertical_size_sub.0) as f32);
+        (cols as usize, size, left as f32)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint_emoji_grid(
         &mut self,
@@ -710,15 +729,19 @@ impl EmojiListWidget {
     ) -> Option<EmojiListEvent> {
         let mut chosen = None;
         let avail_w = ui.available_width().max(EMOJI_CELL_SIZE);
-        let cols = ((avail_w / EMOJI_CELL_SIZE).floor() as usize).max(1);
+        let (cols, cell, grid_left) = Self::grid_geometry(avail_w);
         self.columns = cols;
-        let cell_w = avail_w / cols as f32;
-        let cell_h = EMOJI_CELL_SIZE;
+        let (cell_w, cell_h) = (cell.x, cell.y);
         let rows = items.len().div_ceil(cols);
         let total_h = rows as f32 * cell_h;
 
-        let (grid_rect, _) = ui.allocate_exact_size(Vec2::new(avail_w, total_h), Sense::hover());
+        let (alloc_rect, _) = ui.allocate_exact_size(Vec2::new(avail_w, total_h), Sense::hover());
+        let grid_rect = alloc_rect.translate(Vec2::new(grid_left, 0.0));
         let clip = ui.clip_rect();
+        let area = Vec2::new(
+            st::emoji_pan_area.width.0 as f32,
+            st::emoji_pan_area.height.0 as f32,
+        );
 
         // Virtualized row range: only paint rows intersecting `clip` so all ~1,800 emojis run at 120fps!
         let first_row =
@@ -759,17 +782,20 @@ impl EmojiListWidget {
                 };
 
                 let is_focused = self.focused_index == Some(item_global);
+                // `_overBg`: an `emojiPanArea` rounded rect (`emojiPanRadius`) centred in the cell.
+                let area_rect = Rect::from_center_size(cell_rect.center(), area);
+                let radius = CornerRadius::same(st::emoji_pan_radius.0 as u8);
                 if resp.hovered() || is_focused {
                     ui.painter().rect_filled(
-                        cell_rect.shrink(1.0),
-                        CornerRadius::same(6),
-                        palette.window_bg_over,
+                        area_rect,
+                        radius,
+                        theme_color(ui.ctx(), "emojiPanHover", palette.window_bg_over),
                     );
                 }
                 if is_focused {
                     ui.painter().rect_stroke(
-                        cell_rect.shrink(1.5),
-                        CornerRadius::same(6),
+                        area_rect,
+                        radius,
                         Stroke::new(1.5, palette.window_bg_active),
                         StrokeKind::Inside,
                     );
@@ -1267,12 +1293,23 @@ fn erode(alpha: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
 }
 
 /// Result of [`render_tabbed_search`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct TabbedSearchResponse {
     /// The typed query changed this frame.
     pub changed: bool,
     /// An emoji-group button was clicked (index into [`MoodIconCache::groups`]).
     pub group_clicked: Option<usize>,
+    /// Bottom of the search row (`TabbedSearch::height`: `searchMargin` + `height`); the list
+    /// rows start here (`_rowsTop`).
+    pub bottom: f32,
+}
+
+/// The list area below the search row: from the row's bottom to the bottom of `body`.
+pub(crate) fn list_rect_below_search(body: Rect, search: &TabbedSearchResponse) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(body.left(), search.bottom.clamp(body.top(), body.bottom())),
+        body.max,
+    )
 }
 
 /// Paints tdesktop's `TabbedSearch` row (`defaultTabbedSearch`): a rounded `windowBgOver` pill
@@ -1301,13 +1338,7 @@ pub(crate) fn render_tabbed_search(
             outer.top() + margin_top + height,
         ),
     );
-    ui.allocate_rect(
-        Rect::from_min_max(
-            outer.min,
-            Pos2::new(outer.right(), bar.bottom() + margin_bottom),
-        ),
-        Sense::hover(),
-    );
+    let row_bottom = bar.bottom() + margin_bottom;
 
     let ctx = ui.ctx().clone();
     let dark = ctx.global_style().visuals.dark_mode;
@@ -1320,7 +1351,10 @@ pub(crate) fn render_tabbed_search(
     ui.painter()
         .rect_filled(bar, CornerRadius::same((height / 2.0) as u8), bg);
 
-    let mut out = TabbedSearchResponse::default();
+    let mut out = TabbedSearchResponse {
+        bottom: row_bottom,
+        ..TabbedSearchResponse::default()
+    };
 
     // Search icon button (`defaultTabbedSearchButton`, icon at x = 7, centered vertically).
     let search_btn = Rect::from_min_size(bar.min, Vec2::new(ts.search.width.0 as f32, height));
@@ -1349,8 +1383,13 @@ pub(crate) fn render_tabbed_search(
         ts.cancel.width.0 as f32
     };
     let field_left = search_btn.right();
+    // Groups start at `FadeLeftStart` (search icon x + its width) + `defaultFieldWidth`.
+    let groups_left = bar.left()
+        + ts.search.icon_position.x.0 as f32
+        + SEARCH_ICON_WIDTH
+        + ts.default_field_width.0 as f32;
     let field_right = if show_groups {
-        (field_left + ts.default_field_width.0 as f32).min(bar.right() - 4.0)
+        groups_left.min(bar.right() - 4.0)
     } else {
         bar.right() - cancel_w - 4.0
     };
@@ -1359,8 +1398,13 @@ pub(crate) fn render_tabbed_search(
         Pos2::new(field_right.max(field_left + 20.0), bar.bottom()),
     );
     let font = FontId::proportional(ts.field.style.font.size.0 as f32);
+    // `defaultTabbedSearchField`: `textMargins` + `placeholderMargins` = 4 px before the text.
+    let text_rect = Rect::from_min_max(
+        Pos2::new(field_rect.left() + 4.0, field_rect.top() + 5.0),
+        Pos2::new(field_rect.right() - 2.0, field_rect.bottom() - 5.0),
+    );
     let edit_resp = ui.put(
-        field_rect.shrink2(Vec2::new(2.0, 5.0)),
+        text_rect,
         TextEdit::singleline(query)
             .id(edit_id)
             .frame(Frame::NONE)
@@ -1378,16 +1422,18 @@ pub(crate) fn render_tabbed_search(
     }
 
     if show_groups {
+        // `GroupsStrip`: `groupWidth` slots with no gaps, running to the pill's right end where
+        // the pill's rounded clip path cuts them (no right fade).
         let groups_rect = Rect::from_min_max(
             Pos2::new(field_rect.right(), bar.top()),
-            Pos2::new(bar.right() - 4.0, bar.bottom()),
+            Pos2::new(bar.right(), bar.bottom()),
         );
         let painter = ui.painter_at(groups_rect);
         let group_w = ts.group_width.0 as f32;
         let skip = ts.group_skip.0 as f32;
         let group_titles: Vec<String> = icons.groups().iter().map(|g| g.title.clone()).collect();
         for (idx, title) in group_titles.iter().enumerate() {
-            let x = groups_rect.left() + idx as f32 * (group_w + skip);
+            let x = groups_rect.left() + idx as f32 * group_w;
             if x >= groups_rect.right() {
                 break;
             }
@@ -1410,16 +1456,12 @@ pub(crate) fn render_tabbed_search(
             });
             let active = active_group == Some(idx);
             if active {
-                painter.rect_filled(
-                    Rect::from_center_size(slot.center(), Vec2::new(group_w, group_w - 4.0)),
-                    CornerRadius::same(((group_w - 4.0) / 2.0) as u8),
-                    bg_active,
-                );
+                painter.circle_filled(slot.center(), group_w / 2.0 - skip, bg_active);
             }
             if let Some(tex) = icons.texture(&ctx, idx) {
                 painter.image(
                     tex,
-                    Rect::from_center_size(slot.center(), Vec2::splat(18.0)),
+                    Rect::from_center_size(slot.center(), Vec2::splat(GROUP_ICON_DRAW_SIZE)),
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     if active { fg_active } else { fg },
                 );
@@ -1428,21 +1470,8 @@ pub(crate) fn render_tabbed_search(
                 out.group_clicked = Some(idx);
             }
         }
-        // Right-edge fade (`TabbedSearch::fadeRight`) over the clipped group strip.
-        let fade_w = 12.0;
-        let fade = Rect::from_min_max(
-            Pos2::new(groups_rect.right() - fade_w, groups_rect.top()),
-            groups_rect.max,
-        );
-        let mut mesh = egui::Mesh::default();
-        let transparent = Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 0);
-        mesh.colored_vertex(fade.left_top(), transparent);
-        mesh.colored_vertex(fade.right_top(), bg);
-        mesh.colored_vertex(fade.right_bottom(), bg);
-        mesh.colored_vertex(fade.left_bottom(), transparent);
-        mesh.add_triangle(0, 1, 2);
-        mesh.add_triangle(0, 2, 3);
-        ui.painter().add(egui::Shape::mesh(mesh));
+        let outer_bg = theme_color(&ctx, "emojiPanBg", palette.window_bg);
+        paint_round_end_mask(ui.painter(), bar, outer_bg);
     }
 
     if !query.is_empty() {
@@ -1476,7 +1505,44 @@ pub(crate) fn render_tabbed_search(
             out.changed = true;
         }
     }
+    // Reserve the whole row last: `ui.put` for the text field moved the cursor to the field.
+    ui.allocate_rect(
+        Rect::from_min_max(outer.min, Pos2::new(outer.right(), row_bottom)),
+        Sense::hover(),
+    );
     out
+}
+
+/// Drawn size of a search-row group icon. tdesktop draws the server's icons at 22 px
+/// (`SearchWithGroups::IconSizeOverride`) with about 2 px of padding inside; the outlines made
+/// from emoji sprites fill their box, so they are drawn at the visible size instead.
+const GROUP_ICON_DRAW_SIZE: f32 = 18.0;
+
+/// Width of the `emoji/emoji_search_input` icon (`FadeLeftStart` adds it to `iconPosition.x`).
+const SEARCH_ICON_WIDTH: f32 = 24.0;
+
+/// Covers the outside of `bar`'s rounded right end with `outer`, so whatever was painted up to
+/// the bar's edge is cut along the pill's curve (tdesktop clips the strip to the pill's path).
+fn paint_round_end_mask(painter: &egui::Painter, bar: Rect, outer: Color32) {
+    let r = bar.height() / 2.0;
+    let center = Pos2::new(bar.right() - r, bar.center().y);
+    const STEPS: usize = 24;
+    let mut mesh = egui::Mesh::default();
+    for (corner, from, to) in [
+        (bar.right_top(), -std::f32::consts::FRAC_PI_2, 0.0_f32),
+        (bar.right_bottom(), 0.0, std::f32::consts::FRAC_PI_2),
+    ] {
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(corner, outer);
+        for i in 0..=STEPS {
+            let a = from + (to - from) * i as f32 / STEPS as f32;
+            mesh.colored_vertex(center + r * Vec2::new(a.cos(), a.sin()), outer);
+        }
+        for i in 0..STEPS as u32 {
+            mesh.add_triangle(base, base + 1 + i, base + 2 + i);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Footer icon slot width (`defaultEmojiPan.iconWidth`).
@@ -1486,7 +1552,8 @@ pub(crate) const FOOTER_ICON_AREA: f32 = st::default_emoji_pan.icon_area.0 as f3
 /// Left / right inset of the footer icons (`defaultEmojiPan.iconSkip`).
 pub(crate) const FOOTER_ICON_SKIP: f32 = st::default_emoji_pan.icon_skip.0 as f32;
 
-/// Paints the footer strip background (`categoriesBg`) with its top shadow line.
+/// Paints the footer strip background (`categoriesBg`). No line above it: tdesktop shows
+/// `TabbedSelector::_bottomShadow` only in the emoji-status mode.
 pub(crate) fn paint_footer_background(ui: &Ui, rect: Rect, palette: &Palette) {
     let ctx = ui.ctx();
     let bg = theme_color(ctx, "emojiPanCategories", palette.window_bg);
@@ -1504,13 +1571,6 @@ pub(crate) fn paint_footer_background(ui: &Ui, rect: Rect, palette: &Palette) {
             se: r,
         },
         bg,
-    );
-    ui.painter().line_segment(
-        [
-            Pos2::new(rect.left(), rect.top()),
-            Pos2::new(rect.right(), rect.top()),
-        ],
-        Stroke::new(1.0, theme_color(ctx, "shadowFg", palette.divider)),
     );
 }
 

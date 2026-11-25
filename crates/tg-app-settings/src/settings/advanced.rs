@@ -55,9 +55,9 @@ use super::backend::{
 use super::codes::{DebugOptions, SecretCodeAction};
 use super::strings;
 use super::widgets::{
-    SettingsIconKind, paint_badge_pill, paint_tinted_icon, settings_card, settings_checkbox_row,
-    settings_divider, settings_radio_row, settings_row, settings_row_pad_x,
-    settings_split_toggle_row, settings_toggle_row, subsection_title,
+    SETTINGS_LIST_SKIP, SettingsIconKind, paint_badge_pill, paint_tinted_icon, settings_card,
+    settings_checkbox_row, settings_divider, settings_radio_row, settings_row, settings_row_pad_x,
+    settings_section_divider, settings_split_toggle_row, settings_toggle_row, subsection_title,
 };
 
 /// Power saving flag group mask for Animated Stickers (`PowerSavingLabels` in `settings_power_saving.cpp`).
@@ -692,6 +692,8 @@ fn theme_mode_from_colors(colors: &dyn Colors) -> tg_app_core::stand_in::theme::
 
 /// Vertical skip around dividers and titles (`Builder::addSkip`).
 const SECTION_SKIP: f32 = 8.0;
+/// `st::settings_checkboxes_skip`: the skip that ends the data and auto-download sections.
+const CHECKBOXES_SKIP: f32 = 12.0;
 
 /// Renders the Advanced settings section (`settings_advanced.cpp`).
 #[allow(clippy::too_many_arguments)]
@@ -748,7 +750,7 @@ pub fn render_advanced_section(
 
     // 1. Data and storage (`BuildDataStorageSection`): Connection type, Download path,
     // Manage local storage, Downloads, Ask download path.
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(SETTINGS_LIST_SKIP);
     subsection_title(ui, &tr::lng_settings_data_storage(), colors);
 
     // `connectionType` in `settings_advanced.cpp`: "Default (TCP used)" unless a proxy is
@@ -887,9 +889,9 @@ pub fn render_advanced_section(
         ui.add_space(4.0);
     }
 
-    ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(CHECKBOXES_SKIP);
+    settings_section_divider(ui, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     // 2. Automatic media download (`BuildAutoDownloadSection`): per-source split toggles.
     subsection_title(ui, &tr::lng_media_auto_settings(), colors);
@@ -927,7 +929,9 @@ pub fn render_advanced_section(
         }
     }
 
-    settings_divider(ui, None, colors);
+    ui.add_space(CHECKBOXES_SKIP);
+    settings_section_divider(ui, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     // 3. Window title bar (`BuildWindowTitleSection`): checkboxes.
     subsection_title(ui, &tr::lng_settings_window_system(), colors);
@@ -978,9 +982,9 @@ pub fn render_advanced_section(
         colors,
     );
 
-    ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(SETTINGS_LIST_SKIP);
+    settings_section_divider(ui, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     // 4. System integration (`BuildSystemIntegrationSection`): checkboxes.
     subsection_title(ui, &tr::lng_settings_native_title(), colors);

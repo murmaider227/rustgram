@@ -1,16 +1,16 @@
-//! Additional live MTProto RPC wiring for saved music IDs (`account.getSavedMusicIds`),
-//! single attach-menu bot lookup (`messages.getAttachMenuBot`), and non-personal app-log
-//! telemetry (`help.saveAppLog`).
+//! Additional live MTProto RPC wiring for saved music IDs (`account.getSavedMusicIds`) and the
+//! single attach-menu bot lookup (`messages.getAttachMenuBot`).
+//!
+//! Rustgram never sends `help.saveAppLog`: the Premium promo screen events tdesktop logs
+//! (`settings/sections/settings_premium.cpp`, `SendAppLog`) are deliberately not ported.
 //!
 //! Port origin:
 //! - `Telegram/SourceFiles/data/data_saved_music.cpp` (`SavedMusic::loadIds`, `SavedMusic::has`)
 //! - `Telegram/SourceFiles/inline_bots/bot_attach_web_view.cpp` (`messages.getAttachMenuBot`)
-//! - `Telegram/SourceFiles/settings/sections/settings_premium.cpp` (`SendAppLog`,
-//!   `SendScreenShow`, `SendScreenAccept`)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tg_api::RpcClient;
 use tg_api::channels::count_hash_i64;
@@ -19,7 +19,7 @@ use tg_bots::mini_app::AttachMenuBot;
 use tg_bots::stand_in::UserId as BotUserId;
 use tg_bots::tl_convert::attach_menu_bot_from_tl;
 use tg_data::{Session, UserId as DataUserId};
-use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
+use tg_tl::{enums as tl_enums, functions as tl_fns};
 
 use crate::bridge::LiveBridgeState;
 use crate::media::{block_on_runtime, with_rpc_timeout};
@@ -227,122 +227,6 @@ pub fn get_attach_menu_bot(live: &LiveSession, bot_id: BotUserId) -> Result<Atta
 }
 
 // =============================================================================
-// 3. Non-Personal App Log Telemetry (`help.saveAppLog`)
-// =============================================================================
-
-/// Non-personal UI telemetry events sent to `help.saveAppLog` (`peer = 0`), matching the exact
-/// set tdesktop sends in `settings/sections/settings_premium.cpp:499-549`.
-///
-/// Personal identifiers (peer IDs, phone numbers, message text, or account identifiers) are
-/// intentionally excluded by type construction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NonPersonalAppLogEvent {
-    /// Premium promo screen opened (`"premium.promo_screen_show"`,
-    /// `settings/sections/settings_premium.cpp:519-542`).
-    PremiumPromoScreenShow {
-        /// Ordered list of promo feature keys shown on screen (`premium_promo_order`).
-        order: Vec<String>,
-        /// Entry-point reference string (`source`; empty defaults to `"settings"` via `ResolveRef`).
-        source: String,
-    },
-    /// Premium promo screen accepted (`"premium.promo_screen_accept"`,
-    /// `settings/sections/settings_premium.cpp:544-549`).
-    PremiumPromoScreenAccept,
-}
-
-impl NonPersonalAppLogEvent {
-    /// Resolves an empty promo source reference to `"settings"` (`ResolveRef`,
-    /// `settings_premium.cpp:515-517`).
-    #[must_use]
-    pub fn resolve_source(source: &str) -> &str {
-        if source.is_empty() {
-            "settings"
-        } else {
-            source
-        }
-    }
-
-    /// Encodes this non-personal event as a TL `InputAppEvent` with `peer = 0`.
-    #[must_use]
-    pub fn to_tl(&self, time_secs: f64) -> tl_enums::InputAppEvent {
-        match self {
-            Self::PremiumPromoScreenShow { order, source } => {
-                let list = order
-                    .iter()
-                    .map(|item| {
-                        tl_enums::JSONValue::JsonString(tl_types::JsonString {
-                            value: item.clone(),
-                        })
-                    })
-                    .collect();
-                let values = vec![
-                    tl_enums::JSONObjectValue::JsonObjectValue(tl_types::JsonObjectValue {
-                        key: "premium_promo_order".to_owned(),
-                        value: tl_enums::JSONValue::JsonArray(tl_types::JsonArray { value: list }),
-                    }),
-                    tl_enums::JSONObjectValue::JsonObjectValue(tl_types::JsonObjectValue {
-                        key: "source".to_owned(),
-                        value: tl_enums::JSONValue::JsonString(tl_types::JsonString {
-                            value: Self::resolve_source(source).to_owned(),
-                        }),
-                    }),
-                ];
-                tl_enums::InputAppEvent::InputAppEvent(tl_types::InputAppEvent {
-                    time: time_secs,
-                    r#type: "premium.promo_screen_show".to_owned(),
-                    peer: 0,
-                    data: tl_enums::JSONValue::JsonObject(tl_types::JsonObject { value: values }),
-                })
-            }
-            Self::PremiumPromoScreenAccept => {
-                tl_enums::InputAppEvent::InputAppEvent(tl_types::InputAppEvent {
-                    time: time_secs,
-                    r#type: "premium.promo_screen_accept".to_owned(),
-                    peer: 0,
-                    data: tl_enums::JSONValue::JsonNull,
-                })
-            }
-        }
-    }
-}
-
-/// Sends non-personal app-log events via `help.saveAppLog` using the current Unix timestamp
-/// (fractional seconds, matching `settings/sections/settings_premium.cpp:503-512`).
-///
-/// Returns `Ok(false)` without issuing an RPC if `events` is empty.
-pub fn save_app_log(live: &LiveSession, events: &[NonPersonalAppLogEvent]) -> Result<bool, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    save_app_log_at(live, events, now)
-}
-
-/// Sends non-personal app-log events via `help.saveAppLog` with an explicit Unix timestamp
-/// `time_secs` (fractional seconds, `peer = 0`).
-///
-/// Returns `Ok(false)` without issuing an RPC if `events` is empty.
-pub fn save_app_log_at(
-    live: &LiveSession,
-    events: &[NonPersonalAppLogEvent],
-    time_secs: f64,
-) -> Result<bool, String> {
-    if events.is_empty() {
-        return Ok(false);
-    }
-    let tl_events: Vec<tl_enums::InputAppEvent> =
-        events.iter().map(|ev| ev.to_tl(time_secs)).collect();
-    let rpc = live.runtime().rpc().clone();
-    block_on_runtime(live.runtime().tokio_handle(), async move {
-        with_rpc_timeout(LIVE_EXTRAS_RPC_TIMEOUT, async move {
-            rpc.invoke(&tl_fns::help::SaveAppLog { events: tl_events })
-                .await
-        })
-        .await
-    })
-}
-
-// =============================================================================
 // Convenience Methods on LiveSession
 // =============================================================================
 
@@ -375,20 +259,6 @@ impl LiveSession {
     /// users into `Session`, and updates the session's `AttachMenuStore`.
     pub fn fetch_attach_menu_bot(&self, bot_id: BotUserId) -> Result<AttachMenuBot, String> {
         get_attach_menu_bot(self, bot_id)
-    }
-
-    /// Sends non-personal app-log events via `help.saveAppLog` (`peer = 0`).
-    pub fn save_app_log(&self, events: &[NonPersonalAppLogEvent]) -> Result<bool, String> {
-        save_app_log(self, events)
-    }
-
-    /// Sends non-personal app-log events via `help.saveAppLog` at an explicit timestamp.
-    pub fn save_app_log_at(
-        &self,
-        events: &[NonPersonalAppLogEvent],
-        time_secs: f64,
-    ) -> Result<bool, String> {
-        save_app_log_at(self, events, time_secs)
     }
 }
 

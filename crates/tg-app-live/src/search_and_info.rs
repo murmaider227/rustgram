@@ -830,6 +830,7 @@ pub(crate) fn message_to_search_result(
         sender_name,
         text,
         time: unix_to_local_datetime(msg.date),
+        send_state: crate::convert::message_send_state(session, msg),
         archived,
     })
 }
@@ -3124,6 +3125,7 @@ pub(super) fn search_dialogs(
                             sender_name: crate::preview_text::preview_sender(session, msg),
                             text: body.to_owned(),
                             time: unix_to_local_datetime(msg.date),
+                            send_state: crate::convert::message_send_state(session, msg),
                             archived: item.archived,
                         });
                     }

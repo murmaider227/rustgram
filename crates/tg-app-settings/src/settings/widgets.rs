@@ -486,9 +486,9 @@ fn top_bar_icon_button(
 /// Renders a colored subsection header (`Ui::AddSubsectionTitle`, `st::default_subsection_title`).
 pub fn subsection_title(ui: &mut Ui, title: &str, colors: &dyn Colors) {
     let pad = st::default_subsection_title_padding;
-    ui.add_space(pad.top.scaled().max(8) as f32);
+    ui.add_space(pad.top.scaled() as f32);
     ui.horizontal(|ui| {
-        ui.add_space(pad.left.scaled().max(settings_row_pad_x() as i32) as f32);
+        ui.add_space(pad.left.scaled() as f32);
         ui.label(
             egui::RichText::new(title)
                 .font(font_id_from_style(st::default_subsection_title.style.font))
@@ -498,7 +498,7 @@ pub fn subsection_title(ui: &mut Ui, title: &str, colors: &dyn Colors) {
                 )),
         );
     });
-    ui.add_space(pad.bottom.scaled().max(4) as f32);
+    ui.add_space(pad.bottom.scaled() as f32);
 }
 
 /// tdesktop's `Ui::AddDivider` band (`BoxContentDivider`, `boxDividerHeight` = 8 px). Callers
@@ -511,48 +511,81 @@ pub fn settings_section_divider(ui: &mut Ui, colors: &dyn Colors) -> Rect {
 /// `defaultVerticalListSkip`: the skip `SectionBuilder::addSkip` puts around a divider.
 pub const SETTINGS_LIST_SKIP: f32 = 6.0;
 
-/// Renders a gray divider band (`Ui::AddDivider`) with optional muted explanatory footer (`Ui::AddDividerText`).
+/// Divider with its own skips for pages not yet laid out with tdesktop's exact skips: a 6 px
+/// skip, [`settings_section_divider`] or [`settings_divider_text`], then 4 px.
 pub fn settings_divider(ui: &mut Ui, description: Option<&str>, colors: &dyn Colors) {
-    let vskip = (st::default_vertical_list_skip.scaled() as f32).clamp(4.0, 10.0);
-    ui.add_space(vskip);
-    if let Some(desc) = description {
-        let mut style = FlatLabelStyle::box_label(colors);
-        style.text_fg = colors.color("windowSubTextFg");
-        style.style.font.size = (st::normal_font.scaled_size() as f32 - 1.0).max(11.5);
-
-        let pad = st::default_box_divider_label_padding;
-        let pad_x = pad.left.scaled().max(settings_row_pad_x() as i32) as f32;
-        let pad_y = pad.top.scaled().max(8) as i8;
-        let width = ui.available_width();
-        let bg_color = colors.color("boxDividerBg");
-        let sh_color = colors.color("shadowFg");
-
-        let frame = egui::Frame::NONE
-            .fill(bg_color)
-            .inner_margin(egui::Margin::symmetric(pad_x as i8, pad_y));
-        let resp = frame.show(ui, |ui| {
-            ui.set_min_width((width - pad_x * 2.0).max(120.0));
-            FlatLabel::plain(desc, style)
-                .id_salt(desc)
-                .max_width((width - pad_x * 2.0).max(120.0))
-                .show(ui);
-        });
-        let r = resp.response.rect;
-        ui.painter().line_segment(
-            [Pos2::new(r.left(), r.top()), Pos2::new(r.right(), r.top())],
-            Stroke::new(1.0, sh_color),
-        );
-        ui.painter().line_segment(
-            [
-                Pos2::new(r.left(), r.bottom()),
-                Pos2::new(r.right(), r.bottom()),
-            ],
-            Stroke::new(1.0, sh_color),
-        );
-    } else {
-        divider_bar(ui, 10.0, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
+    match description {
+        Some(desc) => {
+            settings_divider_text(ui, desc, colors);
+        }
+        None => {
+            settings_section_divider(ui, colors);
+        }
     }
     ui.add_space(4.0);
+}
+
+/// `Ui::AddDividerText`: `st::box_divider_label` (13 px, `windowSubTextFg`) inside
+/// `st::default_box_divider_label_padding` (22, 8, 22, 16) on a `BoxContentDivider` background.
+/// Adds no skips around itself, like the original.
+pub fn settings_divider_text(ui: &mut Ui, text: &str, colors: &dyn Colors) -> Rect {
+    let style = FlatLabelStyle::from_tg(&st::box_divider_label, colors);
+    let pad = st::default_box_divider_label_padding;
+    let pad_left = pad.left.scaled() as f32;
+    let pad_right = pad.right.scaled() as f32;
+    let text_w = (ui.available_width() - pad_left - pad_right).max(120.0);
+    let background = ui.painter().add(egui::Shape::Noop);
+    let rect = egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: pad_left as i8,
+            right: pad_right as i8,
+            top: pad.top.scaled() as i8,
+            bottom: pad.bottom.scaled() as i8,
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(text_w);
+            ui.set_max_width(text_w);
+            FlatLabel::plain(text, style)
+                .id_salt(text)
+                .max_width(text_w)
+                .show(ui);
+        })
+        .response
+        .rect;
+    ui.painter()
+        .set(background, box_divider_shapes(rect, colors));
+    rect
+}
+
+/// `BoxContentDivider` as shapes (the same rows `tg_ui::widgets::labels::paint_box_divider`
+/// paints), so a label drawn first can get its background underneath afterwards.
+fn box_divider_shapes(rect: Rect, colors: &dyn Colors) -> Vec<egui::Shape> {
+    let row = |y: f32| {
+        Rect::from_min_max(
+            Pos2::new(rect.left(), y),
+            Pos2::new(rect.right(), (y + 1.0).min(rect.bottom())),
+        )
+    };
+    let shadow = colors.color("shadowFg");
+    let mut shapes = vec![egui::Shape::rect_filled(
+        rect,
+        CornerRadius::ZERO,
+        colors.color("boxDividerBg"),
+    )];
+    for (offset, strength) in [(0.0, 0.61), (1.0, 0.36), (2.0, 0.13)] {
+        shapes.push(egui::Shape::rect_filled(
+            row(rect.top() + offset),
+            CornerRadius::ZERO,
+            shadow.gamma_multiply(strength),
+        ));
+    }
+    shapes.push(egui::Shape::rect_filled(
+        row(rect.bottom() - 1.0),
+        CornerRadius::ZERO,
+        shadow.gamma_multiply(0.13),
+    ));
+    shapes
 }
 
 /// Minimum horizontal clearance kept between a row's left text column and its right-aligned
@@ -640,7 +673,7 @@ pub fn settings_row(
     let right_galley = right_label.filter(|v| !v.is_empty()).map(|val| {
         ui.painter().layout_no_wrap(
             val.to_owned(),
-            font_id_from_style(st::normal_font),
+            font_id_from_style(st::default_settings_right_label.style.font),
             right_fg,
         )
     });
@@ -762,6 +795,9 @@ pub fn settings_toggle_row(
     let h = if let Some(ref sg) = sub_galley {
         (pad_v + title_galley.size().y + sub_gap + sg.size().y + pad_v)
             .max(SETTINGS_ROW_HEIGHT_TWO_LINE)
+    } else if title_galley.rows.len() <= 1 {
+        // `settingsButton` / `settingsButtonNoIcon`: padding around a fixed 20 px text line.
+        base_h
     } else {
         (pad_v + title_galley.size().y + pad_v).max(base_h)
     };
@@ -875,11 +911,8 @@ pub fn settings_split_toggle_row(
 
     let title_fg = resolve_color_ref(st::settings_button.text_fg, colors);
     let sub_fg = colors.color("windowSubTextFg");
-    let title_font = font_id_from_style(st::settings_button.style.font);
-    let sub_font = egui::FontId::new(
-        (title_font.size - 1.5).max(11.5),
-        tg_ui::fonts::family_regular(),
-    );
+    let title_font = font_id_from_style(st::settings_notification_type.style.font);
+    let sub_font = font_id_from_style(st::settings_notification_type_details.style.font);
     let title_galley = ui
         .painter()
         .layout(title.to_owned(), title_font, title_fg, text_max_w);
@@ -892,11 +925,23 @@ pub fn settings_split_toggle_row(
         )
     };
 
+    // `st::settings_notification_type`: the title at `padding.top`, the details label
+    // bottom-aligned to `padding.top + height` (`AddSplitToggle` in settings_notifications.cpp).
+    let type_st = &st::settings_notification_type;
+    let type_pad_top = type_st.padding.top.scaled() as f32;
+    let type_inner_h = type_st.height.scaled() as f32;
+    let type_row_h = type_pad_top + type_inner_h + type_st.padding.bottom.scaled() as f32;
     let pad_v = 6.0_f32;
     let sub_gap = 1.0_f32;
+    let has_details = sub_galley.is_some();
+    let single_lines =
+        title_galley.rows.len() <= 1 && sub_galley.as_ref().is_none_or(|sg| sg.rows.len() <= 1);
     let h = if let Some(ref sg) = sub_galley {
-        (pad_v + title_galley.size().y + sub_gap + sg.size().y + pad_v)
-            .max(SETTINGS_ROW_HEIGHT_TWO_LINE)
+        if single_lines {
+            type_row_h
+        } else {
+            (pad_v + title_galley.size().y + sub_gap + sg.size().y + pad_v).max(type_row_h)
+        }
     } else {
         (pad_v + title_galley.size().y + pad_v).max(SETTINGS_ROW_HEIGHT)
     };
@@ -969,9 +1014,16 @@ pub fn settings_split_toggle_row(
     let text_painter = ui.painter().with_clip_rect(text_clip);
 
     if let Some(sg) = sub_galley {
-        let content_h = title_galley.size().y + sub_gap + sg.size().y;
-        let top_y = (full_rect.center().y - content_h * 0.5).max(full_rect.top() + pad_v);
-        let sub_y = top_y + title_galley.size().y + sub_gap;
+        let (top_y, sub_y) = if single_lines {
+            (
+                full_rect.top() + type_pad_top,
+                full_rect.top() + type_pad_top + type_inner_h - sg.size().y,
+            )
+        } else {
+            let content_h = title_galley.size().y + sub_gap + sg.size().y;
+            let top_y = (full_rect.center().y - content_h * 0.5).max(full_rect.top() + pad_v);
+            (top_y, top_y + title_galley.size().y + sub_gap)
+        };
         text_painter.galley(Pos2::new(text_x, top_y), title_galley, title_fg);
         text_painter.galley(Pos2::new(text_x, sub_y), sg, sub_fg);
     } else {
@@ -979,13 +1031,22 @@ pub fn settings_split_toggle_row(
         text_painter.galley(Pos2::new(text_x, title_y), title_galley, title_fg);
     }
 
-    // Subtle vertical divider line between main button and toggle.
-    ui.painter().line_segment(
-        [
-            Pos2::new(right_rect.left(), full_rect.top() + 6.0),
-            Pos2::new(right_rect.left(), full_rect.bottom() - 6.0),
-        ],
-        Stroke::new(1.0, colors.color("shadowFg")),
+    // Separator between the button and the toggle in `textBgOver`, centered: `height - 2 *
+    // toggle.border` tall next to a details label (`AddTypeButton`), otherwise `2 * border +
+    // diameter` (`AddSeparatedToggle`).
+    let sep_toggle = ToggleStyle::default_toggle(colors);
+    let separator_h = if has_details {
+        (type_inner_h - 2.0 * sep_toggle.border).max(0.0)
+    } else {
+        2.0 * sep_toggle.border + sep_toggle.diameter
+    };
+    ui.painter().rect_filled(
+        Rect::from_center_size(
+            Pos2::new(right_rect.left() - 0.5, full_rect.center().y),
+            Vec2::new(1.0, separator_h),
+        ),
+        CornerRadius::ZERO,
+        resolve_color_ref(type_st.text_bg_over, colors),
     );
 
     let mut toggled_changed = false;
@@ -1023,7 +1084,20 @@ pub fn settings_split_toggle_row(
     (left_resp.clicked(), toggled_changed)
 }
 
-/// Indented `tg-ui` checkbox row matching `st::settings_checkbox_padding`.
+/// `st::settings_checkbox` as `VerticalLayout` places it inside `st::settings_checkbox_padding`:
+/// the `Checkbox` margins stay outside the padding, so the 22 px box starts at the padding's
+/// left edge, the 14 px label sits 15 px after it, and the row is 10 + 22 + 10 px tall.
+fn settings_checkbox_style(colors: &dyn Colors) -> CheckboxStyle {
+    let pad = st::settings_checkbox_padding;
+    let mut style = CheckboxStyle::from_tg(&st::settings_checkbox, colors);
+    style.check_position.x = 0.0;
+    style.margin.left = 0.0;
+    style.margin.top = pad.top.scaled() as f32;
+    style.margin.bottom = pad.bottom.scaled() as f32;
+    style
+}
+
+/// Checkbox row: `st::settings_checkbox` in `st::settings_checkbox_padding`.
 pub fn settings_checkbox_row(
     ui: &mut Ui,
     checked: &mut bool,
@@ -1031,16 +1105,13 @@ pub fn settings_checkbox_row(
     enabled: bool,
     colors: &dyn Colors,
 ) -> Response {
-    let pad_left = st::settings_checkbox_padding
-        .left
-        .scaled()
-        .max(settings_row_pad_x() as i32) as f32;
+    let pad_left = st::settings_checkbox_padding.left.scaled() as f32;
     ui.horizontal(|ui| {
         ui.add_space(pad_left);
         Checkbox::new(
             checked,
             label,
-            CheckboxStyle::default_checkbox(colors),
+            settings_checkbox_style(colors),
             CheckStyle::default_check(colors),
         )
         .enabled(enabled)

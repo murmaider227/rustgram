@@ -1550,7 +1550,10 @@ impl LiveSession {
                 format!("user_{uid}")
             }
         };
-        Some(account_bot_storage_dir(&tdata, &key))
+        let dir = account_bot_storage_dir(&tdata, &key);
+        // The bot storage files are encrypted with the account storage key (SEC3-B2).
+        self.media_cache().register_account_dir(&dir);
+        Some(dir)
     }
 }
 

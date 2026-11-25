@@ -18,7 +18,8 @@ use tg_ui::tg_style::st;
 use crate::chat_helpers::backend::{ChatHelpersBackend, GifItem};
 use crate::chat_helpers::emoji_list_widget::{
     EMOJI_FOOTER_HEIGHT, EMOJI_MOOD_GROUPS, MoodIconCache, footer_slot_rect,
-    paint_footer_background, paint_footer_icon, paint_footer_selection, render_tabbed_search,
+    list_rect_below_search, paint_footer_background, paint_footer_icon, paint_footer_selection,
+    render_tabbed_search,
 };
 use crate::chat_helpers::paint_helper_icon;
 use crate::chat_helpers::stickers_list_widget::paint_clock_icon;
@@ -351,7 +352,7 @@ impl GifsListWidget {
             let items = self.current_items(backend);
 
             // 2. Scrollable mosaic grid.
-            let scroll_rect = ui.available_rect_before_wrap();
+            let scroll_rect = list_rect_below_search(body_rect, &search);
             ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
                 // tdesktop scroll bars overlay the list (`emojiScroll`), they take no width.
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();

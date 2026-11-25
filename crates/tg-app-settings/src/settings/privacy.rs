@@ -19,8 +19,9 @@ use super::backend::{
 };
 use super::strings;
 use super::widgets::{
-    SettingsIconKind, settings_card, settings_checkbox_row, settings_divider, settings_radio_row,
-    settings_row, settings_toggle_row, subsection_title,
+    SETTINGS_LIST_SKIP, SettingsIconKind, settings_card, settings_checkbox_row, settings_divider,
+    settings_divider_text, settings_radio_row, settings_row, settings_section_divider,
+    settings_toggle_row, subsection_title,
 };
 
 /// Active sub-editor box inside Privacy & Security.
@@ -123,9 +124,9 @@ pub fn format_global_ttl(secs: i32) -> String {
 }
 
 /// Skip above the Security / Privacy titles (`st::settings_privacy_skip`).
-const SECURITY_TOP_SKIP: f32 = 4.0;
-/// Skip before a section divider (`Builder::addSkip`).
-const SECTION_SKIP: f32 = 8.0;
+fn privacy_top_skip() -> f32 {
+    st::settings_privacy_skip.scaled() as f32
+}
 
 /// One row of the Privacy list (`BuildPrivacySection`).
 #[derive(Debug, Clone, Copy)]
@@ -202,7 +203,7 @@ pub fn render_privacy_section(
     // 1. Security (`BuildSecuritySection` in `settings_privacy_security.cpp`): Two-Step
     // Verification, Auto-Delete Messages, Local passcode, Passkeys, Blocked users, Connected
     // websites (only when there are any), Active sessions, then the sessions footer.
-    ui.add_space(SECURITY_TOP_SKIP);
+    ui.add_space(privacy_top_skip());
     subsection_title(ui, &tr::lng_settings_security(), colors);
 
     let cloud_state = backend.cloud_password_state();
@@ -360,11 +361,11 @@ pub fn render_privacy_section(
         render_privacy_editor(ui, state, backend, colors, &mut out);
     }
 
-    ui.add_space(SECTION_SKIP);
-    settings_divider(ui, Some(&tr::lng_settings_sessions_about()), colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
+    settings_divider_text(ui, &tr::lng_settings_sessions_about(), colors);
 
     // 2. Privacy (`BuildPrivacySection`): rows without icons, value label on the right.
-    ui.add_space(SECURITY_TOP_SKIP);
+    ui.add_space(privacy_top_skip());
     subsection_title(ui, &tr::lng_settings_privacy_title(), colors);
     let rules = backend.privacy_rules();
     let messages_label = if global_priv.noncontact_peers_paid_stars.unwrap_or(0) > 0 {
@@ -415,8 +416,9 @@ pub fn render_privacy_section(
         render_privacy_editor(ui, state, backend, colors, &mut out);
     }
 
-    ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
+    ui.add_space(st::settings_privacy_security_padding.scaled() as f32);
+    settings_section_divider(ui, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     // 3. New Chats / Archive & Sensitive Content.
     subsection_title(ui, strings::NEW_CHATS_UNKNOWN_TITLE, colors);

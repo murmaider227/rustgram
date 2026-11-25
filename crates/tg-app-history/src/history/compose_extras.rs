@@ -690,17 +690,15 @@ impl RoundVideoRecorderState {
         self.output_dir = Some(dir);
     }
 
-    /// Resolves the output directory for round video captures: explicit override, then active
-    /// account temp directory, and only as a last resort a PID-scoped fallback.
+    /// Resolves the output directory for round video captures: explicit override, then the active
+    /// account temp directory. `None` when neither is known: a capture is never written to
+    /// `%TEMP%`.
     #[must_use]
-    pub fn resolve_output_dir(&self) -> std::path::PathBuf {
+    pub fn resolve_output_dir(&self) -> Option<std::path::PathBuf> {
         if let Some(ref dir) = self.output_dir {
-            return dir.clone();
+            return Some(dir.clone());
         }
-        if let Some(dir) = active_round_video_temp_dir() {
-            return dir;
-        }
-        std::env::temp_dir().join(format!("rustgram_round_videos_pid_{}", std::process::id()))
+        active_round_video_temp_dir()
     }
 
     /// Deletes the most recently captured temporary MP4 file if present (skipping if busy).
@@ -741,12 +739,17 @@ impl RoundVideoRecorderState {
         }
         let duration_secs = ((now_secs - self.started_at).round() as u32).clamp(1, 60);
         if let Some(mut cam) = self.webcam.take() {
-            let out_dir = self.resolve_output_dir();
-            let _ = std::fs::create_dir_all(&out_dir);
-            let captured = cam.finish(&out_dir, Some(duration_secs));
-            self.last_captured_mp4 = captured
-                .mp4_path
-                .and_then(|p| p.to_str().map(str::to_owned));
+            match self.resolve_output_dir() {
+                Some(out_dir) => {
+                    let _ = std::fs::create_dir_all(&out_dir);
+                    let captured = cam.finish(&out_dir, Some(duration_secs));
+                    self.last_captured_mp4 = captured
+                        .mp4_path
+                        .and_then(|p| p.to_str().map(str::to_owned));
+                }
+                // No account folder: drop the capture instead of exporting it to `%TEMP%`.
+                None => cam.cancel(),
+            }
         }
         self.preview_tex = None;
         self.active = false;
@@ -3344,7 +3347,7 @@ mod d3_temp_tests {
         let mut recorder = RoundVideoRecorderState::default();
         assert_eq!(
             recorder.resolve_output_dir(),
-            acc_round_dir,
+            Some(acc_round_dir.clone()),
             "round video recorder must write under the active account temp folder, not %TEMP%"
         );
 
@@ -3368,5 +3371,17 @@ mod d3_temp_tests {
         );
 
         set_active_round_video_temp_dir(None);
+
+        // SEC3-B1: with no account temp folder there is no output directory at all (older builds
+        // fell back to a PID-named folder in `%TEMP%`).
+        let recorder = RoundVideoRecorderState::default();
+        assert_eq!(
+            recorder.resolve_output_dir(),
+            None,
+            "round video recorder must not fall back to %TEMP%"
+        );
+        let mut explicit = RoundVideoRecorderState::default();
+        explicit.set_output_dir(acc_round_dir.clone());
+        assert_eq!(explicit.resolve_output_dir(), Some(acc_round_dir));
     }
 }

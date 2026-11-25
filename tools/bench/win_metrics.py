@@ -24,6 +24,33 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+try:
+    from .workdir_safety import (
+        ProcessJob,
+        ScratchSession,
+        WorkdirCleanupError,
+        copy_workdir_safely,
+        ensure_outside_git_repo,
+        get_process_creation_time,
+        is_inside_git_repo,
+        list_descendant_pids,
+        remove_workdir_verified,
+        stop_process_by_pid,
+    )
+except ImportError:
+    from workdir_safety import (  # type: ignore[no-redef]
+        ProcessJob,
+        ScratchSession,
+        WorkdirCleanupError,
+        copy_workdir_safely,
+        ensure_outside_git_repo,
+        get_process_creation_time,
+        is_inside_git_repo,
+        list_descendant_pids,
+        remove_workdir_verified,
+        stop_process_by_pid,
+    )
+
 # ---------------------------------------------------------------------------
 # Win32 constants & structs
 # ---------------------------------------------------------------------------
@@ -432,35 +459,6 @@ def check_system_idle(
 # ---------------------------------------------------------------------------
 
 
-def list_descendant_pids(root_pid: int) -> list[int]:
-    """Return [root_pid] plus all live descendant PIDs."""
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == INVALID_HANDLE_VALUE:
-        return [root_pid]
-    try:
-        children: dict[int, list[int]] = {}
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
-        while ok:
-            children.setdefault(int(entry.th32ParentProcessID), []).append(int(entry.th32ProcessID))
-            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
-
-        result: list[int] = [root_pid]
-        queue = [root_pid]
-        seen = {root_pid}
-        while queue:
-            cur = queue.pop(0)
-            for ch in children.get(cur, []):
-                if ch not in seen:
-                    seen.add(ch)
-                    result.append(ch)
-                    queue.append(ch)
-        return result
-    finally:
-        kernel32.CloseHandle(snap)
-
-
 def get_process_memory(pid: int) -> dict[str, int] | None:
     """Return private_bytes, working_set_bytes, peak_working_set_bytes for one PID."""
     h = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
@@ -755,63 +753,8 @@ def save_png(frame: np.ndarray, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Process lifecycle & workdir helpers
+# Process lifecycle & workdir helpers (re-exported from workdir_safety)
 # ---------------------------------------------------------------------------
-
-
-def stop_process_by_pid(pid: int, graceful_timeout_s: float = 5.0) -> None:
-    """Gracefully close windows of `pid`, then terminate `pid` and any descendants if needed."""
-    for wi in list_all_windows_for_pid(pid):
-        user32.PostMessageW(wi.hwnd, WM_CLOSE, 0, 0)
-
-    h = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, False, pid)
-    if h:
-        try:
-            wait_ms = int(graceful_timeout_s * 1000)
-            res = kernel32.WaitForSingleObject(h, wait_ms)
-            if res != 0:
-                # Terminate descendants first, then root.
-                for child in reversed(list_descendant_pids(pid)):
-                    if child == pid:
-                        continue
-                    ch = kernel32.OpenProcess(PROCESS_TERMINATE, False, child)
-                    if ch:
-                        kernel32.TerminateProcess(ch, 0)
-                        kernel32.CloseHandle(ch)
-                kernel32.TerminateProcess(h, 0)
-                kernel32.WaitForSingleObject(h, 3000)
-        finally:
-            kernel32.CloseHandle(h)
-
-
-def copy_workdir_safely(src: Path, dst: Path) -> None:
-    """Copy a Telegram/Rustgram workdir into `dst`, skipping lock/log/crash markers."""
-    if dst.exists():
-        shutil.rmtree(dst, ignore_errors=True)
-    dst.mkdir(parents=True, exist_ok=True)
-
-    skip_names = {"working", "log.txt", "debuglogs"}
-    for root, dirs, files in os.walk(src):
-        rel = Path(root).relative_to(src)
-        # Skip DebugLogs / dumps / temp
-        dirs[:] = [d for d in dirs if d.lower() not in {"debuglogs", "dumps", "temp"}]
-        target_dir = dst / rel
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for fname in files:
-            low = fname.lower()
-            if low in skip_names or low.startswith("log_start"):
-                continue
-            s_file = Path(root) / fname
-            d_file = target_dir / fname
-            try:
-                shutil.copy2(s_file, d_file)
-            except OSError:
-                # Best-effort copy when source is held open by a live process.
-                try:
-                    with open(s_file, "rb") as rf, open(d_file, "wb") as wf:
-                        shutil.copyfileobj(rf, wf)
-                except OSError:
-                    pass
 
 
 def read_test_api_credentials(doc_path: Path) -> tuple[str, str]:

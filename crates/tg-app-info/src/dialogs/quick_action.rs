@@ -248,10 +248,8 @@ pub fn perform_quick_dialog_action(
                 tr::lng_quick_dialog_action_toast_unarchive_success()
             })
         }
-        QuickDialogAction::Delete => {
-            backend.delete_dialog(peer_id);
-            Some(crate::dialogs::strings::TOAST_CHAT_REMOVED.to_owned())
-        }
+        // Never deletes directly: the caller opens the `DeleteAndLeaveHandler` confirmation box.
+        QuickDialogAction::Delete => None,
         QuickDialogAction::Disabled => None,
     }
 }

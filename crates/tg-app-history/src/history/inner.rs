@@ -407,6 +407,14 @@ pub struct HistoryInnerWidget {
     reactions_read_for: Vec<MsgId>,
     /// Highest server message id already confirmed/sent as inbox-read for the active peer.
     last_inbox_read_sent: MsgId,
+    /// Highest unread incoming message id shown this frame (`readTill`), the only id that may
+    /// advance the inbox read watermark.
+    read_till_shown: Option<MsgId>,
+    /// Set by the window: the user can see the chat (`MainWindow::markingAsRead`).
+    marking_as_read: bool,
+    /// Set by the live host: one of its overlays (stories, Business, Payments, wallet) covers
+    /// the chat.
+    host_overlay_open: bool,
     /// View-layer interactive emoji burst animation overlays (`HistoryView::EmojiInteractions`).
     emoji_interactions: crate::history::emoji_interactions::HistoryViewEmojiInteractions,
     /// Last painted bubble center & outgoing flag per visible message (for incoming emoji bursts).
@@ -457,6 +465,9 @@ impl HistoryInnerWidget {
             painted_msg_ids: Vec::new(),
             reactions_read_for: Vec::new(),
             last_inbox_read_sent: MsgId(0),
+            read_till_shown: None,
+            marking_as_read: true,
+            host_overlay_open: false,
             scrolled_up: false,
             unread_count: 0,
             assets: MediaAssetCache::new(),
@@ -1152,6 +1163,9 @@ impl HistoryInnerWidget {
         if is_unread_incoming {
             self.unread_count = self.unread_count.max(1);
         }
+        if (was_at_bottom || is_outgoing) && self.messages.len() > MAX_LOADED_AT_BOTTOM {
+            self.unload_oldest_messages(is_group);
+        }
 
         self.update_date_and_unread_heights();
         self.media_runtime
@@ -1163,6 +1177,43 @@ impl HistoryInnerWidget {
         true
     }
 
+    /// Drops the oldest loaded messages down to [`KEEP_LOADED_AFTER_UNLOAD`] while the chat sits at
+    /// the bottom, so a busy chat left open does not grow without bound
+    /// (`History::unloadBlocks` / `HistoryWidget::preloadHistoryIfNeeded`). Scrolling up loads
+    /// them again from the backend.
+    fn unload_oldest_messages(&mut self, is_group: bool) {
+        let Some(drop_count) = self.messages.len().checked_sub(KEEP_LOADED_AFTER_UNLOAD) else {
+            return;
+        };
+        if drop_count == 0 {
+            return;
+        }
+        let dropped: HashSet<MsgId> = self.messages.drain(..drop_count).map(|m| m.id).collect();
+        for id in &dropped {
+            self.layout_cache.remove(id);
+            self.last_painted_bubble_rects.remove(id);
+        }
+        if let Some(first) = self.messages.first() {
+            self.layout_cache.remove(&first.id);
+        }
+        let unread_bar = self
+            .list
+            .unread_bar_index
+            .and_then(|u| u.checked_sub(drop_count));
+        let items: Vec<HistoryListItem> = self
+            .messages
+            .iter()
+            .map(|m| build_list_item(m, is_group))
+            .collect();
+        self.list.set_items(items);
+        self.list.set_unread_bar(unread_bar);
+        self.list
+            .selection
+            .selected_items
+            .retain(|id| !dropped.contains(&MsgId(id.msg.0 as i32)));
+        self.list.loaded_at_top = false;
+    }
+
     /// Marks loaded outgoing messages up to `max_id` as read (`updateReadHistoryOutbox` /
     /// `updateReadChannelOutbox`), refreshing their checkmark glyphs without re-opening.
     pub fn mark_outbox_read_up_to(&mut self, max_id: MsgId) {
@@ -1172,6 +1223,24 @@ impl HistoryInnerWidget {
                 self.layout_cache.remove(&msg.id);
             }
         }
+    }
+
+    /// Sets whether the user can see the chat (`MainWindow::markingAsRead`, computed by the window
+    /// with [`crate::history::marking_read::window_marking_as_read`]). While `false`, shown
+    /// messages and reactions are not marked read.
+    pub fn set_marking_as_read(&mut self, marking: bool) {
+        self.marking_as_read = marking;
+    }
+
+    /// Tells the widget that a live-host overlay covers the chat, so nothing is marked read.
+    pub fn set_host_overlay_open(&mut self, open: bool) {
+        self.host_overlay_open = open;
+    }
+
+    /// Returns `true` when shown messages may be marked read this frame (focus excluded).
+    #[must_use]
+    pub const fn is_marking_as_read(&self) -> bool {
+        self.marking_as_read && !self.host_overlay_open
     }
 
     /// Synchronizes unread counter and inbox read watermark from a live `HistoryUpdated` event.
@@ -1685,6 +1754,21 @@ impl HistoryInnerWidget {
                 self.painted_msg_ids.clear();
                 self.painted_msg_ids
                     .extend(visible_paint.iter().map(|v| self.messages[v.index].id));
+                let broadcast = matches!(peer.summary.kind, PeerKind::Channel);
+                self.read_till_shown = visible_paint
+                    .iter()
+                    .filter_map(|v| {
+                        let msg = self.messages.get(v.index)?;
+                        let unread = !msg.outgoing
+                            && msg.id.0 > 0
+                            && msg.id > self.last_inbox_read_sent;
+                        (unread
+                            && crate::history::marking_read::unread_item_shown(
+                                broadcast, v.top, v.bottom, vis_top, vis_bottom,
+                            ))
+                        .then_some(msg.id)
+                    })
+                    .max();
                 self.media_runtime.begin_frame(now_ms);
                 self.last_bubble_anchors.clear();
 
@@ -2430,7 +2514,9 @@ impl HistoryInnerWidget {
         let total_h = self.list.total_height();
         self.scrolled_up = (total_h - vis_bot) > 120;
 
-        let window_focused = ui.ctx().input(|i| i.focused);
+        // `markingContentsRead`: the window is focused and the user can see the chat (no box,
+        // layer or overlay, not minimized, not idle; set by the window each frame).
+        let window_focused = ui.ctx().input(|i| i.focused) && self.is_marking_as_read();
 
         // `HistoryInner::paintEvent` marks shown messages with unread reactions as read
         // (`readContents`), which clears the floating "♥ N" button and the chat-row badge.
@@ -2450,21 +2536,18 @@ impl HistoryInnerWidget {
         // Like tdesktop (`history_inner_widget.cpp:1513-1515`), reading visible messages clears
         // the unread counter without destroying the `"Unread messages"` divider bar while the
         // chat remains open (it is cleared on close, send, or new arrival at bottom).
-        if window_focused && (self.unread_count > 0 || peer.unread_count > 0) {
-            let max_visible = self
-                .painted_msg_ids
-                .iter()
-                .copied()
-                .filter(|id| id.0 > 0)
-                .max();
-            if let Some(max_id) = max_visible
-                && max_id > self.last_inbox_read_sent
-            {
-                self.last_inbox_read_sent = max_id;
-                backend.mark_history_read(self.peer_id, max_id);
-                if self.list.loaded_at_bottom && !self.scrolled_up {
-                    self.unread_count = 0;
-                }
+        // Only a shown unread incoming item advances the watermark (`readTill`,
+        // `history_inner_widget.cpp:1489-1557`): a visible outgoing message must not mark an
+        // off-screen incoming one read.
+        if window_focused
+            && (self.unread_count > 0 || peer.unread_count > 0)
+            && let Some(max_id) = self.read_till_shown
+            && max_id > self.last_inbox_read_sent
+        {
+            self.last_inbox_read_sent = max_id;
+            backend.mark_history_read(self.peer_id, max_id);
+            if self.list.loaded_at_bottom && !self.scrolled_up {
+                self.unread_count = 0;
             }
         }
 
@@ -3803,6 +3886,11 @@ pub fn is_replies_chat_peer(peer: &HistoryPeerInfo) -> bool {
 }
 
 /// `st::reactStripHeight`, `st::reactStripSize`, `st::reactStripImage`, `st::reactStripSkip`.
+/// More loaded messages than this while the open chat sits at the bottom unloads the oldest page.
+pub const MAX_LOADED_AT_BOTTOM: usize = 500;
+/// Messages kept after unloading the oldest page (one 100-message page below the cap).
+pub const KEEP_LOADED_AFTER_UNLOAD: usize = 400;
+
 const CONTEXT_STRIP_HEIGHT: f32 = 40.0;
 const CONTEXT_STRIP_SIZE: f32 = 32.0;
 const CONTEXT_STRIP_IMAGE: f32 = 26.0;

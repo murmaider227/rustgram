@@ -88,7 +88,6 @@ pub const DELETE_MESSAGE_TITLE: &str = "Delete Message";
 pub const DELETE_MESSAGES_TITLE: &str = "Delete Messages";
 pub const DELETE_SELECTED_PREFIX: &str = "Are you sure you want to delete";
 pub const DELETE_SELECTED_SUFFIX: &str = "selected messages?";
-pub const DELETE_GROUP_ALL_MEMBERS: &str = "Delete group for all members";
 pub const REMEMBER_MY_CHOICE: &str = "Remember my choice";
 
 /// Username box copy without direct `lang.strings` keys.

@@ -22,7 +22,7 @@ use crate::info::birthday_effect::ProfileBirthdayEffect;
 use crate::info::strings;
 
 /// Events emitted by [`ProfileCover::show`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CoverAction {
     /// Clicked the avatar circle (opens photo viewer or photo crop editor).
     AvatarClicked,
@@ -38,6 +38,12 @@ pub enum CoverAction {
     ViewAttachedStickers,
     /// Clicked one of the rounded action buttons under the status line.
     Button(CoverButton),
+    /// Right-clicked the Mute button: open the mute menu (`MuteMenu::SetupMuteMenu`) with its
+    /// top-left at `anchor` (the button's bottom-left plus `infoProfileTopBarActionMenuSkip`).
+    MuteMenu {
+        /// Screen position of the popup's top-left corner.
+        anchor: Pos2,
+    },
 }
 
 /// Rounded action buttons under the profile status (`TopBar::setupActions`, at most three).
@@ -188,7 +194,7 @@ impl ProfileCover {
         )
     }
 
-    /// Draws the 7.4 profile top bar: centered `infoProfileTopBarPhotoSize` avatar, 16 px
+    /// Draws the 7.4 profile top bar: centered `infoProfileTopBarPhotoSize` avatar, 14 px
     /// semibold name, status, and `buttons` as rounded `TopBarActionButton`s.
     #[allow(clippy::too_many_lines)]
     pub fn show_with_buttons(
@@ -295,9 +301,10 @@ impl ProfileCover {
             }
         });
 
-        // Name (`infoProfileCover.name`, 16 px semibold) centered at `infoProfileTopBarTitleTop`.
+        // Name (`TopBar::_title` uses `infoTopBar.title` = `infoTopBarTitle`, 14 px semibold)
+        // centered at `infoProfileTopBarTitleTop`.
         let title_font = FontId::new(
-            px(st::info_profile_cover.name.style.font.size),
+            px(st::info_top_bar_title.style.font.size),
             family_semibold(),
         );
         let bold_fg = colors.color("windowBoldFg");
@@ -418,8 +425,13 @@ impl ProfileCover {
                     Pos2::new(left + idx as f32 * (button_w + space), top),
                     Vec2::new(button_w, size),
                 );
-                if paint_action_button(ui, r, *button, peer.muted, idx, colors) {
+                let resp = paint_action_button(ui, r, *button, peer.muted, idx, colors);
+                if resp.clicked() {
                     action = Some(CoverAction::Button(*button));
+                } else if resp.secondary_clicked() && *button == CoverButton::Mute {
+                    action = Some(CoverAction::MuteMenu {
+                        anchor: Pos2::new(r.min.x, r.max.y + MUTE_MENU_SKIP),
+                    });
                 }
             }
         }
@@ -453,9 +465,12 @@ impl ProfileCover {
     }
 }
 
+/// `infoProfileTopBarActionMenuSkip`: gap between the Mute button and its menu.
+const MUTE_MENU_SKIP: f32 = 10.0;
+
 /// Paints one `TopBarActionButton` (`boxRadius` card, 23 px icon at `IconTop`, 11 px label at
-/// `TextTop`): Day uses `boxBg` at 84% with `infoProfileTopBarActionButtonShadow`, Night has no
-/// shadow (`TopBar::mapActionStyle`).
+/// `TextTop`): `boxBg` at 84% over the cover, with `infoProfileTopBarActionButtonShadow` in Day
+/// only (`TopBar::mapActionStyle`).
 fn paint_action_button(
     ui: &mut Ui,
     rect: Rect,
@@ -463,7 +478,7 @@ fn paint_action_button(
     muted: bool,
     idx: usize,
     colors: &dyn Colors,
-) -> bool {
+) -> egui::Response {
     let label = button.label(muted);
     let resp = ui.interact(
         rect,
@@ -490,12 +505,9 @@ fn paint_action_button(
             Color32::from_black_alpha(22),
         );
     }
+    // `boxBg` at `1 - infoProfileTopBarActionButtonBgOpacity` in both themes.
     let box_bg = colors.color("boxBg");
-    let bg = if night {
-        colors.color("windowBgOver")
-    } else {
-        Color32::from_rgba_unmultiplied(box_bg.r(), box_bg.g(), box_bg.b(), 214)
-    };
+    let bg = Color32::from_rgba_unmultiplied(box_bg.r(), box_bg.g(), box_bg.b(), 214);
     ui.painter()
         .rect_filled(rect, CornerRadius::same(radius as u8), bg);
     if resp.hovered() {
@@ -540,5 +552,5 @@ fn paint_action_button(
         label_font,
         fg,
     );
-    resp.clicked()
+    resp
 }

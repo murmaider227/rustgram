@@ -20,6 +20,7 @@ pub mod emoji_interactions;
 pub mod factcheck;
 pub mod inline_media;
 pub mod inner;
+pub mod marking_read;
 pub mod media;
 pub mod mock;
 pub mod mock_ext;
@@ -56,6 +57,8 @@ mod sections_tests;
 mod tests;
 #[cfg(test)]
 mod tests_scroll_bottom;
+#[cfg(test)]
+mod tests_sec3a;
 #[cfg(test)]
 mod tests_video_editor_wire2;
 #[cfg(test)]
@@ -430,6 +433,9 @@ pub struct HistoryWidget {
     last_inline_compose_text: String,
     pending_inline_prefill: Option<PendingInlinePrefill>,
     pending_forward_draft: Option<PendingForwardDraft>,
+    /// Forward bars parked with the chat they were set in (`History::forwardDraft`): switching
+    /// chats keeps each forward draft with its own chat instead of moving it to the next one.
+    forward_drafts: HashMap<PeerId, crate::history::compose::ComposeMode>,
     /// `BotInfo::startToken` per bot chat, set by a `tg://resolve?domain=<bot>&start=<token>`
     /// link and sent with `messages.startBot` when the user presses START.
     bot_start_tokens: HashMap<PeerId, String>,
@@ -597,6 +603,7 @@ impl HistoryWidget {
             last_inline_compose_text: String::new(),
             pending_inline_prefill: None,
             pending_forward_draft: None,
+            forward_drafts: HashMap::new(),
             bot_start_tokens: HashMap::new(),
             bot_start_shown: false,
             pending_game_url_bot: None,
@@ -1948,21 +1955,29 @@ impl HistoryWidget {
         }
 
         // Handle peer switch: flush previous thread rich draft (with entities), load new peer's slice & draft.
-        // Port of `HistoryWidget::showHistory` + `updateForwarding`: preserve any pending
-        // `ComposeMode::Forward` across peer switches so forwarding into another chat restores
-        // the target chat's draft while keeping the forward preview bar active.
+        // Port of `HistoryWidget::showHistory` + `updateForwarding`: a forward bar belongs to the
+        // chat it was set in (`_history->setForwardDraft`), so it stays with that chat and comes
+        // back when the chat reopens; it never moves to the chat opened next.
         if self.active_peer != peer_id {
             if !self.active_peer.is_zero() {
                 self.inner
                     .finalize_read_metrics_for_backend(backend, now_ms_u64);
                 let _ = backend.flush_read_metrics(false);
             }
-            let pending_forward = match &self.compose.mode {
+            let mut pending_forward = match &self.compose.mode {
                 crate::history::compose::ComposeMode::Forward { .. } => {
                     Some(self.compose.mode.clone())
                 }
                 _ => None,
             };
+            if !self.active_peer.is_zero()
+                && let Some(fwd) = pending_forward.take()
+            {
+                self.forward_drafts.insert(self.active_peer, fwd);
+            }
+            if let Some(fwd) = self.forward_drafts.remove(&peer_id) {
+                pending_forward = Some(fwd);
+            }
             if !self.active_peer.is_zero()
                 && !matches!(
                     self.compose.mode,

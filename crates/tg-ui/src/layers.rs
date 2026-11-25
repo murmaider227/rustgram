@@ -300,59 +300,72 @@ impl LayerStack {
                                 ui.set_min_width(box_w);
                                 ui.set_max_width(box_w);
 
-                                // Title row (`boxTitleHeight = 48px`)
-                                let (title_rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(box_w, style.title_height),
-                                    Sense::hover(),
-                                );
-                                let title_font = style.title.style.font.font_id();
-                                let title_fg = with_alpha(style.title.text_fg, f64::from(opacity));
-                                let title_galley = ui.painter().layout_no_wrap(
-                                    entry.modal.title.clone(),
-                                    title_font,
-                                    title_fg,
-                                );
-                                let title_pos = Pos2::new(
-                                    title_rect.min.x + 24.0,
-                                    title_rect.center().y - title_galley.size().y * 0.5,
-                                );
-                                ui.painter()
-                                    .galley(title_pos, title_galley.clone(), title_fg);
-
-                                if let Some(add) = &entry.modal.additional_title {
-                                    ui.painter().text(
-                                        Pos2::new(
-                                            title_pos.x + title_galley.size().x + 9.0,
-                                            title_rect.center().y,
-                                        ),
-                                        Align2::LEFT_CENTER,
-                                        add,
-                                        egui::FontId::proportional(constants::FSIZE),
-                                        with_alpha(style.title_additional_fg, f64::from(opacity)),
+                                // A box with an empty title and no close button has no title
+                                // row; its content starts at `boxPadding.top` (untitled
+                                // `Ui::BoxContent`, e.g. `DeleteMessagesBox`).
+                                let has_title =
+                                    !entry.modal.title.is_empty() || entry.modal.show_close_button;
+                                if has_title {
+                                    // Title row (`boxTitleHeight = 48px`)
+                                    let (title_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(box_w, style.title_height),
+                                        Sense::hover(),
                                     );
-                                }
-
-                                if entry.modal.show_close_button {
-                                    let close_st = IconButtonStyle::box_title_close(colors);
-                                    let close_rect = Rect::from_min_size(
-                                        Pos2::new(
-                                            title_rect.max.x - close_st.width,
-                                            title_rect.min.y,
-                                        ),
-                                        Vec2::new(close_st.width, close_st.height),
+                                    let title_font = style.title.style.font.font_id();
+                                    let title_fg =
+                                        with_alpha(style.title.text_fg, f64::from(opacity));
+                                    let title_galley = ui.painter().layout_no_wrap(
+                                        entry.modal.title.clone(),
+                                        title_font,
+                                        title_fg,
                                     );
-                                    let mut close_ui =
-                                        ui.new_child(egui::UiBuilder::new().max_rect(close_rect));
-                                    if IconButton::new(IconKind::Close, close_st)
-                                        .show(&mut close_ui)
-                                        .clicked()
-                                        && is_top
-                                    {
-                                        event = Some(LayerEvent {
-                                            box_id: entry.modal.id.clone(),
-                                            action_id: "__close__".to_owned(),
-                                        });
+                                    let title_pos = Pos2::new(
+                                        title_rect.min.x + 24.0,
+                                        title_rect.center().y - title_galley.size().y * 0.5,
+                                    );
+                                    ui.painter()
+                                        .galley(title_pos, title_galley.clone(), title_fg);
+
+                                    if let Some(add) = &entry.modal.additional_title {
+                                        ui.painter().text(
+                                            Pos2::new(
+                                                title_pos.x + title_galley.size().x + 9.0,
+                                                title_rect.center().y,
+                                            ),
+                                            Align2::LEFT_CENTER,
+                                            add,
+                                            egui::FontId::proportional(constants::FSIZE),
+                                            with_alpha(
+                                                style.title_additional_fg,
+                                                f64::from(opacity),
+                                            ),
+                                        );
                                     }
+
+                                    if entry.modal.show_close_button {
+                                        let close_st = IconButtonStyle::box_title_close(colors);
+                                        let close_rect = Rect::from_min_size(
+                                            Pos2::new(
+                                                title_rect.max.x - close_st.width,
+                                                title_rect.min.y,
+                                            ),
+                                            Vec2::new(close_st.width, close_st.height),
+                                        );
+                                        let mut close_ui = ui
+                                            .new_child(egui::UiBuilder::new().max_rect(close_rect));
+                                        if IconButton::new(IconKind::Close, close_st)
+                                            .show(&mut close_ui)
+                                            .clicked()
+                                            && is_top
+                                        {
+                                            event = Some(LayerEvent {
+                                                box_id: entry.modal.id.clone(),
+                                                action_id: "__close__".to_owned(),
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    ui.add_space(style.content_padding.top);
                                 }
 
                                 // Scrollable body area with `boxPadding`.

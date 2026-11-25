@@ -391,6 +391,16 @@ pub enum BoxEvent {
         /// Whether deleted for everyone.
         revoked: bool,
     },
+    /// "Clear history" / "Delete chat" / "Leave" was confirmed in `DeleteMessagesBox`; the shell
+    /// runs `ApiWrap::clearHistory` / `deleteConversation` with the checkbox value.
+    ConversationDeleteConfirmed {
+        /// Chat to clear, delete or leave.
+        peer_id: PeerId,
+        /// `true` for "Clear history".
+        just_clear: bool,
+        /// "Also delete for {user}" / "Delete for all members" was checked.
+        revoke: bool,
+    },
     /// Language pack switched.
     LanguageChanged(String),
     /// Terms of Service accepted or declined.
@@ -1366,6 +1376,14 @@ impl BoxHost {
                 }
                 _ => {}
             },
+            BoxKind::DeleteMessages(s) if action_id == "delete" && s.wipes_history() => {
+                events.push(BoxEvent::ConversationDeleteConfirmed {
+                    peer_id: s.peer_id,
+                    just_clear: matches!(s.mode, delete_messages::DeleteMode::ClearHistory),
+                    revoke: s.revoke_for_everyone,
+                });
+                should_pop = true;
+            }
             BoxKind::DeleteMessages(s) if action_id == "delete" => {
                 if let Ok(count) = s.submit(backend) {
                     events.push(BoxEvent::Deleted {

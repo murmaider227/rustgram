@@ -26,6 +26,8 @@ pub mod widget_host;
 #[cfg(test)]
 mod tests_sec2a;
 #[cfg(test)]
+mod tests_sec3a;
+#[cfg(test)]
 mod tests_sec_b;
 #[cfg(test)]
 mod tests_wire2;

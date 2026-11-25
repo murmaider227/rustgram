@@ -19,6 +19,7 @@ pub mod mini_preview;
 pub mod mock;
 pub mod quick_action;
 pub mod search;
+pub mod search_snippet;
 pub mod strings;
 pub mod suggestions;
 #[cfg(test)]

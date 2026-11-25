@@ -60,9 +60,7 @@ use tg_app::stand_in::settings::ShellSettings;
 use tg_app::stand_in::strings::EnglishStrings;
 use tg_app::stand_in::theme::Palette;
 use tg_app::stand_in::types::PeerId;
-use tg_app::webview::backend::{
-    AppWebViewEvent, BotInfo, ClipboardAccess, ExternalOpener, WebViewLaunchInfo,
-};
+use tg_app::webview::backend::{BotInfo, ClipboardAccess, ExternalOpener, WebViewLaunchInfo};
 use tg_app::webview::mini_app::{ActiveMiniAppModal, MiniAppWindow};
 use tg_app::webview::mock::MockWebViewBackend;
 use tg_app::window::controller::{RootScreen, WindowController};
@@ -504,11 +502,10 @@ fn wp35_mini_app_check_and_request_location_events() {
         &clipboard,
         now,
     );
-    assert_eq!(
-        evs,
-        vec![AppWebViewEvent::OpenExternalUrl {
-            url: "ms-settings:privacy-location".to_owned()
-        }]
+    // SEC3-A A5: location was granted, so the page may not open the OS location settings.
+    assert!(
+        evs.is_empty(),
+        "settings dropped after a granted request: {evs:?}"
     );
 
     let posted = window.posted_raw_events();

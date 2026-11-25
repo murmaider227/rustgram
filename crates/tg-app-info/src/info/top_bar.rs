@@ -269,18 +269,29 @@ impl InfoTopBar {
                 }
             }
         } else {
+            // Over the profile cover tdesktop uses the `infoTopBarBlack*` buttons
+            // (`windowBoldFg` icons, `info_profile_top_bar.style`).
+            let (back_icon, back_icon_over) = if cfg.overlay {
+                (
+                    st::info_top_bar_black_back.icon,
+                    st::info_top_bar_black_back.icon_over,
+                )
+            } else {
+                (st::info_top_bar_back_icon, st::info_top_bar_back_icon_over)
+            };
             let mut left_x = bar_rect.min.x + 18.0;
             if cfg.show_back {
+                // `infoTopBarBack`: 60 px wide, the 32 px icon at x = 11.
                 let back_rect = Rect::from_center_size(
-                    Pos2::new(bar_rect.min.x + 26.0, center_y),
+                    Pos2::new(bar_rect.min.x + 27.0, center_y),
                     Vec2::splat(40.0),
                 );
                 if top_bar_icon_btn(
                     ui,
                     (id_salt, "back"),
                     back_rect,
-                    &st::info_top_bar_back_icon,
-                    &st::info_top_bar_back_icon_over,
+                    &back_icon,
+                    &back_icon_over,
                     &tr::lng_go_back(),
                     colors,
                 ) {
@@ -292,14 +303,22 @@ impl InfoTopBar {
             // Right-side action buttons from right to left.
             let mut right_x = bar_rect.max.x - 6.0;
             if cfg.show_close {
-                let r =
-                    Rect::from_center_size(Pos2::new(right_x - 20.0, center_y), Vec2::splat(40.0));
+                // `infoTopBarClose`: 48 px wide at the right edge, the 32 px icon at x = 5.
+                let close_st = if cfg.overlay {
+                    &st::info_top_bar_black_close
+                } else {
+                    &st::info_top_bar_close
+                };
+                let r = Rect::from_center_size(
+                    Pos2::new(bar_rect.max.x - 27.0, center_y),
+                    Vec2::splat(40.0),
+                );
                 if top_bar_icon_btn(
                     ui,
                     (id_salt, "close"),
                     r,
-                    &st::info_top_bar_close.icon,
-                    &st::info_top_bar_close.icon_over,
+                    &close_st.icon,
+                    &close_st.icon_over,
                     &tr::lng_close(),
                     colors,
                 ) {
@@ -311,12 +330,17 @@ impl InfoTopBar {
             if !cfg.menu_items.is_empty() {
                 let r =
                     Rect::from_center_size(Pos2::new(right_x - 20.0, center_y), Vec2::splat(40.0));
+                let menu_st = if cfg.overlay {
+                    &st::info_top_bar_black_menu
+                } else {
+                    &st::info_top_bar_menu
+                };
                 if top_bar_icon_btn(
                     ui,
                     (id_salt, "menu"),
                     r,
-                    &st::info_top_bar_menu.icon,
-                    &st::info_top_bar_menu.icon_over,
+                    &menu_st.icon,
+                    &menu_st.icon_over,
                     strings::TOOLTIP_MORE_ACTIONS,
                     colors,
                 ) {
@@ -455,10 +479,10 @@ fn top_bar_icon_btn(
     } else {
         icon
     };
-    let ic_rect = Rect::from_center_size(rect.center(), Vec2::splat(22.0));
+    // tdesktop draws `IconButton` icons at their natural size (32 px boxes for `info/*`).
     paint_style_icon(
         ui.painter(),
-        ic_rect,
+        rect,
         *active_icon,
         &ColorsResolver(colors),
         None,

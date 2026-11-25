@@ -167,25 +167,23 @@ def run_single_client(
     skip_5min: bool,
     diag_png: Path | None,
 ) -> dict[str, Any]:
-    if workdir.exists():
-        shutil.rmtree(workdir, ignore_errors=True)
-    workdir.mkdir(parents=True, exist_ok=True)
-
     env = os.environ.copy()
     env.update(extra_env)
 
-    cmd = [str(exe_path), *extra_args, "-workdir", str(workdir)]
-    print(f"[part1] {client} run {run_idx}: launching...", flush=True)
+    with wm.ScratchSession(workdir.parent, graceful_timeout_s=5.0, post_stop_delay_s=1.5) as sess:
+        wd = sess.make_empty_workdir(workdir.name)
+        cmd = [str(exe_path), *extra_args, "-workdir", str(wd)]
+        print(f"[part1] {client} run {run_idx}: launching...", flush=True)
 
-    t_launch = time.perf_counter()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(exe_path.parent),
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
+        t_launch = time.perf_counter()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(exe_path.parent),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        sess.track_process(proc)
         startup = wait_for_window_and_ready(
             proc.pid,
             t_launch,
@@ -234,10 +232,6 @@ def run_single_client(
             "at_30s": {"memory": mem_30s, "cpu": cpu_30s},
             "at_5min": {"memory": mem_5m, "cpu": cpu_5m} if not skip_5min else None,
         }
-    finally:
-        wm.stop_process_by_pid(proc.pid, graceful_timeout_s=5.0)
-        time.sleep(1.5)
-        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def summarize_client_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -275,6 +269,13 @@ def summarize_client_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    try:
+        wm.ensure_outside_git_repo(args.scratch_dir, label="--scratch-dir")
+        if args.diag_dir is not None:
+            wm.ensure_outside_git_repo(args.diag_dir, label="--diag-dir")
+    except ValueError as exc:
+        sys.stderr.write(f"[part1] {exc}\n")
+        return 2
     args.scratch_dir.mkdir(parents=True, exist_ok=True)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
 
@@ -392,4 +393,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except wm.WorkdirCleanupError as exc:
+        sys.stderr.write(f"[part1] {exc}\n")
+        raise SystemExit(4)

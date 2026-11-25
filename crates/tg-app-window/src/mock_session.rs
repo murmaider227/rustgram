@@ -2742,6 +2742,22 @@ impl DialogsBackend for SharedSessionHandle {
         Ok(())
     }
 
+    fn can_revoke_full_history(&self, peer_id: PeerId) -> bool {
+        self.state.lock().is_ok_and(|st| {
+            st.peer(peer_id).is_some_and(|p| match p.kind {
+                InfoPeerKind::User => true,
+                InfoPeerKind::Group | InfoPeerKind::Supergroup => p.can_manage_admins,
+                _ => false,
+            })
+        })
+    }
+
+    fn peer_first_name(&self, peer_id: PeerId) -> Option<String> {
+        let st = self.state.lock().ok()?;
+        let peer = st.peer(peer_id).filter(|p| p.kind == InfoPeerKind::User)?;
+        peer.title.split_whitespace().next().map(str::to_owned)
+    }
+
     fn unblock_and_restart_bot(&mut self, peer_id: PeerId) -> Result<(), String> {
         let is_bot = {
             let mut st = self
@@ -2860,6 +2876,16 @@ impl DialogsBackend for SharedSessionHandle {
                             sender_name: peer.kind.is_group().then(|| m.sender_name.clone()),
                             text: m.preview_snippet(),
                             time: LocalDateTime::from_unix_utc(i64::from(m.date_unix)),
+                            send_state: match (
+                                m.outgoing && peer.kind != InfoPeerKind::SavedMessages,
+                                m.is_sending,
+                                m.is_read,
+                            ) {
+                                (false, _, _) => DialogSendState::None,
+                                (true, true, _) => DialogSendState::Sending,
+                                (true, false, true) => DialogSendState::Received,
+                                (true, false, false) => DialogSendState::Sent,
+                            },
                             archived: peer.archived,
                         });
                     }
@@ -3162,6 +3188,12 @@ impl DialogsBackend for MockSession {
     }
     fn delete_chat(&mut self, peer_id: PeerId, revoke: bool) -> Result<(), String> {
         self.handle.delete_chat(peer_id, revoke)
+    }
+    fn can_revoke_full_history(&self, peer_id: PeerId) -> bool {
+        self.handle.can_revoke_full_history(peer_id)
+    }
+    fn peer_first_name(&self, peer_id: PeerId) -> Option<String> {
+        self.handle.peer_first_name(peer_id)
     }
     fn unblock_and_restart_bot(&mut self, peer_id: PeerId) -> Result<(), String> {
         self.handle.unblock_and_restart_bot(peer_id)

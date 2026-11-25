@@ -926,15 +926,7 @@ pub fn dialog_item_from_session(
         if let Some(msg) = top_msg {
             let preview = crate::preview_text::message_preview_text(session, msg);
             let sender = crate::preview_text::preview_sender(session, msg);
-            let send_state = if !msg.is_outgoing() || peer_id == session.self_peer_id() {
-                DialogSendState::None
-            } else if msg.flags.contains(MessageFlags::BEING_SENT) {
-                DialogSendState::Sending
-            } else if history.is_server_side_unread(msg) {
-                DialogSendState::Sent
-            } else {
-                DialogSendState::Received
-            };
+            let send_state = message_send_state(session, msg);
             (
                 from_data_msg(msg.id),
                 preview,
@@ -1016,6 +1008,38 @@ pub fn dialog_item_from_session(
         is_contact,
         media_preview,
     })
+}
+
+/// Whether outgoing messages to `peer` are always shown as read (`HistoryItem::unread`): bots
+/// (except support), broadcast channels and basic groups migrated to a supergroup.
+fn outgoing_always_read(peer: Option<&Peer>) -> bool {
+    match peer {
+        Some(Peer::User(u)) => u.is_bot() && !u.is_support(),
+        Some(Peer::Channel(ch)) => !ch.is_megagroup(),
+        Some(Peer::Chat(chat)) => chat.is_migrated(),
+        None => false,
+    }
+}
+
+/// Delivery ticks of `msg` in chat-list and search rows: none for incoming messages and Saved
+/// Messages, a clock while sending, one tick while the peer has not read it
+/// (`HistoryItem::unread`), two ticks otherwise.
+#[must_use]
+pub fn message_send_state(session: &Session, msg: &tg_data::Message) -> DialogSendState {
+    let peer_id = msg.peer_id;
+    if !msg.is_outgoing() || peer_id == session.self_peer_id() {
+        DialogSendState::None
+    } else if msg.flags.contains(MessageFlags::BEING_SENT) {
+        DialogSendState::Sending
+    } else if session
+        .history(peer_id)
+        .is_some_and(|h| h.is_server_side_unread(msg))
+        && !outgoing_always_read(session.peer(peer_id))
+    {
+        DialogSendState::Sent
+    } else {
+        DialogSendState::Received
+    }
 }
 
 /// Converts a dialog in `session` into a legacy shell [`DialogEntry`].

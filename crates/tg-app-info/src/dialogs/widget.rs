@@ -66,6 +66,14 @@ pub enum DialogsPanelAction {
     OpenMuteFor(PeerId),
     /// Mute submenu "Select tone" (`RingtonesBox`).
     OpenSelectTone(PeerId),
+    /// Open the `DeleteMessagesBox` confirmation for "Clear history" (`just_clear`) or
+    /// "Delete chat" / "Delete and leave" / "Leave" from the chat-list menu.
+    ConfirmDelete {
+        /// Chat to clear, delete or leave.
+        peer_id: PeerId,
+        /// `true` for "Clear history".
+        just_clear: bool,
+    },
 }
 
 /// Keyboard command mapped from tdesktop's `Shortcuts::Command` (`dialogs_inner_widget.cpp:6484-6620`).
@@ -222,6 +230,11 @@ pub struct DialogsPanel {
     last_birthdays_date: Option<(i32, u8, u8)>,
     request_search_focus: bool,
 }
+
+/// `dialogsMenuToggle` width / height.
+const MENU_TOGGLE_SIZE: f32 = 40.0;
+/// `dialogsFilter.heightMin`.
+const SEARCH_FIELD_HEIGHT: f32 = 35.0;
 
 impl Default for DialogsPanel {
     fn default() -> Self {
@@ -722,6 +735,15 @@ impl DialogsPanel {
                     InnerAction::OpenSelectTone(pid) => {
                         action = Some(DialogsPanelAction::OpenSelectTone(pid));
                     }
+                    InnerAction::ConfirmDelete {
+                        peer_id,
+                        just_clear,
+                    } => {
+                        action = Some(DialogsPanelAction::ConfirmDelete {
+                            peer_id,
+                            just_clear,
+                        });
+                    }
                 }
             }
 
@@ -985,6 +1007,9 @@ impl DialogsPanel {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
+                    // The bar is `topBarHeight` (54 px) with or without the menu toggle: the
+                    // row is as tall as `dialogsMenuToggle` (40 px) inside the 7 px padding.
+                    ui.set_min_height(MENU_TOGGLE_SIZE);
                     // 7.4.6 keeps the main menu button while searching and cancels with the ×
                     // inside the field (`_cancelSearch`); there is no extra back arrow.
                     if show_hamburger && hamburger_button(ui, palette) {
@@ -993,11 +1018,17 @@ impl DialogsPanel {
 
                     let show_clear = !self.search_query.is_empty() || self.search_active;
                     let pill_w = ui.available_width().max(80.0);
-                    let pill_rect = Rect::from_min_size(ui.cursor().min, Vec2::new(pill_w, 34.0));
+                    // `filterTop = (topBarHeight - dialogsFilter.heightMin) / 2` = 9 px.
+                    let pill_top = ui.max_rect().top()
+                        + ((MENU_TOGGLE_SIZE - SEARCH_FIELD_HEIGHT) / 2.0).floor();
+                    let pill_rect = Rect::from_min_size(
+                        Pos2::new(ui.cursor().min.x, pill_top),
+                        Vec2::new(pill_w, SEARCH_FIELD_HEIGHT),
+                    );
                     let focused = ui.ctx().memory(|m| m.has_focus(input_id));
                     ui.painter().rect_filled(
                         pill_rect,
-                        CornerRadius::same(17),
+                        CornerRadius::same(18),
                         if focused {
                             colors.color("filterInputActiveBg")
                         } else {
@@ -1008,7 +1039,7 @@ impl DialogsPanel {
                         // `st::dialogsFilter`: borderActive 2px / denominator 2 in `windowBgRipple`.
                         ui.painter().rect_stroke(
                             pill_rect,
-                            CornerRadius::same(17),
+                            CornerRadius::same(18),
                             Stroke::new(1.0, colors.color("windowBgRipple")),
                             egui::StrokeKind::Inside,
                         );

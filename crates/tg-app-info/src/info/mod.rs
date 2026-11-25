@@ -19,6 +19,7 @@ pub mod global_media;
 pub mod media;
 pub mod members;
 pub mod mock;
+pub mod mute_menu;
 pub mod peer_mgmt_mock;
 pub mod profile_controls;
 pub mod profile_extras_mock;
@@ -32,6 +33,8 @@ pub mod wrap_widget;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_uip4c;
 #[cfg(test)]
 mod tests_wp78;
 

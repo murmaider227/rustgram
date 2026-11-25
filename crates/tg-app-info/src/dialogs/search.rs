@@ -933,7 +933,7 @@ pub fn show_search_body(
                 format!("Found {} public posts", results.total_messages)
             }
         } else {
-            tg_lang::tr::lng_search_found_results(results.total_messages as i64)
+            strings::search_found_results(results.total_messages as i64)
         };
         let filter_label = state.chat_type_filter.label();
         let show_chat_filter = state.tab != SearchTab::PublicPosts;

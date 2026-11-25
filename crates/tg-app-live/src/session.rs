@@ -441,21 +441,30 @@ impl LiveSession {
     }
 
     /// Resolves the directory where temporary copies for `open_in_external_app*` are written.
+    /// `None` until an account folder is attached: plaintext copies never go to `%TEMP%`.
     #[must_use]
-    pub fn external_open_temp_dir(&self) -> PathBuf {
+    pub fn external_open_temp_dir(&self) -> Option<PathBuf> {
         if let Some(dir) = self.account_temp_dir() {
-            return dir.join("external");
+            return Some(dir.join("external"));
         }
         if self.media_cache.is_persistent() {
-            return self.media_cache.root_dir().join("external_tmp");
+            return Some(self.media_cache.root_dir().join("external_tmp"));
         }
-        std::env::temp_dir().join(format!("rustgram_external_pid_{}", std::process::id()))
+        None
+    }
+
+    fn require_external_open_temp_dir(&self) -> anyhow::Result<PathBuf> {
+        self.external_open_temp_dir().ok_or_else(|| {
+            anyhow!("no account folder is attached yet, so the file cannot be opened externally")
+        })
     }
 
     /// Removes unlocked temporary files inside this account's external-open temp directory
     /// without failing when an external viewer still holds a file handle open.
     pub fn cleanup_account_temp_files(&self) {
-        let dir = self.external_open_temp_dir();
+        let Some(dir) = self.external_open_temp_dir() else {
+            return;
+        };
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };
@@ -2430,7 +2439,19 @@ impl DialogsBackend for LiveSession {
     }
 
     fn delete_chat(&mut self, peer_id: PeerId, revoke: bool) -> Result<(), String> {
-        crate::dialogs_actions::delete_chat(self, peer_id, revoke)
+        crate::dialogs_delete::delete_conversation(self, peer_id, revoke)
+    }
+
+    fn clear_history_for(&mut self, peer_id: PeerId, revoke: bool) -> Result<(), String> {
+        crate::dialogs_delete::clear_history_for(self, peer_id, revoke)
+    }
+
+    fn can_revoke_full_history(&self, peer_id: PeerId) -> bool {
+        crate::dialogs_delete::can_revoke_full_history(self, peer_id)
+    }
+
+    fn peer_first_name(&self, peer_id: PeerId) -> Option<String> {
+        crate::dialogs_delete::peer_first_name(self, peer_id)
     }
 
     fn unblock_and_restart_bot(&mut self, peer_id: PeerId) -> Result<(), String> {
@@ -6542,8 +6563,8 @@ impl MediaBackend for LiveSession {
         } else {
             item.file_name
         };
+        let temp_dir = self.require_external_open_temp_dir()?;
         let bytes = self.load_bytes(id)?;
-        let temp_dir = self.external_open_temp_dir();
         let saved =
             tg_platform::file_safety::write_unique_file_in_dir(&temp_dir, &raw_name, &bytes)
                 .map_err(|err| anyhow!("{err}"))?;
@@ -6561,8 +6582,8 @@ impl MediaBackend for LiveSession {
         } else {
             item.file_name
         };
+        let temp_dir = self.require_external_open_temp_dir()?;
         let bytes = self.load_bytes(id)?;
-        let temp_dir = self.external_open_temp_dir();
         let saved =
             tg_platform::file_safety::write_unique_file_in_dir(&temp_dir, &raw_name, &bytes)
                 .map_err(|err| anyhow!("{err}"))?;
@@ -7258,7 +7279,9 @@ mod sec2b_session_tests {
         let acc_temp = dir.path().join("tdata").join("temp_data");
         live.set_account_temp_dir(&acc_temp);
 
-        let ext_dir = live.external_open_temp_dir();
+        let ext_dir = live
+            .external_open_temp_dir()
+            .expect("account temp dir is attached");
         assert_eq!(ext_dir, acc_temp.join("external"));
         assert!(
             !ext_dir.starts_with(std::env::temp_dir().join("rustgram_external")),
@@ -7298,5 +7321,26 @@ mod sec2b_session_tests {
             live.cleanup_account_temp_files();
             assert!(!busy.exists(), "once closed, temp copy must be cleaned up");
         }
+    }
+
+    #[test]
+    fn sec3_b1_external_open_has_no_temp_dir_without_account_folder() {
+        let (_dir, live, _item_id) = make_test_session_with_cached_photo();
+        // Back to the state before an account folder is attached: memory-only cache, no temp dir.
+        live.media_cache().close_to_memory();
+        assert!(live.account_temp_dir().is_none());
+        assert!(!live.media_cache().is_persistent());
+
+        assert_eq!(
+            live.external_open_temp_dir(),
+            None,
+            "without an account folder there is no place for plaintext temp copies"
+        );
+        let err = live
+            .require_external_open_temp_dir()
+            .expect_err("opening in an external app must be refused");
+        assert!(err.to_string().contains("no account folder"));
+        // Nothing to clean, and nothing must be created by the cleanup either.
+        live.cleanup_account_temp_files();
     }
 }

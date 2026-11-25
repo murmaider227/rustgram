@@ -28,6 +28,8 @@ pub mod screen_picker;
 #[cfg(test)]
 pub mod screenshot;
 pub mod strings;
+#[cfg(test)]
+mod tests_sec3a;
 pub mod theme;
 pub mod top_bar;
 
@@ -68,6 +70,7 @@ pub struct AppCallsHost {
     join_as_box: ChooseJoinAsBox,
     last_toast: Option<(String, u64)>,
     demo_shortcuts_enabled: bool,
+    passcode_locked: bool,
 }
 
 impl Default for AppCallsHost {
@@ -105,6 +108,7 @@ impl AppCallsHost {
             join_as_box: ChooseJoinAsBox::default(),
             last_toast: None,
             demo_shortcuts_enabled: true,
+            passcode_locked: false,
         }
     }
 
@@ -117,8 +121,44 @@ impl AppCallsHost {
         self
     }
 
-    /// Opens the Recent Calls dialog (`Calls::BoxController`).
+    /// Mirrors the app passcode lock. While locked no call window, box, top bar or shortcut is
+    /// shown or handled, and every nested call box is closed (`Calls::Instance::hidePanelLayers`,
+    /// `application.cpp:1432-1440`); an active call keeps running and its sounds keep playing.
+    pub fn set_passcode_locked(&mut self, locked: bool) {
+        self.passcode_locked = locked;
+        if locked {
+            self.hide_panel_layers();
+        }
+    }
+
+    /// Returns `true` while the app passcode lock hides the call UI.
+    #[must_use]
+    pub const fn is_passcode_locked(&self) -> bool {
+        self.passcode_locked
+    }
+
+    fn hide_panel_layers(&mut self) {
+        self.recent_calls_box.open = false;
+        self.join_as_box.open = false;
+        self.call_panel.device_menu = None;
+        self.call_panel.screen_picker.close();
+        let group = &mut self.group_panel;
+        group.settings_dialog.open = false;
+        group.recording_dialog.open = false;
+        group.rtmp_dialog.open = false;
+        group.screen_picker.close();
+        group.invite_dialog.open = false;
+        group.leave_confirm_open = false;
+        group.start_scheduled_confirm_open = false;
+        group.request_switch_join_as = false;
+    }
+
+    /// Opens the Recent Calls dialog (`Calls::BoxController`). Refused while the passcode lock is
+    /// shown.
     pub fn open_recent_calls(&mut self) {
+        if self.passcode_locked {
+            return;
+        }
         self.recent_calls_box.open = true;
         self.backend.refresh_recent_calls();
     }
@@ -129,6 +169,9 @@ impl AppCallsHost {
         peer_id: Option<tg_app_core::stand_in::types::PeerId>,
         slug_or_hash: Option<String>,
     ) {
+        if self.passcode_locked {
+            return;
+        }
         let now_ms = self.elapsed_ms();
         if peer_id.is_none()
             && let Some(slug) = slug_or_hash.filter(|s| !s.is_empty())
@@ -158,6 +201,9 @@ impl AppCallsHost {
         peer_id: tg_app_core::stand_in::types::PeerId,
         video: bool,
     ) {
+        if self.passcode_locked {
+            return;
+        }
         let now_ms = self.elapsed_ms();
         self.backend.start_outgoing_call(peer_id, video, now_ms);
         self.backend.confirm_outgoing_call(video, now_ms);
@@ -205,7 +251,9 @@ impl AppCallsHost {
         let ctx = ui.ctx().clone();
         self.palette = CallPalette::from_theme(ctx.global_style().visuals.dark_mode);
         let now_ms = self.elapsed_ms();
-        self.handle_demo_shortcuts(&ctx, now_ms);
+        if !self.passcode_locked {
+            self.handle_demo_shortcuts(&ctx, now_ms);
+        }
 
         self.backend.tick(now_ms);
         for ev in self.backend.drain_sound_events() {
@@ -228,6 +276,14 @@ impl AppCallsHost {
 
         for toast in self.backend.drain_toasts() {
             self.last_toast = Some((toast, now_ms + 3_500));
+        }
+
+        if self.passcode_locked {
+            self.hide_panel_layers();
+            if self.backend.active_call().is_some() || self.backend.active_group_call().is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            return;
         }
 
         // 1. Active call top bar (`calls_top_bar.cpp`) above the main workspace.

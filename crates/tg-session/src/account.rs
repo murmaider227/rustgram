@@ -27,13 +27,15 @@ use tg_mtproto::{
     Client as MtprotoClient, KeysDestroyResult, KeysDestroyer, TgTransportFactory, TransportFactory,
 };
 use tg_storage::cache::media_cache::{
-    derive_media_cache_key, rekey_or_purge_cache_dir, unregister_cache_key,
+    derive_media_cache_key, register_cache_key, rekey_or_purge_cache_dir, unregister_cache_key,
 };
 use tg_storage::peer_id::PeerId as StoragePeerId;
 use tg_storage::serialize::peer::{
     SerializedPeer, SerializedPeerKind, SerializedUser, deserialize_self_user, serialize_self_user,
 };
-use tg_storage::tdf::{clear_key, compose_data_string, compute_data_name_key, to_file_part};
+use tg_storage::tdf::{
+    clear_key, clear_name, compose_data_string, compute_data_name_key, to_file_part,
+};
 use tg_storage::{
     LocalStorage, MtpAuthKeyEntry, MtpAuthorization, PasscodeKdf, StorageEncryptionKey,
     StorageError, StoredSessionSettings,
@@ -126,15 +128,207 @@ pub fn resolve_account_cache_key_for_tdata(
     data_name: &str,
     slot_index: i32,
 ) -> Option<StorageEncryptionKey> {
-    if let Some((unlocked_name, local_key)) = unlocked_domain_key_for_tdata(tdata_dir) {
-        let acc_data_name = compose_data_string(&unlocked_name, slot_index);
-        return Some(derive_media_cache_key(&local_key, &acc_data_name));
+    let (name, local_key) = match unlocked_domain_key_for_tdata(tdata_dir) {
+        Some(unlocked) => unlocked,
+        None => {
+            let domain = tg_storage::domain::DomainStorage::open(tdata_dir, data_name, b"").ok()?;
+            (data_name.to_owned(), domain.local_key().clone())
+        }
+    };
+    let generation = resolve_cache_generation(tdata_dir, &name, slot_index, &local_key);
+    let acc_data_name = compose_data_string(&name, slot_index);
+    Some(derive_media_cache_key(
+        &local_key,
+        &cache_key_name(&acc_data_name, generation.as_deref()),
+    ))
+}
+
+/// Encrypted per-account prefs key holding the random media-cache generation chosen at login.
+///
+/// The cache folder and its key depend on it, so an account that later takes over the same slot
+/// never opens (or can decrypt) files the previous login left behind.
+pub const CACHE_GENERATION_PREFS_KEY: &[u8] = b"tgfork_cache_generation_v1";
+
+/// Marker inserted into a path renamed for deletion (`<name>.deleted-<random>`). A tombstone
+/// never belongs to a live account, so the pending-cleanup queue may always delete it.
+const TOMBSTONE_MARKER: &str = ".deleted-";
+
+type GenerationKey = (PathBuf, String);
+
+static CACHE_GENERATIONS: OnceLock<Mutex<HashMap<GenerationKey, String>>> = OnceLock::new();
+
+fn generation_registry() -> &'static Mutex<HashMap<GenerationKey, String>> {
+    CACHE_GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_cache_generation(tdata_dir: &Path, acc_data_name: &str, generation: Option<&str>) {
+    let key = (normalize_tdata_path(tdata_dir), acc_data_name.to_owned());
+    if let Ok(mut guard) = generation_registry().lock() {
+        match generation {
+            Some(generation) => {
+                guard.insert(key, generation.to_owned());
+            }
+            None => {
+                guard.remove(&key);
+            }
+        }
     }
-    if let Ok(domain) = tg_storage::domain::DomainStorage::open(tdata_dir, data_name, b"") {
-        let acc_data_name = compose_data_string(data_name, slot_index);
-        return Some(derive_media_cache_key(domain.local_key(), &acc_data_name));
+}
+
+fn registered_cache_generation(tdata_dir: &Path, acc_data_name: &str) -> Option<String> {
+    let key = (normalize_tdata_path(tdata_dir), acc_data_name.to_owned());
+    generation_registry().lock().ok()?.get(&key).cloned()
+}
+
+fn is_valid_cache_generation(generation: &str) -> bool {
+    generation.len() == 16
+        && generation
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    tg_crypto::random::random_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn read_cache_generation(prefs: &BTreeMap<Vec<u8>, Vec<u8>>) -> Option<String> {
+    let raw = prefs.get(CACHE_GENERATION_PREFS_KEY)?;
+    let generation = std::str::from_utf8(raw).ok()?;
+    is_valid_cache_generation(generation).then(|| generation.to_owned())
+}
+
+fn resolve_cache_generation(
+    tdata_dir: &Path,
+    data_name: &str,
+    slot_index: i32,
+    local_key: &AuthKey,
+) -> Option<String> {
+    let acc_data_name = compose_data_string(data_name, slot_index);
+    if let Some(generation) = registered_cache_generation(tdata_dir, &acc_data_name) {
+        return Some(generation);
     }
-    None
+    let storage =
+        tg_storage::AccountStorage::open(tdata_dir, data_name, slot_index, local_key.clone())
+            .ok()?;
+    read_cache_generation(&storage.read_prefs().ok()?)
+}
+
+/// Key-derivation name for an account's media cache: the tdesktop data string, plus the
+/// per-login generation for accounts signed in by this build.
+fn cache_key_name(acc_data_name: &str, generation: Option<&str>) -> String {
+    match generation {
+        Some(generation) => format!("{acc_data_name}#cache-generation:{generation}"),
+        None => acc_data_name.to_owned(),
+    }
+}
+
+/// Media cache folder name for a slot: `<file_part>-<generation>` for accounts signed in by this
+/// build, `<file_part>` for accounts signed in before the generation existed.
+#[must_use]
+pub fn account_media_cache_dir_name(
+    data_name: &str,
+    slot_index: i32,
+    generation: Option<&str>,
+) -> String {
+    let file_part = account_data_key_file_part(data_name, slot_index);
+    match generation {
+        Some(generation) => format!("{file_part}-{generation}"),
+        None => file_part,
+    }
+}
+
+/// Resolves the account's media cache folder (`tdata/media_cache/<file_part>[-<generation>]`)
+/// using the generation registered by [`AccountManager`] after unlock or login.
+#[must_use]
+pub fn account_media_cache_dir_for_tdata(
+    tdata_dir: &Path,
+    data_name: &str,
+    slot_index: i32,
+) -> PathBuf {
+    let acc_data_name = compose_data_string(data_name, slot_index);
+    let generation = registered_cache_generation(tdata_dir, &acc_data_name).or_else(|| {
+        let (_, local_key) = unlocked_domain_key_for_tdata(tdata_dir)?;
+        resolve_cache_generation(tdata_dir, data_name, slot_index, &local_key)
+    });
+    tdata_dir
+        .join("media_cache")
+        .join(account_media_cache_dir_name(
+            data_name,
+            slot_index,
+            generation.as_deref(),
+        ))
+}
+
+/// Lists `media_cache/<file_part>-<generation>` folders of the slot other than `keep`.
+fn stale_media_cache_dirs(tdata_dir: &Path, file_part: &str, keep: &str) -> Vec<PathBuf> {
+    let prefix = format!("{file_part}-");
+    let Ok(entries) = fs::read_dir(tdata_dir.join("media_cache")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name != keep
+                    && name
+                        .strip_prefix(&prefix)
+                        .is_some_and(is_valid_cache_generation)
+            })
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn is_tombstone_name(name: &str) -> bool {
+    name.contains(TOMBSTONE_MARKER)
+}
+
+/// Renames `target` to a sibling tombstone (`<name>.deleted-<random>`) so its live name is free
+/// at once, then deletes the tombstone. Returns `None` when `target` is gone (or was never
+/// there), `Some(tombstone)` when the tombstone is still on disk, and `Some(target)` when the
+/// rename failed and the live path itself could not be removed.
+fn remove_via_tombstone(target: &Path) -> Option<PathBuf> {
+    if fs::symlink_metadata(target).is_err() {
+        return None;
+    }
+    let tombstone = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| target.with_file_name(format!("{name}{TOMBSTONE_MARKER}{}", random_hex(6))));
+    let victim = match tombstone {
+        Some(tombstone) if fs::rename(target, &tombstone).is_ok() => tombstone,
+        _ => target.to_path_buf(),
+    };
+    if try_remove_path_with_retries(&victim) {
+        None
+    } else {
+        Some(victim)
+    }
+}
+
+/// Deletes tombstones left directly inside `dir` (e.g. when the queue file could not be written).
+fn sweep_tombstones_in(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_str().is_some_and(is_tombstone_name)
+            && try_remove_path_with_retries(&entry.path())
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn is_tombstone_entry(rel: &Path) -> bool {
+    rel.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_tombstone_name)
 }
 
 fn is_safe_relative_tdata_subpath(rel: &Path) -> bool {
@@ -189,8 +383,16 @@ fn best_effort_prune_dir_contents(dir: &Path) {
     }
 }
 
+/// Queue-line prefix for a live account path that could be neither renamed to a tombstone nor
+/// deleted at logout. Such entries are dropped as soon as a new login takes the slot
+/// ([`drop_live_pending_cleanups`]), so the queue can never delete a newer account's data.
+const LIVE_ENTRY_PREFIX: &str = "live:";
+
 /// Records `target` (which must live strictly inside `tdata_dir`) in `tdata/.pending_cleanup`
 /// so future startups and shutdowns retry removing it once external locks release.
+///
+/// Tombstones (`<name>.deleted-<random>`) are recorded as is; any other path is recorded as a
+/// `live:` entry that a later login in the same slot cancels.
 pub fn record_pending_cleanup(tdata_dir: &Path, target: &Path) {
     let Ok(rel) = target.strip_prefix(tdata_dir) else {
         return;
@@ -202,20 +404,62 @@ pub fn record_pending_cleanup(tdata_dir: &Path, target: &Path) {
     if rel_str.is_empty() || rel_str.contains('\n') || rel_str.contains('\r') {
         return;
     }
+    let line = if is_tombstone_entry(rel) {
+        rel_str
+    } else {
+        format!("{LIVE_ENTRY_PREFIX}{rel_str}")
+    };
+    let mut entries = read_pending_queue(tdata_dir);
+    if !entries.iter().any(|existing| existing == &line) {
+        entries.push(line);
+    }
+    write_pending_queue(tdata_dir, &entries);
+}
 
-    let queue_path = tdata_dir.join(PENDING_CLEANUP_FILENAME);
-    let mut entries: Vec<String> = fs::read_to_string(&queue_path)
+fn read_pending_queue(tdata_dir: &Path) -> Vec<String> {
+    fs::read_to_string(tdata_dir.join(PENDING_CLEANUP_FILENAME))
         .unwrap_or_default()
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_owned)
-        .collect();
-    if !entries.iter().any(|existing| existing == &rel_str) {
-        entries.push(rel_str);
-    }
-    if let Err(err) = fs::write(&queue_path, format!("{}\n", entries.join("\n"))) {
+        .collect()
+}
+
+fn write_pending_queue(tdata_dir: &Path, entries: &[String]) {
+    let queue_path = tdata_dir.join(PENDING_CLEANUP_FILENAME);
+    let res = if entries.is_empty() {
+        match fs::remove_file(&queue_path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        }
+    } else {
+        fs::write(&queue_path, format!("{}\n", entries.join("\n")))
+    };
+    if let Err(err) = res {
         warn!(path = %queue_path.display(), error = %err, "failed to write pending cleanup queue");
+    }
+}
+
+/// Removes queued `live:` entries for `slot_paths` (and their ancestors and descendants): a new
+/// login now owns those paths, so a later retry must not delete them.
+fn drop_live_pending_cleanups(tdata_dir: &Path, slot_paths: &[PathBuf]) {
+    let entries = read_pending_queue(tdata_dir);
+    let kept: Vec<String> = entries
+        .iter()
+        .filter(|line| {
+            let Some(rel) = line.strip_prefix(LIVE_ENTRY_PREFIX) else {
+                return true;
+            };
+            let target = tdata_dir.join(rel);
+            !slot_paths
+                .iter()
+                .any(|p| p.starts_with(&target) || target.starts_with(p))
+        })
+        .cloned()
+        .collect();
+    if kept.len() != entries.len() {
+        write_pending_queue(tdata_dir, &kept);
     }
 }
 
@@ -223,29 +467,53 @@ pub fn record_pending_cleanup(tdata_dir: &Path, target: &Path) {
 /// succeed and retaining entries still held open by external processes.
 ///
 /// Returns the number of previously pending targets successfully deleted.
+///
+/// Untagged entries that are not tombstones (live account paths written by older builds, which
+/// did not cancel them on a new login) are dropped without deleting anything: that slot may now
+/// hold a different account's data. Tombstones left directly in `tdata`, `media_cache`,
+/// `webview_profiles` and `bot_storage` are swept too, in case the queue itself was not written.
 pub fn process_pending_cleanups(tdata_dir: &Path) -> usize {
-    let queue_path = tdata_dir.join(PENDING_CLEANUP_FILENAME);
-    let Ok(raw) = fs::read_to_string(&queue_path) else {
-        return 0;
-    };
-    let mut cleaned = 0usize;
+    let mut cleaned = ["", "media_cache", "webview_profiles", "bot_storage"]
+        .iter()
+        .map(|sub| sweep_tombstones_in(&tdata_dir.join(sub)))
+        .sum::<usize>();
+    let entries = read_pending_queue(tdata_dir);
+    if entries.is_empty() {
+        return cleaned;
+    }
     let mut remaining = Vec::new();
-    for line in raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let rel = Path::new(line);
+    for line in &entries {
+        let (rel_str, live) = match line.strip_prefix(LIVE_ENTRY_PREFIX) {
+            Some(rest) => (rest, true),
+            None => (line.as_str(), false),
+        };
+        let rel = Path::new(rel_str);
         if !is_safe_relative_tdata_subpath(rel) {
             continue;
         }
+        if !live && !is_tombstone_entry(rel) {
+            warn!(
+                entry = line.as_str(),
+                "dropping untagged pending cleanup entry from an older build"
+            );
+            continue;
+        }
         let target = tdata_dir.join(rel);
-        if try_remove_path_with_retries(&target) {
-            cleaned += 1;
-        } else {
-            remaining.push(line.to_owned());
+        if fs::symlink_metadata(&target).is_err() {
+            continue;
+        }
+        match remove_via_tombstone(&target) {
+            None => cleaned += 1,
+            Some(busy) => match busy.strip_prefix(tdata_dir) {
+                Ok(busy_rel) if is_tombstone_entry(busy_rel) => {
+                    remaining.push(busy_rel.to_string_lossy().replace('\\', "/"));
+                }
+                _ => remaining.push(line.clone()),
+            },
         }
     }
-    if remaining.is_empty() {
-        let _ = fs::remove_file(&queue_path);
-    } else {
-        let _ = fs::write(&queue_path, format!("{}\n", remaining.join("\n")));
+    if remaining != entries {
+        write_pending_queue(tdata_dir, &remaining);
     }
     cleaned
 }
@@ -1150,7 +1418,103 @@ impl AccountManager {
     pub fn account_cache_key(&self, index: i32) -> Option<StorageEncryptionKey> {
         let local_key = self.local_key()?;
         let acc_data_name = self.account_data_name(index);
-        Some(derive_media_cache_key(local_key, &acc_data_name))
+        let generation = self.account_cache_generation(index);
+        Some(derive_media_cache_key(
+            local_key,
+            &cache_key_name(&acc_data_name, generation.as_deref()),
+        ))
+    }
+
+    /// Returns the random media-cache generation stored for slot `index` at its last login
+    /// (`None` for accounts signed in before generations existed).
+    #[must_use]
+    pub fn account_cache_generation(&self, index: i32) -> Option<String> {
+        let prefs = self
+            .domain
+            .storage()
+            .account_storage(index)?
+            .read_prefs()
+            .ok()?;
+        read_cache_generation(&prefs)
+    }
+
+    /// Returns slot `index`'s media cache folder (`tdata/media_cache/<file_part>[-<generation>]`).
+    #[must_use]
+    pub fn account_media_cache_dir(&self, index: i32) -> PathBuf {
+        let generation = self.account_cache_generation(index);
+        self.domain
+            .storage()
+            .tdata_path()
+            .join("media_cache")
+            .join(account_media_cache_dir_name(
+                self.domain.storage().data_name(),
+                index,
+                generation.as_deref(),
+            ))
+    }
+
+    /// Starts a new media-cache generation for slot `index` (called once per login), so the
+    /// cache folder and key differ from anything an earlier login in the slot left behind,
+    /// and removes those leftovers.
+    fn rotate_cache_generation(&mut self, index: i32, user_id: UserId) -> Result<()> {
+        let generation = random_hex(8);
+        let Some(acc_storage) = self.domain.storage_mut().account_storage_mut(index) else {
+            return Err(SessionError::AccountNotFound(index));
+        };
+        let mut prefs = acc_storage.read_prefs().unwrap_or_default();
+        prefs.insert(
+            CACHE_GENERATION_PREFS_KEY.to_vec(),
+            generation.as_bytes().to_vec(),
+        );
+        acc_storage.write_prefs(&prefs)?;
+
+        let tdata = self.domain.storage().tdata_path().to_path_buf();
+        let data_name = self.domain.storage().data_name().to_owned();
+        let acc_data_name = compose_data_string(&data_name, index);
+        register_cache_generation(&tdata, &acc_data_name, Some(&generation));
+        let file_part = account_data_key_file_part(&data_name, index);
+        let current = account_media_cache_dir_name(&data_name, index, Some(&generation));
+        let mut leftovers = stale_media_cache_dirs(&tdata, &file_part, &current);
+        leftovers.extend([
+            tdata.join("media_cache").join(format!("account_{index}")),
+            tdata.join("webview_profiles").join(&file_part),
+            tdata.join("bot_storage").join(&file_part),
+            tdata.join("bot_storage").join(format!("account_{index}")),
+            tdata.join(format!("wallet_{file_part}")),
+            tdata.join(&file_part).join("wallet"),
+        ]);
+        for leftover in &leftovers {
+            unregister_cache_key(leftover);
+            match remove_via_tombstone(leftover) {
+                Some(busy) if busy != *leftover => record_pending_cleanup(&tdata, &busy),
+                Some(busy) => warn!(
+                    index,
+                    path = %busy.display(),
+                    "previous login's account data is busy and stays in place"
+                ),
+                None => {}
+            }
+        }
+        // The new login owns every path of this slot now: queued retries for them must not run.
+        let mut owned = leftovers;
+        owned.extend([
+            tdata.join(&file_part),
+            tdata.join("media_cache").join(&current),
+            tdata.join(format!("user_{acc_data_name}")),
+            tdata.join(format!("temp_{acc_data_name}")),
+            tdata
+                .join("bot_storage")
+                .join(format!("user_{}", user_id.0)),
+        ]);
+        drop_live_pending_cleanups(&tdata, &owned);
+        if let Some(local_key) = self.domain.storage().local_key() {
+            let key = derive_media_cache_key(
+                local_key,
+                &cache_key_name(&acc_data_name, Some(&generation)),
+            );
+            register_cache_key(&tdata.join("media_cache").join(current), key);
+        }
+        Ok(())
     }
 
     /// Synchronizes the in-memory domain/cache key registries and re-keys (or purges unreadable
@@ -1168,10 +1532,16 @@ impl AccountManager {
         register_unlocked_domain_key(tdata, data_name, local_key.clone());
         for acc in self.domain.accounts() {
             let acc_data_name = compose_data_string(data_name, acc.index);
-            let key_part = to_file_part(compute_data_name_key(&acc_data_name));
-            let cache_dir = tdata.join("media_cache").join(&key_part);
-            let new_enc_key = derive_media_cache_key(&local_key, &acc_data_name);
-            let old_enc_key = old_local_key.map(|old| derive_media_cache_key(old, &acc_data_name));
+            let generation = self.account_cache_generation(acc.index);
+            register_cache_generation(tdata, &acc_data_name, generation.as_deref());
+            let cache_dir = tdata.join("media_cache").join(account_media_cache_dir_name(
+                data_name,
+                acc.index,
+                generation.as_deref(),
+            ));
+            let key_name = cache_key_name(&acc_data_name, generation.as_deref());
+            let new_enc_key = derive_media_cache_key(&local_key, &key_name);
+            let old_enc_key = old_local_key.map(|old| derive_media_cache_key(old, &key_name));
             if let Err(err) =
                 rekey_or_purge_cache_dir(&cache_dir, old_enc_key.as_ref(), new_enc_key)
             {
@@ -1393,6 +1763,7 @@ impl AccountManager {
             acc_storage.map_mut().self_serialized = serialize_self_user(&serialized_peer, "");
             acc_storage.write_map()?;
         }
+        self.rotate_cache_generation(index, user_id)?;
 
         let auth = self.save_account(index)?;
 
@@ -1774,7 +2145,10 @@ impl AccountManager {
                 deserialize_self_user(ver, &acc.map().self_serialized)
                     .ok()
                     .and_then(|(peer, _)| serialized_peer_to_tl_user(&peer))
-            });
+            })
+            // `Storage::Account::readSelf` drops a record that is not the authorized user
+            // (`storage_account.cpp:3363`).
+            .filter(|user| user_id == Some(UserId::from_tl(user.id)));
 
         let rpc = MtprotoRpc::new(client.clone());
         Ok(LiveAccount {
@@ -1795,16 +2169,22 @@ impl AccountManager {
         let key = compute_data_name_key(&acc_data_name);
         let file_part = to_file_part(key);
         clear_key(key, tdata);
+        register_cache_generation(tdata, &acc_data_name, None);
 
         let keyed_media_cache = tdata.join("media_cache").join(&file_part);
         let legacy_slot_media_cache = tdata.join("media_cache").join(format!("account_{index}"));
+        let generation_caches = stale_media_cache_dirs(tdata, &file_part, &file_part);
         unregister_cache_key(&keyed_media_cache);
         unregister_cache_key(&legacy_slot_media_cache);
+        for dir in &generation_caches {
+            unregister_cache_key(dir);
+        }
 
         let base_dir = tdata.join(&file_part);
-        let mut targets = vec![
+        let mut targets = generation_caches;
+        targets.extend([
             base_dir.join("wallet"),
-            base_dir,
+            base_dir.clone(),
             keyed_media_cache,
             legacy_slot_media_cache,
             tdata.join(format!("user_{acc_data_name}")),
@@ -1813,7 +2193,7 @@ impl AccountManager {
             tdata.join("bot_storage").join(format!("account_{index}")),
             tdata.join("webview_profiles").join(&file_part),
             tdata.join(format!("wallet_{file_part}")),
-        ];
+        ]);
         if let Some(uid) = user_id
             && uid.0 != 0
         {
@@ -1824,17 +2204,19 @@ impl AccountManager {
         }
 
         for target in targets {
-            if !target.exists() {
-                continue;
-            }
-            if !try_remove_path_with_retries(&target) {
+            if let Some(busy) = remove_via_tombstone(&target) {
                 warn!(
                     index,
-                    path = %target.display(),
+                    path = %busy.display(),
                     "account cleanup target busy during logout; recording pending cleanup"
                 );
-                record_pending_cleanup(tdata, &target);
+                record_pending_cleanup(tdata, &busy);
             }
+        }
+        // If the account folder could not be renamed away, at least drop its map so a new
+        // account in this slot does not start from the old map, prefs or self user.
+        if base_dir.exists() {
+            clear_name("map", &base_dir);
         }
     }
 
@@ -2119,14 +2501,14 @@ mod passcode_and_settings_tests {
         }
     }
 
-    fn test_creds() -> ApiCredentials {
+    pub(super) fn test_creds() -> ApiCredentials {
         ApiCredentials {
             api_id: 12_345,
             api_hash: "0123456789abcdef0123456789abcdef".to_owned(),
         }
     }
 
-    fn synthetic_user() -> tg_tl::types::User {
+    pub(super) fn synthetic_user() -> tg_tl::types::User {
         tg_tl::types::User {
             self_: true,
             contact: false,
@@ -2473,8 +2855,7 @@ mod passcode_and_settings_tests {
         mgr.complete_login(0, &synthetic_user()).expect("login");
 
         let tdata = tmp.path().join("tdata");
-        let key_part0 = mgr.account_key_file_part(0);
-        let cache_dir0 = tdata.join("media_cache").join(&key_part0);
+        let cache_dir0 = mgr.account_media_cache_dir(0);
         let key0 = mgr.account_cache_key(0).expect("slot 0 cache key");
         let dl_path = tmp.path().join("downloaded_video.mp4");
 
@@ -2533,7 +2914,11 @@ mod passcode_and_settings_tests {
         // When a cache directory was encrypted with a previous local key, `sync_media_cache_keys`
         // re-encrypts `file_locations` under the active derived key and purges unreadable blobs.
         let stale_local_key = AuthKey::new([0x9Au8; 256]);
-        let stale_cache_key = derive_media_cache_key(&stale_local_key, &mgr.account_data_name(0));
+        let generation0 = mgr.account_cache_generation(0);
+        let stale_cache_key = derive_media_cache_key(
+            &stale_local_key,
+            &cache_key_name(&mgr.account_data_name(0), generation0.as_deref()),
+        );
         let stale_blob_path;
         {
             let stale_cache =
@@ -2577,3 +2962,7 @@ mod passcode_and_settings_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "account_sec3_tests.rs"]
+mod sec3_tests;

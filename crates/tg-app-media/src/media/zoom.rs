@@ -190,7 +190,7 @@ impl ZoomState {
         let skip_bottom = bottom_controls_skip.clamp(0.0, self.viewport_h * 0.5);
         let caption_margin = 11.0;
         let inner_gap = (self.viewport_h - self.height - skip_bottom).max(caption_margin);
-        self.skip_top = self.min_used_top + inner_gap.min(skip_bottom.max(caption_margin));
+        self.skip_top = self.min_used_top + inner_gap.min(skip_bottom);
         self.available_height = (self.viewport_h - skip_bottom - self.skip_top).max(1.0);
         if self.full_screen_video && skip_bottom > 0.0 && self.width > 0.0 {
             let h = self.viewport_w * self.height / self.width;

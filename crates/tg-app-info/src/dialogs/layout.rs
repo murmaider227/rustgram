@@ -35,6 +35,7 @@ use crate::dialogs::backend::{
     MessageSearchResult, SpecialRowKind,
 };
 use crate::dialogs::mini_preview::{PreviewLineColors, paint_preview_line};
+use crate::dialogs::search_snippet::message_search_snippet;
 use crate::dialogs::strings;
 use tg_app_core::stand_in::theme::Palette;
 use tg_ui::widgets::media_marker::{paint_media_marker, split_media_marker};
@@ -1222,6 +1223,21 @@ pub fn paint_message_search_row(
         date_font,
         date_fg,
     );
+    // Ticks left of the date, placed like `layout_dialog_row`'s `send_state_rect`.
+    let mut top_right_w = date_w;
+    if msg.send_state != DialogSendState::None {
+        let skip = tg_history::consts::DIALOGS_SEND_STATE_SKIP as f32;
+        let date_skip = tg_history::consts::DIALOGS_DATE_SKIP as f32;
+        let ss_rect = Rect::from_min_size(
+            Pos2::new(
+                right_edge - date_w - date_skip - skip,
+                rect.top() + st::default_dialog_row.name_top.0 as f32,
+            ),
+            Vec2::new(skip, FontMetrics::default().semibold.height as f32),
+        );
+        paint_send_state_icon(painter, ss_rect, msg.send_state, active, selected, colors);
+        top_right_w += skip;
+    }
 
     let mut name_x = text_left;
     let chat_icon = if msg.special == SpecialRowKind::None {
@@ -1242,7 +1258,7 @@ pub fn paint_message_search_row(
     }
 
     let name_font = font_id_from_style(st::semibold_font);
-    let name_avail = (right_edge - date_w - 8.0 - name_x).max(16.0) as i32;
+    let name_avail = (right_edge - top_right_w - 8.0 - name_x).max(16.0) as i32;
     let elided_name = elide_text_right(&msg.peer_title, name_avail, |s| {
         measure_text_i32(painter, s, name_font.clone())
     });
@@ -1266,24 +1282,30 @@ pub fn paint_message_search_row(
     // `MessageView::prepare`: only group chats show the sender before the text.
     let show_sender = matches!(msg.kind, DialogPeerKind::Group | DialogPeerKind::Forum)
         && msg.special == SpecialRowKind::None;
-    if let Some(sender) = msg.sender_name.as_ref().filter(|_| show_sender) {
-        let prefix = format!("{} ", tg_lang::tr::lng_dialogs_text_from_wrapped(sender));
-        let g = clipped.layout_no_wrap(prefix, preview_font.clone(), service_fg);
-        let w = g.size().x;
-        clipped.galley(
-            Pos2::new(x, clip_rect.center().y - g.size().y * 0.5),
-            g,
-            service_fg,
-        );
-        x += w;
-    }
+    let sender = msg
+        .sender_name
+        .as_deref()
+        .filter(|s| show_sender && !s.is_empty());
 
     // Poll / checklist results start with tdesktop's icon emoji instead of the "📊 " marker.
     let (marker, msg_text) = match split_media_marker(&msg.text) {
         Some((icon, rest)) => (Some(icon), rest),
         None => (None, msg.text.as_str()),
     };
-    if let Some(icon) = marker {
+    // With a left icon the sender is cut off into `_senderCache` and drawn before it;
+    // otherwise it stays inside the text and counts in the search cut (`PreviewWithSender`).
+    let inline_sender = if let Some(icon) = marker {
+        if let Some(sender) = sender {
+            let prefix = format!("{} ", tg_lang::tr::lng_dialogs_text_from_wrapped(sender));
+            let g = clipped.layout_no_wrap(prefix, preview_font.clone(), service_fg);
+            let w = g.size().x;
+            clipped.galley(
+                Pos2::new(x, clip_rect.center().y - g.size().y * 0.5),
+                g,
+                service_fg,
+            );
+            x += w;
+        }
         let line_h = clipped
             .layout_no_wrap("Ag".to_owned(), preview_font.clone(), sub_fg)
             .size()
@@ -1295,37 +1317,23 @@ pub fn paint_message_search_row(
             service_fg,
             colors,
         );
-    }
-    let snippet = search_snippet_from_first_match(msg_text, query);
-    let job = search_snippet_job(&snippet, query, preview_font, sub_fg, service_fg);
+        None
+    } else {
+        sender
+    };
+    let snippet = message_search_snippet(inline_sender, msg_text, query);
+    let job = snippet.layout_job(
+        &preview_font,
+        sub_fg,
+        service_fg,
+        (clip_rect.right() - x).max(1.0),
+    );
     let galley = clipped.layout_job(job);
     clipped.galley(
         Pos2::new(x, clip_rect.center().y - galley.size().y * 0.5),
         galley,
         sub_fg,
     );
-}
-
-/// Cuts `text` so the first query word match starts near the left edge, prefixed with `…`
-/// (`kLeftShift = 15` in `dialogs_message_view.cpp`).
-#[must_use]
-pub fn search_snippet_from_first_match(text: &str, query: &str) -> String {
-    const LEFT_SHIFT: usize = 15;
-    let text = text.trim();
-    let first = query
-        .split_whitespace()
-        .filter_map(|word| find_highlight_ranges(text, word).first().map(|r| r.start))
-        .min();
-    let Some(byte_from) = first else {
-        return text.to_owned();
-    };
-    let char_from = text[..byte_from].chars().count();
-    if char_from < LEFT_SHIFT {
-        return text.to_owned();
-    }
-    let skip = char_from - LEFT_SHIFT;
-    let rest: String = text.chars().skip(skip).collect();
-    format!("\u{2026}{rest}")
 }
 
 /// Finds all case-insensitive non-overlapping UTF-8 byte ranges of `query` inside `text`.

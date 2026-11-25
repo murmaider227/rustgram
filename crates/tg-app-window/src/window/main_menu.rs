@@ -5,19 +5,23 @@
 //! and `Telegram/SourceFiles/window/window_main_menu.style`.
 
 use egui::{
-    Align, Area, Color32, CursorIcon, Frame, Id, Key, Layout, Margin, Order, Pos2, Rect, RichText,
-    Sense, Stroke, Ui, Vec2,
+    Area, Color32, CursorIcon, Frame, Id, Key, Order, Pos2, Rect, Sense, Stroke, Ui, UiBuilder,
+    Vec2,
 };
 use tg_ui::fonts::font_id_from_style;
 use tg_ui::icons::paint_style_icon;
-use tg_ui::stand_in::ToggleStyle;
+use tg_ui::stand_in::Colors;
+use tg_ui::stand_in::{PopupMenuStyle, ToggleStyle};
 use tg_ui::tg_style::{DefaultPaletteResolver, Icon, st};
+use tg_ui::userpic::{UserpicBgColors, paint_vertical_gradient_circle, userpic_colors};
 use tg_ui::widgets::checkbox::paint_toggle_view;
+use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
 
 use tg_app_core::core_types::startup_types::UpdateSnapshot;
 use tg_app_core::stand_in::strings::Strings;
 use tg_app_core::stand_in::theme::{Palette, ThemeMode};
 use tg_app_core::stand_in::types::{AuthUser, PeerId};
+use tg_app_info::info::colors::InfoColors;
 
 /// Main menu drawer width (`st::mainMenuWidth`).
 pub const MAIN_MENU_WIDTH: f32 = 274.0;
@@ -33,6 +37,18 @@ const MAIN_MENU_ICON_LEFT: f32 = 21.0;
 const MAIN_MENU_TEXT_LEFT: f32 = 61.0;
 /// Night Mode toggle right offset (`st::mainMenuButton.toggleSkip`).
 const MAIN_MENU_TOGGLE_SKIP: f32 = 19.0;
+/// Footer height (`st::mainMenuFooterHeightMin`).
+const MAIN_MENU_FOOTER_HEIGHT_MIN: f32 = 80.0;
+/// Footer labels left offset (`st::mainMenuFooterLeft`).
+const MAIN_MENU_FOOTER_LEFT: f32 = 25.0;
+/// "Telegram Desktop" label bottom offset (`st::mainMenuTelegramBottom`).
+const MAIN_MENU_TELEGRAM_BOTTOM: f32 = 38.0;
+/// Version label bottom offset (`st::mainMenuVersionBottom`).
+const MAIN_MENU_VERSION_BOTTOM: f32 = 17.0;
+/// Cover userpic size (`st::mainMenuUserpic.size`).
+const MAIN_MENU_USERPIC_SIZE: f32 = 48.0;
+/// Height of the highlighted "Update Rustgram" row above the footer.
+const MAIN_MENU_UPDATE_ROW_HEIGHT: f32 = 52.0;
 
 /// One signed-in account entry rendered inside the expandable Main Menu accounts list
 /// (`Window::MainMenu::setupAccounts` / `Settings::SetupAccounts`).
@@ -113,6 +129,8 @@ pub enum MainMenuAction {
     RestartToUpdate,
     /// Open a side-menu bot's Mini App (`SetupMenuBots`, `WebViewSourceMainMenu`).
     OpenMenuBot(PeerId),
+    /// "Remove from menu" on a side-menu bot (`AttachWebView::removeFromMenu`).
+    RemoveMenuBot(PeerId),
     /// Dismiss the menu drawer.
     Close,
 }
@@ -135,6 +153,31 @@ pub struct MainMenu {
     live_mode: bool,
     body_rect: Option<Rect>,
     menu_bots: Vec<MainMenuBot>,
+    theme: Option<MenuTheme>,
+    bot_menu: Option<(PeerId, PopupMenuState)>,
+}
+
+/// The embedded palette and the cover userpic gradient for one theme and avatar colour.
+#[derive(Debug, Clone)]
+struct MenuTheme {
+    night: bool,
+    avatar_rgb: [u8; 3],
+    colors: InfoColors,
+    userpic: UserpicBgColors,
+}
+
+/// The `EmptyUserpic` gradient (`historyPeerNUserpicBg` / `Bg2`) whose top colour is nearest to
+/// the flat `avatar_rgb` the session reports for the signed-in user (the live and mock sessions
+/// flatten the peer colour index to one RGB value).
+fn cover_userpic_colors(avatar_rgb: [u8; 3], colors: &dyn Colors) -> UserpicBgColors {
+    let distance = |c: Color32| {
+        let [r, g, b] = avatar_rgb;
+        u32::from(c.r().abs_diff(r)) + u32::from(c.g().abs_diff(g)) + u32::from(c.b().abs_diff(b))
+    };
+    (0u8..7)
+        .map(|index| userpic_colors(index, colors))
+        .min_by_key(|pair| distance(pair.color1))
+        .unwrap_or_else(|| userpic_colors(0, colors))
 }
 
 /// One attach-menu bot shown in the main menu (`AttachWebView::attachBots()` with `inMainMenu`).
@@ -144,6 +187,25 @@ pub struct MainMenuBot {
     pub peer_id: PeerId,
     /// The attach-menu short name (`bot.name`).
     pub name: String,
+}
+
+/// `AttachWebView::removeFromMenu`: `messages.toggleBotInAttachMenu` off, then the
+/// "lng_bot_remove_from_menu_done" toast. The menu keeps its rows from the refreshed store.
+pub fn remove_menu_bot(controller: &mut crate::window::controller::WindowController, bot: PeerId) {
+    let result = controller
+        .session_backend_mut()
+        .as_bots_backend_mut()
+        .map(|bots| {
+            bots.toggle_attach_menu_bot(
+                tg_bots::stand_in::UserId(bot.bare()),
+                tg_bots::mini_app::AttachMenuToggleState::Removed,
+            )
+        });
+    match result {
+        Some(Ok(_)) => controller.show_toast(tg_lang::tr::lng_bot_remove_from_menu_done()),
+        Some(Err(err)) => controller.show_toast(err),
+        None => {}
+    }
 }
 
 /// The side-menu bots of `store` in server order, as `SetupMenuBots` filters them.
@@ -243,7 +305,28 @@ impl MainMenu {
         let screen = self.body_rect.unwrap_or_else(|| ctx.content_rect());
         let drawer_width = MAIN_MENU_WIDTH.min(screen.width() * 0.85);
         let update_row = main_menu_update_row_text(update_snapshot);
-        let footer_reserve = if update_row.is_some() { 118.0 } else { 64.0 };
+        let footer_reserve = if update_row.is_some() {
+            MAIN_MENU_FOOTER_HEIGHT_MIN + MAIN_MENU_UPDATE_ROW_HEIGHT
+        } else {
+            MAIN_MENU_FOOTER_HEIGHT_MIN
+        };
+        let night = theme_mode.is_night();
+        let cached = self
+            .theme
+            .as_ref()
+            .is_some_and(|t| t.night == night && t.avatar_rgb == user.avatar_rgb);
+        if !cached {
+            let colors = InfoColors::for_mode(theme_mode);
+            let userpic = cover_userpic_colors(user.avatar_rgb, &colors);
+            self.theme = Some(MenuTheme {
+                night,
+                avatar_rgb: user.avatar_rgb,
+                colors,
+                userpic,
+            });
+        }
+        let theme = self.theme.clone()?;
+        let cover_colors = theme.userpic;
         let menu_scroll_max_h =
             (screen.height() - MAIN_MENU_COVER_HEIGHT - footer_reserve).max(80.0);
 
@@ -266,15 +349,22 @@ impl MainMenu {
                 }
             });
 
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        let bot_menu_open = self
+            .bot_menu
+            .as_ref()
+            .is_some_and(|(_, state)| state.is_open());
+        if !bot_menu_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             action = Some(MainMenuAction::Close);
         }
 
-        // Left drawer panel.
+        // Left drawer panel. tdesktop's `MainMenu` is a child of the window body, so neither the
+        // drawer nor its shadow reaches the title bar.
+        let mut bot_menu_request = None;
         Area::new(Id::unique("tg_main_menu_drawer"))
             .order(Order::Foreground)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
+                ui.set_clip_rect(screen);
                 Frame::NONE
                     .fill(palette.window_bg)
                     .shadow(egui::Shadow {
@@ -304,6 +394,7 @@ impl MainMenu {
                             ui,
                             cover_rect,
                             user,
+                            cover_colors,
                             self.accounts_expanded,
                             other_accounts_unmuted_unread,
                             palette,
@@ -385,16 +476,24 @@ impl MainMenu {
                                     action = Some(MainMenuAction::MyProfile);
                                 }
                                 // `SetupMenuBots`: bots added to the side menu, with the
-                                // `menuIconBot` glyph until their own icon is available.
+                                // `menuIconBot` glyph until their own icon is available. A right
+                                // click opens the "Remove from menu" popup.
                                 for bot in &self.menu_bots {
-                                    if menu_row(
+                                    let (_, resp) = menu_row_base(
                                         ui,
                                         drawer_width,
                                         st::menu_icon_bot,
                                         &bot.name,
                                         palette,
-                                    ) {
+                                    );
+                                    if resp.clicked() {
                                         action = Some(MainMenuAction::OpenMenuBot(bot.peer_id));
+                                    } else if resp.secondary_clicked() {
+                                        bot_menu_request = Some((
+                                            bot.peer_id,
+                                            resp.interact_pointer_pos()
+                                                .unwrap_or(resp.rect.center()),
+                                        ));
                                     }
                                 }
                                 menu_separator(ui, drawer_width, palette);
@@ -464,65 +563,110 @@ impl MainMenu {
                                 let _ = (has_passcode, strings);
                             });
 
-                        // Footer anchored at the bottom (`MainMenu::_footer`).
-                        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                            let version_text = format!(
-                                "{} \u{2013} {}",
-                                tg_lang::tr::lng_settings_current_version(
-                                    &current_version_short_text(
-                                        &update_snapshot.current_version.to_string(),
-                                    )
-                                ),
-                                tg_lang::tr::lng_menu_about(),
+                        // Footer (`MainMenu::_footer`): "Telegram Desktop" `mainMenuTelegramBottom`
+                        // and the version line `mainMenuVersionBottom` above the drawer bottom.
+                        let version_text = format!(
+                            "{} \u{2013} {}",
+                            tg_lang::tr::lng_settings_current_version(&current_version_short_text(
+                                &update_snapshot.current_version.to_string(),
+                            )),
+                            tg_lang::tr::lng_menu_about(),
+                        );
+                        let bottom = screen.bottom();
+                        let left = screen.left() + MAIN_MENU_FOOTER_LEFT;
+                        let labels = [
+                            (
+                                "Rustgram Desktop".to_owned(),
+                                st::semibold_font,
+                                MAIN_MENU_TELEGRAM_BOTTOM,
+                            ),
+                            (version_text, st::normal_font, MAIN_MENU_VERSION_BOTTOM),
+                        ];
+                        for (text, font, bottom_skip) in labels {
+                            let galley = ui.painter().layout_no_wrap(
+                                text.clone(),
+                                font_id_from_style(font),
+                                palette.window_sub_text_fg,
                             );
-                            let footer_resp = Frame::NONE
-                                .inner_margin(Margin {
-                                    left: 25,
-                                    right: 20,
-                                    top: 8,
-                                    bottom: 12,
-                                })
-                                .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.y = 2.0;
-                                    let r1 = ui.add(
-                                        egui::Label::new(
-                                            RichText::new(version_text)
-                                                .font(font_id_from_style(st::normal_font))
-                                                .color(palette.window_sub_text_fg),
-                                        )
-                                        .sense(Sense::click()),
-                                    );
-                                    let r2 = ui.add(
-                                        egui::Label::new(
-                                            RichText::new("Rustgram Desktop")
-                                                .font(font_id_from_style(st::semibold_font))
-                                                .color(palette.window_sub_text_fg),
-                                        )
-                                        .sense(Sense::click()),
-                                    );
-                                    if r1.hovered() || r2.hovered() {
-                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                    }
-                                    r1.clicked() || r2.clicked()
-                                })
-                                .inner;
-                            if footer_resp {
+                            let rect = Rect::from_min_size(
+                                Pos2::new(left, bottom - bottom_skip - galley.size().y),
+                                galley.size(),
+                            );
+                            ui.painter()
+                                .galley(rect.min, galley, palette.window_sub_text_fg);
+                            let resp = ui.interact(
+                                rect,
+                                ui.make_persistent_id(("tg_main_menu_footer", bottom_skip as i32)),
+                                Sense::click(),
+                            );
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::Role::Link, true, &text)
+                            });
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
                                 action = Some(MainMenuAction::About);
                             }
+                        }
 
-                            // Highlighted "Update Rustgram" row directly above the version footer
-                            // when a verified update is staged and ready (`window_main_menu.cpp`).
-                            if let Some((title, subtitle)) = &update_row {
-                                let (rect, clicked) =
-                                    update_ready_row(ui, drawer_width, title, subtitle, palette);
-                                self.last_update_row_rect = Some(rect);
-                                if clicked {
-                                    action = Some(MainMenuAction::RestartToUpdate);
-                                }
+                        // Highlighted "Update Rustgram" row directly above the footer when a
+                        // verified update is staged and ready (`window_main_menu.cpp`).
+                        if let Some((title, subtitle)) = &update_row {
+                            let row_rect = Rect::from_min_size(
+                                Pos2::new(
+                                    screen.left(),
+                                    bottom
+                                        - MAIN_MENU_FOOTER_HEIGHT_MIN
+                                        - MAIN_MENU_UPDATE_ROW_HEIGHT,
+                                ),
+                                Vec2::new(drawer_width, MAIN_MENU_UPDATE_ROW_HEIGHT),
+                            );
+                            let (rect, clicked) = ui
+                                .scope_builder(UiBuilder::new().max_rect(row_rect), |ui| {
+                                    update_ready_row(ui, drawer_width, title, subtitle, palette)
+                                })
+                                .inner;
+                            self.last_update_row_rect = Some(rect);
+                            if clicked {
+                                action = Some(MainMenuAction::RestartToUpdate);
                             }
-                        });
+                        }
                     });
             });
+
+        // `SetupMenuBots` right-click menu: `popupMenuWithIcons` with "Remove from menu".
+        if let Some((peer_id, pos)) = bot_menu_request {
+            let mut state = PopupMenuState::new();
+            state.open_at(ctx, pos, &PopupMenuStyle::default_popup(&theme.colors));
+            self.bot_menu = Some((peer_id, state));
+        }
+        if let Some((peer_id, state)) = self.bot_menu.as_mut() {
+            let items =
+                [
+                    MenuItem::action("remove_from_menu", tg_lang::tr::lng_bot_remove_from_menu())
+                        .with_style_icon(st::menu_icon_delete),
+                ];
+            let triggered = state.show(
+                ctx,
+                Id::unique("tg_main_menu_bot_popup"),
+                &items,
+                &PopupMenuStyle::default_popup(&theme.colors),
+                &ToggleStyle::default_toggle(&theme.colors),
+            );
+            if triggered.is_some() {
+                action = Some(MainMenuAction::RemoveMenuBot(*peer_id));
+                state.close();
+            }
+            if !state.is_open() {
+                self.bot_menu = None;
+            }
+        }
+        // While the popup is open it takes the click (`Ui::PopupMenu` grabs the mouse): a click
+        // outside only dismisses the popup.
+        if bot_menu_open && !matches!(action, Some(MainMenuAction::RemoveMenuBot(_))) {
+            action = None;
+        }
 
         action
     }
@@ -535,6 +679,7 @@ fn paint_cover(
     ui: &Ui,
     rect: Rect,
     user: &AuthUser,
+    userpic: UserpicBgColors,
     accounts_expanded: bool,
     other_accounts_unmuted_unread: u32,
     palette: &Palette,
@@ -542,14 +687,20 @@ fn paint_cover(
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, palette.window_bg);
 
-    let center = Pos2::new(rect.left() + 24.0 + 24.0, rect.top() + 20.0 + 24.0);
-    let [r, g, b] = user.avatar_rgb;
-    painter.circle_filled(center, 24.0, Color32::from_rgb(r, g, b));
+    // `EmptyUserpic::paint`: vertical gradient, `historyPeerUserpicFont` (semibold) sized
+    // `(size * 13) / 33` in `historyPeerUserpicFg`.
+    let userpic_rect = Rect::from_min_size(
+        Pos2::new(rect.left() + 24.0, rect.top() + 20.0),
+        Vec2::splat(MAIN_MENU_USERPIC_SIZE),
+    );
+    paint_vertical_gradient_circle(painter, userpic_rect, userpic.color1, userpic.color2);
+    let mut initials_font = font_id_from_style(st::semibold_font);
+    initials_font.size = ((MAIN_MENU_USERPIC_SIZE as i32 * 13) / 33) as f32;
     painter.text(
-        center,
+        userpic_rect.center(),
         egui::Align2::CENTER_CENTER,
         &user.initials,
-        font_id_from_style(st::semibold_font),
+        initials_font,
         Color32::WHITE,
     );
 
@@ -780,8 +931,8 @@ fn add_account_row(
     resp.clicked()
 }
 
-/// One `st::mainMenuButton` row: a 24 px outline `menuIcon*` glyph tinted `menuIconFg` at
-/// `iconLeft` and the semibold label at `padding.left`.
+/// One `st::mainMenuButton` row: a 24 px outline `menuIcon*` glyph in `menuIconColor`
+/// (`windowBoldFg`) at `iconLeft` and the `semiboldTextStyle` label at `padding.left`.
 fn menu_row(ui: &mut Ui, width: f32, icon: Icon, label: &str, palette: &Palette) -> bool {
     let (rect, resp) = menu_row_base(ui, width, icon, label, palette);
     let _ = rect;
@@ -810,7 +961,7 @@ fn menu_row_base(
         icon_rect,
         icon,
         &DefaultPaletteResolver,
-        Some(palette.window_sub_text_fg),
+        Some(palette.window_bold_fg),
     );
     ui.painter().text(
         Pos2::new(rect.left() + MAIN_MENU_TEXT_LEFT, rect.center().y),
@@ -870,7 +1021,10 @@ fn update_ready_row(
     subtitle: &str,
     palette: &Palette,
 ) -> (Rect, bool) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 52.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(width, MAIN_MENU_UPDATE_ROW_HEIGHT),
+        Sense::click(),
+    );
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{title} — {subtitle}"))
     });
@@ -947,6 +1101,29 @@ mod tests {
             bio: String::new(),
             initials: "TK".to_owned(),
             avatar_rgb: [0x40, 0xA7, 0xE3],
+        }
+    }
+
+    #[test]
+    fn cover_userpic_uses_the_gradient_of_the_flat_avatar_colour() {
+        let colors = InfoColors::day();
+        // The flat colours the sessions report for colour indices 0..7 (red, orange, violet,
+        // green, cyan, blue, pink) map back to the same `EmptyUserpic` gradients.
+        let flat = [
+            [0xE1, 0x70, 0x76],
+            [0xED, 0xA8, 0x6C],
+            [0xA6, 0x95, 0xE7],
+            [0x7B, 0xC8, 0x62],
+            [0x6E, 0xC9, 0xCB],
+            [0x4D, 0xA6, 0xE8],
+            [0xEE, 0x7A, 0xAE],
+        ];
+        for (index, rgb) in flat.into_iter().enumerate() {
+            assert_eq!(
+                cover_userpic_colors(rgb, &colors),
+                userpic_colors(index as u8, &colors),
+                "colour index {index}"
+            );
         }
     }
 

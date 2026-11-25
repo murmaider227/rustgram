@@ -10,7 +10,8 @@ use std::time::Duration;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align2, Area, Color32, ColorImage, CornerRadius, CursorIcon, FontFamily, FontId, Id, Key,
-    Order, Pos2, Rect, Role, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2, WidgetInfo,
+    Order, Pos2, Rect, Role, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
+    ViewportCommand, WidgetInfo,
 };
 use image::DynamicImage;
 use tg_app_core::chat_helpers::backend::AttachedStickersMedia;
@@ -31,12 +32,11 @@ use crate::media::ocr_selection::{
 use crate::media::pip::{PipRect, PipResumeState, PipWindow};
 use crate::media::strings;
 use crate::media::style::{
-    MEDIAVIEW_BG, MEDIAVIEW_CAPTION_BG, MEDIAVIEW_CAPTION_FG, MEDIAVIEW_CAPTION_MARGIN,
-    MEDIAVIEW_CAPTION_PAD_X, MEDIAVIEW_CAPTION_PAD_Y, MEDIAVIEW_CAPTION_RADIUS,
-    MEDIAVIEW_CONTROL_BG, MEDIAVIEW_CONTROL_BG_OVER, MEDIAVIEW_CONTROL_FG,
-    MEDIAVIEW_HIDE_DURATION_MS, MEDIAVIEW_MENU_BG, MEDIAVIEW_MENU_BG_OVER,
-    MEDIAVIEW_MENU_DANGER_FG, MEDIAVIEW_MENU_FG, MEDIAVIEW_SAVE_MSG_BG, MEDIAVIEW_SAVE_MSG_FG,
-    MEDIAVIEW_SAVE_MSG_SHOWN_MS, MEDIAVIEW_SHOW_DURATION_MS, MEDIAVIEW_SUB_FG,
+    MEDIAVIEW_BG, MEDIAVIEW_CAPTION_BG, MEDIAVIEW_CAPTION_FG, MEDIAVIEW_CAPTION_PAD_X,
+    MEDIAVIEW_CAPTION_PAD_Y, MEDIAVIEW_CAPTION_RADIUS, MEDIAVIEW_CONTROL_BG, MEDIAVIEW_CONTROL_FG,
+    MEDIAVIEW_CONTROLLER_HEIGHT, MEDIAVIEW_HIDE_DURATION_MS, MEDIAVIEW_MENU_BG,
+    MEDIAVIEW_MENU_BG_OVER, MEDIAVIEW_MENU_DANGER_FG, MEDIAVIEW_MENU_FG, MEDIAVIEW_SAVE_MSG_BG,
+    MEDIAVIEW_SAVE_MSG_FG, MEDIAVIEW_SAVE_MSG_SHOWN_MS, MEDIAVIEW_SHOW_DURATION_MS,
     MEDIAVIEW_TEXT_LINK_FG, MEDIAVIEW_VIDEO_BG, MEDIAVIEW_WAIT_HIDE_MS, MediaColors,
     paint_centered_style_icon, paint_centered_style_icon_alpha, paint_transparent_checkerboard,
     with_opacity,
@@ -48,6 +48,14 @@ use crate::media::video_stream::{
 use crate::media::zoom::ZoomState;
 use tg_platform::ocr::{OcrResult, recognize_rgba8};
 use tg_platform::screenshot_protection::{ReasonId, ScreenshotProtectionManager};
+
+/// `OverlayWidget::_minUsedTop` (`topNotchSkip()`): zero on desktop, the content may use the
+/// whole screen height.
+const MIN_USED_TOP: f64 = 0.0;
+
+/// `kMaximizedIconOpacity`: idle opacity of the viewer's icons and footer text while it covers
+/// the screen (`OverlayWidget::controlOpacity`).
+const MAXIMIZED_ICON_OPACITY: f32 = 0.6;
 
 /// Standard arrow-key seek step in fullscreen video mode (`kSeekTimeMs = 5s`).
 pub const SEEK_STEP_SHORT_MS: i64 = 5_000;
@@ -166,9 +174,13 @@ impl GalleryNavigator {
                 Some(tg_lang::tr::lng_mediaview_n_of_amount(&n, &amount))
             }
             Some(_) => {
-                let file_word = tg_lang::tr::lng_mediaview_doc_image();
+                let file = self
+                    .current()
+                    .map(|i| i.file_name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(tg_lang::tr::lng_mediaview_doc_image);
                 Some(tg_lang::tr::lng_mediaview_file_n_of_amount(
-                    &file_word, &n, &amount,
+                    &file, &n, &amount,
                 ))
             }
         }
@@ -832,11 +844,7 @@ impl MediaOverlayWidget {
             return Ok(());
         };
 
-        let bottom_skip = if item.kind.shows_playback_controls() {
-            136.0
-        } else {
-            88.0
-        };
+        let bottom_skip = self.bottom_controls_skip(&item);
         self.zoom.set_content(
             f64::from(item.width.max(1)),
             f64::from(item.height.max(1)),
@@ -845,7 +853,7 @@ impl MediaOverlayWidget {
         self.zoom.resize_viewport(
             f64::from(self.last_viewport_size.x),
             f64::from(self.last_viewport_size.y),
-            56.0,
+            MIN_USED_TOP,
             bottom_skip,
         );
 
@@ -863,7 +871,7 @@ impl MediaOverlayWidget {
                         self.zoom.resize_viewport(
                             f64::from(self.last_viewport_size.x),
                             f64::from(self.last_viewport_size.y),
-                            56.0,
+                            MIN_USED_TOP,
                             bottom_skip,
                         );
                         self.content = ActiveContent::Photo {
@@ -919,7 +927,7 @@ impl MediaOverlayWidget {
                                     self.zoom.resize_viewport(
                                         f64::from(self.last_viewport_size.x),
                                         f64::from(self.last_viewport_size.y),
-                                        56.0,
+                                        MIN_USED_TOP,
                                         bottom_skip,
                                     );
                                 }
@@ -1052,19 +1060,14 @@ impl MediaOverlayWidget {
         let vp_size = viewport_rect.size();
         if (vp_size - self.last_viewport_size).length_sq() > 1.0 {
             self.last_viewport_size = vp_size;
-            let bottom_skip = if self
+            let bottom_skip = self
                 .gallery
                 .current()
-                .is_some_and(|i| i.kind.shows_playback_controls())
-            {
-                136.0
-            } else {
-                88.0
-            };
+                .map_or(0.0, |i| self.bottom_controls_skip(i));
             self.zoom.resize_viewport(
                 f64::from(vp_size.x),
                 f64::from(vp_size.y),
-                56.0,
+                MIN_USED_TOP,
                 bottom_skip,
             );
         }
@@ -1282,7 +1285,8 @@ impl MediaOverlayWidget {
 
                     if bg_resp.double_clicked() {
                         if item.kind.shows_playback_controls() {
-                            self.zoom.toggle_fullscreen_video(136.0);
+                            self.zoom
+                                .toggle_fullscreen_video(self.bottom_controls_skip(&item));
                             self.controls.in_fullscreen = self.zoom.full_screen_video;
                         } else {
                             self.zoom.zoom_reset();
@@ -1333,80 +1337,98 @@ impl MediaOverlayWidget {
                 let mut chrome_painter = painter.clone();
                 chrome_painter.multiply_opacity(chrome_opacity);
 
-                // ── Left / Right gallery navigation chevrons (`st::mediaviewLeft` / `Right`) ──
+                // ── Left / Right gallery navigation (`_leftNav` / `_rightNav`): 90 px wide zones
+                // along the screen edges, `mediaviewHeaderTop` away from the top and bottom; the
+                // 36 px circle shows only under the mouse (`OverlayWidget::paintControls`). ──
                 if !self.zoom.full_screen_video {
-                    let ctrl_size = st::mediaview_control_size.0 as f32;
-                    if self.gallery.can_prev() {
-                        let left_btn = Rect::from_center_size(
-                            Pos2::new(viewport_rect.min.x + 42.0, viewport_rect.center().y),
-                            Vec2::splat(ctrl_size),
-                        );
-                        let resp = ui.interact(left_btn, Id::unique("mv_nav_prev"), Sense::click());
-                        chrome_painter.circle_filled(
-                            left_btn.center(),
-                            ctrl_size * 0.42,
-                            if resp.hovered() {
-                                MEDIAVIEW_CONTROL_BG_OVER
-                            } else {
-                                mv_control_bg
-                            },
-                        );
-                        paint_centered_style_icon(
-                            ctx,
-                            &chrome_painter,
+                    let nav_w = st::mediaview_control_size.0 as f32;
+                    let nav_skip = st::mediaview_header_top.0 as f32;
+                    let over_d = st::mediaview_icon_over.0 as f32;
+                    let zone_h = (viewport_rect.height() - 2.0 * nav_skip).max(0.0);
+                    let navs = [
+                        (
+                            -1,
+                            self.gallery.can_prev(),
+                            viewport_rect.min.x,
                             &st::mediaview_left,
-                            left_btn,
-                            &colors,
-                        );
-                        if resp.clicked() {
-                            self.navigate(backend, -1, world_now_ms);
+                            "mv_nav_prev",
+                        ),
+                        (
+                            1,
+                            self.gallery.can_next(),
+                            viewport_rect.max.x - nav_w,
+                            &st::mediaview_right,
+                            "mv_nav_next",
+                        ),
+                    ];
+                    for (delta, enabled, x, icon, id) in navs {
+                        if !enabled {
+                            continue;
                         }
-                    }
-                    if self.gallery.can_next() {
-                        let right_btn = Rect::from_center_size(
-                            Pos2::new(viewport_rect.max.x - 42.0, viewport_rect.center().y),
-                            Vec2::splat(ctrl_size),
+                        let zone = Rect::from_min_size(
+                            Pos2::new(x, viewport_rect.min.y + nav_skip),
+                            Vec2::new(nav_w, zone_h),
                         );
-                        let resp =
-                            ui.interact(right_btn, Id::unique("mv_nav_next"), Sense::click());
-                        chrome_painter.circle_filled(
-                            right_btn.center(),
-                            ctrl_size * 0.42,
-                            if resp.hovered() {
-                                MEDIAVIEW_CONTROL_BG_OVER
-                            } else {
-                                mv_control_bg
-                            },
-                        );
-                        paint_centered_style_icon(
+                        let resp = ui.interact(zone, Id::unique(id), Sense::click());
+                        let hovered = resp.hovered();
+                        if hovered {
+                            chrome_painter.circle_filled(
+                                zone.center(),
+                                over_d * 0.5,
+                                mv_control_bg,
+                            );
+                        }
+                        paint_centered_style_icon_alpha(
                             ctx,
                             &chrome_painter,
-                            &st::mediaview_right,
-                            right_btn,
+                            icon,
+                            zone,
                             &colors,
+                            control_opacity(hovered),
                         );
                         if resp.clicked() {
-                            self.navigate(backend, 1, world_now_ms);
+                            self.navigate(backend, delta, world_now_ms);
                         }
                     }
                 }
 
-                // ── Top header bar (sender name, date, counter, zoom badge, close button) ──
-                if !self.zoom.full_screen_video {
-                    ui.scope(|ui| {
-                        ui.multiply_opacity(chrome_opacity);
-                        self.paint_header(ui, viewport_rect, &item, &colors, &mut events);
-                    });
+                // ── Window title buttons in the top-right corner (`mediaviewTitle`): minimize,
+                // maximize / restore and close over their own shadows; no top bar. ──
+                ui.scope(|ui| {
+                    ui.multiply_opacity(chrome_opacity);
+                    self.paint_title_controls(ui, viewport_rect, &colors, &mut events);
+                });
+                if !self.open {
+                    return;
                 }
 
-                // ── Video PlaybackControls pill (for videos) + Sponsored video overlay ──
-                let mut caption_bottom_offset = 66.0_f32;
+                // Footer texts bottom-left (`_headerNav`, `_nameNav`, `_dateNav`).
+                let show_footer =
+                    !self.zoom.full_screen_video && !is_stream_mode && !is_theme_preview;
+                let footer =
+                    FooterLayout::compute(ui, viewport_rect, &self.header_text(&item), &item);
+                // `OverlayWidget::resizeCenteredControls`: the album strip and the caption keep
+                // clear of the footer texts on both sides.
+                let bottom_skip = (footer.right() - viewport_rect.min.x)
+                    + st::mediaview_caption_margin.width.0 as f32;
+                let centered_w = (viewport_rect.width() - 2.0 * bottom_skip)
+                    .max(st::msg_min_width.0 as f32 + 2.0 * MEDIAVIEW_CAPTION_PAD_X);
+                let album = album_strip_range(self.gallery.items(), self.gallery.current_index());
+                let thumbs_top = (!self.zoom.full_screen_video && album.is_some())
+                    .then(|| viewport_rect.max.y - GroupThumbsStrip::height());
+
+                // ── Video PlaybackControls (`refreshClipControllerGeometry`): centered,
+                // `mediaviewCaptionPadding.bottom` above the album strip or the screen bottom. ──
+                let mut caption_bottom = thumbs_top
+                    .unwrap_or(viewport_rect.max.y - st::mediaview_caption_margin.height.0 as f32);
                 if item.kind.shows_playback_controls() {
-                    let controls_margin = if self.zoom.full_screen_video {
-                        22.0
+                    let controller_bottom = if self.zoom.full_screen_video {
+                        viewport_rect.max.y
                     } else {
-                        62.0
+                        thumbs_top.unwrap_or(viewport_rect.max.y)
                     };
+                    let controls_margin =
+                        viewport_rect.max.y - controller_bottom + MEDIAVIEW_CAPTION_PAD_Y;
                     let controls_rect = self.controls.layout_rect(viewport_rect, controls_margin);
                     let sponsored_events =
                         self.playback_sponsored
@@ -1417,7 +1439,8 @@ impl MediaOverlayWidget {
                     let actions =
                         self.controls
                             .show(ui, controls_rect, Id::unique("mv_playback_controls"));
-                    caption_bottom_offset = viewport_rect.max.y - controls_rect.min.y + 10.0;
+                    caption_bottom =
+                        controls_rect.min.y - st::mediaview_caption_margin.height.0 as f32;
                     for action in actions {
                         self.handle_playback_action(
                             action,
@@ -1429,19 +1452,12 @@ impl MediaOverlayWidget {
                     }
                 }
 
-                // ── Album Group Thumbnails Strip (`media_view_group_thumbs`): only the
-                // items of the current message's album (`ComputeContext` = `groupId`). ──
-                let album = album_strip_range(self.gallery.items(), self.gallery.current_index());
-                if !self.zoom.full_screen_video
-                    && let Some(album) = album
-                {
-                    let strip_h = GroupThumbsStrip::height();
+                // ── Album thumbnails (`media_view_group_thumbs`) at the very bottom, between the
+                // footer texts and the buttons: only the current message's album. ──
+                if let (Some(album), Some(top)) = (album, thumbs_top) {
                     let strip_rect = Rect::from_min_size(
-                        Pos2::new(
-                            viewport_rect.min.x + 120.0,
-                            viewport_rect.max.y - caption_bottom_offset - strip_h - 4.0,
-                        ),
-                        Vec2::new((viewport_rect.width() - 240.0).max(60.0), strip_h),
+                        Pos2::new(viewport_rect.center().x - centered_w * 0.5, top),
+                        Vec2::new(centered_w, GroupThumbsStrip::height()),
                     );
                     let picked = ui
                         .scope(|ui| {
@@ -1461,39 +1477,49 @@ impl MediaOverlayWidget {
                             self.navigate(backend, delta, world_now_ms);
                         }
                     }
-                    caption_bottom_offset += strip_h + 6.0;
                 } else {
                     self.group_thumbs.clear();
                 }
 
-                // ── Caption with rich entities ──
+                // ── Caption with rich entities (`refreshCaptionGeometry`) ──
                 if !self.zoom.full_screen_video && !item.caption.text.is_empty() {
+                    let max_text_w = centered_w - 2.0 * MEDIAVIEW_CAPTION_PAD_X;
                     ui.scope(|ui| {
                         ui.multiply_opacity(chrome_opacity);
                         self.paint_caption(
                             ui,
                             viewport_rect,
                             &item.caption,
-                            caption_bottom_offset,
+                            caption_bottom,
+                            max_text_w,
                             &colors,
                         );
                     });
                 }
 
-                // ── Bottom-left sender/file info + Bottom-right action toolbar ──
-                if !self.zoom.full_screen_video && !is_stream_mode && !is_theme_preview {
+                // ── Footer texts bottom-left + buttons bottom-right ──
+                if show_footer {
                     ui.scope(|ui| {
                         ui.multiply_opacity(chrome_opacity);
-                        self.paint_bottom_actions(
-                            ui,
-                            viewport_rect,
-                            &item,
-                            backend,
-                            &colors,
-                            world_now_ms,
-                            &mut events,
-                        );
+                        self.paint_footer(ui, &footer, &item, backend, &mut events);
                     });
+                    if self.open {
+                        ui.scope(|ui| {
+                            ui.multiply_opacity(chrome_opacity);
+                            self.paint_bottom_actions(
+                                ui,
+                                viewport_rect,
+                                &item,
+                                backend,
+                                &colors,
+                                world_now_ms,
+                                &mut events,
+                            );
+                        });
+                    }
+                }
+                if !self.open {
+                    return;
                 }
 
                 // ── Save/Copy toast banner (`st::mediaviewSaveMsgCheck` + `mediaviewSaveMsgStyle`) ──
@@ -1544,6 +1570,11 @@ impl MediaOverlayWidget {
         let rot = self.zoom.rotation;
         let fh = self.zoom.flip_h;
         let fv = self.zoom.flip_v;
+        let album_item = self
+            .gallery
+            .current()
+            .filter(|i| i.grouped_id.is_some())
+            .map(|i| i.id);
 
         match &mut self.content {
             ActiveContent::Photo {
@@ -1554,6 +1585,9 @@ impl MediaOverlayWidget {
                 rendered_flip_v,
                 ..
             } => {
+                if let Some(id) = album_item {
+                    self.group_thumbs.remember(ctx, id, base_image);
+                }
                 if texture.is_none()
                     || *rendered_rotation != rot
                     || *rendered_flip_h != fh
@@ -1711,7 +1745,11 @@ impl MediaOverlayWidget {
                     self.ocr.active = false;
                 }
             } else if self.zoom.full_screen_video {
-                self.zoom.toggle_fullscreen_video(136.0);
+                let skip = self
+                    .gallery
+                    .current()
+                    .map_or(0.0, |i| self.bottom_controls_skip(i));
+                self.zoom.toggle_fullscreen_video(skip);
                 self.controls.in_fullscreen = false;
             } else {
                 self.close();
@@ -1834,6 +1872,22 @@ impl MediaOverlayWidget {
         }
     }
 
+    /// Height kept free under the content (`OverlayWidget::recountSkipTop`): only a video's
+    /// playback controller (plus the album strip under it) takes room; photos use the whole
+    /// screen and the footer is drawn over them.
+    fn bottom_controls_skip(&self, item: &MediaItem) -> f64 {
+        if !item.kind.shows_playback_controls() {
+            return 0.0;
+        }
+        let thumbs =
+            if album_strip_range(self.gallery.items(), self.gallery.current_index()).is_some() {
+                GroupThumbsStrip::height()
+            } else {
+                0.0
+            };
+        f64::from(MEDIAVIEW_CONTROLLER_HEIGHT + 2.0 * MEDIAVIEW_CAPTION_PAD_Y + thumbs)
+    }
+
     fn handle_playback_action(
         &mut self,
         action: PlaybackControlsAction,
@@ -1882,7 +1936,8 @@ impl MediaOverlayWidget {
                 }
             }
             PlaybackControlsAction::ToggleFullScreen => {
-                self.zoom.toggle_fullscreen_video(136.0);
+                self.zoom
+                    .toggle_fullscreen_video(self.bottom_controls_skip(item));
                 self.controls.in_fullscreen = self.zoom.full_screen_video;
             }
             PlaybackControlsAction::ToPictureInPicture => {
@@ -1904,171 +1959,190 @@ impl MediaOverlayWidget {
         }
     }
 
-    fn paint_header(
+    /// Header line of the footer (`OverlayWidget::updateHeader`): "Photo N of M" / "File N of M"
+    /// inside a list, otherwise "Single Photo" or the file name.
+    fn header_text(&self, item: &MediaItem) -> String {
+        if let Some(counter) = self.gallery.counter_text() {
+            return counter;
+        }
+        match item.kind {
+            MediaItemKind::Photo => tg_lang::tr::lng_mediaview_single_photo(),
+            _ if item.file_name.is_empty() => tg_lang::tr::lng_mediaview_doc_image(),
+            _ => item.file_name.clone(),
+        }
+    }
+
+    /// Minimize, maximize / restore and close in the top-right corner (`mediaviewTitle`,
+    /// 44×32 px buttons whose icons carry their own shadow).
+    fn paint_title_controls(
         &mut self,
         ui: &mut Ui,
         viewport_rect: Rect,
-        item: &MediaItem,
         colors: &MediaColors<'_>,
         events: &mut Vec<OverlayEvent>,
     ) {
         let ctx = ui.ctx().clone();
-        let painter = ui.painter();
-        let control_fg = colors.color_or("mediaviewControlFg", MEDIAVIEW_CONTROL_FG);
-        let control_bg = colors.color_or("mediaviewControlBg", MEDIAVIEW_CONTROL_BG);
-        let accent = colors.color_or("windowBgActive", Color32::from_rgb(0x40, 0xA7, 0xE3));
-        let header_rect =
-            Rect::from_min_size(viewport_rect.min, Vec2::new(viewport_rect.width(), 56.0));
-        // Subtle top gradient scrim for contrast.
-        painter.rect_filled(
-            header_rect,
-            CornerRadius::ZERO,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 96),
+        let painter = ui.painter().clone();
+        let size = Vec2::new(
+            st::mediaview_title_button.width.0 as f32,
+            st::mediaview_title_button.height.0 as f32,
         );
-
-        // Sender monogram circle + name + date.
-        let avatar_center = Pos2::new(header_rect.min.x + 32.0, header_rect.center().y);
-        painter.circle_filled(avatar_center, 16.0, accent);
-        let initial = item
-            .sender_name
-            .chars()
-            .next()
-            .unwrap_or('T')
-            .to_uppercase()
-            .to_string();
-        painter.text(
-            avatar_center,
-            Align2::CENTER_CENTER,
-            initial,
-            font_id_from_style(st::mediaview_thick_font),
-            Color32::WHITE,
-        );
-
-        let text_x = header_rect.min.x + 58.0;
-        painter.text(
-            Pos2::new(text_x, header_rect.min.y + 18.0),
-            Align2::LEFT_CENTER,
-            &item.sender_name,
-            font_id_from_style(st::mediaview_thick_font),
-            control_fg,
-        );
-        let subtitle = match self.gallery.counter_text() {
-            Some(counter) => format!("{}  ·  {}", item.date_text, counter),
-            None => item.date_text.clone(),
+        let (fullscreen, maximized) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.fullscreen.unwrap_or(false), v.maximized.unwrap_or(false))
+        });
+        let maximize_icon = if fullscreen || maximized {
+            &st::mediaview_title_restore
+        } else {
+            &st::mediaview_title_maximize
         };
-        painter.text(
-            Pos2::new(text_x, header_rect.min.y + 38.0),
-            Align2::LEFT_CENTER,
-            subtitle,
-            font_id_from_style(st::mediaview_font),
-            MEDIAVIEW_SUB_FG,
-        );
-
-        // Right-side controls: Zoom percentage pill (`-`, `100%`, `+`) + Close button (`st::mediaviewTitleClose`).
-        let close_rect = Rect::from_min_size(
-            Pos2::new(header_rect.max.x - 46.0, header_rect.min.y + 10.0),
-            Vec2::splat(36.0),
-        );
-        let close_resp = ui
-            .interact(close_rect, Id::unique("mv_close_btn"), Sense::click())
-            .on_hover_text(tg_lang::tr::lng_close());
-        if close_resp.hovered() {
-            painter.circle_filled(close_rect.center(), 17.0, MEDIAVIEW_CONTROL_BG_OVER);
-        }
-        paint_centered_style_icon(
-            &ctx,
-            painter,
-            &st::mediaview_title_close,
-            close_rect,
-            colors,
-        );
-        if close_resp.clicked() {
-            self.close();
-            events.push(OverlayEvent::Closed);
-        }
-
-        if !item.kind.shows_playback_controls() {
-            let zoom_pill = Rect::from_min_size(
-                Pos2::new(close_rect.min.x - 118.0, header_rect.min.y + 13.0),
-                Vec2::new(108.0, 30.0),
+        let buttons = [
+            (TitleButton::Minimize, &st::mediaview_title_minimize),
+            (TitleButton::Maximize, maximize_icon),
+            (TitleButton::Close, &st::mediaview_title_close),
+        ];
+        let count = buttons.len() as f32;
+        for (i, (button, icon)) in buttons.into_iter().enumerate() {
+            let rect = Rect::from_min_size(
+                Pos2::new(
+                    viewport_rect.max.x - size.x * (count - i as f32),
+                    viewport_rect.min.y,
+                ),
+                size,
             );
-            painter.rect_filled(zoom_pill, CornerRadius::same(15), control_bg);
-
-            let out_rect = Rect::from_min_size(zoom_pill.min, Vec2::new(28.0, 30.0));
-            let pct_rect = Rect::from_min_size(
-                Pos2::new(out_rect.max.x, zoom_pill.min.y),
-                Vec2::new(52.0, 30.0),
-            );
-            let in_rect = Rect::from_min_size(
-                Pos2::new(pct_rect.max.x, zoom_pill.min.y),
-                Vec2::new(28.0, 30.0),
-            );
-
-            let out_resp = ui.interact(out_rect, Id::unique("mv_zoom_out"), Sense::click());
-            let pct_resp = ui.interact(pct_rect, Id::unique("mv_zoom_reset"), Sense::click());
-            let in_resp = ui.interact(in_rect, Id::unique("mv_zoom_in"), Sense::click());
-
-            painter.text(
-                out_rect.center(),
-                Align2::CENTER_CENTER,
-                "\u{2212}",
-                font_id_from_style(st::mediaview_thick_font),
-                control_fg,
-            );
-            painter.text(
-                pct_rect.center(),
-                Align2::CENTER_CENTER,
-                format!("{}%", self.zoom.zoom_percent()),
-                font_id_from_style(st::mediaview_font),
-                control_fg,
-            );
-            painter.text(
-                in_rect.center(),
-                Align2::CENTER_CENTER,
-                "+",
-                font_id_from_style(st::mediaview_thick_font),
-                control_fg,
-            );
-
-            if out_resp.clicked() {
-                self.zoom.zoom_out(None);
+            let resp = ui.interact(rect, Id::unique(("mv_title", i)), Sense::click());
+            if button == TitleButton::Close {
+                let label = tg_lang::tr::lng_close();
+                resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &label));
             }
-            if pct_resp.clicked() {
-                self.zoom.zoom_reset();
+            paint_centered_style_icon(&ctx, &painter, icon, rect, colors);
+            if !resp.clicked() {
+                continue;
             }
-            if in_resp.clicked() {
-                self.zoom.zoom_in(None);
+            match button {
+                TitleButton::Minimize => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
+                TitleButton::Maximize => {
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
+                }
+                TitleButton::Close => {
+                    self.close();
+                    events.push(OverlayEvent::Closed);
+                }
             }
         }
     }
 
+    /// Header, sender name and date at the bottom-left (`OverlayWidget::paintFooterContent`).
+    /// The date opens the message in its chat (`Over::Date` → `toMessage`).
+    fn paint_footer(
+        &mut self,
+        ui: &mut Ui,
+        footer: &FooterLayout,
+        item: &MediaItem,
+        backend: &dyn MediaBackend,
+        events: &mut Vec<OverlayEvent>,
+    ) {
+        let colors = MediaColors::from_ctx(ui.ctx());
+        let fg = colors.color_or("mediaviewControlFg", MEDIAVIEW_CONTROL_FG);
+        let idle = with_opacity(fg, MAXIMIZED_ICON_OPACITY);
+        let thick = font_id_from_style(st::mediaview_thick_font);
+        let normal = font_id_from_style(st::mediaview_font);
+        let painter = ui.painter().clone();
+
+        painter.with_clip_rect(footer.header_rect).text(
+            footer.header_rect.min,
+            Align2::LEFT_TOP,
+            &footer.header,
+            thick,
+            idle,
+        );
+        if let Some(name_rect) = footer.name_rect {
+            let name = ellipsize_single_line(ui, &item.sender_name, &normal, name_rect.width());
+            painter.with_clip_rect(name_rect).text(
+                name_rect.min,
+                Align2::LEFT_TOP,
+                name,
+                normal.clone(),
+                idle,
+            );
+        }
+        if let Some(separator) = footer.separator_rect {
+            painter.text(
+                separator.min,
+                Align2::LEFT_TOP,
+                FOOTER_SEPARATOR,
+                normal.clone(),
+                idle,
+            );
+        }
+
+        let date_resp = ui.interact(
+            footer.date_rect,
+            Id::unique("mv_footer_date"),
+            Sense::click(),
+        );
+        date_resp.widget_info(|| WidgetInfo::labeled(Role::Link, true, &item.date_text));
+        let hovered = date_resp.hovered();
+        let date_fg = with_opacity(fg, control_opacity(hovered));
+        let galley = painter.layout_no_wrap(item.date_text.clone(), normal, date_fg);
+        if hovered {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            let baseline = galley
+                .rows
+                .first()
+                .and_then(|row| row.row.glyphs.first())
+                .map_or(galley.size().y, |g| g.pos.y);
+            let y = footer.date_rect.min.y + baseline + 1.0;
+            painter.line_segment(
+                [
+                    Pos2::new(footer.date_rect.min.x, y),
+                    Pos2::new(footer.date_rect.max.x, y),
+                ],
+                Stroke::new(1.0, date_fg),
+            );
+        }
+        painter.galley(footer.date_rect.min, galley, date_fg);
+        if date_resp.clicked() {
+            backend.show_in_chat(item.peer_id, item.msg_id);
+            events.push(OverlayEvent::ShowInChat {
+                peer_id: item.peer_id,
+                msg_id: item.msg_id,
+            });
+            self.close();
+        }
+    }
+
+    /// Caption pill above the album strip / video controller / screen bottom
+    /// (`OverlayWidget::refreshCaptionGeometry`, `paintCaptionContent`).
     fn paint_caption(
         &mut self,
         ui: &mut Ui,
         viewport_rect: Rect,
         caption: &TextWithEntities,
-        bottom_offset: f32,
+        caption_bottom: f32,
+        max_text_w: f32,
         colors: &MediaColors<'_>,
     ) {
         let caption_bg = colors.color_or("mediaviewCaptionBg", MEDIAVIEW_CAPTION_BG);
         let caption_fg = colors.color_or("mediaviewCaptionFg", MEDIAVIEW_CAPTION_FG);
-        let max_w = (viewport_rect.width() - 64.0).clamp(240.0, 560.0);
-        let job = build_caption_layout_job(
-            caption,
-            max_w - 2.0 * MEDIAVIEW_CAPTION_PAD_X,
-            &self.revealed_spoilers,
-        );
+        let job = build_caption_layout_job(caption, max_text_w.max(1.0), &self.revealed_spoilers);
         let galley = ui.fonts_mut(|f| f.layout_job(job));
-        let text_size = galley.size();
-        let pill_w = (text_size.x + 2.0 * MEDIAVIEW_CAPTION_PAD_X).min(max_w);
-        let pill_h = (text_size.y + 2.0 * MEDIAVIEW_CAPTION_PAD_Y).min(120.0);
-        let pill_rect = Rect::from_min_size(
+        let line_h = galley
+            .rows
+            .first()
+            .map_or(galley.size().y, |row| row.height().max(1.0));
+        // At most a quarter of the screen, whole lines only.
+        let max_h = ((viewport_rect.height() / 4.0) / line_h).floor() * line_h;
+        let text_size = Vec2::new(galley.size().x, galley.size().y.min(max_h.max(line_h)));
+        let text_rect = Rect::from_min_size(
             Pos2::new(
-                viewport_rect.center().x - pill_w * 0.5,
-                viewport_rect.max.y - bottom_offset - pill_h - MEDIAVIEW_CAPTION_MARGIN,
+                viewport_rect.center().x - text_size.x * 0.5,
+                caption_bottom - text_size.y - MEDIAVIEW_CAPTION_PAD_Y,
             ),
-            Vec2::new(pill_w, pill_h),
+            text_size,
         );
+        let pill_rect =
+            text_rect.expand2(Vec2::new(MEDIAVIEW_CAPTION_PAD_X, MEDIAVIEW_CAPTION_PAD_Y));
 
         let painter = ui.painter();
         painter.rect_filled(
@@ -2076,14 +2150,9 @@ impl MediaOverlayWidget {
             CornerRadius::same(MEDIAVIEW_CAPTION_RADIUS as u8),
             caption_bg,
         );
-        painter.galley(
-            Pos2::new(
-                pill_rect.min.x + MEDIAVIEW_CAPTION_PAD_X,
-                pill_rect.min.y + MEDIAVIEW_CAPTION_PAD_Y,
-            ),
-            galley,
-            caption_fg,
-        );
+        painter
+            .with_clip_rect(text_rect)
+            .galley(text_rect.min, galley, caption_fg);
 
         // Clicking caption reveals any spoiler entities.
         let has_spoiler = caption
@@ -2102,6 +2171,8 @@ impl MediaOverlayWidget {
         }
     }
 
+    /// Bottom-right buttons (`OverlayWidget::updateControls` / `paintControls`): from the right
+    /// More, Rotate, Save and Recognize in 46×54 px cells; a 36 px circle only under the mouse.
     #[allow(clippy::too_many_arguments)]
     fn paint_bottom_actions(
         &mut self,
@@ -2114,118 +2185,105 @@ impl MediaOverlayWidget {
         events: &mut Vec<OverlayEvent>,
     ) {
         let ctx = ui.ctx().clone();
-        let painter = ui.painter();
-        let footer_h = 54.0;
-        let footer_rect = Rect::from_min_size(
-            Pos2::new(viewport_rect.min.x, viewport_rect.max.y - footer_h),
-            Vec2::new(viewport_rect.width(), footer_h),
+        let painter = ui.painter().clone();
+        let control_bg = colors.color_or("mediaviewControlBg", MEDIAVIEW_CONTROL_BG);
+        let cell = Vec2::new(
+            st::mediaview_icon_size.width.0 as f32,
+            st::mediaview_icon_size.height.0 as f32,
         );
-        // `OverlayWidget::paint`: photos and videos get no file-name line and no bar behind the
-        // bottom-right buttons; only a document shows its name and size.
-        let shows_file_line = item.kind == MediaItemKind::Document;
-        if shows_file_line {
-            painter.rect_filled(
-                footer_rect,
-                CornerRadius::ZERO,
-                Color32::from_rgba_unmultiplied(0, 0, 0, 96),
-            );
-        }
-
-        // Bottom-right icon buttons (`st::mediaviewRotate`, `Share`, `Save`, `More`).
-        let btn_sz = Vec2::splat(38.0);
-        let y = footer_rect.center().y - btn_sz.y * 0.5;
-        let mut x = footer_rect.max.x - 16.0 - btn_sz.x;
-
-        let more_rect = Rect::from_min_size(Pos2::new(x, y), btn_sz);
-        x -= btn_sz.x + 6.0;
-        let save_rect = Rect::from_min_size(Pos2::new(x, y), btn_sz);
-        x -= btn_sz.x + 6.0;
-        let forward_rect = Rect::from_min_size(Pos2::new(x, y), btn_sz);
-        x -= btn_sz.x + 6.0;
-        let rotate_rect = Rect::from_min_size(Pos2::new(x, y), btn_sz);
-
-        // Bottom-left metadata: file name + dimensions / rotation (clipped clear of buttons).
-        let rot_suffix = if self.zoom.rotation != 0 {
-            format!(" · {}°", self.zoom.rotation)
-        } else {
-            String::new()
+        let over_r = st::mediaview_icon_over.0 as f32 * 0.5;
+        let nav_rect = |index: usize| {
+            Rect::from_min_size(
+                Pos2::new(
+                    viewport_rect.max.x - cell.x * index as f32,
+                    viewport_rect.max.y - cell.y,
+                ),
+                cell,
+            )
         };
-        let info_line = format!(
-            "{}  ·  {}×{}{}",
-            item.file_name, item.width, item.height, rot_suffix
-        );
-        let info_left = footer_rect.min.x + st::mediaview_text_left.0 as f32;
-        let info_max_w = (rotate_rect.min.x - 12.0 - info_left).max(40.0);
-        let info_font = font_id_from_style(st::mediaview_font);
-        let info_clip = Rect::from_min_max(
-            Pos2::new(info_left, footer_rect.min.y),
-            Pos2::new(info_left + info_max_w, footer_rect.max.y),
-        );
-        if shows_file_line {
-            let fitted_info = ellipsize_single_line(ui, &info_line, &info_font, info_max_w);
-            painter.with_clip_rect(info_clip).text(
-                Pos2::new(info_left, footer_rect.center().y),
-                Align2::LEFT_CENTER,
-                fitted_info,
-                info_font,
-                MEDIAVIEW_SUB_FG,
-            );
+        let mut index = 1;
+        let more_rect = nav_rect(index);
+        index += 1;
+        let rotate_rect = nav_rect(index);
+        index += 1;
+        let save_visible = item.allows_save;
+        let save_rect = nav_rect(index);
+        if save_visible {
+            index += 1;
         }
+        let recognize_visible = item.kind == MediaItemKind::Photo
+            && self
+                .ocr
+                .result
+                .as_ref()
+                .is_some_and(|r| !r.lines.is_empty());
+        let recognize_rect = nav_rect(index);
 
-        let more_resp = ui
-            .interact(more_rect, ui.scope_id().with("mv_act_more"), Sense::click())
-            .on_hover_text("More");
-        more_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "More"));
+        let more_label = "More".to_owned();
         let save_label = tg_lang::tr::lng_mediaview_save_as();
-        let save_resp = ui
-            .interact(save_rect, ui.scope_id().with("mv_act_save"), Sense::click())
-            .on_hover_text(&save_label);
-        save_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &save_label));
-        let fwd_label = tg_lang::tr::lng_mediaview_forward();
-        let fwd_resp = ui
-            .interact(
-                forward_rect,
-                ui.scope_id().with("mv_act_forward"),
-                Sense::click(),
-            )
-            .on_hover_text(&fwd_label);
-        fwd_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &fwd_label));
-        let rot_resp = ui
-            .interact(
+        let recognize_label = strings::RECOGNIZE_TEXT_LABEL.to_owned();
+        let buttons = [
+            (
+                BottomButton::More,
+                true,
+                more_rect,
+                &st::mediaview_more,
+                more_label,
+            ),
+            (
+                BottomButton::Rotate,
+                true,
                 rotate_rect,
-                ui.scope_id().with("mv_act_rotate"),
-                Sense::click(),
-            )
-            .on_hover_text(strings::ROTATE_CW_90);
-        rot_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, strings::ROTATE_CW_90));
-
-        for (r, hovered) in [
-            (more_rect, more_resp.hovered() || self.more_menu_open),
-            (save_rect, save_resp.hovered()),
-            (forward_rect, fwd_resp.hovered()),
-            (rotate_rect, rot_resp.hovered()),
-        ] {
+                &st::mediaview_rotate,
+                strings::ROTATE_CW_90.to_owned(),
+            ),
+            (
+                BottomButton::Save,
+                save_visible,
+                save_rect,
+                &st::mediaview_save,
+                save_label,
+            ),
+            (
+                BottomButton::Recognize,
+                recognize_visible,
+                recognize_rect,
+                &st::mediaview_recognize,
+                recognize_label,
+            ),
+        ];
+        let mut clicked = None;
+        for (button, visible, rect, icon, label) in buttons {
+            if !visible {
+                continue;
+            }
+            let resp = ui.interact(rect, ui.scope_id().with(("mv_act", button)), Sense::click());
+            resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &label));
+            let hovered = resp.hovered()
+                || (button == BottomButton::More && self.more_menu_open)
+                || (button == BottomButton::Recognize && self.ocr.active);
             if hovered {
-                painter.circle_filled(r.center(), 18.0, MEDIAVIEW_CONTROL_BG_OVER);
+                painter.circle_filled(rect.center(), over_r, control_bg);
+            }
+            paint_centered_style_icon_alpha(
+                &ctx,
+                &painter,
+                icon,
+                rect,
+                colors,
+                control_opacity(hovered),
+            );
+            if resp.clicked() {
+                clicked = Some(button);
             }
         }
 
-        paint_centered_style_icon(&ctx, painter, &st::mediaview_more, more_rect, colors);
-        paint_centered_style_icon(&ctx, painter, &st::mediaview_save, save_rect, colors);
-        paint_centered_style_icon(&ctx, painter, &st::mediaview_share, forward_rect, colors);
-        paint_centered_style_icon(&ctx, painter, &st::mediaview_rotate, rotate_rect, colors);
-
-        if rot_resp.clicked() {
-            self.zoom.rotate_cw();
-        }
-        if fwd_resp.clicked() && item.allows_forward {
-            self.trigger_forward(item, backend, world_now_ms, events);
-        }
-        if save_resp.clicked() && item.allows_save {
-            self.trigger_save(item, backend, world_now_ms, events);
-        }
-        if more_resp.clicked() {
-            self.more_menu_open = !self.more_menu_open;
+        match clicked {
+            Some(BottomButton::More) => self.more_menu_open = !self.more_menu_open,
+            Some(BottomButton::Rotate) => self.zoom.rotate_cw(),
+            Some(BottomButton::Save) => self.trigger_save(item, backend, world_now_ms, events),
+            Some(BottomButton::Recognize) => self.ocr.active = !self.ocr.active,
+            None => {}
         }
 
         // ── More context menu (`OverlayWidget::fillContextMenuActions`) ──
@@ -2822,6 +2880,130 @@ pub fn build_caption_layout_job(
     job
 }
 
+/// `Ui::kQBullet` between the sender name and the date in the footer.
+const FOOTER_SEPARATOR: &str = "\u{2022}";
+
+/// `OverlayWidget::controlOpacity`: full under the mouse, `kMaximizedIconOpacity` otherwise.
+fn control_opacity(hovered: bool) -> f32 {
+    if hovered { 1.0 } else { MAXIMIZED_ICON_OPACITY }
+}
+
+/// Top-right window buttons of the viewer (`mediaviewTitle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// Bottom-right buttons of the viewer (`Over::More`, `Rotate`, `Save`, `Recognize`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BottomButton {
+    More,
+    Rotate,
+    Save,
+    Recognize,
+}
+
+/// Bottom-left footer geometry (`OverlayWidget::updateControls` / `updateHeader`): the header
+/// at `mediaviewHeaderTop` from the bottom, "name • date" at `mediaviewTextTop`.
+#[derive(Debug, Clone, PartialEq)]
+struct FooterLayout {
+    header: String,
+    header_rect: Rect,
+    name_rect: Option<Rect>,
+    separator_rect: Option<Rect>,
+    date_rect: Rect,
+}
+
+impl FooterLayout {
+    fn compute(ui: &Ui, viewport_rect: Rect, header: &str, item: &MediaItem) -> Self {
+        let thick = font_id_from_style(st::mediaview_thick_font);
+        let normal = font_id_from_style(st::mediaview_font);
+        let width = |text: &str, font: &FontId| {
+            ui.painter()
+                .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+                .size()
+        };
+        let left = viewport_rect.min.x + st::mediaview_text_left.0 as f32;
+        let third = viewport_rect.width() / 3.0;
+        let header_size = width(header, &thick);
+        let (header, header_w) = if header_size.x > third {
+            (ellipsize_middle(ui, header, &thick, third), third)
+        } else {
+            (header.to_owned(), header_size.x)
+        };
+        let header_rect = Rect::from_min_size(
+            Pos2::new(
+                left,
+                viewport_rect.max.y - st::mediaview_header_top.0 as f32,
+            ),
+            Vec2::new(header_w, header_size.y),
+        );
+        let text_top = viewport_rect.max.y - st::mediaview_text_top.0 as f32;
+        let skip_half = st::mediaview_text_skip_half.0 as f32;
+        let date_size = width(&item.date_text, &normal);
+        let (name_rect, separator_rect, date_left) = if item.sender_name.is_empty() {
+            (None, None, left)
+        } else {
+            let name_size = width(&item.sender_name, &normal);
+            let name_rect = Rect::from_min_size(
+                Pos2::new(left, text_top),
+                Vec2::new(name_size.x.min(third), name_size.y),
+            );
+            let separator_size = width(FOOTER_SEPARATOR, &normal);
+            let separator_rect = Rect::from_min_size(
+                Pos2::new(name_rect.max.x + skip_half, text_top),
+                separator_size,
+            );
+            (
+                Some(name_rect),
+                Some(separator_rect),
+                separator_rect.max.x + skip_half,
+            )
+        };
+        Self {
+            header,
+            header_rect,
+            name_rect,
+            separator_rect,
+            date_rect: Rect::from_min_size(Pos2::new(date_left, text_top), date_size),
+        }
+    }
+
+    /// Right edge of the widest footer line (`resizeCenteredControls` `bottomSkip`).
+    fn right(&self) -> f32 {
+        self.date_rect.max.x.max(self.header_rect.max.x)
+    }
+}
+
+/// Elides `text` in the middle to fit `max_width` (`Qt::ElideMiddle` in `updateHeader`).
+fn ellipsize_middle(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let fits = |s: &str| {
+        ui.painter()
+            .layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+            <= max_width
+    };
+    let mut keep = chars.len();
+    while keep > 0 {
+        let head = keep.div_ceil(2);
+        let tail = keep / 2;
+        let candidate: String = chars[..head]
+            .iter()
+            .chain(std::iter::once(&'\u{2026}'))
+            .chain(chars[chars.len() - tail..].iter())
+            .collect();
+        if fits(&candidate) {
+            return candidate;
+        }
+        keep -= 1;
+    }
+    "\u{2026}".to_owned()
+}
+
 fn ellipsize_single_line(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> String {
     let full = ui
         .painter()
@@ -2860,3 +3042,8 @@ mod tests_uip_f;
 #[path = "tests_wp74i_album_strip.rs"]
 #[cfg(test)]
 mod tests_wp74i_album_strip;
+
+#[cfg(test)]
+#[path = "tests_uip4_e.rs"]
+#[cfg(test)]
+mod tests_uip4_e;

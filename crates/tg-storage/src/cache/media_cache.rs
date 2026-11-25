@@ -6,8 +6,10 @@
 //!
 //! Security model (aligned with tdesktop's `lib_storage/storage/cache/` and `storage_account.cpp`):
 //! - Every cached blob on disk is encrypted using tdesktop's `TDEF` AES-256-CTR [`EncryptedFile`]
-//!   format with a per-account [`StorageEncryptionKey`] derived from the `tdata` local key, plus
-//!   an inner SHA-256 integrity digest.
+//!   format with a per-account [`StorageEncryptionKey`] derived from the `tdata` local key, and
+//!   authenticated with an inner HMAC-SHA-256 under a key derived from the cache key. The MAC
+//!   also covers the entry the blob belongs to, so a blob cannot be altered or swapped for
+//!   another entry's blob by someone who can write the cache folder but does not have the key.
 //! - Cache lookup keys in SQLite are keyed SHA-256 digests, and all relative/absolute paths stored
 //!   in `media_cache` and `file_locations` are encrypted with random per-row salts.
 //! - Legacy unencrypted caches (`PRAGMA user_version < 2` or non-`TDEF` blobs) are purged on open.
@@ -24,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use tg_crypto::{
     AES_BLOCK_SIZE, AuthKey, STORAGE_CTR_SALT_SIZE, StorageEncryptionKey, const_time_eq,
-    random_bytes, sha256,
+    hmac_sha256_parts, random_bytes, sha256,
 };
 
 use crate::encrypted_file::{EncryptedFile, OpenMode, TDEF_MAGIC};
@@ -36,8 +38,12 @@ const MEDIA_CACHE_SCHEMA_VERSION: i32 = 2;
 /// Prefix for encrypted string columns stored in SQLite (`enc1:<salt>:<mac>:<ciphertext>`).
 const ENC_STRING_PREFIX: &str = "enc1:";
 
-/// Header length inside each `TDEF` blob payload: `u64 LE plaintext_len` + `32-byte SHA-256`.
+/// Header length inside each `TDEF` blob payload: `u64 LE plaintext_len` + `32-byte HMAC-SHA-256`.
 const BLOB_FRAME_HEADER_LEN: usize = 8 + 32;
+
+/// File-name prefix of streamed media files inside `<cache root>/streamed`. The rest of the name
+/// is a keyed hash ([`keyed_stream_file_stem`]), so names do not reveal document ids.
+pub const STREAM_FILE_PREFIX: &str = "s_";
 
 /// Legacy plaintext sidecar manifest filename purged during migration.
 const LEGACY_MANIFEST_FILENAME: &str = "cache_meta.json";
@@ -102,12 +108,27 @@ pub fn random_ephemeral_cache_key() -> StorageEncryptionKey {
     }
 }
 
+/// Returns the random [`StorageEncryptionKey`] of this process (generated on first use, never
+/// written to disk). Cache writers use it for directories that have no registered account key, so
+/// nothing is stored in plaintext and files written by one process are unreadable by the next.
+#[must_use]
+pub fn process_ephemeral_cache_key() -> StorageEncryptionKey {
+    static KEY: OnceLock<StorageEncryptionKey> = OnceLock::new();
+    KEY.get_or_init(random_ephemeral_cache_key).clone()
+}
+
 /// Registers an active cache root directory's encryption key in memory so companion cache writers
 /// (such as [`crate::StreamedFileDownloader`] storing `.part` files inside `<cache_root>/streamed`)
 /// automatically encrypt files under `root_dir` with the same account key.
 pub fn register_cache_key(root_dir: &Path, key: StorageEncryptionKey) {
     let norm = normalize_registry_path(root_dir);
     if let Ok(mut guard) = key_registry().lock() {
+        // A directory registered before it existed is stored under the path as given; once it
+        // exists it is stored under its canonical path. Drop the first form so a lookup cannot
+        // return a key that was replaced.
+        if norm != root_dir {
+            guard.remove(root_dir);
+        }
         guard.insert(norm, key);
     }
 }
@@ -328,6 +349,7 @@ impl MediaCacheIndex {
             // Always delete any leftover plaintext manifest or unencrypted blobs.
             let _ = fs::remove_file(root_dir.join(LEGACY_MANIFEST_FILENAME));
             purge_non_tdef_blobs(&root_dir.join("blobs"));
+            purge_legacy_stream_files(&root_dir.join("streamed"));
             Self::init_schema(conn)?;
             if !cache_matches_key(conn, key)? {
                 purge_cache_contents(root_dir, conn, key)?;
@@ -406,7 +428,7 @@ impl MediaCacheIndex {
                 if let Some(parent) = full_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                write_encrypted_blob(&full_path, &self.key, bytes)?;
+                write_encrypted_blob_bound(&full_path, &self.key, &entry_id, bytes)?;
             }
             CacheBackend::MemoryOnly { blobs } => {
                 if let Ok(mut guard) = blobs.lock() {
@@ -448,7 +470,8 @@ impl MediaCacheIndex {
 
     /// Read and decrypt a cached blob by `key`, updating its `last_accessed` timestamp.
     pub fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let db_key = encode_hex(&keyed_entry_id(&self.key, key));
+        let entry_id = keyed_entry_id(&self.key, key);
+        let db_key = encode_hex(&entry_id);
         let enc_rel_path: Option<String> = self
             .conn
             .query_row(
@@ -469,7 +492,7 @@ impl MediaCacheIndex {
         match &self.backend {
             CacheBackend::Disk { root_dir } => {
                 let full_path = root_dir.join(&rel);
-                match read_encrypted_blob(&full_path, &self.key) {
+                match read_encrypted_blob_bound(&full_path, &self.key, &entry_id) {
                     Ok(bytes) => {
                         let _ = self.conn.execute(
                             "UPDATE media_cache SET last_accessed = ?1 WHERE key = ?2",
@@ -485,8 +508,11 @@ impl MediaCacheIndex {
                     }
                     Err(StorageError::DecryptionFailed)
                     | Err(StorageError::InvalidMagic)
-                    | Err(StorageError::ChecksumMismatch) => {
-                        // Purge unreadable/corrupt/plaintext blob and treat as cache miss.
+                    | Err(StorageError::ChecksumMismatch)
+                    | Err(StorageError::CorruptData(_)) => {
+                        // Purge unreadable/corrupt/plaintext blob, and any blob that fails
+                        // authentication (tampered, or written by an older build), and treat
+                        // it as a cache miss.
                         let _ = fs::remove_file(&full_path);
                         let _ = self
                             .conn
@@ -856,17 +882,65 @@ fn keyed_entry_id(key: &StorageEncryptionKey, cache_key: &str) -> [u8; 32] {
     ])
 }
 
+/// Returns the file-name stem for the streamed media file of object `(key_high, key_low)`:
+/// [`STREAM_FILE_PREFIX`] followed by a keyed hash. Without the cache key the name does not
+/// reveal which document it belongs to, and it changes when the key changes.
+#[must_use]
+pub fn keyed_stream_file_stem(key: &StorageEncryptionKey, key_high: u64, key_low: u64) -> String {
+    let id = sha256(&[
+        key.as_bytes(),
+        b"rustgram.media_cache.stream\0",
+        &key_high.to_le_bytes(),
+        &key_low.to_le_bytes(),
+    ]);
+    format!("{STREAM_FILE_PREFIX}{}", encode_hex(&id[..16]))
+}
+
+/// Derives the HMAC key that authenticates cache content from the cache encryption key.
+fn blob_mac_key(key: &StorageEncryptionKey) -> [u8; 32] {
+    sha256(&[key.as_bytes(), b"rustgram.media_cache.blob_mac.v1\0"])
+}
+
+fn blob_mac(key: &StorageEncryptionKey, context: &[u8], plaintext: &[u8]) -> [u8; 32] {
+    hmac_sha256_parts(
+        &blob_mac_key(key),
+        &[
+            b"rustgram.media_cache.blob\0",
+            &(context.len() as u64).to_le_bytes(),
+            context,
+            &(plaintext.len() as u64).to_le_bytes(),
+            plaintext,
+        ],
+    )
+}
+
 /// Encrypts `plaintext` into a `TDEF` [`EncryptedFile`] at `path` with an inner length prefix and
-/// SHA-256 payload digest.
+/// an HMAC-SHA-256 over the content under a key derived from `key`.
 pub fn write_encrypted_blob(
     path: &Path,
     key: &StorageEncryptionKey,
     plaintext: &[u8],
 ) -> Result<()> {
+    write_encrypted_blob_bound(path, key, &[], plaintext)
+}
+
+/// Reads and authenticates a `TDEF` [`EncryptedFile`] blob written by [`write_encrypted_blob`].
+pub fn read_encrypted_blob(path: &Path, key: &StorageEncryptionKey) -> Result<Vec<u8>> {
+    read_encrypted_blob_bound(path, key, &[])
+}
+
+/// Like [`write_encrypted_blob`], with `context` (for example the entry id or the owner of the
+/// file) covered by the MAC: [`read_encrypted_blob_bound`] accepts the file only with the same
+/// `context`, so one valid blob cannot be copied over another.
+pub fn write_encrypted_blob_bound(
+    path: &Path,
+    key: &StorageEncryptionKey,
+    context: &[u8],
+    plaintext: &[u8],
+) -> Result<()> {
     let mut framed = Vec::with_capacity(BLOB_FRAME_HEADER_LEN + plaintext.len());
     framed.extend_from_slice(&(plaintext.len() as u64).to_le_bytes());
-    let digest = sha256(&[plaintext]);
-    framed.extend_from_slice(&digest);
+    framed.extend_from_slice(&blob_mac(key, context, plaintext));
     framed.extend_from_slice(plaintext);
 
     let mut file = EncryptedFile::open(path, OpenMode::Write, key)?;
@@ -875,8 +949,14 @@ pub fn write_encrypted_blob(
     Ok(())
 }
 
-/// Reads and authenticates a `TDEF` [`EncryptedFile`] blob written by [`write_encrypted_blob`].
-pub fn read_encrypted_blob(path: &Path, key: &StorageEncryptionKey) -> Result<Vec<u8>> {
+/// Reads a `TDEF` [`EncryptedFile`] blob written by [`write_encrypted_blob_bound`] and checks its
+/// HMAC for `context`. A blob that was altered, belongs to another context, or was written by an
+/// older build (unkeyed SHA-256 digest) fails with [`StorageError::ChecksumMismatch`].
+pub fn read_encrypted_blob_bound(
+    path: &Path,
+    key: &StorageEncryptionKey,
+    context: &[u8],
+) -> Result<Vec<u8>> {
     let mut file = EncryptedFile::open(path, OpenMode::Read, key)?;
     let total = usize::try_from(file.size())
         .map_err(|_| StorageError::CorruptData("encrypted blob exceeds addressable size".into()))?;
@@ -905,10 +985,10 @@ pub fn read_encrypted_blob(path: &Path, key: &StorageEncryptionKey) -> Result<Ve
             "encrypted blob length exceeds stored bytes".into(),
         ));
     }
-    let stored_digest = &buf[8..BLOB_FRAME_HEADER_LEN];
+    let stored_mac = &buf[8..BLOB_FRAME_HEADER_LEN];
     let plaintext = &buf[BLOB_FRAME_HEADER_LEN..end];
-    let computed = sha256(&[plaintext]);
-    if !const_time_eq(stored_digest, &computed) {
+    let computed = blob_mac(key, context, plaintext);
+    if !const_time_eq(stored_mac, &computed) {
         return Err(StorageError::ChecksumMismatch);
     }
     Ok(plaintext.to_vec())
@@ -1065,6 +1145,27 @@ fn purge_legacy_plaintext_cache(root_dir: &Path, conn: &Connection) -> Result<()
          VACUUM;",
     )?;
     Ok(())
+}
+
+/// File-name prefix older builds used in `<cache root>/streamed`
+/// (`stream_<document id>_<dc>.bin` plus its `.part` / `.part.meta`).
+const LEGACY_STREAM_FILE_PREFIX: &str = "stream_";
+
+/// Deletes the files older builds left in `<cache root>/streamed`: their names carry the
+/// document id, and current builds never open those names again.
+fn purge_legacy_stream_files(streamed_dir: &Path) {
+    let Ok(entries) = fs::read_dir(streamed_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|n| n.starts_with(LEGACY_STREAM_FILE_PREFIX))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn purge_non_tdef_blobs(blobs_dir: &Path) {
@@ -1470,5 +1571,177 @@ mod tests {
                 .map(|r| r.path),
             Some(dl_path)
         );
+    }
+
+    #[test]
+    fn sec3_b2_re_registering_a_directory_replaces_its_key() {
+        let root = TempDir::new().expect("tempdir");
+        let dir = root.path().join("bot_storage").join("user_1");
+        let first = derive_media_cache_key(&test_local_key(0x71), "data");
+        let second = derive_media_cache_key(&test_local_key(0x72), "data");
+
+        // Registered before the directory exists, then again once it exists.
+        register_cache_key(&dir, first);
+        fs::create_dir_all(&dir).expect("mkdir");
+        register_cache_key(&dir, second.clone());
+        assert_eq!(
+            lookup_cache_key_for_path(&dir.join("bot_storage_1.tdef"))
+                .as_ref()
+                .map(|k| k.as_bytes()),
+            Some(second.as_bytes()),
+            "the replaced key must not be returned"
+        );
+        unregister_cache_key(&dir);
+        assert!(lookup_cache_key_for_path(&dir).is_none());
+    }
+
+    fn xor_at(bytes: &mut [u8], at: usize, delta: &[u8]) {
+        for (b, d) in bytes[at..at + delta.len()].iter_mut().zip(delta) {
+            *b ^= *d;
+        }
+    }
+
+    fn xor_pair(a: &[u8], b: &[u8]) -> Vec<u8> {
+        a.iter().zip(b).map(|(x, y)| x ^ y).collect()
+    }
+
+    #[test]
+    fn sec3_b3_cache_blob_rewritten_without_the_key_is_dropped() {
+        let dir = TempDir::new().expect("tempdir");
+        let key = derive_media_cache_key(&test_local_key(0x51), "data");
+        let cache = MediaCacheIndex::open_with_key(dir.path(), key).expect("open");
+
+        // The attacker knows the cached plaintext (a document they sent) and can write the cache
+        // folder, but does not have the key. AES-CTR is malleable: XOR-ing the ciphertext with
+        // `old ^ new` turns the content into `new`, and the same trick rewrites an unkeyed
+        // digest stored next to it. That was enough for the old SHA-256 format.
+        let known: &[u8] = b"INVOICE_ORIGINAL_CONTENT_0001.pdf";
+        let forged: &[u8] = b"INVOICE_REPLACED_BY_ATTACKER.exe!";
+        assert_eq!(known.len(), forged.len());
+        let entry = cache
+            .put_blob("doc:2:4242", MediaCacheTag::Document, known)
+            .expect("put");
+        let blob_path = dir.path().join(&entry.rel_path);
+
+        let mut raw = fs::read(&blob_path).expect("read blob");
+        let frame_at = crate::encrypted_file::TDEF_DATA_START_OFFSET as usize;
+        xor_at(
+            &mut raw,
+            frame_at + 8,
+            &xor_pair(&sha256(&[known]), &sha256(&[forged])),
+        );
+        xor_at(
+            &mut raw,
+            frame_at + BLOB_FRAME_HEADER_LEN,
+            &xor_pair(known, forged),
+        );
+        fs::write(&blob_path, &raw).expect("write forged blob");
+
+        assert_eq!(
+            cache.get_blob("doc:2:4242").expect("get forged"),
+            None,
+            "a blob rewritten without the key must not be returned"
+        );
+        assert!(!blob_path.exists(), "the forged blob must be deleted");
+        assert_eq!(cache.stats().expect("stats").entry_count, 0);
+
+        // A plain bit flip in the content is rejected too.
+        let entry = cache
+            .put_blob("doc:2:4242", MediaCacheTag::Document, known)
+            .expect("put again");
+        let blob_path = dir.path().join(&entry.rel_path);
+        let mut raw = fs::read(&blob_path).expect("read blob");
+        raw[frame_at + BLOB_FRAME_HEADER_LEN + 3] ^= 0x01;
+        fs::write(&blob_path, &raw).expect("write flipped blob");
+        assert_eq!(cache.get_blob("doc:2:4242").expect("get flipped"), None);
+    }
+
+    #[test]
+    fn sec3_b3_cache_blob_cannot_be_swapped_between_entries() {
+        let dir = TempDir::new().expect("tempdir");
+        let key = derive_media_cache_key(&test_local_key(0x52), "data");
+        let cache = MediaCacheIndex::open_with_key(dir.path(), key.clone()).expect("open");
+
+        let wanted = cache
+            .put_blob(
+                "doc:2:1",
+                MediaCacheTag::Document,
+                b"the document the user asked for",
+            )
+            .expect("put wanted");
+        let other = cache
+            .put_blob(
+                "doc:2:2",
+                MediaCacheTag::Document,
+                b"another valid cached document",
+            )
+            .expect("put other");
+        // Both files are valid blobs under the same key; copy one over the other.
+        fs::copy(
+            dir.path().join(&other.rel_path),
+            dir.path().join(&wanted.rel_path),
+        )
+        .expect("swap blobs");
+
+        assert_eq!(
+            cache.get_blob("doc:2:1").expect("get swapped"),
+            None,
+            "a blob of another entry must not be returned"
+        );
+        assert_eq!(
+            cache.get_blob("doc:2:2").expect("get other").as_deref(),
+            Some(&b"another valid cached document"[..])
+        );
+
+        // The standalone helpers bind to their context the same way.
+        let path = dir.path().join("sidecar.tdef");
+        write_encrypted_blob_bound(&path, &key, b"owner-1", b"payload").expect("write bound");
+        assert_eq!(
+            read_encrypted_blob_bound(&path, &key, b"owner-1").expect("read bound"),
+            b"payload"
+        );
+        assert!(matches!(
+            read_encrypted_blob_bound(&path, &key, b"owner-2"),
+            Err(StorageError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            read_encrypted_blob(&path, &key),
+            Err(StorageError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn sec3_b3_stream_file_names_are_keyed_and_old_names_are_purged() {
+        let dir = TempDir::new().expect("tempdir");
+        let key_a = derive_media_cache_key(&test_local_key(0x53), "data");
+        let key_b = derive_media_cache_key(&test_local_key(0x54), "data");
+        let doc_id = 0x0000_0000_000d_bf89_u64;
+
+        let stem = keyed_stream_file_stem(&key_a, doc_id, 2);
+        assert!(stem.starts_with(STREAM_FILE_PREFIX));
+        assert_eq!(stem, keyed_stream_file_stem(&key_a, doc_id, 2));
+        assert_ne!(stem, keyed_stream_file_stem(&key_b, doc_id, 2));
+        assert_ne!(stem, keyed_stream_file_stem(&key_a, doc_id, 4));
+        assert!(
+            !stem.contains("dbf89"),
+            "the file name must not carry the document id"
+        );
+
+        // Files that older builds named after the document id are removed when the cache opens.
+        drop(MediaCacheIndex::open_with_key(dir.path(), key_a.clone()).expect("create"));
+        let streamed = dir.path().join("streamed");
+        fs::create_dir_all(&streamed).expect("mkdir streamed");
+        let old_final = streamed.join("stream_00000000000dbf89_0000000000000002.bin");
+        let old_part = streamed.join("stream_00000000000dbf89_0000000000000002.bin.part");
+        let old_meta = streamed.join("stream_00000000000dbf89_0000000000000002.bin.part.meta");
+        let current = streamed.join(format!("{stem}.bin"));
+        for path in [&old_final, &old_part, &old_meta, &current] {
+            fs::write(path, b"x").expect("write");
+        }
+        drop(MediaCacheIndex::open_with_key(dir.path(), key_a).expect("reopen"));
+        assert!(!old_final.exists());
+        assert!(!old_part.exists());
+        assert!(!old_meta.exists());
+        assert!(current.exists(), "current-format names are kept");
     }
 }

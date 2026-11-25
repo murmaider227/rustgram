@@ -34,6 +34,7 @@ use crate::info::downloads::{DownloadsAction, DownloadsSection};
 use crate::info::global_media::{GLOBAL_MEDIA_PAGE_SIZE, GlobalMediaAction, GlobalMediaSection};
 use crate::info::media::{MediaListAction, MediaListWidget, MediaProvider};
 use crate::info::members::{CommonGroupsSection, MembersAction, MembersSection};
+use crate::info::mute_menu::{MuteMenuCommand, ProfileMuteMenu};
 use crate::info::profile_controls::{
     ContactNoteDraft, ContactNoteOutcome, ContactPhotoDraft, ContactPhotoOutcome,
     DeleteContactDraft, DeleteContactOutcome, DeleteOwnPhotoDraft, DeleteOwnPhotoOutcome,
@@ -217,6 +218,8 @@ pub enum InfoWrapEvent {
     JoinGroupCall(PeerId),
     /// Open "Notification Sound" for a chat (`RingtonesBox`).
     OpenSelectTone(PeerId),
+    /// Open the "Clear history" confirmation box (`ClearHistoryHandler`).
+    OpenClearHistory(PeerId),
     /// Open Delete Messages / Leave Peer confirmation box.
     OpenDelete {
         /// Target peer id.
@@ -343,6 +346,13 @@ pub struct InfoWrapWidget {
     /// The backend's answer for the profile last shown, so the cover (painted every frame)
     /// asks the backend once per peer; the live backend may need an RPC to answer.
     active_photo_ref_cache: std::cell::RefCell<Option<(PeerId, Option<ProfilePhotoRef>)>>,
+    /// The Mute button's right-click menu (`MuteMenu::SetupMuteMenu`).
+    mute_menu: ProfileMuteMenu,
+    /// Whether the shown peer's notification sound is off (`NotifySound::none`), as the host
+    /// last reported it with [`Self::set_notify_sound_silent`].
+    notify_silent: Option<(PeerId, bool)>,
+    /// "Disable sound" / "Enable sound" picked in the mute menu, for the host to apply.
+    sound_toggle_request: Option<(PeerId, bool)>,
 }
 
 impl InfoWrapWidget {
@@ -383,6 +393,74 @@ impl InfoWrapWidget {
             chat_effects_paused: false,
             active_photo_ref_override: None,
             active_photo_ref_cache: std::cell::RefCell::new(None),
+            mute_menu: ProfileMuteMenu::default(),
+            notify_silent: None,
+            sound_toggle_request: None,
+        }
+    }
+
+    /// Tells the profile whether `peer_id`'s notification sound is off, so the mute menu shows
+    /// "Enable sound" instead of "Disable sound" (`FillMuteMenu`).
+    pub fn set_notify_sound_silent(&mut self, peer_id: PeerId, silent: bool) {
+        self.notify_silent = Some((peer_id, silent));
+    }
+
+    /// Takes the pending "Disable sound" / "Enable sound" request from the mute menu:
+    /// `(peer, enable)`, to apply with `DialogsBackend::set_dialog_sound_enabled`.
+    pub fn take_sound_toggle_request(&mut self) -> Option<(PeerId, bool)> {
+        self.sound_toggle_request.take()
+    }
+
+    /// Whether the profile Mute button's menu is open.
+    #[must_use]
+    pub const fn is_mute_menu_open(&self) -> bool {
+        self.mute_menu.is_open()
+    }
+
+    fn show_mute_menu(
+        &mut self,
+        ui: &Ui,
+        backend: &mut dyn InfoBackend,
+        colors: &dyn Colors,
+        events: &mut Vec<InfoWrapEvent>,
+    ) {
+        let InfoSection::Profile { peer_id, .. } = self.current else {
+            self.mute_menu.close();
+            return;
+        };
+        if !self.mute_menu.is_open() {
+            return;
+        }
+        let Some(peer) = backend.peer_profile(peer_id) else {
+            self.mute_menu.close();
+            return;
+        };
+        let silent = self
+            .notify_silent
+            .filter(|(pid, _)| *pid == peer_id)
+            .is_some_and(|(_, silent)| silent);
+        let Some(command) = self.mute_menu.show(
+            ui.ctx(),
+            ui.scope_id().with(("info_profile_mute_menu", peer_id.0)),
+            peer.muted,
+            silent,
+            colors,
+        ) else {
+            return;
+        };
+        match command {
+            MuteMenuCommand::SelectTone => events.push(InfoWrapEvent::OpenSelectTone(peer_id)),
+            MuteMenuCommand::MuteFor => events.push(InfoWrapEvent::OpenMuteFor(peer_id)),
+            MuteMenuCommand::SetSoundEnabled { enable } => {
+                self.notify_silent = Some((peer_id, !enable));
+                self.sound_toggle_request = Some((peer_id, enable));
+            }
+            MuteMenuCommand::ToggleMuteForever => self.handle_profile_action(
+                ProfileAction::ToggleNotifications(peer_id),
+                &peer,
+                backend,
+                events,
+            ),
         }
     }
 
@@ -651,10 +729,10 @@ impl InfoWrapWidget {
             self.handle_top_bar_action(act, peer_id, peer.as_ref(), backend, &mut events);
         }
 
-        let events = self.show_body(ui, backend, in_third_column, colors, peer, events);
+        let mut events = self.show_body(ui, backend, in_third_column, colors, peer, events);
+        self.show_mute_menu(ui, backend, colors, &mut events);
 
         if profile_overlay {
-            let mut events = events;
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(top_rect));
             let peer = backend.peer_profile(peer_id);
             if let Some(act) = self
@@ -921,6 +999,9 @@ impl InfoWrapWidget {
                     if let Some(ref mut eff) = self.birthday_effect {
                         eff.tick(now_secs, self.chat_effects_paused);
                     }
+                    // The cover and the `VerticalBlocks` under it: no egui spacing between rows,
+                    // only tdesktop's skips (`infoProfileSkip`).
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     let profile_balance = backend.peer_profile_balance(peer_id);
                     let active_photo_ref =
                         self.resolve_active_profile_photo_ref(&*backend, peer_id);
@@ -967,6 +1048,9 @@ impl InfoWrapWidget {
                                 if let Some(act) = act {
                                     self.handle_profile_action(act, &peer, backend, &mut events);
                                 }
+                            }
+                            CoverAction::MuteMenu { anchor } => {
+                                self.mute_menu.open_at(ui.ctx(), anchor, colors);
                             }
                             CoverAction::AvatarClicked => {
                                 if peer.can_edit {
@@ -1296,6 +1380,7 @@ impl InfoWrapWidget {
                         }
                     }
 
+                    let blocks_top = ui.cursor().min.y;
                     if let Some(act) = ProfileActionsView::show_with_today_and_photo_ref(
                         ui,
                         &peer,
@@ -1307,11 +1392,35 @@ impl InfoWrapWidget {
                         self.handle_profile_action(act, &peer, backend, &mut events);
                     }
 
-                    // Inline members list on group profiles
+                    // `SetupSharedMediaClassic` (side column): right after the details block.
+                    if !self.show_inline_media {
+                        let mut media_act = None;
+                        let any = peer.media_counts.photos_videos
+                            + peer.media_counts.files
+                            + peer.media_counts.links
+                            + peer.media_counts.voice
+                            + peer.media_counts.music
+                            + peer.media_counts.gifs
+                            > 0
+                            || (peer.media_counts.common_groups > 0
+                                && matches!(peer.kind, InfoPeerKind::User | InfoPeerKind::Bot));
+                        if any {
+                            block_separator(ui, blocks_top, colors);
+                            ProfileActionsView::show_media_counts(
+                                ui,
+                                &peer,
+                                colors,
+                                &mut media_act,
+                            );
+                        }
+                        if let Some(act) = media_act {
+                            self.handle_profile_action(act, &peer, backend, &mut events);
+                        }
+                    }
+
+                    // Inline members list on group profiles (`InnerWidget::makeMembersPart`).
                     if self.show_inline_members && peer.kind.is_group() {
-                        ui.add_space(6.0);
-                        divider_bar(ui, 8.0, colors);
-                        ui.add_space(4.0);
+                        block_separator(ui, blocks_top, colors);
                         let effective_q = if !top_query.is_empty() {
                             top_query.as_str()
                         } else {
@@ -1390,33 +1499,6 @@ impl InfoWrapWidget {
                             colors,
                         ) {
                             self.handle_media_event(m_ev, &mut events);
-                        }
-                    }
-
-                    if !self.show_inline_media {
-                        let mut media_act = None;
-                        let any = peer.media_counts.photos_videos
-                            + peer.media_counts.files
-                            + peer.media_counts.links
-                            + peer.media_counts.voice
-                            + peer.media_counts.music
-                            + peer.media_counts.gifs
-                            > 0
-                            || (peer.media_counts.common_groups > 0
-                                && matches!(peer.kind, InfoPeerKind::User | InfoPeerKind::Bot));
-                        if any {
-                            ui.add_space(crate::info::actions::INFO_SECTION_SKIP);
-                            divider_bar(ui, 8.0, colors);
-                            ui.add_space(crate::info::actions::INFO_SECTION_SKIP);
-                            ProfileActionsView::show_media_counts(
-                                ui,
-                                &peer,
-                                colors,
-                                &mut media_act,
-                            );
-                        }
-                        if let Some(act) = media_act {
-                            self.handle_profile_action(act, &peer, backend, &mut events);
                         }
                     }
 
@@ -2478,6 +2560,18 @@ fn push_profile_extra_items(items: &mut Vec<MenuItem>, peer: &PeerProfile, has_p
 }
 
 /// `UserData::shortName()`: the first name (the title up to its first space).
+/// `VerticalBlocks` separator before a profile block: `infoProfileSkip`, the divider bar and
+/// `infoProfileSkip` again when a block is already shown above (the cursor moved past
+/// `blocks_top`), otherwise only the leading `infoProfileSkip`.
+fn block_separator(ui: &mut Ui, blocks_top: f32, colors: &dyn Colors) {
+    let skip = crate::info::actions::INFO_SECTION_SKIP;
+    if ui.cursor().min.y > blocks_top + 0.5 {
+        ui.add_space(skip);
+        divider_bar(ui, 8.0, colors);
+    }
+    ui.add_space(skip);
+}
+
 fn short_name(title: &str) -> String {
     title.split_whitespace().next().unwrap_or(title).to_owned()
 }

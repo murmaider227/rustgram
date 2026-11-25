@@ -351,15 +351,15 @@ pub fn resolve_default_downloads_dir() -> PathBuf {
 
 /// Computes the per-account persistent media cache directory inside `tdata`, keyed by the
 /// account's tdesktop data-name hash (`ToFilePart(compute_data_name_key(compose_data_string(..)))`)
-/// rather than the raw slot index.
+/// rather than the raw slot index, plus the slot's per-login cache generation, so a new account
+/// in a reused slot never opens what an earlier login left behind.
 #[must_use]
 pub fn account_media_cache_dir_for_data_name(
     tdata_dir: &std::path::Path,
     data_name: &str,
     slot_index: i32,
 ) -> PathBuf {
-    let key_part = tg_session::account::account_data_key_file_part(data_name, slot_index);
-    tdata_dir.join("media_cache").join(key_part)
+    tg_session::account::account_media_cache_dir_for_tdata(tdata_dir, data_name, slot_index)
 }
 
 /// Computes the per-account persistent media cache directory inside `tdata` for the default

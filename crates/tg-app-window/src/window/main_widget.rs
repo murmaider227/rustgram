@@ -1223,6 +1223,19 @@ impl MainWidget {
                     peer_id,
                 )));
             }
+            DialogsPanelAction::ConfirmDelete {
+                peer_id,
+                just_clear,
+            } => {
+                actions.push(MainWidgetAction::InfoEvent(if just_clear {
+                    InfoWrapEvent::OpenClearHistory(peer_id)
+                } else {
+                    InfoWrapEvent::OpenDelete {
+                        peer_id,
+                        message_ids: Vec::new(),
+                    }
+                }));
+            }
             // `Filler::addBlockUser`: a blocked bot restarts, a user gets `PeerMenuBlockUserBox`,
             // unblocking and blocking a bot happen directly.
             DialogsPanelAction::ToggleBlock(peer_id) => {

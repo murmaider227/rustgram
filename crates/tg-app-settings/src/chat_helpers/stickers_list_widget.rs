@@ -5,7 +5,7 @@
 //! `Telegram/SourceFiles/chat_helpers/stickers_list_widget.cpp`, and `stickers_list_footer.cpp`.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -26,8 +26,8 @@ use crate::chat_helpers::backend::{
 };
 use crate::chat_helpers::emoji_list_widget::{
     EMOJI_FOOTER_HEIGHT, EMOJI_HEADER_HEIGHT, EMOJI_MOOD_GROUPS, MoodIconCache, emoji_list_margin,
-    footer_slot_rect, paint_footer_background, paint_footer_icon, paint_footer_selection,
-    render_tabbed_search, theme_color,
+    footer_slot_rect, list_rect_below_search, paint_footer_background, paint_footer_icon,
+    paint_footer_selection, render_tabbed_search, theme_color,
 };
 use crate::chat_helpers::gift_box_pack::{GiftBoxPack, GiftBoxPackKind};
 use crate::chat_helpers::paint_helper_icon;
@@ -64,7 +64,9 @@ pub enum StickersListEvent {
 ///
 /// A live backend may have to fetch a sticker's file before it can return it; spreading new
 /// lookups over frames keeps opening the panel responsive (the rest show placeholders first,
-/// like tdesktop's path-thumbnail placeholders while `DocumentMedia` loads).
+/// like tdesktop's path-thumbnail placeholders while `DocumentMedia` loads). Only first
+/// lookups count: re-checking a sticker whose download is already running is a cache check, so
+/// stickers still loading never hold back the lookups of the cells after them.
 pub const STICKER_MEDIA_FETCHES_PER_FRAME: usize = 2;
 
 thread_local! {
@@ -244,6 +246,8 @@ pub struct StickerMediaCache {
     static_textures: HashMap<DocumentId, TextureHandle>,
     lottie_slots: HashMap<DocumentId, LottiePreviewSlot>,
     failed: HashMap<DocumentId, ()>,
+    /// Stickers whose first lookup returned `None` (the backend is still loading them).
+    pending: HashSet<DocumentId>,
     workers: Option<LottieWorkers>,
     workers_unavailable: bool,
     fetch_pass: u64,
@@ -306,6 +310,16 @@ impl StickerMediaCache {
         time_secs: f64,
         backend: &dyn ChatHelpersBackend,
     ) -> Option<(egui::TextureId, Vec2, bool)> {
+        self.texture_with(ctx, doc_id, time_secs, |id| backend.sticker_media(id))
+    }
+
+    fn texture_with(
+        &mut self,
+        ctx: &egui::Context,
+        doc_id: DocumentId,
+        time_secs: f64,
+        fetch: impl FnOnce(DocumentId) -> Option<StickerMedia>,
+    ) -> Option<(egui::TextureId, Vec2, bool)> {
         self.poll_workers(ctx);
         if let Some(tex) = self.static_textures.get(&doc_id) {
             return Some((tex.id(), tex.size_vec2(), false));
@@ -327,13 +341,19 @@ impl StickerMediaCache {
             self.fetch_pass = pass;
             self.fetches_this_pass = 0;
         }
-        if self.fetches_this_pass >= STICKER_MEDIA_FETCHES_PER_FRAME {
-            ctx.request_repaint();
-            return None;
+        if !self.pending.contains(&doc_id) {
+            if self.fetches_this_pass >= STICKER_MEDIA_FETCHES_PER_FRAME {
+                ctx.request_repaint();
+                return None;
+            }
+            self.fetches_this_pass += 1;
         }
-        self.fetches_this_pass += 1;
 
-        let media = backend.sticker_media(doc_id)?;
+        let Some(media) = fetch(doc_id) else {
+            self.pending.insert(doc_id);
+            return None;
+        };
+        self.pending.remove(&doc_id);
         match media {
             StickerMedia::StaticRgba {
                 width,
@@ -902,7 +922,7 @@ impl StickersListWidget {
             }
 
             // 2. Scrollable stickers list.
-            let scroll_rect = ui.available_rect_before_wrap();
+            let scroll_rect = list_rect_below_search(body_rect, &search);
             ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
                 // tdesktop scroll bars overlay the list (`emojiScroll`), they take no width.
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
@@ -1932,6 +1952,37 @@ mod tests {
             started <= STICKER_MEDIA_FETCHES_PER_FRAME,
             "one frame started {started} media lookups"
         );
+    }
+
+    /// Stage 3 (live): the panel filled in a few stickers at a time. The two stickers still
+    /// downloading used up the per-frame lookup budget on every frame, so the cells after them
+    /// never started loading until those two finished.
+    #[test]
+    fn stickers_still_loading_do_not_hold_back_later_cells() {
+        let ctx = egui::Context::default();
+        let mut cache = StickerMediaCache::new();
+        let docs: Vec<DocumentId> = (1..=8).map(DocumentId).collect();
+        let loading = |id: DocumentId| id.0 <= 2;
+        let fetch = |id: DocumentId| {
+            (!loading(id)).then(|| StickerMedia::StaticRgba {
+                width: 1,
+                height: 1,
+                rgba: vec![255; 4],
+            })
+        };
+        for frame in 0..4 {
+            run_frame(&ctx, f64::from(frame) / 30.0, |ctx| {
+                for &d in &docs {
+                    let _ = cache.texture_with(ctx, d, 0.0, fetch);
+                }
+            });
+        }
+        assert_eq!(
+            cache.static_textures.len(),
+            6,
+            "every loaded sticker must get its texture while two others are still loading"
+        );
+        assert_eq!(cache.pending.len(), 2);
     }
 
     #[test]

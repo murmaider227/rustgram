@@ -534,11 +534,14 @@ impl eframe::App for TgforkApp {
         self.track_window_geometry(&ctx);
         self.process_startup_hooks(&ctx);
 
+        self.calls_host.set_passcode_locked(passcode_locked);
         self.calls_host.update_and_render(ui);
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
             self.controller
                 .show_with_stories(ui, Some(&mut self.stories));
         });
+        self.calls_host
+            .set_passcode_locked(self.controller.root_screen() == RootScreen::PasscodeLock);
         let dark_taskbar = tg_platform::system_info::is_dark_taskbar().unwrap_or(dark_mode);
         let audio_bar = self.controller.main_widget_mut().audio_player_bar_mut();
         let _ = self

@@ -10,7 +10,6 @@
 //! 4. `account.getSavedMusicIds` (`CountHash`, `NotModified`, 30 s throttle, cache update on
 //!    `account.saveMusic`).
 //! 5. `messages.getAttachMenuBot` (user ingestion, `AttachMenuStore` upsert, bot ID validation).
-//! 6. `help.saveAppLog` (non-personal events only with `peer = 0`, exact JSON payload).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -40,7 +39,7 @@ use tg_voip::{AudioBackendKind, GroupMediaConfig, MediaEngineConfig};
 use tokio::sync::broadcast;
 
 use crate::convert::from_data_peer;
-use crate::live_extras::{NonPersonalAppLogEvent, compute_saved_music_ids_hash};
+use crate::live_extras::compute_saved_music_ids_hash;
 use crate::session::LiveSession;
 
 type QueuedResponses = Arc<Mutex<VecDeque<(u32, Result<Vec<u8>, InvocationError>)>>>;
@@ -860,74 +859,4 @@ fn messages_get_attach_menu_bot_fetches_ingests_users_and_upserts_store() {
         .fetch_attach_menu_bot(BotUserId(bot_uid))
         .expect_err("mismatched bot id must fail");
     assert!(err.contains("999"));
-}
-
-// =============================================================================
-// 6. help.saveAppLog (non-personal events only)
-// =============================================================================
-
-#[test]
-fn help_save_app_log_sends_only_non_personal_events_with_zero_peer() {
-    let (_rt, rpc, live) = make_live();
-
-    // Empty event list is a no-op with zero RPCs.
-    let empty_ok = live
-        .save_app_log_at(&[], 1_750_000_000.0)
-        .expect("empty log");
-    assert!(!empty_ok);
-    assert!(rpc.take_requests::<tl_fns::help::SaveAppLog>().is_empty());
-
-    rpc.enqueue_ok(tl_fns::help::SaveAppLog::CONSTRUCTOR_ID, &true);
-    let events = vec![
-        NonPersonalAppLogEvent::PremiumPromoScreenShow {
-            order: vec!["stories".to_owned(), "double_limits".to_owned()],
-            source: String::new(),
-        },
-        NonPersonalAppLogEvent::PremiumPromoScreenAccept,
-    ];
-    let saved = live
-        .save_app_log_at(&events, 1_750_000_000.25)
-        .expect("saveAppLog");
-    assert!(saved);
-
-    let reqs = rpc.take_requests::<tl_fns::help::SaveAppLog>();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].events.len(), 2);
-
-    let tl_enums::InputAppEvent::InputAppEvent(ref show_ev) = reqs[0].events[0];
-    assert_eq!(show_ev.time, 1_750_000_000.25);
-    assert_eq!(show_ev.r#type, "premium.promo_screen_show");
-    assert_eq!(show_ev.peer, 0);
-    assert_eq!(
-        show_ev.data,
-        tl_enums::JSONValue::JsonObject(tl_types::JsonObject {
-            value: vec![
-                tl_enums::JSONObjectValue::JsonObjectValue(tl_types::JsonObjectValue {
-                    key: "premium_promo_order".to_owned(),
-                    value: tl_enums::JSONValue::JsonArray(tl_types::JsonArray {
-                        value: vec![
-                            tl_enums::JSONValue::JsonString(tl_types::JsonString {
-                                value: "stories".to_owned(),
-                            }),
-                            tl_enums::JSONValue::JsonString(tl_types::JsonString {
-                                value: "double_limits".to_owned(),
-                            }),
-                        ],
-                    }),
-                }),
-                tl_enums::JSONObjectValue::JsonObjectValue(tl_types::JsonObjectValue {
-                    key: "source".to_owned(),
-                    value: tl_enums::JSONValue::JsonString(tl_types::JsonString {
-                        value: "settings".to_owned(),
-                    }),
-                }),
-            ],
-        })
-    );
-
-    let tl_enums::InputAppEvent::InputAppEvent(ref accept_ev) = reqs[0].events[1];
-    assert_eq!(accept_ev.time, 1_750_000_000.25);
-    assert_eq!(accept_ev.r#type, "premium.promo_screen_accept");
-    assert_eq!(accept_ev.peer, 0);
-    assert_eq!(accept_ev.data, tl_enums::JSONValue::JsonNull);
 }

@@ -24,10 +24,6 @@ pub const TOAST_UNMUTED: &str = "Notifications unmuted";
 pub const TOAST_MARKED_READ: &str = "Marked as read";
 /// Toast shown after marking a single dialog as unread.
 pub const TOAST_MARKED_UNREAD: &str = "Marked as unread";
-/// Toast shown after clearing a chat's history.
-pub const TOAST_HISTORY_CLEARED: &str = "History cleared";
-/// Toast shown after removing/leaving a dialog.
-pub const TOAST_CHAT_REMOVED: &str = "Chat removed";
 /// Placeholder preview shown on a dialog whose history was cleared.
 pub const PREVIEW_HISTORY_CLEARED: &str = "History was cleared";
 /// Empty state message inside the Archived Chats view.
@@ -50,4 +46,28 @@ pub fn remove_from_named_folder(title: &str) -> String {
 #[must_use]
 pub fn search_in_scope(name: &str) -> String {
     format!("In: {name}")
+}
+/// Message search results header. Telegram Desktop 7.4.6 shows the cloud English pack's
+/// `"{count} messages found"`; the bundled `lng_search_found_results` still reads
+/// `"Found {count} messages"`, so only that bundled English text is replaced and other
+/// languages keep their translation.
+#[must_use]
+pub fn search_found_results(count: i64) -> String {
+    let translated = tg_lang::tr::lng_search_found_results(count);
+    let (bundled, cloud) = if count == 1 {
+        (
+            format!("Found {count} message"),
+            format!("{count} message found"),
+        )
+    } else {
+        (
+            format!("Found {count} messages"),
+            format!("{count} messages found"),
+        )
+    };
+    if translated == bundled {
+        cloud
+    } else {
+        translated
+    }
 }

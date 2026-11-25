@@ -120,6 +120,157 @@ const MAX_HISTORY_DELTAS_PER_PEER: usize = 256;
 /// Maximum distinct peers retained in `history_deltas` before collapsing into a global reload flag.
 const MAX_TRACKED_HISTORY_DELTA_PEERS: usize = 128;
 
+/// Most notification events queued for the UI; beyond it the oldest message notifications are
+/// dropped first (read and delete events keep stale popups from staying on screen).
+pub const MAX_QUEUED_NOTIFY_EVENTS: usize = 1024;
+
+/// Most session events queued for the UI. Critical events are never dropped.
+pub const MAX_QUEUED_SESSION_EVENTS: usize = 256;
+
+/// Most story updates queued for the UI (they wait while the stories lists load).
+pub const MAX_QUEUED_STORY_UPDATES: usize = 2048;
+
+/// Events the UI must see even when the queue overflows: sign-out, sync state, security alerts
+/// and full-reload requests.
+fn is_critical_session_event(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::Ready
+            | SessionEvent::SyncError(_)
+            | SessionEvent::ForceLogout { .. }
+            | SessionEvent::NewAuthorization(_)
+            | SessionEvent::DifferenceTooLong { .. }
+            | SessionEvent::ChannelTooLong { .. }
+            | SessionEvent::LangPackTooLong { .. }
+    )
+}
+
+/// Whether a queued `old` event is made redundant by the newer `new` one.
+fn session_event_supersedes(new: &SessionEvent, old: &SessionEvent) -> bool {
+    use SessionEvent as E;
+    match (new, old) {
+        (E::SyncError(_), E::SyncError(_))
+        | (E::DifferenceTooLong { .. }, E::DifferenceTooLong { .. })
+        | (E::QuickReplies(_), E::QuickReplies(_)) => true,
+        (E::ChannelTooLong { channel_id: a, .. }, E::ChannelTooLong { channel_id: b, .. }) => {
+            a == b
+        }
+        (E::NotifySettingsUpdated { peer: a, .. }, E::NotifySettingsUpdated { peer: b, .. }) => {
+            a == b
+        }
+        (
+            E::StickerSetsOrder {
+                masks: m1,
+                emojis: e1,
+                ..
+            },
+            E::StickerSetsOrder {
+                masks: m2,
+                emojis: e2,
+                ..
+            },
+        ) => m1 == m2 && e1 == e2,
+        _ => new == old,
+    }
+}
+
+/// Queues `event`, replacing an older event it supersedes. On overflow the oldest non-critical
+/// events are dropped and one [`SessionEvent::Ready`] is kept queued: every consumer treats it
+/// as "reload cached state" (`refresh_cached_views`). Returns `true` if events were dropped.
+fn push_session_event(queue: &mut VecDeque<SessionEvent>, event: SessionEvent) -> bool {
+    if let Some(pos) = queue
+        .iter()
+        .position(|old| session_event_supersedes(&event, old))
+    {
+        queue.remove(pos);
+    }
+    queue.push_back(event);
+    let mut dropped = false;
+    while queue.len() > MAX_QUEUED_SESSION_EVENTS {
+        let victim = queue
+            .iter()
+            .position(|e| !is_critical_session_event(e))
+            .or_else(|| {
+                // Only critical events left (distinct new-authorization alerts, per-channel
+                // reloads): keep sign-out and the reload request, drop the oldest of the rest.
+                queue.iter().position(|e| {
+                    !matches!(e, SessionEvent::ForceLogout { .. } | SessionEvent::Ready)
+                })
+            });
+        let Some(pos) = victim else {
+            break;
+        };
+        queue.remove(pos);
+        dropped = true;
+    }
+    if dropped && !queue.iter().any(|e| matches!(e, SessionEvent::Ready)) {
+        queue.push_back(SessionEvent::Ready);
+    }
+    dropped
+}
+
+/// Queues a notification event, coalescing read events per chat and topic. On overflow the
+/// oldest message notifications are dropped first. Returns `true` if events were dropped.
+fn push_notify_event(
+    queue: &mut VecDeque<IncomingNotifyEvent>,
+    event: IncomingNotifyEvent,
+) -> bool {
+    match &event {
+        IncomingNotifyEvent::HistoryRead {
+            session_id,
+            peer_id,
+            ..
+        } => queue.retain(|old| {
+            !matches!(old, IncomingNotifyEvent::HistoryRead { session_id: s, peer_id: p, .. }
+                if s == session_id && p == peer_id)
+        }),
+        IncomingNotifyEvent::TopicRead {
+            session_id,
+            peer_id,
+            topic_root_id,
+            ..
+        } => queue.retain(|old| {
+            !matches!(old, IncomingNotifyEvent::TopicRead {
+                session_id: s, peer_id: p, topic_root_id: t, ..
+            } if s == session_id && p == peer_id && t == topic_root_id)
+        }),
+        _ => {}
+    }
+    queue.push_back(event);
+    let mut dropped = false;
+    while queue.len() > MAX_QUEUED_NOTIFY_EVENTS {
+        let pos = queue
+            .iter()
+            .position(|e| matches!(e, IncomingNotifyEvent::Notification(_)))
+            .unwrap_or(0);
+        queue.remove(pos);
+        dropped = true;
+    }
+    dropped
+}
+
+/// Queues a story update, coalescing read marks per peer and stealth-mode changes. On overflow
+/// the oldest updates are dropped. Returns `true` if updates were dropped.
+fn push_story_update(queue: &mut VecDeque<tl_enums::Update>, update: tl_enums::Update) -> bool {
+    match &update {
+        tl_enums::Update::ReadStories(new) => queue.retain(|old| {
+            !matches!(old, tl_enums::Update::ReadStories(o)
+                if o.peer == new.peer && o.max_id <= new.max_id)
+        }),
+        tl_enums::Update::StoriesStealthMode(_) => {
+            queue.retain(|old| !matches!(old, tl_enums::Update::StoriesStealthMode(_)));
+        }
+        _ => {}
+    }
+    queue.push_back(update);
+    let mut dropped = false;
+    while queue.len() > MAX_QUEUED_STORY_UPDATES {
+        queue.pop_front();
+        dropped = true;
+    }
+    dropped
+}
+
 /// Coalesced per-peer history deltas captured from `tg_data::ChangeEvent`s for an open chat view.
 #[derive(Debug, Default, Clone)]
 pub struct PeerHistoryDelta {
@@ -173,6 +324,9 @@ pub struct LiveBridgeState {
     pub last_error: Mutex<Option<String>>,
     /// Monotonically increasing change counter bumped on every change event.
     pub generation: AtomicU64,
+    /// Set when story updates were dropped because the queue was full; the stories lists should
+    /// be reloaded from the server ([`Self::take_story_updates_overflowed`]).
+    pub story_updates_overflowed: AtomicBool,
 }
 
 impl Default for LiveBridgeState {
@@ -195,7 +349,44 @@ impl LiveBridgeState {
             connection_status: Mutex::new(ConnectionStatus::Connecting),
             last_error: Mutex::new(None),
             generation: AtomicU64::new(0),
+            story_updates_overflowed: AtomicBool::new(false),
         }
+    }
+
+    /// Queues a notification event (bounded, see [`MAX_QUEUED_NOTIFY_EVENTS`]).
+    pub fn push_notify_event(&self, event: IncomingNotifyEvent) {
+        if let Ok(mut guard) = self.notify_events.lock()
+            && push_notify_event(&mut guard, event)
+        {
+            warn!("notification queue full; dropped the oldest notifications");
+        }
+    }
+
+    /// Queues a session event (bounded, see [`MAX_QUEUED_SESSION_EVENTS`]). Critical events are
+    /// never dropped; an overflow queues [`SessionEvent::Ready`] so the UI reloads its state.
+    pub fn push_session_event(&self, event: SessionEvent) {
+        if let Ok(mut guard) = self.session_events.lock()
+            && push_session_event(&mut guard, event)
+        {
+            warn!("session event queue full; requesting a state reload");
+            drop(guard);
+            self.mark_history_deltas_lagged();
+        }
+    }
+
+    /// Queues a story update (bounded, see [`MAX_QUEUED_STORY_UPDATES`]).
+    pub fn push_story_update(&self, update: tl_enums::Update) {
+        if let Ok(mut guard) = self.story_updates.lock()
+            && push_story_update(&mut guard, update)
+        {
+            warn!("story update queue full; dropped the oldest story updates");
+            self.story_updates_overflowed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Returns (and clears) whether story updates were dropped since the last call.
+    pub fn take_story_updates_overflowed(&self) -> bool {
+        self.story_updates_overflowed.swap(false, Ordering::AcqRel)
     }
 
     fn with_peer_delta(&self, peer_id: DataPeerId, f: impl FnOnce(&mut PeerHistoryDelta)) {
@@ -425,18 +616,14 @@ impl LiveRuntimeBridge {
                             }
                             SessionEvent::StoryUpdate(_) => {
                                 if let SessionEvent::StoryUpdate(update) = ev {
-                                    if let Ok(mut guard) = state_events.story_updates.lock() {
-                                        guard.push_back(*update);
-                                    }
+                                    state_events.push_story_update(*update);
                                     state_events.notify_ui();
                                 }
                                 continue;
                             }
                             _ => {}
                         }
-                        if let Ok(mut guard) = state_events.session_events.lock() {
-                            guard.push_back(ev);
-                        }
+                        state_events.push_session_event(ev);
                         state_events.notify_ui();
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -479,13 +666,11 @@ async fn handle_change_event(
         ChangeEvent::MessageUpdated { id, flags } => {
             if flags.contains(MessageUpdateFlags::DESTROYED) {
                 state.record_message_deleted(id.peer, id.msg);
-                if let Ok(mut guard) = state.notify_events.lock() {
-                    guard.push_back(IncomingNotifyEvent::MessageDeleted {
-                        session_id,
-                        peer_id: from_data_peer(id.peer),
-                        msg_id: from_data_msg(id.msg),
-                    });
-                }
+                state.push_notify_event(IncomingNotifyEvent::MessageDeleted {
+                    session_id,
+                    peer_id: from_data_peer(id.peer),
+                    msg_id: from_data_msg(id.msg),
+                });
             } else if flags.contains(MessageUpdateFlags::NEW_ADDED) {
                 state.record_message_added(id.peer, id.msg);
                 let maybe_notif = {
@@ -499,10 +684,8 @@ async fn handle_change_event(
                         Some(message_to_incoming_notification(&session, msg, session_id))
                     })
                 };
-                if let Some(notif) = maybe_notif
-                    && let Ok(mut guard) = state.notify_events.lock()
-                {
-                    guard.push_back(IncomingNotifyEvent::Notification(Box::new(notif)));
+                if let Some(notif) = maybe_notif {
+                    state.push_notify_event(IncomingNotifyEvent::Notification(Box::new(notif)));
                 }
             } else if flags.intersects(
                 MessageUpdateFlags::EDITED
@@ -531,10 +714,8 @@ async fn handle_change_event(
                         }
                     })
                 };
-                if let Some(read_till_id) = read_till
-                    && let Ok(mut guard) = state.notify_events.lock()
-                {
-                    guard.push_back(IncomingNotifyEvent::HistoryRead {
+                if let Some(read_till_id) = read_till {
+                    state.push_notify_event(IncomingNotifyEvent::HistoryRead {
                         session_id,
                         peer_id: from_data_peer(peer_id),
                         read_till_id,
@@ -545,3 +726,7 @@ async fn handle_change_event(
         _ => {}
     }
 }
+
+#[cfg(test)]
+#[path = "bridge_sec3_tests.rs"]
+mod sec3_tests;

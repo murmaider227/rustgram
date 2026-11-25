@@ -18,6 +18,7 @@ pub mod contacts_extras;
 pub mod convert;
 pub mod deep_links;
 pub mod dialogs_actions;
+mod dialogs_delete;
 pub mod dice_pack;
 pub mod emoji_pack;
 pub mod engagement;
@@ -130,6 +131,8 @@ mod tests_storage_wiring;
 mod tests_stories_channels_conformance;
 #[cfg(test)]
 mod tests_transcribe;
+#[cfg(test)]
+mod tests_uip4_f;
 #[cfg(test)]
 mod tests_uip_f;
 #[cfg(test)]

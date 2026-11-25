@@ -21,9 +21,11 @@ use tg_data::{
     DocumentData, DocumentKind, ExtendedMedia, Message, MessageContent, MessageMedia, PhotoData,
 };
 use tg_storage::StorageEncryptionKey;
+use tg_storage::cache::legacy_temp::sweep_legacy_temp_dirs_once;
 pub use tg_storage::cache::media_cache::MediaCacheTag;
 use tg_storage::cache::media_cache::{
-    MediaCacheIndex, read_encrypted_blob, unregister_cache_key, write_encrypted_blob,
+    MediaCacheIndex, read_encrypted_blob, register_cache_key, unregister_cache_key,
+    write_encrypted_blob,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -139,6 +141,12 @@ struct LiveMediaCacheInner {
     index: MediaCacheIndex,
     root_dir: PathBuf,
     is_persistent: bool,
+    /// `true` when the index was opened with the account's storage key (derived from the `tdata`
+    /// local key), `false` for a memory-only cache or one using a random per-process key.
+    has_account_key: bool,
+    /// Folders outside the cache root that were given the account key
+    /// ([`LiveMediaCache::register_account_dir`]).
+    account_dirs: Vec<PathBuf>,
     size_limit_bytes: i64,
     time_limit_days: i32,
     in_flight: HashMap<String, InFlightDownload>,
@@ -152,6 +160,8 @@ impl LiveMediaCacheInner {
             index,
             root_dir,
             is_persistent,
+            has_account_key: false,
+            account_dirs: Vec::new(),
             size_limit_bytes: DEFAULT_CACHE_SIZE_LIMIT_BYTES,
             time_limit_days: DEFAULT_CACHE_TIME_LIMIT_DAYS,
             in_flight: HashMap::new(),
@@ -168,6 +178,14 @@ impl LiveMediaCacheInner {
 
     fn manifest_path(&self) -> PathBuf {
         self.root_dir.join(ENCRYPTED_MANIFEST_FILENAME)
+    }
+
+    /// Removes the account key from every folder it was registered for (logout, or the cache is
+    /// being reopened with another key).
+    fn forget_account_dirs(&mut self) {
+        for dir in self.account_dirs.drain(..) {
+            unregister_cache_key(&dir);
+        }
     }
 
     fn load_manifest(&mut self) {
@@ -244,10 +262,10 @@ impl LiveMediaCache {
         let dir = root_dir.into();
         let index = MediaCacheIndex::open_with_key(&dir, key)
             .map_err(|e| anyhow!("failed to open MediaCacheIndex at {}: {e}", dir.display()))?;
+        let mut inner = LiveMediaCacheInner::from_index(index, dir, true);
+        inner.has_account_key = true;
         Ok(Self {
-            inner: Arc::new(Mutex::new(LiveMediaCacheInner::from_index(
-                index, dir, true,
-            ))),
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
@@ -315,7 +333,13 @@ impl LiveMediaCache {
             .inner
             .lock()
             .map_err(|_| anyhow!("media cache mutex poisoned"))?;
+        guard.forget_account_dirs();
         *guard = LiveMediaCacheInner::from_index(index, dir, true);
+        guard.has_account_key = true;
+        drop(guard);
+        // An account folder is attached: media no longer goes to the system temp directory, so
+        // whatever older builds left there can be removed (once per process, in the background).
+        sweep_legacy_temp_dirs_once();
         Ok(())
     }
 
@@ -329,7 +353,10 @@ impl LiveMediaCache {
             .inner
             .lock()
             .map_err(|_| anyhow!("media cache mutex poisoned"))?;
+        guard.forget_account_dirs();
         *guard = LiveMediaCacheInner::from_index(index, dir, true);
+        drop(guard);
+        sweep_legacy_temp_dirs_once();
         Ok(())
     }
 
@@ -342,6 +369,7 @@ impl LiveMediaCache {
             if guard.is_persistent && !old_root.as_os_str().is_empty() {
                 unregister_cache_key(&old_root);
             }
+            guard.forget_account_dirs();
             if let Ok(index) = MediaCacheIndex::open_memory_only() {
                 *guard = LiveMediaCacheInner::from_index(index, PathBuf::new(), false);
             }
@@ -361,6 +389,37 @@ impl LiveMediaCache {
             .lock()
             .map(|g| g.root_dir.clone())
             .unwrap_or_default()
+    }
+
+    /// Gives `dir`, a folder outside the cache root that holds other data of this account at rest
+    /// (the Mini App bot storage), the account's storage key: writers there find it with
+    /// `tg_storage::cache::media_cache::lookup_cache_key_for_path` and encrypt with it.
+    ///
+    /// Returns `false` and registers nothing while this cache has no account key (memory-only,
+    /// or opened with a random per-process key): data encrypted with such a key could not be
+    /// read back after a restart, so those writers keep their data in memory instead.
+    pub fn register_account_dir(&self, dir: &Path) -> bool {
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        if !guard.has_account_key {
+            return false;
+        }
+        register_cache_key(dir, guard.index.encryption_key().clone());
+        if !guard.account_dirs.iter().any(|known| known == dir) {
+            guard.account_dirs.push(dir.to_path_buf());
+        }
+        true
+    }
+
+    /// Returns the directory for streamed media files (`<cache root>/streamed`) once the cache is
+    /// attached to an account folder. Files there are encrypted with the cache key. `None` before
+    /// an account folder exists: streamed media must then use an ephemeral key instead.
+    #[must_use]
+    pub fn streamed_dir(&self) -> Option<PathBuf> {
+        let guard = self.inner.lock().ok()?;
+        (guard.is_persistent && !guard.root_dir.as_os_str().is_empty())
+            .then(|| guard.root_dir.join("streamed"))
     }
 
     /// Reads cached bytes for `key`, updating its LRU `last_accessed` timestamp.
@@ -1151,5 +1210,42 @@ mod tests {
         reopened.close_to_memory();
         cache.close_to_memory();
         assert!(!cache.is_persistent());
+    }
+
+    #[test]
+    fn sec3_b2_account_dir_gets_the_account_key_only_when_one_is_known() {
+        use tg_storage::cache::media_cache::lookup_cache_key_for_path;
+
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let bot_dir = root.path().join("bot_storage").join("user_7");
+        let key = derive_media_cache_key(&AuthKey::new([0x4Du8; 256]), "data");
+
+        // Memory-only cache: no account key yet.
+        let cache = LiveMediaCache::open_memory_only();
+        assert!(!cache.register_account_dir(&bot_dir));
+        assert!(lookup_cache_key_for_path(&bot_dir).is_none());
+
+        // Persistent cache with a random per-process key: still no account key.
+        cache
+            .reopen_at(root.path().join("cache_ephemeral"))
+            .expect("reopen without key");
+        assert!(!cache.register_account_dir(&bot_dir));
+        assert!(lookup_cache_key_for_path(&bot_dir).is_none());
+
+        // Attached with the account key: the folder gets exactly that key.
+        cache
+            .reopen_at_with_key(root.path().join("cache"), key.clone())
+            .expect("attach with key");
+        assert!(cache.register_account_dir(&bot_dir));
+        assert_eq!(
+            lookup_cache_key_for_path(&bot_dir)
+                .as_ref()
+                .map(|k| k.as_bytes()),
+            Some(key.as_bytes())
+        );
+
+        // Logout (cache closed to memory) removes the key again.
+        cache.close_to_memory();
+        assert!(lookup_cache_key_for_path(&bot_dir).is_none());
     }
 }

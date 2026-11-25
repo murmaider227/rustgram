@@ -5,3 +5,17 @@
 /tdata
 /.idea
 /.vscode
+
+# Benchmark and UI-parity tool outputs, scratch workdirs, and captures
+/tools/**/out/
+/tools/**/scratch/
+/tools/**/diag/
+/tools/**/snaps/
+/tools/**/snapshots/
+/tools/**/pairs/
+/tools/**/probe_diag/
+/tools/**/memdiag_out/
+/tools/**/__pycache__/
+/tools/bench/memdiag/target/
+/tools/bench/*.png
+/tools/uiparity/*.png

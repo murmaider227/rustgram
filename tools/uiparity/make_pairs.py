@@ -18,6 +18,10 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
+import verify_report_privacy as vrp  # noqa: E402
+import workdir_safety as ws  # noqa: E402
+
 
 PAIR_RE = re.compile(r"^(\d{2})_(.+)_(1440x900|390x844)_(official|rustgram)\.png$")
 
@@ -165,7 +169,12 @@ def main() -> int:
         print("Pass --snap-dir or set UIPARITY_SNAP_DIR", file=sys.stderr)
         return 2
 
-    snap_dir = Path(args.snap_dir)
+    try:
+        snap_dir = ws.ensure_outside_git_repo(Path(args.snap_dir), label="--snap-dir")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     groups: dict[tuple[str, str, str], dict[str, Path]] = {}
     for p in sorted(snap_dir.glob("*.png")):
         m = PAIR_RE.match(p.name)
@@ -191,9 +200,9 @@ def main() -> int:
             "id": nn,
             "screen": screen,
             "size": size,
-            "official": str(sides["official"]),
-            "rustgram": str(sides["rustgram"]),
-            "pair": str(pair_path),
+            "official": sides["official"].name,
+            "rustgram": sides["rustgram"].name,
+            "pair": pair_path.name,
             **metrics,
         }
         results.append(entry)
@@ -205,7 +214,16 @@ def main() -> int:
         print(f"{idx:2d}. {r['id']}_{r['screen']}_{r['size']}: dist={r['distance']:5.2f} (SSIM={r['ssim']:.4f}, MAE={r['mae']:5.2f}, diff={r['diff_pixel_pct']:5.2f}%)")
 
     out_json = Path(args.out_json) if args.out_json else (snap_dir / "metrics.json")
+    out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps({"pairs": results, "ranked": ranked}, indent=2), encoding="utf-8")
+    rc = vrp.verify_files([out_json])
+    if rc != 0:
+        try:
+            out_json.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print("[make_pairs] Privacy verification failed; removed unsafe metrics JSON.", file=sys.stderr)
+        return rc
     print(f"\nWrote metrics to {out_json}")
     return 0
 

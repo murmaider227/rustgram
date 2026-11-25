@@ -181,7 +181,40 @@ pub struct MiniAppWindow {
     location_access: Option<bool>,
     /// Device location fix for `web_app_request_location`, in flight on a worker thread.
     location_pending: Option<PlatformCall<Option<tg_platform::geolocation::GeoLocation>>>,
+    /// `web_app_open_location_settings` has no handler in tdesktop. A page may open the OS
+    /// location settings once per window, and only after a location request it made was
+    /// denied (by the user or because the OS blocks location); any other request is dropped.
+    location_settings: LocationSettingsGate,
     posted_raw_events: Vec<(String, serde_json::Value)>,
+}
+
+/// Whether the page may open the OS location settings (see `MiniAppWindow::location_settings`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LocationSettingsGate {
+    /// No denied location request yet: the event is dropped.
+    #[default]
+    Closed,
+    /// A location request was denied: the next event opens the settings once.
+    AllowedOnce,
+    /// The settings were opened once for this window: later events are dropped.
+    Used,
+}
+
+impl LocationSettingsGate {
+    fn on_location_denied(&mut self) {
+        if *self == Self::Closed {
+            *self = Self::AllowedOnce;
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        if *self == Self::AllowedOnce {
+            *self = Self::Used;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl MiniAppWindow {
@@ -232,6 +265,7 @@ impl MiniAppWindow {
             geo_provider: tg_app_core::core_types::geo::default_geolocation_provider(),
             location_access: None,
             location_pending: None,
+            location_settings: LocationSettingsGate::Closed,
             posted_raw_events: Vec::new(),
         }
     }
@@ -769,6 +803,12 @@ impl MiniAppWindow {
                     self.request_location_for_page();
                 }
                 MiniAppAction::OpenLocationSettings => {
+                    if !self.location_settings.take() {
+                        tracing::debug!(
+                            "mini app: open_location_settings dropped (no denied location request)"
+                        );
+                        continue;
+                    }
                     let uri = tg_platform::url_policy::WINDOWS_LOCATION_SETTINGS_URI;
                     let _ = external.open_url(uri);
                     events.push(AppWebViewEvent::OpenExternalUrl {
@@ -922,6 +962,7 @@ impl MiniAppWindow {
                     self.controller.record_user_interaction(now);
                     self.post_current_location();
                 } else {
+                    self.location_settings.on_location_denied();
                     self.post_raw_json_event(
                         "location_requested",
                         tg_app_core::core_types::geo::mini_app_location_requested_json(None),
@@ -1081,15 +1122,21 @@ impl MiniAppWindow {
             GeolocationStatus::Disabled | GeolocationStatus::NotAvailable
         );
         match self.location_access {
-            _ if os_blocked => self.post_raw_json_event(
-                "location_requested",
-                tg_app_core::core_types::geo::mini_app_location_requested_json(None),
-            ),
+            _ if os_blocked => {
+                self.location_settings.on_location_denied();
+                self.post_raw_json_event(
+                    "location_requested",
+                    tg_app_core::core_types::geo::mini_app_location_requested_json(None),
+                );
+            }
             Some(true) => self.post_current_location(),
-            Some(false) => self.post_raw_json_event(
-                "location_requested",
-                tg_app_core::core_types::geo::mini_app_location_requested_json(None),
-            ),
+            Some(false) => {
+                self.location_settings.on_location_denied();
+                self.post_raw_json_event(
+                    "location_requested",
+                    tg_app_core::core_types::geo::mini_app_location_requested_json(None),
+                );
+            }
             None => {
                 let already_asking =
                     matches!(self.active_modal, Some(ActiveMiniAppModal::ConfirmLocation))

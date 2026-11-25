@@ -7,9 +7,8 @@
 //! and `Telegram/SourceFiles/media/audio/media_audio_loader.cpp`.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,7 +40,13 @@ use tg_media::transfer::{
     validate_get_cdn_file_request, validate_get_file_request,
 };
 use tg_session::SessionRuntime;
+use tg_storage::StorageEncryptionKey;
 use tg_storage::cache::binlog::CacheKey as StorageCacheKey;
+use tg_storage::cache::legacy_temp::ephemeral_stream_dir_name;
+use tg_storage::cache::media_cache::{
+    keyed_stream_file_stem, lookup_cache_key_for_path, process_ephemeral_cache_key,
+    random_ephemeral_cache_key,
+};
 use tg_storage::streamed_downloader::{
     ChunkFuture, ChunkProvider, DEFAULT_MAX_IN_FLIGHT_PARTS, DownloadProgress,
     StreamedDownloadError, StreamedDownloadResult, StreamedDownloaderConfig,
@@ -2037,33 +2042,59 @@ impl<C: RpcClient + Clone + 'static> TelegramRangeLoader<C> {
         self
     }
 
-    fn persistent_target_path(&self) -> Option<PathBuf> {
-        self.storage_dir.as_ref().map(|dir| {
-            dir.join(format!(
-                "stream_{:016x}_{:016x}.bin",
-                self.cache_key.high, self.cache_key.low
-            ))
-        })
+    /// Path of this media's file inside `storage_dir`, with the key that encrypts it: the key
+    /// registered for the directory (the account cache key under the account's media cache),
+    /// otherwise this process's random key. The file name is a keyed hash of the cache key
+    /// (`s_<hash>.bin`), so file names in the cache do not reveal document ids.
+    fn persistent_target(&self) -> Option<(PathBuf, StorageEncryptionKey)> {
+        let dir = self.storage_dir.as_ref()?;
+        let key = lookup_cache_key_for_path(dir).unwrap_or_else(process_ephemeral_cache_key);
+        let stem = keyed_stream_file_stem(&key, self.cache_key.high, self.cache_key.low);
+        Some((dir.join(format!("{stem}.bin")), key))
     }
 
-    fn read_from_finalized_target(
-        &self,
-        offset: u64,
-        len: usize,
-    ) -> Option<tg_video::error::Result<Vec<u8>>> {
-        let target = self.persistent_target_path()?;
-        let meta = fs::metadata(&target).ok()?;
-        if !meta.is_file() || meta.len() != self.total_size {
-            return None;
+    /// Reads `[offset, offset + len)` through the streamed downloader, which authenticates every
+    /// part it reads from disk. A file that fails authentication is deleted and downloaded
+    /// again once; its content is never returned. `None` when the size is unknown or the
+    /// downloader cannot be opened.
+    fn read_streamed(&self, offset: u64, len: usize) -> Option<StreamedDownloadResult<Vec<u8>>> {
+        for attempt in 0..2 {
+            let (dl, _) = self.ensure_streamed()?;
+            match block_on_runtime(&self.handle, dl.read_range(offset, len)) {
+                Err(StreamedDownloadError::IntegrityMismatch { offset: bad }) if attempt == 0 => {
+                    tracing::warn!(
+                        offset = bad,
+                        "streamed cache file failed authentication, downloading it again"
+                    );
+                    self.discard_streamed();
+                }
+                other => return Some(other),
+            }
         }
-        let res = (|| -> std::io::Result<Vec<u8>> {
-            let mut file = File::open(&target)?;
-            file.seek(SeekFrom::Start(offset))?;
-            let mut buf = vec![0u8; len];
-            file.read_exact(&mut buf)?;
-            Ok(buf)
-        })();
-        Some(res.map_err(|_| StreamingError::LoadFailed.into()))
+        None
+    }
+
+    /// Drops the current streamed downloader together with its files on disk.
+    fn discard_streamed(&self) {
+        if let Some(abort) = self
+            .bg_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            abort.abort();
+        }
+        let state = self
+            .streamed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(state) = state {
+            state.downloader.discard();
+            if let Some(dir) = state.ephemeral_dir {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
     }
 
     fn ensure_streamed(&self) -> Option<StreamedHandle<C>> {
@@ -2095,18 +2126,20 @@ impl<C: RpcClient + Clone + 'static> TelegramRangeLoader<C> {
             origin,
         ));
 
-        let (target_path, ephemeral_dir) = if let Some(target) = self.persistent_target_path() {
-            (target, None)
-        } else {
-            let dir = std::env::temp_dir().join(format!(
-                "rustgram_stream_{:016x}_{:016x}_{:016x}",
-                self.cache_key.high,
-                self.cache_key.low,
-                random_u64()
-            ));
-            let target = dir.join("stream.bin");
-            (target, Some(dir))
-        };
+        // Streamed media is never written in plaintext. Inside a storage directory the file is
+        // encrypted with that directory's key (the account cache key when the directory lies
+        // under the account's media cache, this process's random key otherwise). Without a
+        // storage directory (no account folder yet) the file goes to a random-named temp folder,
+        // encrypted with a key that exists only in this loader's memory.
+        let (target_path, ephemeral_dir, encryption_key) =
+            if let Some((target, key)) = self.persistent_target() {
+                (target, None, key)
+            } else {
+                let dir = std::env::temp_dir()
+                    .join(ephemeral_stream_dir_name(std::process::id(), random_u64()));
+                let target = dir.join("s.bin");
+                (target, Some(dir), random_ephemeral_cache_key())
+            };
 
         let mut cfg =
             StreamedDownloaderConfig::new(self.cache_key.high, self.total_size, target_path);
@@ -2114,6 +2147,7 @@ impl<C: RpcClient + Clone + 'static> TelegramRangeLoader<C> {
         cfg.part_size = self.part_size as usize;
         cfg.max_in_flight = self.max_in_flight;
         cfg.expected_sha256 = self.expected_sha256;
+        cfg.encryption_key = Some(encryption_key);
 
         let downloader = StreamedFileDownloader::open(cfg, Arc::clone(&provider)).ok()?;
         let out = (downloader.clone(), Arc::clone(&provider));
@@ -2198,13 +2232,9 @@ impl<C: RpcClient + Clone + 'static> TelegramRangeLoader<C> {
     }
 
     /// Drives [`StreamedFileDownloader::download_all`] to completion and returns the finalized
-    /// file path on disk.
+    /// file path on disk. The file is encrypted: read its content with
+    /// [`RangeLoader::load_range`], not from the path.
     pub fn download_to_file(&self) -> StreamedDownloadResult<PathBuf> {
-        if let Some(target) = self.persistent_target_path()
-            && fs::metadata(&target).is_ok_and(|m| m.is_file() && m.len() == self.total_size)
-        {
-            return Ok(target);
-        }
         let Some((dl, _)) = self.ensure_streamed() else {
             return Err(StreamedDownloadError::InvalidConfig(
                 "streamed downloader unavailable for unknown-size media".into(),
@@ -2313,14 +2343,10 @@ impl<C: RpcClient + Clone + 'static> RangeLoader for TelegramRangeLoader<C> {
             len
         };
 
-        if self.total_size > 0 {
-            if let Some(res) = self.read_from_finalized_target(offset, target_len) {
-                return res;
-            }
-            if let Some((dl, _)) = self.ensure_streamed() {
-                return block_on_runtime(&self.handle, dl.read_range(offset, target_len))
-                    .map_err(|_| StreamingError::LoadFailed.into());
-            }
+        if self.total_size > 0
+            && let Some(res) = self.read_streamed(offset, target_len)
+        {
+            return res.map_err(|_| StreamingError::LoadFailed.into());
         }
 
         let mut out = Vec::with_capacity(target_len);
@@ -2477,10 +2503,15 @@ impl<C: RpcClient + Clone + 'static> AudioDataSource for LiveAudioDataSource<C> 
 
         if self.storage_dir.is_some() && resolved.size > 0 {
             let loader = self.open_range_loader(id)?;
-            let path = loader
+            loader
                 .download_to_file()
                 .map_err(|e| AudioError::SourceNotFound(e.to_string()))?;
-            let bytes = fs::read(&path).map_err(|e| AudioError::SourceNotFound(e.to_string()))?;
+            // The file on disk is encrypted: read it back through the loader.
+            let size = usize::try_from(resolved.size)
+                .map_err(|e| AudioError::SourceNotFound(e.to_string()))?;
+            let bytes = loader
+                .load_range(0, size)
+                .map_err(|e| AudioError::SourceNotFound(e.to_string()))?;
             return Ok(AudioInput::from_bytes(bytes, ext_hint));
         }
 

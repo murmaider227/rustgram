@@ -21,8 +21,9 @@ use super::backend::{
 };
 use super::strings;
 use super::widgets::{
-    SettingsIconKind, settings_card, settings_checkbox_row, settings_divider, settings_row_pad_x,
-    settings_split_toggle_row, settings_toggle_row, subsection_title,
+    SETTINGS_LIST_SKIP, SettingsIconKind, settings_card, settings_checkbox_row,
+    settings_divider_text, settings_row_pad_x, settings_section_divider, settings_split_toggle_row,
+    settings_toggle_row, subsection_title,
 };
 
 /// Persistent UI state for the Notifications & Sounds section.
@@ -52,7 +53,7 @@ pub fn render_notifications_section(
     let mut out = NotificationsOutput::default();
     let toast = &mut out.toast;
     ui.spacing_mut().item_spacing.y = 0.0;
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(st::settings_privacy_skip.scaled() as f32);
 
     // 1. Multi-account (`BuildMultiAccountSection`): only with more than one account.
     if core.accounts_order.len() > 1 {
@@ -67,9 +68,9 @@ pub fn render_notifications_section(
             true,
             colors,
         );
-        ui.add_space(SECTION_SKIP);
-        settings_divider(ui, Some(&tr::lng_settings_notify_all_about()), colors);
-        ui.add_space(SECTION_SKIP);
+        ui.add_space(SETTINGS_LIST_SKIP);
+        settings_divider_text(ui, &tr::lng_settings_notify_all_about(), colors);
+        ui.add_space(SETTINGS_LIST_SKIP);
     }
 
     // 2. Global settings (`BuildGlobalNotificationsSection`).
@@ -121,18 +122,18 @@ pub fn render_notifications_section(
     ) {
         core.notifications_volume = (vol * 100.0).round().clamp(1.0, 100.0) as u16;
     }
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     // 3. Notification view preview (`SetupNotifyViewOptions`): sample toast on the chat
     // wallpaper with the "Name" / "Text" pills; a plain divider when notifications are off.
     if core.desktop_notify {
         render_notify_preview(ui, &mut core.notify_view, colors);
     } else {
-        settings_divider(ui, None, colors);
+        settings_section_divider(ui, colors);
     }
 
     // 4. Notifications for chats (`BuildNotifyTypeSection`).
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(st::notify_preview_bottom_skip.scaled() as f32);
     subsection_title(ui, &tr::lng_settings_notify_title(), colors);
     for scope in NotifyScope::ALL {
         let mut scope_cfg = backend.scope_notifications(scope);
@@ -199,7 +200,7 @@ pub fn render_notifications_section(
 
     // 5. Events (`BuildEventNotificationsSection`).
     ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
+    settings_section_divider(ui, colors);
     ui.add_space(SECTION_SKIP);
     subsection_title(ui, &tr::lng_settings_events_title(), colors);
     let joined_lbl = tr::lng_settings_events_joined();
@@ -230,7 +231,7 @@ pub fn render_notifications_section(
 
     // 6. Calls (`BuildCallNotificationsSection`): `callsDisabledHere` of the current session.
     ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
+    settings_section_divider(ui, colors);
     ui.add_space(SECTION_SKIP);
     subsection_title(ui, &tr::lng_settings_notifications_calls_title(), colors);
     let current = backend
@@ -253,7 +254,7 @@ pub fn render_notifications_section(
 
     // 7. Badge counter (`BuildBadgeCounterSection`).
     ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
+    settings_section_divider(ui, colors);
     ui.add_space(SECTION_SKIP);
     subsection_title(ui, &tr::lng_settings_badge_title(), colors);
     settings_checkbox_row(
@@ -281,7 +282,7 @@ pub fn render_notifications_section(
     // 8. System integration (`BuildSystemIntegrationAndAdvancedSection`): the native toggle;
     // with native notifications off, focus mode, corner and count.
     ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
+    settings_section_divider(ui, colors);
     ui.add_space(SECTION_SKIP);
     subsection_title(ui, &tr::lng_settings_native_title(), colors);
     let mut native = core.native_notifications.unwrap_or(true);
@@ -307,7 +308,7 @@ pub fn render_notifications_section(
             colors,
         );
         ui.add_space(SECTION_SKIP);
-        settings_divider(ui, None, colors);
+        settings_section_divider(ui, colors);
         ui.add_space(SECTION_SKIP);
         subsection_title(ui, &tr::lng_settings_notifications_position(), colors);
         render_corner_picker(
@@ -337,8 +338,8 @@ pub fn render_notifications_section(
     out
 }
 
-/// Vertical skip around dividers and titles (`st::settings_checkboxes_skip`).
-const SECTION_SKIP: f32 = 8.0;
+/// Vertical skip around the dividers of this page (`st::settings_checkboxes_skip`).
+const SECTION_SKIP: f32 = 12.0;
 
 /// Status line under a per-chat-type split toggle (`AddTypeButton`): "Click here to change"
 /// without exceptions, otherwise "On, 2 exceptions" / "Off, 2 exceptions".
@@ -364,20 +365,44 @@ fn labeled_slider_row(
     disabled: bool,
     colors: &dyn Colors,
 ) -> bool {
-    let pad_x = settings_row_pad_x();
-    let label_font = egui::FontId::new(12.0, tg_ui::fonts::family_regular());
+    // `Ui::AddRingtonesVolumeSlider`: `MakeSliderWithLabel(settingsScale, settingsScaleLabel,
+    // spacew * 2, width("100%"))` inside `settingsBigScalePadding`.
+    let pad = st::settings_big_scale_padding;
+    let pad_left = pad.left.scaled() as f32;
+    let pad_right = pad.right.scaled() as f32;
+    let slider_st = MediaSliderStyle::from_tg(&st::settings_scale, colors);
+    let label_font = font_id_from_style(st::settings_scale_label.style.font);
     let label_fg = colors.color("windowActiveTextFg");
-    let label_w = ui
+    let min_label_w = ui
         .painter()
         .layout_no_wrap("100%".to_owned(), label_font.clone(), label_fg)
         .size()
         .x;
+    let label_galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), label_font.clone(), label_fg);
+    let space_w = ui
+        .painter()
+        .layout_no_wrap(
+            " ".to_owned(),
+            font_id_from_style(st::normal_font),
+            label_fg,
+        )
+        .size()
+        .x;
+    let row_h = slider_st
+        .seek_size
+        .height
+        .max(ui.fonts_mut(|f| f.row_height(&label_font)));
     let full_w = ui.available_width();
-    let (row_rect, _) = ui.allocate_exact_size(Vec2::new(full_w, 30.0), Sense::hover());
-    let slider_w = (full_w - pad_x * 2.0 - label_w - 10.0).max(120.0);
+    ui.add_space(pad.top.scaled() as f32);
+    let (row_rect, _) = ui.allocate_exact_size(Vec2::new(full_w, row_h), Sense::hover());
+    ui.add_space(pad.bottom.scaled() as f32);
+    let label_right = label_galley.size().x.max(min_label_w) + space_w * 2.0;
+    let slider_w = (full_w - pad_left - pad_right - label_right).max(slider_st.seek_size.width);
     let slider_rect = Rect::from_min_size(
-        Pos2::new(row_rect.left() + pad_x, row_rect.top()),
-        Vec2::new(slider_w, row_rect.height()),
+        Pos2::new(row_rect.left() + pad_left, row_rect.top()),
+        Vec2::new(slider_w, row_h),
     );
     let changed = ui
         .scope_builder(
@@ -385,7 +410,7 @@ fn labeled_slider_row(
                 .max_rect(slider_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
             |ui| {
-                MediaSlider::new(value, MediaSliderStyle::default_media_slider(colors))
+                MediaSlider::new(value, slider_st)
                     .always_display_marker(true)
                     .disabled(disabled)
                     .width(slider_w)
@@ -394,11 +419,12 @@ fn labeled_slider_row(
             },
         )
         .inner;
-    ui.painter().text(
-        Pos2::new(row_rect.right() - pad_x, row_rect.center().y),
-        Align2::RIGHT_CENTER,
-        label,
-        label_font,
+    ui.painter().galley(
+        Pos2::new(
+            row_rect.right() - pad_right - label_galley.size().x,
+            row_rect.center().y - label_galley.size().y * 0.5,
+        ),
+        label_galley,
         label_fg,
     );
     changed
@@ -492,7 +518,7 @@ fn render_notify_preview(ui: &mut Ui, view: &mut NotifyView, colors: &dyn Colors
         Pos2::new(card.left() + 64.0, card.top() + 9.0),
         Align2::LEFT_TOP,
         title,
-        font_id_from_style(st::semibold_font),
+        font_id_from_style(st::default_subsection_title.style.font),
         text_fg,
     );
     let body = if text_shown {
@@ -504,7 +530,7 @@ fn render_notify_preview(ui: &mut Ui, view: &mut NotifyView, colors: &dyn Colors
         Pos2::new(card.left() + 64.0, card.top() + 30.0),
         Align2::LEFT_TOP,
         body,
-        font_id_from_style(st::normal_font),
+        font_id_from_style(st::box_text_style.font),
         text_fg,
     );
 

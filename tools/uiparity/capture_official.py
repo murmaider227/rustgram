@@ -17,7 +17,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
 import win_capture as wc  # noqa: E402
+import workdir_safety as ws  # noqa: E402
 
 
 def wait_ui(sec: float = 0.5) -> None:
@@ -42,8 +44,9 @@ def snap(hwnd: int, snap_dir: Path, name: str, size_tag: str = "1440x900") -> No
 
 
 def close_overlays(hwnd: int, pos_x: int, pos_y: int) -> None:
+    wc.focus_window(hwnd)
     for _ in range(3):
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.18)
     ensure_size(hwnd, 1440, 900, pos_x, pos_y)
 
@@ -55,7 +58,7 @@ def toggle_night_mode(hwnd: int, pos_x: int, pos_y: int) -> None:
     wait_ui(0.45)
     wc.click_client(hwnd, 238, 517)
     wait_ui(0.6)
-    wc.send_hotkey("ESC")
+    wc.send_hotkey(hwnd, "ESC")
     wait_ui(0.3)
 
 
@@ -65,6 +68,8 @@ def main() -> int:
     ap.add_argument("--exe", default=os.environ.get("UIPARITY_OFFICIAL_EXE", "official_tg"))
     ap.add_argument("--desktop", default="Default")
     ap.add_argument("--pos", default="-1860,60")
+    ap.add_argument("--test-account", action="store_true",
+                    help="Confirm the target Official Telegram window is logged into a disposable test account (required)")
     ap.add_argument("--row-dm", type=int, default=0, help="0-based row of 1:1 DM chat")
     ap.add_argument("--row-group", type=int, default=1, help="0-based row of Group chat")
     ap.add_argument("--row-channel", type=int, default=2, help="0-based row of Channel")
@@ -76,11 +81,21 @@ def main() -> int:
     ap.add_argument("--photo-y", type=int, default=620, help="Y coord inside photo message")
     args = ap.parse_args()
 
+    try:
+        wc.require_test_account_confirmation(args.test_account, "capture_official.py")
+    except PermissionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     if not args.snap_dir:
         print("Pass --snap-dir or set UIPARITY_SNAP_DIR", file=sys.stderr)
         return 2
 
-    snap_dir = Path(args.snap_dir)
+    try:
+        snap_dir = ws.ensure_outside_git_repo(Path(args.snap_dir), label="--snap-dir")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     snap_dir.mkdir(parents=True, exist_ok=True)
     pos_x, pos_y = (int(v) for v in args.pos.split(","))
 
@@ -96,7 +111,7 @@ def main() -> int:
         # 01. Chat list (all chats) with folders bar (no active chat selected)
         wc.click_client(hwnd, 36, 118)  # All chats folder
         wait_ui(0.3)
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.3)
         ensure_size(hwnd, 1440, 900, pos_x, pos_y)
         snap(hwnd, snap_dir, "01_chat_list_folders")
@@ -110,11 +125,11 @@ def main() -> int:
         # 05. Composer focused with text (on 1:1 chat)
         wc.click_client(hwnd, 860, 875)
         wait_ui(0.2)
-        wc.send_text("Checking composer focus, caret, and send button styling")
+        wc.send_text(hwnd, "Checking composer focus, caret, and send button styling")
         wait_ui(0.3)
         snap(hwnd, snap_dir, "05_composer_text")
-        wc.send_hotkey("CTRL", "A")
-        wc.send_hotkey("BACK")
+        wc.send_hotkey(hwnd, "CTRL", "A")
+        wc.send_hotkey(hwnd, "BACK")
         wait_ui(0.2)
 
         # 06. Emoji panel, 07. Sticker panel, 08. GIF panel (docked right column resized back to 1440x900)
@@ -144,14 +159,14 @@ def main() -> int:
         wc.click_client(hwnd, args.msg_x + 75, args.msg_y + 125)
         wait_ui(0.6)
         snap(hwnd, snap_dir, "20_forward_box")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.25)
 
         # 10. Chat list context menu (right-click DM row)
         wc.click_client(hwnd, 220, row_y(args.row_dm), button="right")
         wait_ui(0.5)
         snap(hwnd, snap_dir, "10_chat_list_context_menu")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.25)
 
         # 11. Profile of a user (third column / info) on 1:1 chat
@@ -172,12 +187,14 @@ def main() -> int:
         ]
         if mv_wins:
             mv_hwnd = mv_wins[0].hwnd
+            wc.focus_window(mv_hwnd)
             wc.resize_client_area(mv_hwnd, 1440, 900, pos_x, pos_y)
             wait_ui(0.4)
             snap(mv_hwnd, snap_dir, "19_media_viewer_photo")
+            wc.send_hotkey(mv_hwnd, "ESC")
         else:
             snap(hwnd, snap_dir, "19_media_viewer_photo")
-        wc.send_hotkey("ESC")
+            wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.4)
         ensure_size(hwnd, 1440, 900, pos_x, pos_y)
 
@@ -209,10 +226,10 @@ def main() -> int:
         # 18. Search (global, with results)
         wc.click_client(hwnd, 220, 52)  # Search field in dialogs column
         wait_ui(0.3)
-        wc.send_text(args.search_query)
+        wc.send_text(hwnd, args.search_query)
         wait_ui(0.9)
         snap(hwnd, snap_dir, "18_search_global")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.3)
 
         # 22. Main menu (hamburger)
@@ -224,7 +241,7 @@ def main() -> int:
         wc.click_client(hwnd, 120, 275)
         wait_ui(0.5)
         snap(hwnd, snap_dir, "21_new_group_box")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.3)
 
         # 13-17. Settings main + Notifications + Privacy + Chat Settings + Advanced
@@ -255,11 +272,11 @@ def main() -> int:
         wc.click_client(hwnd, 650, 446)  # Advanced
         wait_ui(0.5)
         snap(hwnd, snap_dir, "17_settings_advanced")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.25)
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.25)
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.3)
 
         # 29-30. Narrow 390x844: chat list and chat (Day theme, 1:1 DM)
@@ -269,7 +286,7 @@ def main() -> int:
         wait_ui(0.5)
         ensure_size(hwnd, 390, 844, pos_x, pos_y)
         snap(hwnd, snap_dir, "30_narrow_chat", "390x844")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.4)
         snap(hwnd, snap_dir, "29_narrow_chat_list", "390x844")
 
@@ -278,7 +295,7 @@ def main() -> int:
         toggle_night_mode(hwnd, pos_x, pos_y)
 
         # 24. Night chat list
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.3)
         ensure_size(hwnd, 1440, 900, pos_x, pos_y)
         snap(hwnd, snap_dir, "24_night_chat_list")
@@ -315,13 +332,16 @@ def main() -> int:
         wc.click_client(hwnd, 120, 476)
         wait_ui(0.55)
         snap(hwnd, snap_dir, "26_night_settings")
-        wc.send_hotkey("ESC")
+        wc.send_hotkey(hwnd, "ESC")
         wait_ui(0.3)
 
         # Return to Day theme cleanly
         toggle_night_mode(hwnd, pos_x, pos_y)
         print("Official Telegram 30-screen capture complete.")
         return 0
+    except wc.ForegroundWindowError as exc:
+        print(f"[capture_official] {exc}", file=sys.stderr)
+        return 3
     finally:
         if hdesk:
             wc.user32.CloseDesktop(hdesk)

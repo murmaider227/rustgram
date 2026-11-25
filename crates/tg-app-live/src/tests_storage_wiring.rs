@@ -908,14 +908,19 @@ fn wp59_live_streamed_media_out_of_order_seeks_and_resumable_partial_metadata() 
     loader1.stop();
     drop(loader1);
 
+    // The file name is a keyed hash of the cache key and the sidecar is encrypted (SEC3-B3).
     let streamed_dir = h.live.media_cache().root_dir().join("streamed");
-    let target_base = streamed_dir.join(format!("stream_{:016x}_{:016x}.bin", 901_001u64, 2u64));
+    let cache_key = tg_storage::cache::media_cache::lookup_cache_key_for_path(&streamed_dir)
+        .expect("cache key registered for the streamed dir");
+    let stem = tg_storage::cache::media_cache::keyed_stream_file_stem(&cache_key, 901_001u64, 2u64);
+    let target_base = streamed_dir.join(format!("{stem}.bin"));
     let part_file = PathBuf::from(format!("{}.part", target_base.display()));
     let meta_file = PathBuf::from(format!("{}.part.meta", target_base.display()));
     assert!(part_file.is_file(), "sparse .part file must persist");
     assert!(meta_file.is_file(), "resumable .part.meta must persist");
 
-    let persisted_meta = PartialFileMetadata::load(&meta_file).expect("load persisted metadata");
+    let persisted_meta = PartialFileMetadata::load_encrypted(&meta_file, &cache_key)
+        .expect("load persisted metadata");
     assert_eq!(persisted_meta.total_size, total_size as u64);
     assert!(
         !persisted_meta.is_part_saved(0),
@@ -1297,6 +1302,16 @@ fn wp59_direct_range_loader_with_origin_and_sha256_finalization() {
 
     let finalized_path = loader.download_to_file().expect("finalize with SHA-256");
     assert!(finalized_path.is_file());
-    assert_eq!(fs::read(&finalized_path).expect("read finalized"), payload);
+    // The finalized file is encrypted on disk; its content is read back through the loader.
+    assert_ne!(fs::read(&finalized_path).expect("read finalized"), payload);
+    assert_eq!(
+        loader
+            .load_range(0, payload.len())
+            .expect("read finalized content"),
+        payload
+    );
     assert!(loader.progress().expect("progress").finished);
 }
+
+#[path = "tests_sec3b.rs"]
+mod sec3b;

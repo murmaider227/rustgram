@@ -862,6 +862,15 @@ fn bot_local_storage_persists_per_bot_and_per_account_in_tdata_across_reloads() 
     let live1 = make_live(101, rpc1);
     seed_user_and_bot(&live1, 101, bot_id);
     live1.attach_webview_tdata_dir(tdata.path().to_path_buf(), None);
+    // Bot storage is encrypted with the account storage key (SEC3-B2), which the session gets
+    // together with its account media cache.
+    let account_key = |seed: u8| {
+        tg_crypto::StorageEncryptionKey::new(vec![seed; tg_crypto::StorageEncryptionKey::SIZE_V2])
+            .expect("account storage key")
+    };
+    live1
+        .set_media_cache_dir_with_key(tdata.path().join("media_cache").join("a1"), account_key(1))
+        .expect("attach account 1 cache");
 
     // Account 2 (`user_202`) sharing the same `tdata` directory.
     let rpc2 = FakeRpcClient::new();
@@ -869,6 +878,9 @@ fn bot_local_storage_persists_per_bot_and_per_account_in_tdata_across_reloads() 
     let live2 = make_live(202, rpc2);
     seed_user_and_bot(&live2, 202, bot_id);
     live2.attach_webview_tdata_dir(tdata.path().to_path_buf(), None);
+    live2
+        .set_media_cache_dir_with_key(tdata.path().join("media_cache").join("a2"), account_key(2))
+        .expect("attach account 2 cache");
 
     let palette = TgPalette::default();
     let external = NoopExternalOpener;
@@ -933,15 +945,25 @@ fn bot_local_storage_persists_per_bot_and_per_account_in_tdata_across_reloads() 
     }
     host1.close_mini_app();
 
-    let expected_file = tdata
-        .path()
-        .join("bot_storage")
-        .join("user_101")
-        .join(format!("bot_storage_{bot_id}.json"));
+    let account_dir = tdata.path().join("bot_storage").join("user_101");
+    let expected_file = account_dir.join(format!("bot_storage_{bot_id}.tdef"));
     assert!(
         expected_file.exists(),
         "expected persisted bot storage file at {}",
         expected_file.display()
+    );
+    // The file is encrypted: no plaintext JSON file, and the saved value is not on disk in clear.
+    assert!(
+        !account_dir
+            .join(format!("bot_storage_{bot_id}.json"))
+            .exists(),
+        "bot storage must not be written as plaintext JSON"
+    );
+    let raw = std::fs::read(&expected_file).expect("read bot storage file");
+    assert!(
+        !raw.windows(b"hello-tdata".len())
+            .any(|w| w == b"hello-tdata"),
+        "bot storage values must be encrypted on disk"
     );
 
     // 4b. Reopen Mini App in a fresh AppWebViewHost on Account 1 -> keys reload automatically from tdata.

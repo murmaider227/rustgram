@@ -937,9 +937,44 @@ struct SharedMediaThumbCache(
     std::collections::HashMap<(i32, u64), Option<(egui::TextureHandle, Rect)>>,
 );
 
+/// Largest encoded shared-media thumbnail decoded for the grid; anything bigger is not a
+/// thumbnail and stays a placeholder tile.
+pub(crate) const SHARED_MEDIA_THUMB_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Largest thumbnail side accepted, checked from the header before any pixels are allocated
+/// (Telegram never sends photo sizes above 2560 px).
+pub(crate) const SHARED_MEDIA_THUMB_MAX_SIDE: u32 = 2560;
+/// Side the decoded thumbnail is scaled down to fit: a grid tile is at most ~100 logical px.
+const SHARED_MEDIA_THUMB_DRAW_SIDE: u32 = 320;
+
+/// Decodes server thumbnail bytes for the shared-media grid with bounded memory: rejects
+/// oversized input and images whose header dimensions exceed
+/// [`SHARED_MEDIA_THUMB_MAX_SIDE`] before decoding, then decodes through
+/// `tg_media::image::read_image` (format allow-list, EXIF orientation) scaled to fit
+/// [`SHARED_MEDIA_THUMB_DRAW_SIDE`].
+pub(crate) fn decode_shared_media_thumb(bytes: &[u8]) -> Option<image::RgbaImage> {
+    if bytes.is_empty() || bytes.len() > SHARED_MEDIA_THUMB_MAX_BYTES {
+        return None;
+    }
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if w == 0 || h == 0 || w > SHARED_MEDIA_THUMB_MAX_SIDE || h > SHARED_MEDIA_THUMB_MAX_SIDE {
+        return None;
+    }
+    tg_media::image::read_image(tg_media::image::ReadArgs {
+        content: bytes.to_vec(),
+        max_size: Some((SHARED_MEDIA_THUMB_DRAW_SIDE, SHARED_MEDIA_THUMB_DRAW_SIDE)),
+        ..Default::default()
+    })
+    .ok()
+    .map(|r| r.image)
+}
+
 /// Decodes (once per context) the thumbnail of shared-media item `msg_id` into a texture plus the
-/// UV rect of its centred square. Full bytes go through `image`; stripped previews (`0x01 ...`)
-/// through `tg_media::image::inline`.
+/// UV rect of its centred square. Full bytes go through [`decode_shared_media_thumb`]; stripped
+/// previews (`0x01 ...`, at most 255x255 by format) through `tg_media::image::inline`.
 fn shared_media_thumb_texture(
     ctx: &egui::Context,
     msg_id: i32,
@@ -968,9 +1003,7 @@ fn shared_media_thumb_texture(
     let decoded = if stripped {
         tg_media::image::inline::from_inline_bytes(bytes).ok()
     } else {
-        image::load_from_memory(bytes)
-            .ok()
-            .map(|img| img.to_rgba8())
+        decode_shared_media_thumb(bytes)
     };
     let entry = decoded
         .filter(|img| img.width() > 0 && img.height() > 0)

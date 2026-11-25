@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 
 use egui::{CornerRadius, Stroke, StrokeKind, Ui};
 use serde::{Deserialize, Serialize};
+use tg_storage::StorageEncryptionKey;
+use tg_storage::cache::media_cache::{
+    lookup_cache_key_for_path, read_encrypted_blob_bound, write_encrypted_blob_bound,
+};
 use tg_theme::Palette as TgPalette;
 use tg_ui::fonts::font_id_from_style;
 use tg_ui::tg_style::st;
@@ -31,6 +35,121 @@ pub const MAX_DOWNLOADS_BOTS: usize = 4096;
 pub const MAX_DOWNLOADS_PER_BOT: usize = 16_384;
 
 pub use tg_app_core::core_types::misc::account_bot_storage_dir;
+
+/// MAC context of an encrypted per-bot storage file; the bot id is appended, so one bot's file
+/// is not accepted as another bot's.
+const BOT_STORAGE_CONTEXT: &[u8] = b"rustgram.bot_storage.v1\0";
+
+/// MAC context of the marker written once the plaintext files of older builds are migrated.
+const BOT_STORAGE_MIGRATED_CONTEXT: &[u8] = b"rustgram.bot_storage.migrated.v1\0";
+
+/// Marker file name inside the account's bot storage directory.
+const BOT_STORAGE_MIGRATED_MARKER: &str = "plaintext_migrated.tdef";
+
+fn bot_storage_context(bot_id: u64) -> Vec<u8> {
+    let mut context = BOT_STORAGE_CONTEXT.to_vec();
+    context.extend_from_slice(&bot_id.to_le_bytes());
+    context
+}
+
+/// Path of `bot_id`'s encrypted storage file (`<dir>/bot_storage_<bot_id>.tdef`).
+#[must_use]
+pub fn bot_storage_file_path(dir: &Path, bot_id: u64) -> PathBuf {
+    dir.join(format!("bot_storage_{bot_id}.tdef"))
+}
+
+/// Path of the plaintext JSON file older builds wrote for `bot_id`.
+fn legacy_plaintext_path(dir: &Path, bot_id: u64) -> PathBuf {
+    dir.join(format!("bot_storage_{bot_id}.json"))
+}
+
+/// The account storage key registered for `dir` (the account's bot storage directory, see
+/// `LiveMediaCache::register_account_dir`). `None` when no account key is known: nothing is then
+/// written to or read from disk.
+fn bot_storage_key(dir: &Path) -> Option<StorageEncryptionKey> {
+    lookup_cache_key_for_path(dir)
+}
+
+/// Bot id of a legacy plaintext file name (`bot_storage_<bot_id>.json`).
+fn legacy_plaintext_bot_id(file_name: &str) -> Option<u64> {
+    file_name
+        .strip_prefix("bot_storage_")?
+        .strip_suffix(".json")?
+        .parse()
+        .ok()
+}
+
+fn write_encrypted_bot_file(
+    dir: &Path,
+    bot_id: u64,
+    key: &StorageEncryptionKey,
+    data: &[u8],
+) -> Result<PathBuf, String> {
+    let path = bot_storage_file_path(dir, bot_id);
+    let tmp = dir.join(format!("bot_storage_{bot_id}.tdef.tmp"));
+    write_encrypted_blob_bound(&tmp, key, &bot_storage_context(bot_id), data).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("failed to write {}: {e}", tmp.display())
+    })?;
+    if let Err(rename_err) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("failed to finalize {} ({rename_err}): {e}", path.display())
+        })?;
+    }
+    Ok(path)
+}
+
+/// Encrypts the plaintext `bot_storage_<bot_id>.json` files older builds left in `dir`, deletes
+/// the plaintext, and writes a marker authenticated with `key`. Once the marker is present,
+/// plaintext files are only deleted, never read: a `.json` planted later cannot feed values to a
+/// Mini App. A bot that already has an encrypted file keeps it.
+fn migrate_legacy_plaintext(dir: &Path, key: &StorageEncryptionKey) {
+    let marker = dir.join(BOT_STORAGE_MIGRATED_MARKER);
+    let already_migrated =
+        read_encrypted_blob_bound(&marker, key, BOT_STORAGE_MIGRATED_CONTEXT).is_ok();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut all_removed = true;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let path = entry.path();
+        if name.starts_with("bot_storage_") && name.ends_with(".json.tmp") {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Some(bot_id) = legacy_plaintext_bot_id(name) else {
+            continue;
+        };
+        if !already_migrated
+            && !bot_storage_file_path(dir, bot_id).exists()
+            && let Ok(bytes) = std::fs::read(&path)
+        {
+            let mut parsed = BotLocalStorage::new();
+            if parsed.deserialize_bot(bot_id, &bytes).is_ok()
+                && !parsed.keys(bot_id).is_empty()
+                && let Ok(data) = parsed.serialize_bot(bot_id)
+                && let Err(err) = write_encrypted_bot_file(dir, bot_id, key, &data)
+            {
+                // Keep the plaintext for the next attempt rather than lose the data.
+                tracing::warn!(bot_id, %err, "Failed to migrate plaintext BotLocalStorage");
+                all_removed = false;
+                continue;
+            }
+        }
+        if std::fs::remove_file(&path).is_err() && path.exists() {
+            all_removed = false;
+        }
+    }
+    if !already_migrated && all_removed {
+        let _ = write_encrypted_blob_bound(&marker, key, BOT_STORAGE_MIGRATED_CONTEXT, b"1");
+    }
+}
 
 /// Per-bot key-value storage enforcing tdesktop's 5 MiB quota (`InlineBots::Storage`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -143,53 +262,73 @@ impl BotLocalStorage {
         Ok(())
     }
 
-    /// Persists `bot_id`'s storage under `<dir>/bot_storage_<bot_id>.json` (or removes the file
-    /// when `bot_id` has no stored keys).
+    /// Persists `bot_id`'s storage under `<dir>/bot_storage_<bot_id>.tdef` (or removes the file
+    /// when `bot_id` has no stored keys), encrypted and authenticated with the account storage
+    /// key registered for `dir`, like tdesktop's `Storage::Account::writeBotStorage`
+    /// (`inline_bots/inline_bot_storage.cpp:117-124`). Mini Apps keep login and session tokens
+    /// here, so nothing is written when no account key is known: the call fails and the values
+    /// stay in memory only.
     pub fn save_bot_to_dir(&self, bot_id: u64, dir: &Path) -> Result<PathBuf, String> {
-        let path = dir.join(format!("bot_storage_{bot_id}.json"));
+        let path = bot_storage_file_path(dir, bot_id);
         let is_empty = self.bots.get(&bot_id).is_none_or(BTreeMap::is_empty);
         if is_empty {
+            Self::delete_bot_from_dir(bot_id, dir)?;
+            return Ok(path);
+        }
+        let key = bot_storage_key(dir).ok_or_else(|| {
+            format!(
+                "no account storage key for {}: bot storage is kept in memory only",
+                dir.display()
+            )
+        })?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+        let data = self.serialize_bot(bot_id)?;
+        let path = write_encrypted_bot_file(dir, bot_id, &key, &data)?;
+        let _ = std::fs::remove_file(legacy_plaintext_path(dir, bot_id));
+        Ok(path)
+    }
+
+    /// Removes `bot_id`'s persisted storage file from `dir` if present (and the plaintext file
+    /// an older build may have left).
+    pub fn delete_bot_from_dir(bot_id: u64, dir: &Path) -> Result<(), String> {
+        for path in [
+            bot_storage_file_path(dir, bot_id),
+            legacy_plaintext_path(dir, bot_id),
+        ] {
             if path.exists() {
                 std::fs::remove_file(&path)
                     .map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
             }
-            return Ok(path);
-        }
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
-        let data = self.serialize_bot(bot_id)?;
-        let tmp = dir.join(format!("bot_storage_{bot_id}.json.tmp"));
-        std::fs::write(&tmp, data)
-            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
-        if let Err(rename_err) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&path);
-            std::fs::rename(&tmp, &path).map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                format!("failed to finalize {} ({rename_err}): {e}", path.display())
-            })?;
-        }
-        Ok(path)
-    }
-
-    /// Removes `bot_id`'s persisted storage file from `dir` if present.
-    pub fn delete_bot_from_dir(bot_id: u64, dir: &Path) -> Result<(), String> {
-        let path = dir.join(format!("bot_storage_{bot_id}.json"));
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
         }
         Ok(())
     }
 
-    /// Loads `bot_id`'s storage from `<dir>/bot_storage_<bot_id>.json` if it exists.
+    /// Loads `bot_id`'s storage from `<dir>/bot_storage_<bot_id>.tdef` if it exists.
+    ///
+    /// The first load with an account key migrates the plaintext files of older builds in `dir`
+    /// (all bots) to encrypted files and deletes the plaintext. A file that fails authentication
+    /// (altered, another bot's, another account's key) is deleted, not trusted. Without an
+    /// account key nothing is read.
     pub fn load_bot_from_dir(&mut self, bot_id: u64, dir: &Path) -> Result<(), String> {
-        let path = dir.join(format!("bot_storage_{bot_id}.json"));
+        let Some(key) = bot_storage_key(dir) else {
+            return Ok(());
+        };
+        migrate_legacy_plaintext(dir, &key);
+        let path = bot_storage_file_path(dir, bot_id);
         if !path.exists() {
             return Ok(());
         }
-        let bytes =
-            std::fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        self.deserialize_bot(bot_id, &bytes)
+        match read_encrypted_blob_bound(&path, &key, &bot_storage_context(bot_id)) {
+            Ok(bytes) => self.deserialize_bot(bot_id, &bytes),
+            Err(err) => {
+                let _ = std::fs::remove_file(&path);
+                Err(format!(
+                    "dropped {}: it failed authentication ({err})",
+                    path.display()
+                ))
+            }
+        }
     }
 }
 
@@ -594,9 +733,178 @@ fn render_prepared_recipient_list(
 mod tests {
     use super::*;
 
+    fn test_key(seed: u8) -> StorageEncryptionKey {
+        tg_storage::cache::media_cache::derive_media_cache_key(
+            &tg_storage::AuthKey::new([seed; 256]),
+            "data",
+        )
+    }
+
+    fn dir_contains(dir: &Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .any(|e| {
+                std::fs::read(e.path())
+                    .expect("read file")
+                    .windows(needle.len())
+                    .any(|w| w == needle)
+            })
+    }
+
+    #[test]
+    fn sec3_b2_bot_storage_is_encrypted_with_the_account_key() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("bot_storage").join("user_1");
+        let key = test_key(0x21);
+        tg_storage::cache::media_cache::register_cache_key(&dir, key.clone());
+
+        let mut storage = BotLocalStorage::new();
+        assert!(storage.write(
+            1001,
+            "session_token",
+            Some("SECRET_TOKEN_abc123".to_owned())
+        ));
+        let path = storage.save_bot_to_dir(1001, &dir).expect("save");
+        assert_eq!(path, bot_storage_file_path(&dir, 1001));
+        assert!(path.is_file());
+        assert!(
+            !legacy_plaintext_path(&dir, 1001).exists(),
+            "no plaintext JSON file may be written"
+        );
+        let raw = std::fs::read(&path).expect("read raw");
+        assert!(raw.starts_with(b"TDEF"));
+        assert!(!dir_contains(&dir, b"SECRET_TOKEN"));
+        assert!(!dir_contains(&dir, b"session_token"));
+
+        let mut loaded = BotLocalStorage::new();
+        loaded.load_bot_from_dir(1001, &dir).expect("load");
+        assert_eq!(
+            loaded.read(1001, "session_token"),
+            Some("SECRET_TOKEN_abc123")
+        );
+
+        // One bot's file is not accepted as another bot's.
+        std::fs::copy(&path, bot_storage_file_path(&dir, 2002)).expect("copy to other bot");
+        let mut other = BotLocalStorage::new();
+        assert!(other.load_bot_from_dir(2002, &dir).is_err());
+        assert_eq!(other.read(2002, "session_token"), None);
+        assert!(
+            !bot_storage_file_path(&dir, 2002).exists(),
+            "a file that fails authentication is deleted"
+        );
+
+        // An altered file is dropped, not trusted.
+        let mut altered = raw.clone();
+        let last = altered.len() - 20;
+        altered[last] ^= 0x01;
+        std::fs::write(&path, &altered).expect("write altered");
+        let mut reloaded = BotLocalStorage::new();
+        assert!(reloaded.load_bot_from_dir(1001, &dir).is_err());
+        assert_eq!(reloaded.read(1001, "session_token"), None);
+        assert!(!path.exists());
+
+        // Another account's key cannot read the file either.
+        std::fs::write(&path, &raw).expect("restore");
+        tg_storage::cache::media_cache::register_cache_key(&dir, test_key(0x22));
+        let mut wrong_key = BotLocalStorage::new();
+        assert!(wrong_key.load_bot_from_dir(1001, &dir).is_err());
+        assert_eq!(wrong_key.read(1001, "session_token"), None);
+        tg_storage::cache::media_cache::unregister_cache_key(&dir);
+    }
+
+    #[test]
+    fn sec3_b2_plaintext_bot_storage_is_migrated_and_deleted() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("bot_storage").join("user_2");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Files written by an older build: two bots, plus a stale temp file.
+        std::fs::write(
+            legacy_plaintext_path(&dir, 1001),
+            br#"{"session_token":"LEGACY_TOKEN_1001","theme":"dark"}"#,
+        )
+        .expect("write legacy 1001");
+        std::fs::write(
+            legacy_plaintext_path(&dir, 3003),
+            br#"{"auth":"LEGACY_TOKEN_3003"}"#,
+        )
+        .expect("write legacy 3003");
+        std::fs::write(
+            dir.join("bot_storage_1001.json.tmp"),
+            br#"{"session_token":"LEGACY_TOKEN_TMP"}"#,
+        )
+        .expect("write legacy tmp");
+        tg_storage::cache::media_cache::register_cache_key(&dir, test_key(0x23));
+
+        // Opening bot 1001 migrates every bot's plaintext file, not only its own.
+        let mut storage = BotLocalStorage::new();
+        storage
+            .load_bot_from_dir(1001, &dir)
+            .expect("load migrates");
+        assert_eq!(
+            storage.read(1001, "session_token"),
+            Some("LEGACY_TOKEN_1001")
+        );
+        assert_eq!(storage.read(1001, "theme"), Some("dark"));
+        assert!(!legacy_plaintext_path(&dir, 1001).exists());
+        assert!(!legacy_plaintext_path(&dir, 3003).exists());
+        assert!(!dir.join("bot_storage_1001.json.tmp").exists());
+        assert!(bot_storage_file_path(&dir, 1001).is_file());
+        assert!(bot_storage_file_path(&dir, 3003).is_file());
+        assert!(
+            !dir_contains(&dir, b"LEGACY_TOKEN"),
+            "no plaintext token may remain on disk"
+        );
+        let mut other = BotLocalStorage::new();
+        other
+            .load_bot_from_dir(3003, &dir)
+            .expect("load migrated 3003");
+        assert_eq!(other.read(3003, "auth"), Some("LEGACY_TOKEN_3003"));
+
+        // After the migration a planted plaintext file is deleted, never read.
+        std::fs::write(
+            legacy_plaintext_path(&dir, 4004),
+            br#"{"auth":"PLANTED_BY_ATTACKER"}"#,
+        )
+        .expect("plant");
+        let mut planted = BotLocalStorage::new();
+        planted.load_bot_from_dir(4004, &dir).expect("load planted");
+        assert_eq!(planted.read(4004, "auth"), None);
+        assert!(!legacy_plaintext_path(&dir, 4004).exists());
+        assert!(!bot_storage_file_path(&dir, 4004).exists());
+        tg_storage::cache::media_cache::unregister_cache_key(&dir);
+    }
+
+    #[test]
+    fn sec3_b2_bot_storage_without_account_key_stays_in_memory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("bot_storage").join("user_3");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut storage = BotLocalStorage::new();
+        assert!(storage.write(1001, "token", Some("MEMORY_ONLY_TOKEN".to_owned())));
+        assert!(
+            storage.save_bot_to_dir(1001, &dir).is_err(),
+            "without an account key nothing may be written"
+        );
+        assert_eq!(std::fs::read_dir(&dir).expect("read dir").count(), 0);
+        assert_eq!(storage.read(1001, "token"), Some("MEMORY_ONLY_TOKEN"));
+
+        // A plaintext file is neither read nor migrated without a key.
+        std::fs::write(legacy_plaintext_path(&dir, 1001), br#"{"token":"OLD"}"#).expect("write");
+        let mut loaded = BotLocalStorage::new();
+        loaded
+            .load_bot_from_dir(1001, &dir)
+            .expect("load without key");
+        assert_eq!(loaded.read(1001, "token"), None);
+    }
+
     #[test]
     fn bot_local_storage_quota_and_persistence() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("bot_storage").join("user_4");
+        tg_storage::cache::media_cache::register_cache_key(&dir, test_key(0x24));
+        let dir = dir.as_path();
         let mut storage = BotLocalStorage::new();
 
         assert!(storage.write(1001, "theme", Some("dark".to_owned())));
@@ -611,11 +919,11 @@ mod tests {
 
         // Save and reload from disk.
         storage
-            .save_bot_to_dir(1001, dir.path())
+            .save_bot_to_dir(1001, dir)
             .expect("save bot storage");
         let mut loaded = BotLocalStorage::new();
         loaded
-            .load_bot_from_dir(1001, dir.path())
+            .load_bot_from_dir(1001, dir)
             .expect("load bot storage");
         assert_eq!(loaded.read(1001, "theme"), Some("dark"));
         assert_eq!(loaded.read(1001, "token"), Some("abc123"));
@@ -625,6 +933,10 @@ mod tests {
         assert_eq!(loaded.read(1001, "token"), None);
         loaded.clear(1001);
         assert_eq!(loaded.total_bytes(1001), 0);
+        // Saving an empty table removes the file.
+        loaded.save_bot_to_dir(1001, dir).expect("save empty");
+        assert!(!bot_storage_file_path(dir, 1001).exists());
+        tg_storage::cache::media_cache::unregister_cache_key(dir);
     }
 
     #[test]

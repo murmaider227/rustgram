@@ -986,8 +986,8 @@ impl FramelessTitleBarState {
     /// double-click maximize, resize edge triggers (`ViewportCommand::BeginResize`) and the
     /// 36 px Minimize / Maximize / Close buttons.
     ///
-    /// The strip is painted on its own `Order::Middle` layer so the host panel's separator
-    /// line never shows (tdesktop's `titleShadow` is a near-transparent `#00000003`).
+    /// The strip is painted on its own `Order::Middle` layer; its last pixel row is the
+    /// near-transparent `titleShadow` (`#00000003`) line, as `Ui::Platform::TitleWidget` paints it.
     pub fn show_title_bar(&mut self, ui: &mut Ui, title: &str, palette: &Palette) {
         let ctx = ui.ctx().clone();
         let viewport_rect = ctx.viewport_rect();
@@ -1028,6 +1028,14 @@ impl FramelessTitleBarState {
             .with_clip_rect(bar_rect);
         let colors = TitleColors::from_palette(palette);
         painter.rect_filled(bar_rect, CornerRadius::ZERO, colors.bg);
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(bar_rect.left(), bar_rect.bottom() - 1.0),
+                bar_rect.max,
+            ),
+            CornerRadius::ZERO,
+            TITLE_SHADOW,
+        );
 
         let drag_rect = Rect::from_min_max(
             bar_rect.min,
@@ -1096,6 +1104,8 @@ impl FramelessTitleBarState {
 
 /// Window title bar height (`st::windowTitleHeight`).
 pub const WINDOW_TITLE_HEIGHT: f32 = 24.0;
+/// `titleShadow`: the one pixel line at the bottom of the custom window title (`#00000003`).
+pub const TITLE_SHADOW: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 3);
 /// Window title control button width (`st::windowTitleButtonWidth`).
 pub const WINDOW_TITLE_BUTTON_WIDTH: f32 = 36.0;
 

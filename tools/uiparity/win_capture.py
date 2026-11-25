@@ -56,6 +56,8 @@ user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.ShowWindow.restype = wintypes.BOOL
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = wintypes.HWND
 user32.BringWindowToTop.argtypes = [wintypes.HWND]
 user32.BringWindowToTop.restype = wintypes.BOOL
 user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
@@ -332,11 +334,22 @@ def launch_on_desktop(
 
 
 def kill_pid(pid: int) -> None:
-    """Terminate a process strictly by PID."""
+    """Terminate a process and its entire descendant tree strictly by PID."""
     import subprocess
 
+    bench_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bench"))
+    if bench_dir not in sys.path:
+        sys.path.insert(0, bench_dir)
+    try:
+        import workdir_safety as ws
+
+        ws.stop_process_by_pid(pid, graceful_timeout_s=2.0)
+        return
+    except Exception:
+        pass
+
     subprocess.run(
-        ["taskkill", "/PID", str(pid), "/F"],
+        ["taskkill", "/PID", str(pid), "/T", "/F"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -521,7 +534,32 @@ def _screen_to_abs(sx: int, sy: int) -> tuple[int, int]:
     return ax, ay
 
 
+class ForegroundWindowError(RuntimeError):
+    """Raised when GetForegroundWindow() does not match the expected target HWND before SendInput."""
+
+
+def require_test_account_confirmation(confirmed: bool, context: str = "UI automation") -> None:
+    """Refuse to drive a window unless --test-account explicitly confirms a disposable test account."""
+    if not confirmed:
+        raise PermissionError(
+            f"Refusing to run {context}: pass --test-account to confirm the target window belongs "
+            f"to a disposable test account (not a personal Telegram session)."
+        )
+
+
+def assert_foreground_window(expected_hwnd: int) -> None:
+    """Verify GetForegroundWindow() is `expected_hwnd` before emitting any global SendInput."""
+    if not expected_hwnd:
+        raise ForegroundWindowError("Aborting SendInput: expected target HWND is empty/zero.")
+    actual_hwnd = int(user32.GetForegroundWindow() or 0)
+    if actual_hwnd != int(expected_hwnd):
+        raise ForegroundWindowError(
+            f"Aborting SendInput: foreground window changed (got hwnd={actual_hwnd}, expected hwnd={expected_hwnd})."
+        )
+
+
 def move_client(hwnd: int, rel_x: int, rel_y: int) -> None:
+    assert_foreground_window(hwnd)
     cx, cy, _, _ = get_client_origin_and_size(hwnd)
     sx, sy = cx + rel_x, cy + rel_y
     ax, ay = _screen_to_abs(sx, sy)
@@ -542,6 +580,7 @@ def click_client(hwnd: int, rel_x: int, rel_y: int, button: str = "left", double
     up_flag = MOUSEEVENTF_LEFTUP if button == "left" else MOUSEEVENTF_RIGHTUP
     clicks = 2 if double else 1
     for _ in range(clicks):
+        assert_foreground_window(hwnd)
         inps = (INPUT * 2)()
         inps[0].type = INPUT_MOUSE
         inps[0].mi = MOUSEINPUT(0, 0, 0, down_flag, 0, 0)
@@ -554,6 +593,7 @@ def click_client(hwnd: int, rel_x: int, rel_y: int, button: str = "left", double
 def scroll_client(hwnd: int, rel_x: int, rel_y: int, delta: int) -> None:
     move_client(hwnd, rel_x, rel_y)
     time.sleep(0.04)
+    assert_foreground_window(hwnd)
     inp = INPUT(type=INPUT_MOUSE)
     inp.mi = MOUSEINPUT(0, 0, ctypes.c_uint32(delta).value, MOUSEEVENTF_WHEEL, 0, 0)
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
@@ -571,8 +611,11 @@ def _vk_from_name(name: str) -> int:
     raise ValueError(f"Unknown key name: {name}")
 
 
-def send_hotkey(*keys: str) -> None:
-    """Press and release a chord like ('CTRL', 'F') or ('ESC',)."""
+def send_hotkey(expected_hwnd: int, *keys: str) -> None:
+    """Press and release a chord like ('CTRL', 'F') or ('ESC',) after checking foreground HWND."""
+    if not keys:
+        return
+    assert_foreground_window(expected_hwnd)
     vks = [_vk_from_name(k) for k in keys]
     inps = (INPUT * (len(vks) * 2))()
     idx = 0
@@ -584,25 +627,30 @@ def send_hotkey(*keys: str) -> None:
         inps[idx].type = INPUT_KEYBOARD
         inps[idx].ki = KEYBDINPUT(vk, user32.MapVirtualKeyW(vk, 0), KEYEVENTF_KEYUP, 0, 0)
         idx += 1
+    assert_foreground_window(expected_hwnd)
     user32.SendInput(len(inps), inps, ctypes.sizeof(INPUT))
     time.sleep(0.08)
 
 
-def send_text(text: str) -> None:
-    """Type unicode text via SendInput KEYEVENTF_UNICODE."""
+def send_text(expected_hwnd: int, text: str, batch_size: int = 16) -> None:
+    """Type unicode text via SendInput KEYEVENTF_UNICODE, checking foreground HWND before each key batch."""
     if not text:
         return
-    inps = (INPUT * (len(text) * 2))()
-    idx = 0
-    for ch in text:
-        code = ord(ch)
-        inps[idx].type = INPUT_KEYBOARD
-        inps[idx].ki = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
-        idx += 1
-        inps[idx].type = INPUT_KEYBOARD
-        inps[idx].ki = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
-        idx += 1
-    user32.SendInput(len(inps), inps, ctypes.sizeof(INPUT))
+    step = max(1, int(batch_size))
+    for start in range(0, len(text), step):
+        chunk = text[start : start + step]
+        assert_foreground_window(expected_hwnd)
+        inps = (INPUT * (len(chunk) * 2))()
+        idx = 0
+        for ch in chunk:
+            code = ord(ch)
+            inps[idx].type = INPUT_KEYBOARD
+            inps[idx].ki = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
+            idx += 1
+            inps[idx].type = INPUT_KEYBOARD
+            inps[idx].ki = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+            idx += 1
+        user32.SendInput(len(inps), inps, ctypes.sizeof(INPUT))
     time.sleep(0.08)
 
 
@@ -616,7 +664,16 @@ def main() -> int:
     ap.add_argument("--capture", default="", help="Output PNG path")
     ap.add_argument("--method", choices=["printwindow", "screen"], default="printwindow")
     ap.add_argument("--list", action="store_true", help="List visible windows")
+    ap.add_argument("--test-account", action="store_true",
+                    help="Confirm the target window belongs to a test account (required for --resize)")
     args = ap.parse_args()
+
+    if args.resize:
+        try:
+            require_test_account_confirmation(args.test_account, "win_capture.py --resize")
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     hdesk = None
     if args.desktop and args.desktop.lower() != "current":

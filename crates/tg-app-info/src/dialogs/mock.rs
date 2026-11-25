@@ -1185,6 +1185,7 @@ fn build_message_corpus(dialogs: &[DialogItem]) -> Vec<MessageSearchResult> {
                 sender_name: d.last_sender.clone(),
                 text: d.last_message.clone(),
                 time: d.last_message_time,
+                send_state: d.send_state,
                 archived: d.archived,
             });
         }
@@ -1247,6 +1248,7 @@ fn build_message_corpus(dialogs: &[DialogItem]) -> Vec<MessageSearchResult> {
             sender_name: sender.map(str::to_owned),
             text: text.to_owned(),
             time,
+            send_state: DialogSendState::None,
             archived: false,
         });
     }

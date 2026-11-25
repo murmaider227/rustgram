@@ -1940,6 +1940,23 @@ impl WindowController {
                     }
                     let embedded = self.theme_manager.embedded_type();
                     let accent = self.theme_manager.accent();
+                    // SEC3-A A2: read receipts only while the user can see the chat.
+                    let chat_covered = !self.box_host.is_empty()
+                        || self.layer_stack.is_layer_shown()
+                        || self.media_overlay.is_open()
+                        || matches!(
+                            session.main_section(),
+                            Some(crate::window::section::SectionMemento::Settings { .. })
+                        );
+                    self.main_widget
+                        .history_mut()
+                        .inner_mut()
+                        .set_marking_as_read(
+                            tg_app_history::history::marking_read::window_marking_as_read(
+                                &ctx,
+                                chat_covered,
+                            ),
+                        );
                     let emitted = self.main_widget.show_with_stories(
                         ui,
                         session,
@@ -2799,10 +2816,34 @@ impl WindowController {
                             None
                         };
                         DeleteMessagesBoxState::for_delete_or_leave(&peer, false)
+                            .with_revoke_full_history(
+                                tg_app_core::dialogs::backend::DialogsBackend::can_revoke_full_history(
+                                    &*self.session_backend,
+                                    peer_id,
+                                ),
+                                tg_app_core::dialogs::backend::DialogsBackend::peer_first_name(&*self.session_backend, peer_id),
+                            )
                             .with_future_creator(future_creator)
                     } else {
                         DeleteMessagesBoxState::for_messages(&peer, message_ids)
                     };
+                    self.box_host
+                        .push(ctx, BoxKind::DeleteMessages(state), &self.theme_manager);
+                }
+            }
+            InfoWrapEvent::OpenClearHistory(peer_id) => {
+                if let Some(peer) = InfoBackend::peer_profile(&*self.session_backend, peer_id) {
+                    let state = DeleteMessagesBoxState::for_delete_or_leave(&peer, true)
+                        .with_revoke_full_history(
+                            tg_app_core::dialogs::backend::DialogsBackend::can_revoke_full_history(
+                                &*self.session_backend,
+                                peer_id,
+                            ),
+                            tg_app_core::dialogs::backend::DialogsBackend::peer_first_name(
+                                &*self.session_backend,
+                                peer_id,
+                            ),
+                        );
                     self.box_host
                         .push(ctx, BoxKind::DeleteMessages(state), &self.theme_manager);
                 }
@@ -3144,6 +3185,30 @@ impl WindowController {
                     && let Some(session) = self.session.as_mut()
                     && session.active_peer() == peer_id
                 {
+                    session.clear_section_stack(SectionShow::clear_stack());
+                } else {
+                    self.main_widget
+                        .notify_external_message(peer_id, &*self.session_backend);
+                }
+            }
+            BoxEvent::ConversationDeleteConfirmed {
+                peer_id,
+                just_clear,
+                revoke,
+            } => {
+                let backend = &mut *self.session_backend;
+                let result = if just_clear {
+                    tg_app_core::dialogs::backend::DialogsBackend::clear_history_for(backend, peer_id, revoke)
+                } else {
+                    tg_app_core::dialogs::backend::DialogsBackend::delete_chat(backend, peer_id, revoke)
+                };
+                if let Err(err) = result {
+                    self.layer_stack.show_toast(err);
+                } else if !just_clear
+                    && let Some(session) = self.session.as_mut()
+                    && session.active_peer() == peer_id
+                {
+                    // `Core::App().closeChatFromWindows(peer)`.
                     session.clear_section_stack(SectionShow::clear_stack());
                 } else {
                     self.main_widget
@@ -3912,6 +3977,9 @@ impl WindowController {
             MainMenuAction::OpenMenuBot(bot_id) => {
                 self.layer_stack.close_main_menu();
                 self.open_mini_app_from_chat(bot_id, None, None, false);
+            }
+            MainMenuAction::RemoveMenuBot(bot_id) => {
+                crate::window::main_menu::remove_menu_bot(self, bot_id);
             }
             MainMenuAction::Logout => {
                 self.layer_stack.show_box(ModalBox::ConfirmLogout);

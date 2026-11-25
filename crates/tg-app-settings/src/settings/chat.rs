@@ -9,7 +9,8 @@ use tg_core::settings::{DoubleClickQuickAction, InputSubmitSettings, QuickDialog
 use tg_core::{CoreSettings, GlobalConfig};
 use tg_lang::tr;
 use tg_theme::{
-    Color, EmbeddedType, colorize_scheme, colorizer_from, default_accent_colors, embedded_themes,
+    Color, EmbeddedType, colorize_scheme, colorizer_from, default_accent_colors, embedded_scheme,
+    embedded_themes, ensure_contrast,
 };
 use tg_ui::fonts::font_id_from_style;
 use tg_ui::stand_in::{Colors, InputFieldStyle, RoundButtonStyle};
@@ -24,8 +25,9 @@ use super::theme_bridge::{
     theme_to_core_embedded,
 };
 use super::widgets::{
-    SettingsIconKind, settings_card, settings_checkbox_row, settings_divider, settings_radio_row,
-    settings_row, settings_row_pad_x, settings_toggle_row, subsection_title,
+    SETTINGS_LIST_SKIP, SettingsIconKind, settings_card, settings_checkbox_row, settings_divider,
+    settings_divider_text, settings_radio_row, settings_row, settings_row_pad_x,
+    settings_section_divider, settings_toggle_row, subsection_title,
 };
 
 /// Persistent UI state for Chat Settings.
@@ -89,9 +91,6 @@ pub struct ChatSettingsOutput {
     pub toast: Option<String>,
 }
 
-/// Vertical skip around dividers and titles (`Builder::addSkip`).
-const SECTION_SKIP: f32 = 8.0;
-
 /// Renders the Chat Settings (`settings_chat.cpp`) section.
 #[allow(clippy::too_many_arguments)]
 pub fn render_chat_settings_section(
@@ -108,18 +107,16 @@ pub fn render_chat_settings_section(
     ui.spacing_mut().item_spacing.y = 0.0;
 
     // 1. Themes (`SetupThemeOptions` / `SetupDefaultThemes` in `settings_chat.cpp`).
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(st::settings_privacy_skip.scaled() as f32);
     subsection_title(ui, &tr::lng_settings_themes(), colors);
-    ui.add_space(st::settings_themes_top_skip.scaled().clamp(4, 10) as f32 - 4.0);
+    ui.add_space(st::settings_themes_top_skip.scaled() as f32);
     render_embedded_theme_cards(ui, core, live_theme, colors, &mut out);
-    ui.add_space(st::settings_themes_bottom_skip.scaled().max(8) as f32);
 
     // 2. Accent colors (`Window::Theme::DefaultAccentColors`) + "System accent color".
     render_accent_palette(ui, state, core, live_theme, colors, &mut out);
     if live_theme.is_dark() != was_dark {
         out.toggled_dark_mode = Some(live_theme.is_dark());
     }
-    ui.add_space(6.0);
     settings_checkbox_row(
         ui,
         &mut core.system_accent_color_enabled,
@@ -127,9 +124,11 @@ pub fn render_chat_settings_section(
         true,
         colors,
     );
-    ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
-    ui.add_space(SECTION_SKIP);
+    // `AddSkip` closing `SetupDefaultThemes`, another closing `SetupThemeOptions`, then
+    // `SetupThemeSettings`: divider and `settingsPrivacySkip`.
+    ui.add_space(SETTINGS_LIST_SKIP * 2.0);
+    settings_section_divider(ui, colors);
+    ui.add_space(st::settings_privacy_skip.scaled() as f32);
 
     // 3. Theme settings (`SetupThemeSettings`): name color, auto-night mode, font family.
     subsection_title(ui, &tr::lng_settings_theme_settings(), colors);
@@ -225,17 +224,17 @@ pub fn render_chat_settings_section(
             .show(ui);
         });
     }
-    ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(st::settings_checkboxes_skip.scaled() as f32);
+    settings_section_divider(ui, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     // 4. Chat wallpaper (`SetupChatBackground` / `BackgroundRow`): current wallpaper thumbnail
     // with "Choose from gallery" / "Choose from file" links.
     subsection_title(ui, &tr::lng_settings_section_background(), colors);
     render_background_row(ui, state, colors, &mut out);
-    ui.add_space(SECTION_SKIP);
-    settings_divider(ui, None, colors);
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(st::settings_tile_skip.scaled() as f32);
+    settings_section_divider(ui, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     // 5. Chat list quick action (`SetupChatListQuickAction`).
     let dialog_quick_title = tr::lng_settings_quick_dialog_action_title();
@@ -270,9 +269,9 @@ pub fn render_chat_settings_section(
             QuickDialogAction::Delete => QuickDialogAction::Disabled,
         };
     }
-    ui.add_space(SECTION_SKIP);
-    settings_divider(ui, Some(&dialog_quick_about), colors);
-    ui.add_space(SECTION_SKIP);
+    ui.add_space(SETTINGS_LIST_SKIP);
+    settings_divider_text(ui, &dialog_quick_about, colors);
+    ui.add_space(SETTINGS_LIST_SKIP);
 
     // 5. Messages & Layout options.
     subsection_title(ui, strings::MESSAGES_SECTION, colors);
@@ -653,7 +652,9 @@ fn render_embedded_theme_cards(
     let full_w = ui.available_width();
     let avail = (full_w - pad_x * 2.0).max(card_w * count);
     let gap = ((avail - card_w * count) / (count - 1.0).max(1.0)).max(4.0);
-    let (row, _) = ui.allocate_exact_size(Vec2::new(full_w, preview_h + 26.0), Sense::hover());
+    let label_h = ui.fonts_mut(|f| f.row_height(&font_id_from_style(st::normal_font)));
+    let block_h = (st::settings_theme.text_position.y.scaled() as f32 + label_h).round();
+    let (row, _) = ui.allocate_exact_size(Vec2::new(full_w, block_h), Sense::hover());
 
     for (i, mut scheme) in themes.into_iter().enumerate() {
         let core_kind = theme_to_core_embedded(scheme.kind);
@@ -704,17 +705,32 @@ fn render_embedded_theme_cards(
             theme_color_to_egui(scheme.sent),
         );
 
-        // Radio (`st::default_radio`, 9 px) in the scheme's radio colors.
-        let radio_c = Pos2::new(preview.center().x, preview.bottom() - 12.0 - 9.0);
-        let (radio_fg, radio_w) = if selected {
-            (theme_color_to_egui(scheme.radiobutton_active), 2.0)
+        // `CloudListCheck`: a `st::default_radio` (22 px, 2 px ring inset by `outerSkip`, 10 px
+        // dot) `settingsThemeRadioBottom` above the bottom. `ensureContrast` gives both states
+        // the active color made readable over the background, the untoggled one at alpha 192.
+        let radio = &st::default_radio;
+        let diameter = radio.diameter.scaled() as f32;
+        let thickness = radio.thickness.scaled() as f32;
+        let radio_c = Pos2::new(
+            preview.center().x,
+            preview.bottom() - st::settings_theme_radio_bottom.scaled() as f32 - diameter * 0.5,
+        );
+        let contrast = ensure_contrast(scheme.radiobutton_active, scheme.background);
+        let radio_fg = if selected {
+            Color32::from_rgb(contrast.r, contrast.g, contrast.b)
         } else {
-            (theme_color_to_egui(scheme.radiobutton_inactive), 1.5)
+            Color32::from_rgba_unmultiplied(contrast.r, contrast.g, contrast.b, 192)
         };
-        ui.painter()
-            .circle_stroke(radio_c, 8.0, Stroke::new(radio_w, radio_fg));
+        let ring_skip = radio.outer_skip.scaled() as f32 / 10.0 + thickness * 0.5;
+        ui.painter().circle_stroke(
+            radio_c,
+            diameter * 0.5 - ring_skip,
+            Stroke::new(thickness, radio_fg),
+        );
         if selected {
-            ui.painter().circle_filled(radio_c, 4.5, radio_fg);
+            let dot_skip = radio.skip.scaled() as f32 / 10.0;
+            ui.painter()
+                .circle_filled(radio_c, diameter * 0.5 - dot_skip, radio_fg);
         }
 
         ui.painter().text(
@@ -777,12 +793,17 @@ fn render_background_row(
     colors: &dyn Colors,
     out: &mut ChatSettingsOutput,
 ) {
-    let pad_x = settings_row_pad_x();
-    let thumb = 76.0_f32;
+    // `BackgroundRow` (76 px thumb) inside `settingsBackgroundPadding` (22, 11, 10, 12).
+    let pad = st::settings_background_padding;
+    let thumb = st::settings_background_thumb.scaled() as f32;
     let full_w = ui.available_width();
-    let (row, _) = ui.allocate_exact_size(Vec2::new(full_w, thumb + 8.0), Sense::hover());
+    let row_h = pad.top.scaled() as f32 + thumb + pad.bottom.scaled() as f32;
+    let (row, _) = ui.allocate_exact_size(Vec2::new(full_w, row_h), Sense::hover());
     let thumb_rect = Rect::from_min_size(
-        Pos2::new(row.left() + pad_x, row.top() + 4.0),
+        Pos2::new(
+            row.left() + pad.left.scaled() as f32,
+            row.top() + pad.top.scaled() as f32,
+        ),
         Vec2::splat(thumb),
     );
     {
@@ -794,12 +815,19 @@ fn render_background_row(
         };
     }
 
-    let link_x = thumb_rect.right() + 16.0;
-    let link_font = font_id_from_style(st::normal_font);
+    // `BackgroundRow::resizeGetHeight`: `settingsLink` buttons at `settingsFromGalleryTop`,
+    // the second `settingsFromFileTop` below the first.
+    let link_x = thumb_rect.right() + st::settings_thumb_skip.scaled() as f32;
+    let link_font = font_id_from_style(st::settings_link.font);
     let link_fg = colors.color("windowActiveTextFg");
+    let link_h = ui.fonts_mut(|f| f.row_height(&link_font));
+    let gallery_top = thumb_rect.top() + st::settings_from_gallery_top.scaled() as f32;
     let links = [
-        (tr::lng_settings_bg_from_gallery(), thumb_rect.top() + 12.0),
-        (tr::lng_settings_bg_from_file(), thumb_rect.top() + 45.0),
+        (tr::lng_settings_bg_from_gallery(), gallery_top),
+        (
+            tr::lng_settings_bg_from_file(),
+            gallery_top + link_h + st::settings_from_file_top.scaled() as f32,
+        ),
     ];
     for (i, (label, y)) in links.iter().enumerate() {
         let r = ui.painter().text(
@@ -873,93 +901,114 @@ fn render_accent_palette(
     colors: &dyn Colors,
     out: &mut ChatSettingsOutput,
 ) {
-    let presets = default_accent_colors(live_theme.kind);
+    // `ColorsPalette::show`: the scheme's own accent first, then `DefaultAccentColors`; a
+    // current color missing from the list replaces its last entry.
+    let scheme_accent = embedded_scheme(live_theme.kind).accent_color;
+    let mut list = default_accent_colors(live_theme.kind);
+    list.insert(0, scheme_accent);
     let active_accent = live_theme.accent;
-    let core_kind = theme_to_core_embedded(live_theme.kind);
-    let pad_x = settings_row_pad_x();
-    let swatch_sz = (st::settings_accent_color_size.scaled() as f32).clamp(24.0, 32.0);
-    let swatch_r = swatch_sz * 0.5 - 1.0;
-    let swatch_line = (st::settings_accent_color_line.scaled() as f32).max(2.0);
-
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.add_space(pad_x);
-        let slots = presets.len() as f32 + 1.0;
-        let step = ((ui.available_width() - pad_x - swatch_sz) / (slots - 1.0).max(1.0))
-            .clamp(swatch_sz + 4.0, 44.0);
-        for (idx, preset) in presets.iter().copied().enumerate() {
-            let selected = match active_accent {
-                Some(a) => a == preset,
-                None => idx == 0,
-            };
-            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(swatch_sz), Sense::click());
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            }
-            if resp.clicked() {
-                if idx == 0 {
-                    core.themes_accent_colors.clear(core_kind);
-                    live_theme.update(live_theme.kind, None);
-                } else {
-                    core.themes_accent_colors
-                        .set(core_kind, theme_color_to_core(preset));
-                    live_theme.update(live_theme.kind, Some(preset));
-                }
-                out.toast = Some(format!(
-                    "{} ({})",
-                    tr::lng_settings_theme_accent_title(),
-                    preset.to_hex_string()
-                ));
-            }
-            ui.painter()
-                .circle_filled(rect.center(), swatch_r, theme_color_to_egui(preset));
-            if selected {
-                // Selected swatch: a ring with a window-colored gap (`settingsAccentColorLine`).
-                ui.painter().circle_filled(
-                    rect.center(),
-                    swatch_r + 3.0,
-                    theme_color_to_egui(preset),
-                );
-                ui.painter()
-                    .circle_filled(rect.center(), swatch_r + 0.5, colors.color("windowBg"));
-                ui.painter().circle_filled(
-                    rect.center(),
-                    swatch_r - swatch_line + 1.0,
-                    theme_color_to_egui(preset),
-                );
-            }
-            ui.add_space(step - swatch_sz);
+    let current = active_accent.unwrap_or(scheme_accent);
+    let selected_idx = match list.iter().position(|&c| c == current) {
+        Some(i) => i,
+        None => {
+            let last = list.len() - 1;
+            list[last] = current;
+            last
         }
+    };
+    let core_kind = theme_to_core_embedded(live_theme.kind);
 
-        // Custom color hex toggle button with real `st::menu_icon_add`.
-        let (cust_rect, cust_resp) = ui.allocate_exact_size(Vec2::splat(swatch_sz), Sense::click());
-        if cust_resp.hovered() {
+    // `ColorsPalette::updateInnerGeometry`: `settingsAccentColorSize` buttons spread across the
+    // `settingsButtonNoIcon` padding, `2 * defaultVerticalListSkip` above and one below.
+    let size = st::settings_accent_color_size.scaled() as f32;
+    let padding = st::settings_button_no_icon.padding;
+    let pad_left = padding.left.scaled() as f32;
+    let pad_right = padding.right.scaled() as f32;
+    let top = SETTINGS_LIST_SKIP * 2.0;
+    let full_w = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(
+        Vec2::new(full_w, top + size + SETTINGS_LIST_SKIP),
+        Sense::hover(),
+    );
+    let count = list.len() + 1;
+    let inner_w = full_w - pad_left - pad_right;
+    let skip = ((inner_w - size * count as f32) / (count - 1) as f32).max(0.0);
+    let button_rect = |index: usize| {
+        let x = (row.left() + pad_left + index as f32 * (size + skip)).round();
+        Rect::from_min_size(Pos2::new(x, row.top() + top), Vec2::splat(size))
+    };
+
+    for (idx, color) in list.iter().copied().enumerate() {
+        let rect = button_rect(idx);
+        let resp = ui.interact(rect, ui.scope_id().with(("accent", idx)), Sense::click());
+        if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        // "Custom color" swatch: a ring of colored dots (`settingsAccentColorCustom`).
-        let dot_colors = [
-            Color32::from_rgb(0xe8, 0x5c, 0x5c),
-            Color32::from_rgb(0xf3, 0xa5, 0x2e),
-            Color32::from_rgb(0x5c, 0xc0, 0x5c),
-            Color32::from_rgb(0x44, 0xa4, 0xe8),
-            Color32::from_rgb(0xa0, 0x6c, 0xe0),
-            Color32::from_rgb(0xe0, 0x6c, 0xb8),
-        ];
-        for (k, dot) in dot_colors.iter().enumerate() {
-            let angle = std::f32::consts::TAU * k as f32 / dot_colors.len() as f32;
-            let c = cust_rect.center() + Vec2::new(angle.cos(), angle.sin()) * (swatch_r * 0.55);
-            ui.painter().circle_filled(c, swatch_r * 0.24, *dot);
-        }
-        if cust_resp
-            .on_hover_text(strings::CUSTOM_ACCENT_TOOLTIP)
-            .clicked()
-        {
-            state.custom_accent_open = !state.custom_accent_open;
-            if let Some(cur) = active_accent {
-                state.custom_accent_hex = cur.to_hex_string();
+        if resp.clicked() {
+            if color == scheme_accent {
+                core.themes_accent_colors.clear(core_kind);
+                live_theme.update(live_theme.kind, None);
+            } else {
+                core.themes_accent_colors
+                    .set(core_kind, theme_color_to_core(color));
+                live_theme.update(live_theme.kind, Some(color));
             }
+            out.toast = Some(format!(
+                "{} ({})",
+                tr::lng_settings_theme_accent_title(),
+                color.to_hex_string()
+            ));
         }
-    });
+        // `PaintRoundColorButton`: the filled circle; the chosen one gets a `boxBg` ring of
+        // `settingsAccentColorLine` inset by `settingsAccentColorSkip`.
+        ui.painter()
+            .circle_filled(rect.center(), size * 0.5, theme_color_to_egui(color));
+        if idx == selected_idx {
+            let line = st::settings_accent_color_line.scaled() as f32;
+            let inset = st::settings_accent_color_skip.scaled() as f32;
+            ui.painter().circle_stroke(
+                rect.center(),
+                size * 0.5 - inset,
+                Stroke::new(line, colors.color("boxBg")),
+            );
+        }
+    }
+
+    // `PaintCustomButton`: the first seven colors as dots, one in the center and six around.
+    let cust_rect = button_rect(list.len());
+    let cust_resp = ui.interact(
+        cust_rect,
+        ui.scope_id().with("accent_custom"),
+        Sense::click(),
+    );
+    if cust_resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let small = size / 8.0;
+    let dot_at = |center: Vec2, color: Color| {
+        let at = cust_rect.min + (Vec2::splat(1.0) + center) * (size * 0.5);
+        ui.painter()
+            .circle_filled(at, small, theme_color_to_egui(color));
+    };
+    if let Some(&first) = list.first() {
+        dot_at(Vec2::ZERO, first);
+    }
+    for i in 0..6 {
+        let angle = i as f32 * std::f32::consts::PI / 3.0;
+        let point = Vec2::new(angle.cos(), angle.sin()) * (1.0 - 2.0 * small / size);
+        if let Some(&color) = list.get(i + 1) {
+            dot_at(point, color);
+        }
+    }
+    if cust_resp
+        .on_hover_text(strings::CUSTOM_ACCENT_TOOLTIP)
+        .clicked()
+    {
+        state.custom_accent_open = !state.custom_accent_open;
+        if let Some(cur) = active_accent {
+            state.custom_accent_hex = cur.to_hex_string();
+        }
+    }
 
     if state.custom_accent_open {
         ui.add_space(6.0);

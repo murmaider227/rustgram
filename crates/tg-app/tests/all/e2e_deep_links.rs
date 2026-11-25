@@ -30,7 +30,7 @@ use tg_app::stand_in::types::{MsgId, PeerId};
 use tg_app::startup::ipc::IncomingActivation;
 use tg_app::window::section::{SectionMemento, SettingsPage};
 
-use crate::common::{TEST_STEP_DT, apply_deterministic_style, click_at, init_headless_env};
+use crate::common::{TEST_STEP_DT, apply_deterministic_style, init_headless_env};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -760,9 +760,23 @@ fn e2e_deep_links_resolve_invite_preview_share_settings_and_instant_view() {
             .is_open(),
         "media overlay must open for live photo"
     );
-    // Click the Forward icon button in the media overlay bottom-right toolbar
-    // (`footer_h = 54`, `btn_sz = 38`, 3rd button from right in 1280x820 viewport).
-    click_at(&mut harness, egui::Pos2::new(1157.0, 793.0));
+    // Forward sits in the overlay's "More" menu, as in tdesktop
+    // (`OverlayWidget::fillContextMenuActions`); the bottom-right buttons are More, Rotate, Save.
+    let more = harness.get_by_label("More");
+    let more_center = more.rect().center();
+    more.click();
+    step_n(&mut harness, 2);
+    // The chat behind the overlay has its own "Forward"; take the menu entry next to "More".
+    let forward_label = tg_lang::tr::lng_mediaview_forward();
+    harness
+        .query_all_by_label(&forward_label)
+        .min_by(|a, b| {
+            let da = a.rect().center().distance(more_center);
+            let db = b.rect().center().distance(more_center);
+            da.total_cmp(&db)
+        })
+        .expect("Forward entry in the media overlay's More menu")
+        .click();
     step_n(&mut harness, 4);
     assert!(
         !harness

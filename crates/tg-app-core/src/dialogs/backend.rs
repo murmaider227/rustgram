@@ -651,6 +651,8 @@ pub struct MessageSearchResult {
     pub text: String,
     /// Message timestamp.
     pub time: LocalDateTime,
+    /// Delivery ticks drawn before the time for outgoing messages.
+    pub send_state: DialogSendState,
     /// Whether this result belongs to an archived chat.
     pub archived: bool,
 }
@@ -1044,6 +1046,26 @@ pub trait DialogsBackend: Send {
     /// (`ApiWrap::deleteConversation`, `window/window_peer_menu.cpp:2864`).
     fn delete_chat(&mut self, _peer_id: PeerId, _revoke: bool) -> Result<(), String> {
         Err("Deleting chat is not supported by this backend.".to_owned())
+    }
+
+    /// Clears the history with `peer_id` (`ApiWrap::clearHistory`), also for the other side or
+    /// for every member when `revoke`. The default ignores `revoke`.
+    fn clear_history_for(&mut self, peer_id: PeerId, revoke: bool) -> Result<(), String> {
+        let _ = revoke;
+        self.clear_history(peer_id);
+        Ok(())
+    }
+
+    /// Whether the whole history with `peer_id` can be deleted for everyone
+    /// (`PeerData::canRevokeFullHistory`): users other than self and bots, and basic groups or
+    /// supergroups the account created. Drives the `DeleteMessagesBox` checkbox.
+    fn can_revoke_full_history(&self, _peer_id: PeerId) -> bool {
+        false
+    }
+
+    /// The first name of user `peer_id` for "Also delete for {user}" (`UserData::firstName`).
+    fn peer_first_name(&self, _peer_id: PeerId) -> Option<String> {
+        None
     }
 
     /// Unblocks `peer_id` (`contacts.unblock`) and, when `peer_id` is a non-support bot, sends

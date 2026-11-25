@@ -283,11 +283,24 @@ impl LiveSession {
             return None;
         };
         let resolved = document_to_location(&document);
-        Some(TelegramRangeLoader::new(
+        Some(self.story_range_loader(resolved))
+    }
+
+    /// Builds a story video loader that streams into the account's encrypted `streamed` cache
+    /// directory. Before an account folder exists the loader encrypts with an ephemeral key.
+    fn story_range_loader(
+        &self,
+        resolved: crate::media::ResolvedMediaLocation,
+    ) -> TelegramRangeLoader<tg_app_core::core_types::erased_rpc::ErasedRpcClient> {
+        let loader = TelegramRangeLoader::new(
             self.runtime().rpc().clone(),
             self.runtime().tokio_handle().clone(),
             resolved,
-        ))
+        );
+        match self.media_cache().streamed_dir() {
+            Some(dir) => loader.with_storage_dir(dir),
+            None => loader,
+        }
     }
 
     /// Opens a streaming [`tg_video::StreamingPlayer`] over [`TelegramRangeLoader`] for a video story.
@@ -1682,11 +1695,7 @@ impl StoriesBackend for LiveSession {
             StoryMedia::Video { document, .. } => {
                 let resolved = document_to_location(&document);
                 let total_size = resolved.size;
-                let loader = TelegramRangeLoader::new(
-                    self.runtime().rpc().clone(),
-                    self.runtime().tokio_handle().clone(),
-                    resolved,
-                );
+                let loader = self.story_range_loader(resolved);
                 let bytes = read_all_via_range_loader(&loader, total_size)?;
                 StoryMediaAsset::VideoBytes(bytes)
             }

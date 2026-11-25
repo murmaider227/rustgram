@@ -1,6 +1,7 @@
 //! Security review #2 (SEC2-A) integration tests and before/after snapshots:
 //! - L2: the passcode lock is app-wide across accounts and account switching is refused while locked
 //! - L3/L10: locking closes Instant View / Mini App windows; Ctrl+Shift+P/B/T do nothing while locked
+//! - SEC3-A A1: locking closes Recent Calls and Ctrl+Shift+H does nothing while locked
 
 use std::path::Path;
 use std::sync::Arc;
@@ -248,5 +249,51 @@ fn l3_l10_lock_closes_windows_and_blocks_overlay_shortcuts() {
         !ws.has_additional_windows_open(),
         "the lock closed Instant View and keeps everything closed"
     );
+    drop(host);
+}
+
+/// SEC3-A A1: the lock closes Recent Calls, Ctrl+Shift+H does not reopen it, and the controller's
+/// Recent Calls request is refused until unlock.
+#[test]
+fn a1_lock_closes_recent_calls_and_blocks_calls_shortcut() {
+    let rt = tokio_rt();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut host = two_account_host(&rt, dir.path());
+    let ctx = egui::Context::default();
+    let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+
+    let ws = host.active_workspace_mut().expect("active");
+    ws.calls_host_mut().open_recent_calls();
+    assert!(ws.calls_host().is_recent_calls_open());
+    ws.controller_mut().setup_passcode_lock();
+
+    for _ in 0..2 {
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                Event::ModifiersChanged(Modifiers::COMMAND | Modifiers::SHIFT),
+                Event::Key {
+                    key: Key::H,
+                    physical_key: Some(Key::H),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            let frame_ctx = ui.ctx().clone();
+            let _ = ws.show(&frame_ctx, ui);
+        });
+        out.textures_delta.clear();
+        assert!(
+            !ws.calls_host().is_recent_calls_open(),
+            "Recent Calls must stay closed while locked"
+        );
+    }
+    assert!(ws.calls_host().is_passcode_locked());
+    ws.calls_host_mut().open_recent_calls();
+    assert!(!ws.calls_host().is_recent_calls_open());
     drop(host);
 }

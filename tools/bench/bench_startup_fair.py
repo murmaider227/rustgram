@@ -146,7 +146,14 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def launch(client: str, exe: Path, workdir: Path, args: argparse.Namespace, run: int) -> tuple[Any, float]:
+def launch(
+    client: str,
+    exe: Path,
+    workdir: Path,
+    args: argparse.Namespace,
+    run: int,
+    sess: wm.ScratchSession | None = None,
+) -> tuple[Any, float]:
     import subprocess
 
     if client == "official":
@@ -159,6 +166,8 @@ def launch(client: str, exe: Path, workdir: Path, args: argparse.Namespace, run:
     if args.rustgram_stderr_dir is not None:
         args.rustgram_stderr_dir.mkdir(parents=True, exist_ok=True)
         stderr = open(args.rustgram_stderr_dir / f"rustgram_run{run}.txt", "wb")  # noqa: SIM115
+        if sess is not None:
+            sess.track_file(stderr)
     cmd = [str(exe), "--live", "-testmode", "-workdir", str(workdir)]
     t_launch = time.perf_counter()
     proc = subprocess.Popen(cmd, cwd=str(exe.parent), env=env, stdout=subprocess.DEVNULL, stderr=stderr)
@@ -266,12 +275,12 @@ def measure_open_chat(
 def one_run(client: str, run: int, args: argparse.Namespace, layout: dict[str, Any]) -> dict[str, Any]:
     exe = args.official_exe if client == "official" else args.rustgram_exe
     src = args.official_workdir if client == "official" else args.rustgram_workdir
-    wd = args.scratch_dir / f"fair_{client}_{run}"
-    wm.copy_workdir_safely(src, wd)
-    proc, t_launch = launch(client, exe, wd, args, run)
     rec: dict[str, Any] = {"run": run, "timestamp_utc": datetime.now(timezone.utc).isoformat()}
     diag = args.diag_dir if (args.diag_dir is not None and run == 1) else None
-    try:
+    with wm.ScratchSession(args.scratch_dir, graceful_timeout_s=5.0, post_stop_delay_s=2.0) as sess:
+        wd = sess.copy_workdir(src, f"fair_{client}_{run}")
+        proc, t_launch = launch(client, exe, wd, args, run, sess=sess)
+        sess.track_process(proc)
         hwnd, t_vis = wait_visible(proc.pid, t_launch, args.timeout_s)
         if hwnd is None or t_vis is None:
             rec["error"] = "no visible window"
@@ -308,10 +317,6 @@ def one_run(client: str, run: int, args: argparse.Namespace, layout: dict[str, A
             flush=True,
         )
         return rec
-    finally:
-        wm.stop_process_by_pid(proc.pid, graceful_timeout_s=5.0)
-        time.sleep(2.0)
-        shutil.rmtree(wd, ignore_errors=True)
 
 
 def summarize(data: dict[str, Any]) -> None:
@@ -345,6 +350,15 @@ def summarize(data: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    try:
+        wm.ensure_outside_git_repo(args.scratch_dir, label="--scratch-dir")
+        if args.diag_dir is not None:
+            wm.ensure_outside_git_repo(args.diag_dir, label="--diag-dir")
+        if args.rustgram_stderr_dir is not None:
+            wm.ensure_outside_git_repo(args.rustgram_stderr_dir, label="--rustgram-stderr-dir")
+    except ValueError as exc:
+        sys.stderr.write(f"[fair] {exc}\n")
+        return 2
     desk = interactive_desktop_check()
     print(f"[fair] desktop: {desk}", flush=True)
     if not desk["interactive"]:
@@ -402,4 +416,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except wm.WorkdirCleanupError as exc:
+        sys.stderr.write(f"[fair] {exc}\n")
+        raise SystemExit(4)
