@@ -48,6 +48,8 @@ checked line by line against Telegram Desktop.
 - **Compatible local data.** Reads and writes Telegram Desktop's `tdata` format.
 - **Tested against Telegram.** Over 2,000 tests, including protocol conformance suites that replay
   scripted MTProto sessions byte for byte, and live runs against Telegram's official test servers.
+- **Fast and light.** Starts faster and uses less than half the memory of Telegram Desktop 7.4.6 in our
+  measurements ([Performance](#performance)).
 - **About a million lines of Rust** across some 1,200 source files.
 
 ## Features
@@ -65,6 +67,24 @@ checked line by line against Telegram Desktop.
 
 Implemented means the code and its tests exist; most of it has not yet been used day to day on
 Telegram's production servers.
+
+## Performance
+
+Measured against Telegram Desktop 7.4.6 on one Windows 11 PC (Ryzen 7 9700X, 31 GiB RAM), both
+clients on Telegram's test servers with the same test account; medians of 5 runs. Method, raw runs
+and what was not measured: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+| Metric | Telegram Desktop 7.4.6 | Rustgram |
+|---|---:|---:|
+| Start → first window | 729 ms | **560 ms** |
+| Start → chat list ready | 1484 ms | **849 ms** |
+| Open a chat → history ready | 217 ms | **34 ms** |
+| Private memory after start | 311.7 MiB | **133.3 MiB** |
+| Working set after start | 297.4 MiB | **147.8 MiB** |
+| Start → first window, no account | 1232 ms | **475 ms** |
+| Idle private memory, no account | 288.1 MiB | **110.9 MiB** |
+
+The test account has one chat, so scrolling and memory with many chats were not measured yet.
 
 ## Project status
 
