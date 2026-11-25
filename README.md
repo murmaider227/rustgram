@@ -34,6 +34,8 @@ checked line by line against Telegram Desktop.
 > **Status: pre-release.** Rustgram is under active development and not yet ready for daily use.
 > Read [Project status](#project-status) before you try it with a real account.
 
+[Code signing policy](#code-signing-policy) · [Privacy](docs/PRIVACY.md)
+
 ## Highlights
 
 - **Pure Rust, top to bottom.** MTProto 2.0 with perfect forward secrecy, AES-IGE / AES-CTR,
@@ -167,6 +169,20 @@ More detail is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 </table>
 
 All names and messages in the screenshots are sample data.
+
+## Code signing policy
+
+Release builds are made only by the [release workflow](.github/workflows/release.yml) on GitHub Actions from a
+tagged commit of this repository and published as a draft that a maintainer reviews before release. Each release
+lists the SHA-256 of every file in `SHA256SUMS.txt`. Pre-releases are not Authenticode-signed yet, so Windows
+SmartScreen may warn when you run the installer. Update packages (`.tupdate`) are signed with the project's
+Ed25519 update key, and Rustgram installs an update only after verifying that signature. Details:
+[CODE_SIGNING.md](CODE_SIGNING.md).
+
+## Privacy
+
+Rustgram has no servers of its own and collects no analytics or telemetry. See the
+[privacy policy](docs/PRIVACY.md).
 
 ## Contributing
 

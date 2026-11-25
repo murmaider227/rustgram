@@ -67,6 +67,7 @@ fn dev_signing_key() -> SigningKey {
 }
 
 #[test]
+#[cfg_attr(not(windows), ignore = "spawns the Windows updater executable")]
 fn e2e_fake_http_check_download_verify_unpack_apply_and_relaunch() {
     let signing_key = dev_signing_key();
     let verifying_key = signing_key.verifying_key();
