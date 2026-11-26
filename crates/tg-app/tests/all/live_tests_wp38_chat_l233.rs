@@ -135,13 +135,18 @@ impl RpcClient for FakeRpcClient {
             .expect("lock recorded")
             .push((ctor, raw));
 
-        let next = self.responses.lock().expect("lock responses").pop_front();
+        // Background work (chat-list preloads, peer refreshes) may send requests this test did not
+        // queue, in any order. They get no answer and leave the queue alone; only the queued request
+        // type takes the queued answer (same rule as `common::is_background_list_request`, TGB-2941).
+        let next = {
+            let mut responses = self.responses.lock().expect("lock responses");
+            match responses.front() {
+                Some((expected, _)) if *expected == ctor => responses.pop_front(),
+                _ => None,
+            }
+        };
         match next {
-            Some((expected, outcome)) => {
-                assert_eq!(
-                    ctor, expected,
-                    "unexpected RPC ctor: got {ctor:#010x}, expected {expected:#010x}"
-                );
+            Some((_, outcome)) => {
                 let bytes = outcome?;
                 R::Return::from_bytes(&bytes)
                     .map_err(|e| InvocationError::Deserialize(e.to_string()))

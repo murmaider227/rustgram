@@ -72,21 +72,25 @@ Telegram's production servers.
 
 ## Performance
 
-Measured against Telegram Desktop 7.4.6 on one Windows 11 PC (Ryzen 7 9700X, 31 GiB RAM), both
-clients on Telegram's test servers with the same test account; medians of 5 runs. Method, raw runs
-and what was not measured: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Rustgram 0.1.0-alpha.2 measured against Telegram Desktop 7.4.6 on 2026-11-26 on one Windows 11 PC
+(Ryzen 7 9700X, 31 GiB RAM), both clients on Telegram's test servers with the same test account;
+medians of 5 runs. Method, raw runs and what was not measured: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 | Metric | Telegram Desktop 7.4.6 | Rustgram |
 |---|---:|---:|
-| Start → first window | 729 ms | **560 ms** |
-| Start → chat list ready | 1484 ms | **849 ms** |
-| Open a chat → history ready | 217 ms | **34 ms** |
-| Private memory after start | 311.7 MiB | **133.3 MiB** |
-| Working set after start | 297.4 MiB | **147.8 MiB** |
-| Start → first window, no account | 1232 ms | **475 ms** |
-| Idle private memory, no account | 288.1 MiB | **110.9 MiB** |
+| Start → first window | 771 ms | **368 ms** |
+| Start → chat list ready | 1568 ms | **847 ms** |
+| Open a chat → history ready | 217 ms | **38 ms** |
+| Private memory after start | 311.3 MiB | **117.7 MiB** |
+| Working set after start | 285.8 MiB | **140.5 MiB** |
+| Start → first window, no account | 1232 ms* | **272 ms** |
+| Idle private memory, no account | 288.1 MiB* | **92.8 MiB** |
 
-The test account has one chat, so scrolling and memory with many chats were not measured yet.
+\* Telegram Desktop's no-account numbers are from 2026-11-25 (same version): without an account it
+connects to the production servers, which these test runs do not use.
+
+The test account has two chats, so scrolling and memory with many chats were not measured against
+Telegram Desktop yet.
 
 ## Project status
 
