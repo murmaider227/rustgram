@@ -37,7 +37,8 @@ use tg_mtproto::{
     TransportFactory,
 };
 use tg_session::{
-    MtprotoRpc, SessionEvent, SessionRuntime, SessionRuntimeConfig, build_mtproto_client_config,
+    LogoutReason, MtprotoRpc, SessionEvent, SessionRuntime, SessionRuntimeConfig,
+    build_mtproto_client_config,
 };
 use tg_tl::mtproto::{
     GzipPacked, MsgContainer, RpcResult, enums as mtp_enums, functions as mtp_functions,
@@ -2571,7 +2572,9 @@ async fn conformance_7_error_routing_logout_duplicated_flood_500_and_404() {
         assert_eq!(
             ev1,
             SessionEvent::ForceLogout {
-                notification_type: "AUTH_KEY_UNREGISTERED".to_owned(),
+                reason: LogoutReason::Unauthorized {
+                    error: "AUTH_KEY_UNREGISTERED".to_owned(),
+                },
             }
         );
 
@@ -2588,7 +2591,9 @@ async fn conformance_7_error_routing_logout_duplicated_flood_500_and_404() {
         assert_eq!(
             ev2,
             SessionEvent::ForceLogout {
-                notification_type: "SESSION_REVOKED".to_owned(),
+                reason: LogoutReason::Unauthorized {
+                    error: "SESSION_REVOKED".to_owned(),
+                },
             }
         );
 

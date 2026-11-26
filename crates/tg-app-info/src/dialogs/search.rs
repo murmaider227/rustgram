@@ -25,7 +25,7 @@ use crate::dialogs::backend::{
 };
 use crate::dialogs::layout::{
     DialogColors, RowPaintState, SEARCHED_BAR_HEIGHT, measure_text_i32, paint_dialog_row,
-    paint_global_peer_row, paint_message_search_row, paint_peer_avatar, paint_section_bar,
+    paint_global_peer_row, paint_message_search_row, paint_peer_userpic, paint_section_bar,
     paint_semibold_text, paint_sponsored_peer_row,
 };
 use crate::dialogs::strings;
@@ -1206,9 +1206,10 @@ fn show_search_suggestions(
                 Pos2::new(row_rect.left() + 12.0, row_rect.top() + 8.0),
                 Vec2::splat(40.0),
             );
-            paint_peer_avatar(
+            paint_peer_userpic(
                 ui.painter(),
                 photo_rect,
+                item.peer_id,
                 item.special,
                 item.color_index,
                 &item.title,
@@ -1369,9 +1370,10 @@ fn paint_top_peer_cell(
         Pos2::new(cell_rect.center().x, cell_rect.top() + 30.0),
         Vec2::splat(st::top_peers_selector_userpic_size.0.min(44) as f32),
     );
-    paint_peer_avatar(
+    paint_peer_userpic(
         ui.painter(),
         photo_rect,
+        peer.peer_id,
         SpecialRowKind::None,
         peer.color_index,
         &peer.full_title,

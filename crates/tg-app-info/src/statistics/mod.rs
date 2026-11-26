@@ -356,6 +356,9 @@ impl StatisticsScreenHost {
 
     /// Shows a transient toast notification for 3 seconds.
     pub fn show_toast(&mut self, msg: String, now_ms: i64) {
+        let Some(msg) = tg_app_core::user_error::visible_toast_text(msg) else {
+            return;
+        };
         self.toast_message = Some((msg, now_ms + 3_000));
     }
 
@@ -609,14 +612,9 @@ impl StatisticsScreenHost {
         let mut pending_toast: Option<String> = None;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
-            if let Some(ref err) = self.load_error {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{}{err}", strings::LOAD_FAILED_PREFIX))
-                            .size(13.0)
-                            .color(to_color32(palette.delta_negative)),
-                    );
-                });
+            // A failed stats load shows nothing; the loading state stays
+            // (`info_statistics_inner_widget.cpp:656-665`).
+            if self.load_error.is_some() {
                 return;
             }
 

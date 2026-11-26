@@ -449,7 +449,7 @@ impl LiveSession {
 
     fn ensure_bot_full_loaded(&self, bot_id: BotUserId) {
         let peer = DataPeerId::from_user(DataUserId(bot_id.0));
-        if !crate::open_chat_prefetch::wait_in_flight(
+        if !crate::open_chat_prefetch::started_in_background(
             self,
             peer,
             crate::open_chat_prefetch::OpenChatRequest::BotInfo,

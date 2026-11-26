@@ -136,6 +136,7 @@ pub struct EmojiListWidget {
     active_group: Option<usize>,
     mood_icons: MoodIconCache,
     mood_groups_polled_at: Option<f64>,
+    mood_groups_from_server: bool,
     columns: usize,
 }
 
@@ -164,6 +165,7 @@ impl EmojiListWidget {
             active_group: None,
             mood_icons: MoodIconCache::default(),
             mood_groups_polled_at: None,
+            mood_groups_from_server: false,
             columns: EMOJI_COLUMNS,
         }
     }
@@ -210,13 +212,19 @@ impl EmojiListWidget {
 
     /// Pulls the search-row groups from `backend.emoji_groups()` (`messages.getEmojiGroups`,
     /// `EmojiStatuses::emojiGroupsValue` in `tabbed_selector.cpp` `MakeSearch`) when the panel is
-    /// first shown and then every [`MOOD_GROUPS_POLL_SECS`]. An empty list or an error keeps
-    /// the groups already shown (the built-in [`EMOJI_MOOD_GROUPS`] until the server answers),
-    /// as tdesktop keeps its last `messages.emojiGroups` on a failed request.
+    /// first shown and then every [`MOOD_GROUPS_POLL_SECS`] ([`MOOD_GROUPS_RETRY_SECS`] until the
+    /// first server answer: the live backend loads them in the background). An empty list or an
+    /// error keeps the groups already shown (the built-in [`EMOJI_MOOD_GROUPS`] until the server
+    /// answers), as tdesktop keeps its last `messages.emojiGroups` on a failed request.
     pub fn refresh_mood_groups(&mut self, backend: &dyn ChatHelpersBackend, now: f64) {
+        let interval = if self.mood_groups_from_server {
+            MOOD_GROUPS_POLL_SECS
+        } else {
+            MOOD_GROUPS_RETRY_SECS
+        };
         if self
             .mood_groups_polled_at
-            .is_some_and(|at| now >= at && now - at < MOOD_GROUPS_POLL_SECS)
+            .is_some_and(|at| now >= at && now - at < interval)
         {
             return;
         }
@@ -226,6 +234,7 @@ impl EmojiListWidget {
             .map(|list| mood_groups_from_server(&list))
             .unwrap_or_default();
         if !groups.is_empty() {
+            self.mood_groups_from_server = true;
             self.set_mood_groups(groups);
         }
     }
@@ -446,6 +455,10 @@ impl EmojiListWidget {
         let full_rect = ui.available_rect_before_wrap();
         let now = ui.input(|i| i.time);
         self.refresh_mood_groups(backend, now);
+        if !self.mood_groups_from_server {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(MOOD_GROUPS_RETRY_SECS));
+        }
 
         // Reserve bottom footer strip (`EMOJI_FOOTER_HEIGHT`).
         let footer_rect = Rect::from_min_max(
@@ -1145,6 +1158,9 @@ impl From<&EmojiMoodGroup> for MoodGroup {
 /// Seconds between `backend.emoji_groups()` polls while the emoji tab is shown; the live
 /// backend answers from its hash-checked cache in between server refreshes.
 pub const MOOD_GROUPS_POLL_SECS: f64 = 60.0;
+
+/// Seconds between `backend.emoji_groups()` polls until the server groups first arrive.
+pub const MOOD_GROUPS_RETRY_SECS: f64 = 1.0;
 
 /// Converts `messages.getEmojiGroups` entries into search-row groups (`GroupsFromTL` in
 /// `data_emoji_statuses.cpp`). The `emojiGroupPremium` entry is dropped: its `*premium` query

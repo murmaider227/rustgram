@@ -495,13 +495,9 @@ impl LiveSession {
                     entry.round_view = is_round_video;
                 }
                 self.bridge_state().notify_ui();
-                if is_too_long {
-                    TranscribeToggleOutcome::TooLong {
-                        max_secs: (limits.trials_max_length_ms / 1000).max(0) as u32,
-                    }
-                } else {
-                    TranscribeToggleOutcome::Failed(err_str)
-                }
+                // The bubble shows the failure (`entry.toolong` / `entry.failed`,
+                // `api/api_transcribes.cpp:219-231`); `TooLong` is only the local length check.
+                TranscribeToggleOutcome::Failed(err_str)
             }
         }
     }

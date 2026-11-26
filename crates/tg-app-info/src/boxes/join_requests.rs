@@ -341,8 +341,11 @@ fn render_request_card(
         Pos2::new(rect.min.x + 22.0, rect.min.y + 26.0),
         Vec2::splat(40.0),
     );
-    EmptyUserpic::for_color_index(req.color_index, &req.name, colors)
-        .paint_circle(ui.painter(), av_rect);
+    EmptyUserpic::for_color_index(req.color_index, &req.name, colors).paint_circle_or_photo(
+        ui.painter(),
+        av_rect,
+        req.user_id.0,
+    );
 
     let text_x = av_rect.max.x + 12.0;
     let name_line = if let Some(ref uname) = req.username {

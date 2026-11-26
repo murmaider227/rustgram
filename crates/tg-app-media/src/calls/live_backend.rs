@@ -623,7 +623,17 @@ impl LiveCallsBackend {
                             }
                         }
                         CallAction::ShowError(err) => {
-                            self.toast_queue.push(err);
+                            let user = self
+                                .instance
+                                .current_call()
+                                .map(|call| PeerId::from_user(call.peer_user_id().raw()))
+                                .map(|peer_id| self.peer_or_fallback(peer_id).name)
+                                .unwrap_or_default();
+                            if let Some(text) =
+                                tg_app_core::user_error::call_error(&err, &user).into_text()
+                            {
+                                self.toast_queue.push(text);
+                            }
                         }
                         CallAction::NotifyFinished | CallAction::NotifyFailed => {
                             let keep_rating = self
@@ -1123,7 +1133,10 @@ impl CallsBackend for LiveCallsBackend {
                         }
                     }
                     Err(err) => {
-                        self.toast_queue.push(format!("Camera unavailable: {err}"));
+                        self.toast_queue.push({
+                            tracing::warn!(%err, "camera unavailable");
+                            tg_lang::tr::lng_call_error_no_camera()
+                        });
                     }
                 }
             }
@@ -1148,8 +1161,10 @@ impl CallsBackend for LiveCallsBackend {
                         }
                     }
                     Err(err) => {
-                        self.toast_queue
-                            .push(format!("Screen capture unavailable: {err}"));
+                        self.toast_queue.push({
+                            tracing::warn!(%err, "screen capture unavailable");
+                            tg_lang::tr::lng_group_call_failed_screen()
+                        });
                     }
                 }
             }
@@ -1362,8 +1377,10 @@ impl CallsBackend for LiveCallsBackend {
                     }
                 }
                 Err(err) => {
-                    self.toast_queue
-                        .push(format!("Screen capture unavailable: {err}"));
+                    self.toast_queue.push({
+                        tracing::warn!(%err, "screen capture unavailable");
+                        tg_lang::tr::lng_group_call_failed_screen()
+                    });
                 }
             }
         }

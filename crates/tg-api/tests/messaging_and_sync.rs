@@ -975,6 +975,8 @@ async fn updates_handler_session_mutations_pts_gap_channel_diff_stream_and_force
         pre_events,
         vec![UpdateEvent::ForceLogout {
             notification_type: "AUTH_KEY_DROP_DUPLICATE".into(),
+            message: "Logout".into(),
+            entities: Vec::new(),
         }]
     );
 

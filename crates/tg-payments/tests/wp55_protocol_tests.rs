@@ -89,7 +89,7 @@ fn withdraw_and_withdrawal_url_and_delete_and_get_saved_and_toggle_notifications
     assert_eq!(GIFT_WITHDRAW_TMP_PASSWORD_PERIOD_SECS, 600);
     assert!(is_tmp_password_refused_error("TMP_PASSWORD_INVALID"));
     assert!(is_tmp_password_refused_error(
-        "RPC error RpcError { code: 400, name: \"TMP_PASSWORD_INVALID\", value: None }"
+        "RPC error 400: TMP_PASSWORD_INVALID"
     ));
     assert!(is_tmp_password_refused_error("PASSWORD_HASH_INVALID"));
     assert!(is_tmp_password_refused_error("SRP_PASSWORD_CHANGED"));

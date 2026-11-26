@@ -891,7 +891,7 @@ pub(crate) fn load_unread_things_page(
                 UnreadThingsKind::PollVotes => true,
             };
             let hm = message_to_history_message(session, &dm);
-            session.insert_message(dm);
+            session.insert_existing_message(dm);
             if matches_kind {
                 matched_ids.push(msg_id);
             }

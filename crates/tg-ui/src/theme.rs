@@ -14,6 +14,8 @@ use tg_theme::{
     embedded_scheme, embedded_themes, load_theme_from_bytes, prepare_embedded_palette,
 };
 
+pub use tg_theme::PaletteColor;
+
 use crate::anim::with_alpha;
 use crate::fonts::ensure_tdesktop_fonts;
 use crate::icons::{CachedIconTexture, IconTextureCache, invalidate_context_icon_cache};
@@ -28,11 +30,28 @@ pub trait Colors {
     fn color(&self, name: &str) -> Color32 {
         self.get(name).unwrap_or(Color32::TRANSPARENT)
     }
+
+    /// Look up a typed palette colour (`colors.get_at(PaletteColor::WINDOW_BG)`).
+    ///
+    /// Palettes read the slot directly; adapters that remap names keep this default, which
+    /// asks [`Self::get`] with the colour's name, so their overrides still apply.
+    fn get_at(&self, color: PaletteColor) -> Option<Color32> {
+        self.get(color.name())
+    }
+
+    /// Typed counterpart of [`Self::color`]: a misspelt colour is a compile error.
+    fn at(&self, color: PaletteColor) -> Color32 {
+        self.get_at(color).unwrap_or(Color32::TRANSPARENT)
+    }
 }
 
 impl<T: Colors + ?Sized> Colors for &T {
     fn get(&self, name: &str) -> Option<Color32> {
         (**self).get(name)
+    }
+
+    fn get_at(&self, color: PaletteColor) -> Option<Color32> {
+        (**self).get_at(color)
     }
 }
 
@@ -80,11 +99,22 @@ impl Colors for Palette {
             _ => self.color_by_name(name).map(theme_color_to_egui),
         }
     }
+
+    fn get_at(&self, color: PaletteColor) -> Option<Color32> {
+        if color == PaletteColor::TRANSPARENT {
+            return Some(Color32::TRANSPARENT);
+        }
+        Some(theme_color_to_egui(Palette::at(self, color)))
+    }
 }
 
 impl Colors for ThemeInstance {
     fn get(&self, name: &str) -> Option<Color32> {
         self.palette.get(name)
+    }
+
+    fn get_at(&self, color: PaletteColor) -> Option<Color32> {
+        self.palette.get_at(color)
     }
 }
 
@@ -173,6 +203,32 @@ impl ColorResolver for DayPalette {
     }
 }
 
+/// A built-in theme with its accent colour, as remembered for day mode or for night mode
+/// (tdesktop keeps one saved theme per mode: `Local::` `themeKeyDay` / `themeKeyNight`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedEmbedded {
+    /// Built-in theme.
+    pub kind: EmbeddedType,
+    /// Accent colour override chosen for it, if any.
+    pub accent: Option<ThemeColor>,
+}
+
+impl SavedEmbedded {
+    /// tdesktop's default for a mode with no saved theme (`ChatBackground::reapplyWithNightMode`):
+    /// `NightThemePath()` for night, the empty path (Classic) for day.
+    #[must_use]
+    pub const fn default_for(night: bool) -> Self {
+        Self {
+            kind: if night {
+                EmbeddedType::Night
+            } else {
+                EmbeddedType::Default
+            },
+            accent: None,
+        }
+    }
+}
+
 /// Runtime theme manager for switching embedded themes, night mode, accent colors,
 /// custom `.tdesktop-theme` palettes, wallpapers, and DPI scale, while invalidating
 /// cached icon textures whenever visual state changes.
@@ -182,11 +238,20 @@ pub struct ThemeManager {
     palette: Palette,
     recipe: Option<EmbeddedAccentRecipe>,
     night_mode: NightModeState,
+    /// Theme remembered for day mode; the night-mode toggle returns to it.
+    saved_day: SavedEmbedded,
+    /// Theme remembered for night mode.
+    saved_night: SavedEmbedded,
     wallpaper: Option<WallPaper>,
     scale: Scale,
     generation: u64,
+    /// Process-unique id of this manager, so values derived from its palette can be cached
+    /// by [`Self::palette_cache_key`].
+    instance_id: u64,
     icon_cache: IconTextureCache,
 }
+
+static NEXT_THEME_MANAGER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Default for ThemeManager {
     fn default() -> Self {
@@ -208,15 +273,25 @@ impl ThemeManager {
         let recipe = EmbeddedAccentRecipe::new(kind).ok();
         let mut night_mode = NightModeState::default();
         night_mode.set_night_mode(kind.is_dark());
+        let mut saved_day = SavedEmbedded::default_for(false);
+        let mut saved_night = SavedEmbedded::default_for(true);
+        if kind.is_dark() {
+            saved_night.kind = kind;
+        } else {
+            saved_day.kind = kind;
+        }
         Self {
             embedded: kind,
             accent: None,
             palette,
             recipe,
             night_mode,
+            saved_day,
+            saved_night,
             wallpaper: None,
             scale: tg_style::scale(),
             generation: 1,
+            instance_id: NEXT_THEME_MANAGER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             icon_cache: IconTextureCache::new(),
         }
     }
@@ -297,6 +372,14 @@ impl ThemeManager {
         self.generation
     }
 
+    /// Key that changes whenever this manager's palette may have changed: `(instance id,
+    /// generation)`. Every palette change goes through [`Self::invalidate_textures`], which
+    /// bumps the generation, so a value derived from the palette stays valid while its key does.
+    #[must_use]
+    pub const fn palette_cache_key(&self) -> (u64, u64) {
+        (self.instance_id, self.generation)
+    }
+
     /// Shared read access to the managed icon texture cache.
     #[must_use]
     pub const fn icon_cache(&self) -> &IconTextureCache {
@@ -317,13 +400,38 @@ impl ThemeManager {
         self.palette = palette;
         self.recipe = EmbeddedAccentRecipe::new(kind).ok();
         self.night_mode.set_night_mode(kind.is_dark());
+        self.remember(SavedEmbedded { kind, accent });
         self.invalidate_textures();
+    }
+
+    /// The built-in theme remembered for night mode (`night == true`) or for day mode.
+    #[must_use]
+    pub const fn saved_embedded(&self, night: bool) -> SavedEmbedded {
+        if night {
+            self.saved_night
+        } else {
+            self.saved_day
+        }
+    }
+
+    /// Remembers `saved` for its own mode without applying it (restoring the saved day and
+    /// night themes at start-up). The applied theme does not change.
+    pub fn remember(&mut self, saved: SavedEmbedded) {
+        if saved.kind.is_dark() {
+            self.saved_night = saved;
+        } else {
+            self.saved_day = saved;
+        }
     }
 
     /// Switch accent color on the current embedded theme (`None` resets to base accent)
     /// and invalidate cached textures.
     pub fn set_accent(&mut self, accent: Option<ThemeColor>) {
         self.accent = accent;
+        self.remember(SavedEmbedded {
+            kind: self.embedded,
+            accent,
+        });
         match accent {
             Some(color) => {
                 if let Some(recipe) = &self.recipe {
@@ -341,21 +449,13 @@ impl ThemeManager {
         self.invalidate_textures();
     }
 
-    /// Switch between day (`EmbeddedType::Default`) and night (`EmbeddedType::Night`) themes.
+    /// Switch between day and night mode, applying the theme remembered for the target mode
+    /// (`ChatBackground::reapplyWithNightMode`: the saved theme of that mode, else Classic for
+    /// day and `NightThemePath()` for night). Does nothing when that mode is already active.
     pub fn set_night_mode(&mut self, night: bool) {
-        let target = if night {
-            if self.embedded.is_dark() {
-                self.embedded
-            } else {
-                EmbeddedType::Night
-            }
-        } else if !self.embedded.is_dark() {
-            self.embedded
-        } else {
-            EmbeddedType::Default
-        };
-        if target != self.embedded || self.night_mode.is_night_mode() != night {
-            self.set_embedded(target, None);
+        if self.embedded.is_dark() != night || self.night_mode.is_night_mode() != night {
+            let saved = self.saved_embedded(night);
+            self.set_embedded(saved.kind, saved.accent);
         }
     }
 
@@ -428,6 +528,10 @@ impl Colors for ThemeManager {
     fn get(&self, name: &str) -> Option<Color32> {
         self.palette.get(name)
     }
+
+    fn get_at(&self, color: PaletteColor) -> Option<Color32> {
+        self.palette.get_at(color)
+    }
 }
 
 impl ColorResolver for ThemeManager {
@@ -440,7 +544,24 @@ impl ColorResolver for ThemeManager {
 /// from `windowBg` luminance) and register tdesktop's bundled fonts.
 pub fn apply_palette_visuals(ctx: &egui::Context, colors: &dyn Colors) {
     ensure_tdesktop_fonts(ctx);
+    let visuals = palette_visuals(colors);
+    // tdesktop's look depends only on its palette, never on the OS light/dark setting. Pin the
+    // egui theme to the palette so a later OS theme report (eframe's default preference follows
+    // the system) cannot swap in egui's stock style for the other mode.
+    let theme = if visuals.dark_mode {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    };
+    ctx.set_theme(theme);
+    ctx.set_visuals_of(theme, visuals);
+}
 
+/// The `egui::Visuals` of a palette (light or dark by the contrast of `windowBg`), without
+/// applying them anywhere. [`apply_palette_visuals`] sets them for the whole window; a panel
+/// that previews another theme sets them on its own `Ui` only.
+#[must_use]
+pub fn palette_visuals(colors: &dyn Colors) -> Visuals {
     let window_bg = colors.color("windowBg");
     let window_bg_over = colors.color("windowBgOver");
     let window_fg = colors.color("windowFg");
@@ -479,16 +600,7 @@ pub fn apply_palette_visuals(ctx: &egui::Context, colors: &dyn Colors) {
     visuals.widgets.hovered.bg_stroke.color = border_active;
     visuals.widgets.active.bg_fill = active_bg;
     visuals.widgets.active.bg_stroke.color = active_bg;
-    // tdesktop's look depends only on its palette, never on the OS light/dark setting. Pin the
-    // egui theme to the palette so a later OS theme report (eframe's default preference follows
-    // the system) cannot swap in egui's stock style for the other mode.
-    let theme = if is_dark {
-        egui::Theme::Dark
-    } else {
-        egui::Theme::Light
-    };
-    ctx.set_theme(theme);
-    ctx.set_visuals_of(theme, visuals);
+    visuals
 }
 
 #[cfg(test)]
@@ -523,5 +635,46 @@ mod palette_theme_tests {
             let window_bg = ThemeManager::with_embedded(embedded).color("windowBg");
             assert_eq!(visuals.panel_fill, window_bg, "{embedded:?} with OS {os:?}");
         }
+    }
+
+    /// TGB-2955: the night toggle returns to the theme (and accent) each mode had, as
+    /// tdesktop's saved day / night themes do, instead of always Classic / Tinted.
+    #[test]
+    fn night_toggle_returns_to_the_theme_remembered_for_each_mode() {
+        let accent = ThemeColor::rgb(0xd0, 0x40, 0x40);
+        let mut tm = ThemeManager::new();
+        tm.set_embedded(EmbeddedType::DayBlue, Some(accent));
+        tm.set_night_mode(true);
+        assert_eq!(tm.embedded_type(), EmbeddedType::Night);
+        assert!(tm.is_dark());
+        tm.set_embedded(EmbeddedType::NightGreen, None);
+        tm.set_night_mode(false);
+        assert_eq!(tm.embedded_type(), EmbeddedType::DayBlue);
+        assert_eq!(tm.accent(), Some(accent));
+        assert!(!tm.is_dark());
+        tm.toggle_night_mode();
+        assert_eq!(tm.embedded_type(), EmbeddedType::NightGreen);
+
+        // Asking for the mode that is already active changes nothing.
+        let generation = tm.generation();
+        tm.set_night_mode(true);
+        assert_eq!(tm.generation(), generation);
+    }
+
+    /// TGB-2955: the dark palette reaches egui on the frame after the switch.
+    #[test]
+    fn dark_theme_gives_dark_egui_visuals_on_the_next_frame() {
+        let ctx = egui::Context::default();
+        let mut tm = ThemeManager::new();
+        tm.apply_to_egui(&ctx);
+        run_frame(&ctx, None);
+        assert!(!ctx.global_style().visuals.dark_mode);
+
+        tm.set_night_mode(true);
+        tm.apply_to_egui(&ctx);
+        run_frame(&ctx, None);
+        let visuals = ctx.global_style().visuals.clone();
+        assert!(visuals.dark_mode);
+        assert_eq!(visuals.panel_fill, tm.color("windowBg"));
     }
 }

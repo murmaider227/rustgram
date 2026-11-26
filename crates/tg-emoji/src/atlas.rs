@@ -3,8 +3,12 @@
 //! Port origin: `Telegram/lib_ui/ui/emoji_config.cpp` (`Ui::Emoji::One::sprite/row/column`
 //! and sprite sheet loading), using Apache-2.0 Noto Emoji (`googlefonts/noto-emoji` v2.042)
 //! instead of Apple's proprietary emoji artwork.
+//!
+//! The emoji keep their sheet/row/column indexing, but the binary embeds each sheet row as its own
+//! tile (`build.rs` splits `assets/sheet_*.webp`), so drawing an emoji for the first time decodes
+//! one 2048x64 row of 32 emoji (about 1 ms) instead of a whole 2048x1024 sheet.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use tg_text::emoji::{self, EmojiRef};
 use thiserror::Error;
@@ -24,30 +28,31 @@ pub const SHEET_WIDTH_PX: u32 = (SHEET_COLS as u32) * CELL_SIZE_PX;
 /// Sprite sheet pixel height (`16 * 64 = 1024`).
 pub const SHEET_HEIGHT_PX: u32 = (SHEET_ROWS as u32) * CELL_SIZE_PX;
 
-static SHEET_BYTES: [&[u8]; SHEET_COUNT] = [
-    include_bytes!("../assets/sheet_0.webp"),
-    include_bytes!("../assets/sheet_1.webp"),
-    include_bytes!("../assets/sheet_2.webp"),
-    include_bytes!("../assets/sheet_3.webp"),
-    include_bytes!("../assets/sheet_4.webp"),
-    include_bytes!("../assets/sheet_5.webp"),
-    include_bytes!("../assets/sheet_6.webp"),
-    include_bytes!("../assets/sheet_7.webp"),
-];
+/// Number of embedded tiles: one per sheet row (`8 * 16 = 128`), indexed `emoji_index >> 5`.
+pub const TILE_COUNT: usize = SHEET_COUNT * SHEET_ROWS;
+/// Tile pixel width: a full sheet row (`2048`).
+pub const TILE_WIDTH_PX: u32 = SHEET_WIDTH_PX;
+/// Tile pixel height: one emoji cell (`64`).
+pub const TILE_HEIGHT_PX: u32 = CELL_SIZE_PX;
+
+include!(concat!(env!("OUT_DIR"), "/tiles.rs"));
 
 static PRESENT_BITMAP: &[u8] = include_bytes!("../assets/present.bin");
 
-/// Errors produced when decoding or querying an emoji sprite sheet.
+/// Errors produced when decoding or querying an emoji tile.
 #[derive(Debug, Error)]
 pub enum EmojiError {
-    /// Requested sprite sheet index is out of bounds.
-    #[error("emoji sprite sheet index {0} out of bounds (max {max})", max = SHEET_COUNT - 1)]
-    SheetOutOfBounds(usize),
-    /// Decoding the embedded WebP sprite sheet failed.
-    #[error("failed to decode emoji sprite sheet {sheet}: {message}")]
+    /// Requested tile index is out of bounds.
+    #[error("emoji tile index {0} out of bounds (max {max})", max = TILE_COUNT - 1)]
+    TileOutOfBounds(usize),
+    /// The tile has no emoji pixels, so nothing is embedded for it.
+    #[error("emoji tile {0} is empty")]
+    EmptyTile(usize),
+    /// Decoding the embedded PNG tile failed.
+    #[error("failed to decode emoji tile {tile}: {message}")]
     DecodeFailed {
-        /// Sheet index that failed to decode.
-        sheet: usize,
+        /// Tile index that failed to decode.
+        tile: usize,
         /// Underlying decoder error string.
         message: String,
     },
@@ -77,9 +82,11 @@ pub struct EmojiSprite {
     pub col: usize,
     /// Row within the sheet (`0..SHEET_ROWS`).
     pub row: usize,
-    /// Pixel rectangle `[x, y, width, height]` inside the sprite sheet.
+    /// Tile holding the cell (`sheet * SHEET_ROWS + row`, `0..TILE_COUNT`).
+    pub tile: usize,
+    /// Pixel rectangle `[x, y, width, height]` inside the tile.
     pub pixel_rect: [u32; 4],
-    /// Normalized texture UV coordinates `[u_min, v_min, u_max, v_max]` in `0.0..=1.0`.
+    /// Normalized UV coordinates `[u_min, v_min, u_max, v_max]` inside the tile texture.
     pub uv: [f32; 4],
     /// Cell dimension in pixels (`CELL_SIZE_PX`).
     pub cell_size: u32,
@@ -104,19 +111,20 @@ impl EmojiSprite {
     }
 }
 
-/// Decoded RGBA8 pixel buffer for one sprite sheet.
+/// Decoded RGBA8 pixel buffer for one tile (one sheet row of 32 emoji cells).
 #[derive(Debug, Clone)]
-pub struct EmojiSheetImage {
-    /// Width in pixels (`SHEET_WIDTH_PX`).
+pub struct EmojiTileImage {
+    /// Width in pixels (`TILE_WIDTH_PX`).
     pub width: u32,
-    /// Height in pixels (`SHEET_HEIGHT_PX`).
+    /// Height in pixels (`TILE_HEIGHT_PX`).
     pub height: u32,
-    /// Straight (unpremultiplied) RGBA8 pixels (`width * height * 4` bytes).
+    /// Straight (unpremultiplied) RGBA8 pixels (`width * height * 4` bytes). Colour channels
+    /// that premultiplication would hide are normalised (see `build.rs`); alpha is exact.
     pub rgba: Vec<u8>,
 }
 
-impl EmojiSheetImage {
-    /// Converts this decoded sheet into an [`egui::ColorImage`].
+impl EmojiTileImage {
+    /// Converts this decoded tile into an [`egui::ColorImage`].
     #[must_use]
     pub fn to_color_image(&self) -> egui::ColorImage {
         egui::ColorImage::from_rgba_unmultiplied(
@@ -128,11 +136,13 @@ impl EmojiSheetImage {
 
 /// Thread-safe, lazily decoded Noto Emoji sprite atlas.
 ///
-/// Sprite sheets are embedded in the binary and decoded on demand on first lookup,
-/// keeping startup instant and memory bounded to only the sheets actually displayed.
+/// Tiles are embedded in the binary and decoded on demand. [`Self::decode_tile`] keeps the
+/// decoded pixels for later single-emoji extraction ([`Self::emoji_rgba`]); the GPU texture path
+/// uses [`Self::decode_tile_transient`], which keeps nothing, so an uploaded tile does not also
+/// stay in RAM (512 KiB per tile).
 #[derive(Debug)]
 pub struct EmojiAtlas {
-    sheets: [OnceLock<Arc<EmojiSheetImage>>; SHEET_COUNT],
+    tiles: [Mutex<Option<Arc<EmojiTileImage>>>; TILE_COUNT],
 }
 
 impl Default for EmojiAtlas {
@@ -146,7 +156,7 @@ impl EmojiAtlas {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sheets: std::array::from_fn(|_| OnceLock::new()),
+            tiles: std::array::from_fn(|_| Mutex::new(None)),
         }
     }
 
@@ -233,29 +243,56 @@ impl EmojiAtlas {
         Some((sprite, size))
     }
 
-    /// Lazily decodes and caches the RGBA8 pixel buffer for sprite sheet `sheet`.
-    pub fn decode_sheet(&self, sheet: usize) -> Result<Arc<EmojiSheetImage>, EmojiError> {
+    /// Lazily decodes and keeps the RGBA8 pixel buffer for tile `tile`.
+    ///
+    /// The decoded tile stays in memory until [`Self::release_tile`]; use
+    /// [`Self::decode_tile_transient`] when the pixels are only needed once (texture upload).
+    pub fn decode_tile(&self, tile: usize) -> Result<Arc<EmojiTileImage>, EmojiError> {
         let slot = self
-            .sheets
-            .get(sheet)
-            .ok_or(EmojiError::SheetOutOfBounds(sheet))?;
-        if let Some(existing) = slot.get() {
+            .tiles
+            .get(tile)
+            .ok_or(EmojiError::TileOutOfBounds(tile))?;
+        // Decoding under the slot lock makes concurrent callers share one decode.
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(existing) = guard.as_ref() {
             return Ok(Arc::clone(existing));
         }
-        let bytes = SHEET_BYTES[sheet];
-        let img = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP)
-            .map_err(|err| EmojiError::DecodeFailed {
-                sheet,
-                message: err.to_string(),
-            })?
-            .to_rgba8();
-        let decoded = Arc::new(EmojiSheetImage {
-            width: img.width(),
-            height: img.height(),
-            rgba: img.into_raw(),
-        });
-        let _ = slot.set(Arc::clone(&decoded));
-        Ok(slot.get().map_or(decoded, Arc::clone))
+        let decoded = Arc::new(decode_tile_pixels(tile)?);
+        *guard = Some(Arc::clone(&decoded));
+        Ok(decoded)
+    }
+
+    /// Decodes tile `tile` without keeping it: returns the retained copy when one exists,
+    /// otherwise a fresh decode that is freed as soon as the caller drops it.
+    pub fn decode_tile_transient(&self, tile: usize) -> Result<Arc<EmojiTileImage>, EmojiError> {
+        let slot = self
+            .tiles
+            .get(tile)
+            .ok_or(EmojiError::TileOutOfBounds(tile))?;
+        if let Some(existing) = slot.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        decode_tile_pixels(tile).map(Arc::new)
+    }
+
+    /// Drops the retained decoded copy of `tile` (if any).
+    pub fn release_tile(&self, tile: usize) {
+        if let Some(slot) = self.tiles.get(tile) {
+            slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+        }
+    }
+
+    /// Number of tiles whose decoded pixels are currently kept in memory.
+    #[must_use]
+    pub fn retained_tile_count(&self) -> usize {
+        self.tiles
+            .iter()
+            .filter(|slot| {
+                slot.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some()
+            })
+            .count()
     }
 
     /// Extracts a standalone `CELL_SIZE_PX x CELL_SIZE_PX` RGBA8 buffer for a single emoji.
@@ -263,21 +300,41 @@ impl EmojiAtlas {
         let Some(sprite) = self.sprite(emoji_ref) else {
             return Ok(None);
         };
-        let sheet = self.decode_sheet(sprite.sheet)?;
+        let tile = self.decode_tile(sprite.tile)?;
         let [px, py, pw, ph] = sprite.pixel_rect;
-        let stride = (sheet.width as usize) * 4;
+        let stride = (tile.width as usize) * 4;
         let row_bytes = (pw as usize) * 4;
         let mut out = vec![0u8; (pw as usize) * (ph as usize) * 4];
         for y in 0..(ph as usize) {
             let src_start = ((py as usize) + y) * stride + (px as usize) * 4;
             let dst_start = y * row_bytes;
-            if src_start + row_bytes <= sheet.rgba.len() {
+            if src_start + row_bytes <= tile.rgba.len() {
                 out[dst_start..dst_start + row_bytes]
-                    .copy_from_slice(&sheet.rgba[src_start..src_start + row_bytes]);
+                    .copy_from_slice(&tile.rgba[src_start..src_start + row_bytes]);
             }
         }
         Ok(Some(out))
     }
+}
+
+fn decode_tile_pixels(tile: usize) -> Result<EmojiTileImage, EmojiError> {
+    let bytes = TILE_PNG
+        .get(tile)
+        .ok_or(EmojiError::TileOutOfBounds(tile))?;
+    if bytes.is_empty() {
+        return Err(EmojiError::EmptyTile(tile));
+    }
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .map_err(|err| EmojiError::DecodeFailed {
+            tile,
+            message: err.to_string(),
+        })?
+        .into_rgba8();
+    Ok(EmojiTileImage {
+        width: img.width(),
+        height: img.height(),
+        rgba: img.into_raw(),
+    })
 }
 
 fn sprite_for_index_inner(index: usize, is_fallback: bool) -> EmojiSprite {
@@ -285,22 +342,23 @@ fn sprite_for_index_inner(index: usize, is_fallback: bool) -> EmojiSprite {
     let row = (index >> 5) & 0x0F;
     let col = index & 0x1F;
     let px = (col as u32) * CELL_SIZE_PX;
-    let py = (row as u32) * CELL_SIZE_PX;
 
-    // Inset UV by 0.5 texels to prevent bilinear bleeding from neighboring cells.
-    let half_u = 0.5 / (SHEET_WIDTH_PX as f32);
-    let half_v = 0.5 / (SHEET_HEIGHT_PX as f32);
-    let u0 = (px as f32) / (SHEET_WIDTH_PX as f32) + half_u;
-    let v0 = (py as f32) / (SHEET_HEIGHT_PX as f32) + half_v;
-    let u1 = ((px + CELL_SIZE_PX) as f32) / (SHEET_WIDTH_PX as f32) - half_u;
-    let v1 = ((py + CELL_SIZE_PX) as f32) / (SHEET_HEIGHT_PX as f32) - half_v;
+    // Inset UV by 0.5 texels to prevent bilinear bleeding from neighboring cells. The tile is the
+    // sheet row, so these are the sheet's texel coordinates shifted up by `row * CELL_SIZE_PX`.
+    let half_u = 0.5 / (TILE_WIDTH_PX as f32);
+    let half_v = 0.5 / (TILE_HEIGHT_PX as f32);
+    let u0 = (px as f32) / (TILE_WIDTH_PX as f32) + half_u;
+    let u1 = ((px + CELL_SIZE_PX) as f32) / (TILE_WIDTH_PX as f32) - half_u;
+    let v0 = half_v;
+    let v1 = 1.0 - half_v;
 
     EmojiSprite {
         emoji_index: index,
         sheet,
         col,
         row,
-        pixel_rect: [px, py, CELL_SIZE_PX, CELL_SIZE_PX],
+        tile: index >> 5,
+        pixel_rect: [px, 0, CELL_SIZE_PX, CELL_SIZE_PX],
         uv: [u0, v0, u1, v1],
         cell_size: CELL_SIZE_PX,
         is_fallback,

@@ -2336,6 +2336,21 @@ async fn notify_settings_scopes_topics_sounds_stories_exceptions_and_updates_ove
                 seq: 0,
             }))
         }
+        x if x == tl_fns::messages::GetPeerDialogs::CONSTRUCTOR_ID => ServerAction::ok(
+            &tl_enums::messages::PeerDialogs::PeerDialogs(tl_types::messages::PeerDialogs {
+                dialogs: vec![],
+                messages: vec![],
+                chats: vec![],
+                users: vec![],
+                state: tl_enums::updates::State::State(tl_types::updates::State {
+                    pts: 0,
+                    qts: 0,
+                    date: 0,
+                    seq: 0,
+                    unread_count: 0,
+                }),
+            }),
+        ),
         other => panic!("unexpected RPC ctor 0x{other:08x}"),
     });
 
@@ -2628,7 +2643,9 @@ async fn notify_settings_scopes_topics_sounds_stories_exceptions_and_updates_ove
             ))],
             &[],
         );
-        s.ensure_history(peer_pid).in_chat_list = true;
+        let history = s.ensure_history(peer_pid);
+        history.in_chat_list = true;
+        history.set_folder(None);
         s.sync_dialog_lists(peer_pid);
     }
 

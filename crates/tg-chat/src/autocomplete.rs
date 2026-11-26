@@ -732,6 +732,9 @@ pub struct BotCommandRow {
     pub user_id: UserId,
     /// Bot's primary username (empty for shortcuts or username-less bots).
     pub bot_username: String,
+    /// Name of the row's user (the bot, or self for shortcuts), for the empty userpic's
+    /// initials (`PeerData::paintUserpicLeft`).
+    pub bot_name: String,
     /// Command name without leading `/` (empty for the special "Edit shortcuts" header row).
     pub command: String,
     /// Command description (or message count string for shortcuts).
@@ -829,6 +832,7 @@ pub fn filter_bot_commands(
         BotCommandRow {
             user_id: user.id,
             bot_username: user.primary_username().to_string(),
+            bot_name: user.display_name.clone(),
             command: cmd.command.clone(),
             description: cmd.description.clone(),
             ephemeral: false,
@@ -885,6 +889,7 @@ pub fn filter_bot_commands(
             brows.push(BotCommandRow {
                 user_id: self_user.id,
                 bot_username: String::new(),
+                bot_name: self_user.display_name.clone(),
                 command: shortcut.name.clone(),
                 description: format!("{} messages", shortcut.count),
                 ephemeral: false,
@@ -898,6 +903,7 @@ pub fn filter_bot_commands(
                 BotCommandRow {
                     user_id: self_user.id,
                     bot_username: String::new(),
+                    bot_name: self_user.display_name.clone(),
                     command: String::new(),
                     description: String::new(),
                     ephemeral: false,
@@ -1609,6 +1615,7 @@ mod tests {
         let row = BotCommandRow {
             user_id: UserId(10),
             bot_username: "alpha_bot".into(),
+            bot_name: "Alpha Bot".into(),
             command: "help".into(),
             description: "Help".into(),
             ephemeral: false,

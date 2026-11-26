@@ -11,12 +11,15 @@
 
 pub use tg_app_core::dialogs::backend;
 pub mod community;
+pub mod emoji_status;
 pub mod entry_menu;
 pub mod filters_menu;
 pub mod inner;
 pub mod layout;
+pub mod list_cache;
 pub mod mini_preview;
 pub mod mock;
+pub mod mute_label;
 pub mod quick_action;
 pub mod search;
 pub mod search_snippet;
@@ -24,6 +27,10 @@ pub mod strings;
 pub mod suggestions;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_frame_cache;
+#[cfg(test)]
+mod tests_tgb2972_2946;
 pub mod video_userpic;
 pub mod widget;
 
@@ -304,6 +311,7 @@ fn dialog_item_from_stand_in(entry: &DialogEntry) -> DialogItem {
         color_index: tg_ui::userpic::decide_color_index(entry.peer.id.bare()),
         verified: false,
         premium: false,
+        emoji_status_id: None,
         online: entry.peer.status == "online",
         active_call: false,
         muted: entry.peer.muted,

@@ -5,14 +5,15 @@
 //! Port origin: `Telegram/SourceFiles/history/history_inner_widget.cpp` and
 //! `Telegram/SourceFiles/history/view/history_view_list_widget.cpp`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use egui::{
     Color32, CornerRadius, FontId, Id, Key, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, Ui, Vec2,
 };
 use tg_history::consts::{
-    FontMetrics, HISTORY_PHOTO_LEFT, HISTORY_UNREAD_BAR_MARGIN, LINE_WIDTH, MSG_DATE_SPACE,
-    MSG_MARGIN, MSG_MAX_WIDTH, MSG_PADDING, MSG_PHOTO_SIZE, MSG_PHOTO_SKIP,
+    FontMetrics, HISTORY_PHOTO_LEFT, HISTORY_UNREAD_BAR_MARGIN, LINE_WIDTH, MSG_MARGIN,
+    MSG_MAX_WIDTH, MSG_PADDING, MSG_PHOTO_SIZE, MSG_PHOTO_SKIP,
 };
 use tg_history::{
     AttachMetadata, BottomInfoInput, CivilDate, DocumentInput, DocumentKind, ElementChatMode,
@@ -30,7 +31,7 @@ use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
 
 use crate::bots::inline_keyboard::{InlineKeyboardActivation, InlineKeyboardState};
 use crate::history::backend::{
-    HistoryBackend, HistoryMedia, HistoryMessage, HistoryPeerInfo, HistorySlice,
+    HistoryBackend, HistoryMedia, HistoryMessage, HistoryPeerInfo, HistorySlice, Loadable,
     MessageSummaryEntry, ServiceAction, to_hist_full, to_hist_peer,
 };
 use crate::history::bubble::{
@@ -43,6 +44,8 @@ use crate::history::inline_media::HistoryMediaRuntime;
 use crate::history::media::{
     MediaAssetCache, MediaInteraction, VoicePlaybackState, format_duration, format_file_size,
 };
+use crate::history::paint_cache::MessagePaintCache;
+use crate::history::read_gate::{BackendReadGate, Gated};
 use crate::history::sections_model::{CopiedRichText, ReplyQuote, slice_text_with_entities};
 use crate::history::text_bridge::{
     entities_to_rich_text, estimate_text_metrics, measure_rich_text, message_text_style,
@@ -59,6 +62,63 @@ pub enum CachedItemLayout {
     Message(Box<MessageLayout>),
     /// Service message layout (`tg-history::ServiceLayout`).
     Service(Box<ServiceLayout>),
+}
+
+/// One entry of the per-message layout cache: the geometry and what painting keeps with it
+/// (the prepared text). Dropping the entry (an edit, a new width) drops both.
+#[derive(Debug)]
+struct CachedItem {
+    layout: CachedItemLayout,
+    paint: MessagePaintCache,
+}
+
+impl CachedItem {
+    fn new(layout: CachedItemLayout) -> Self {
+        Self {
+            layout,
+            paint: MessagePaintCache::default(),
+        }
+    }
+}
+
+/// Loaded messages whose registered media is still arriving, as found by the last scan of the
+/// list. The list is scanned again when it or a media descriptor may have changed and at least
+/// once per poll interval, instead of twice on every frame.
+#[derive(Debug, Default)]
+struct MediaWatch {
+    /// Photos whose descriptor says `Loading` or `Pending`.
+    loading: Vec<MsgId>,
+    /// One of `loading` is still being read from the disk cache (`Pending`): polled on every
+    /// frame until the read lands.
+    cache_reads: bool,
+    /// Round videos registered before their video arrived.
+    pending_rounds: Vec<MsgId>,
+    /// A descriptor or a message changed since the scan.
+    dirty: bool,
+    /// `(len, first id, last id)` of the list at the scan, `None` before the first scan.
+    scanned_list: Option<(usize, Option<MsgId>, Option<MsgId>)>,
+    scanned_ms: i64,
+}
+
+/// How long one frame may spend asking for the media of messages away from the viewport
+/// (`HistoryInnerWidget::request_backlog_media`); at least one message is asked per frame.
+const MEDIA_BACKLOG_BUDGET: Duration = Duration::from_millis(2);
+/// Most messages away from the viewport asked for on one frame.
+const MEDIA_BACKLOG_MAX_PER_FRAME: usize = 16;
+
+/// How many messages keep their prepared text (`MessagePaintCache`) after they were painted.
+/// A galley holds every glyph of the text, so keeping one for each message ever scrolled
+/// through would grow without bound; a message that left this window is prepared again when
+/// it is painted next, which costs what one frame cost before.
+const PAINT_CACHES_KEPT: usize = 128;
+
+/// Whether the audio playlists read this message's media when a slice is applied
+/// (`HistoryMediaRuntime::sync_peer_audio_tracks`): its descriptor has to be there by then.
+fn media_feeds_audio_playlist(msg: &HistoryMessage) -> bool {
+    matches!(
+        msg.media,
+        Some(HistoryMedia::Voice(_) | HistoryMedia::RoundVideo(_) | HistoryMedia::Document(_))
+    )
 }
 
 /// Events bubbled up from [`HistoryInnerWidget`] to [`crate::history::HistoryWidget`].
@@ -99,8 +159,16 @@ pub enum InnerEvent {
     },
     /// User copied text or link (for toast feedback).
     Copied(String),
-    /// User clicked a link / mention / hashtag.
+    /// User clicked a link / mention.
     OpenLink(String),
+    /// User clicked a hashtag, cashtag, bot command or name mention in a message's text
+    /// (the element click handlers of `core/click_handler_types.cpp`).
+    EntityLink {
+        /// Message whose text holds the entity (`ClickHandlerContext::itemId`).
+        msg_id: MsgId,
+        /// The clicked entity.
+        link: tg_ui::entity_link::EntityLink,
+    },
     /// User clicked a hidden `messageEntityTextUrl` link requiring scheme check and confirmation.
     OpenHiddenLink(String),
     /// User clicked a photo/video/sticker media item.
@@ -339,6 +407,15 @@ pub enum InnerEvent {
     ViewSuggestedUserpic(MsgId),
 }
 
+/// The page [`HistoryInnerWidget::load_peer`] waits for.
+#[derive(Debug, Clone, Copy)]
+struct PendingOpen {
+    around_id: MsgId,
+    peer_kind: PeerKind,
+    /// The chat was switched to (scroll to the anchor, not keep the position).
+    switching: bool,
+}
+
 /// Virtualized chat history list widget (`HistoryInner` / `HistoryView::ListWidget`).
 #[derive(Debug)]
 pub struct HistoryInnerWidget {
@@ -351,23 +428,33 @@ pub struct HistoryInnerWidget {
     /// Jump-to-message highlight animator (`tg-history::ElementHighlighter`).
     highlighter: ElementHighlighter,
     /// Per-message layout cache keyed by `MsgId` for the current `layout_width`.
-    layout_cache: HashMap<MsgId, CachedItemLayout>,
+    layout_cache: HashMap<MsgId, CachedItem>,
     /// Viewport width (integer logical pixels) for which `layout_cache` is valid.
     layout_width: i32,
     /// Chat layout mode (`Default` vs `Wide`) for which `layout_cache` is valid.
     layout_wide: bool,
     /// Current vertical scroll offset in logical pixels.
     scroll_offset_y: f32,
+    /// How far the rows are lifted by a pull past the bottom ([`Self::set_bottom_stretch`]).
+    bottom_stretch: f32,
     /// Pending explicit scroll target (`Some(y)` overrides `ScrollArea` on next frame).
     pending_scroll_y: Option<f32>,
     /// True if next paint should jump to the very bottom.
     pending_scroll_to_bottom: bool,
+    /// The first page of the chat is still loading (`HistoryWidget::_firstLoadRequest`): the
+    /// list stays empty and the anchor waits for the page.
+    pending_open: Option<PendingOpen>,
     /// Pending message id to center and highlight once laid out.
     pending_jump_msg: Option<MsgId>,
+    /// `ShowAtUnreadMsgId`: the next paint scrolls the "Unread messages" bar to the top of the
+    /// view (`HistoryWidget::unreadBarTop`) instead of pinning to the bottom.
+    pending_scroll_to_unread_bar: bool,
     /// Last measured viewport height.
     last_viewport_h: f32,
     /// Whether the user is scrolled away from the bottom (controls FAB visibility).
     scrolled_up: bool,
+    /// What the scroll bar of the last frame was drawn from.
+    last_scroll_metrics: ScrollMetrics,
     /// Unread counter reported by backend slice.
     unread_count: u32,
     /// Cached textures & Lottie compositions.
@@ -437,6 +524,19 @@ pub struct HistoryInnerWidget {
     reduced_motion: bool,
     /// Hover fade animation tracker for bubble corner quick actions.
     bubble_hover_quick_actions: crate::history::quick_action::BubbleHoverQuickActions,
+    /// Messages of the opened slice whose inline media has not been asked for yet: `load_peer`
+    /// asks for the ones near the viewport on the first frame, the rest follow frame by frame.
+    media_backlog: HashSet<MsgId>,
+    /// Messages whose media is still arriving (polled by `refresh_loading_media`).
+    media_watch: MediaWatch,
+    /// Version gate for the backend reads repeated on every frame.
+    read_gate: BackendReadGate,
+    /// Reactors of a private chat (the peer and the own name), kept while the gate allows.
+    reaction_userpics: Option<Gated<ReactionUserpics>>,
+    /// Messages holding prepared text, oldest first (`trim_paint_caches`).
+    paint_cache_order: VecDeque<MsgId>,
+    /// The painted messages `paint_cache_order` was last updated for.
+    paint_cache_painted: Vec<MsgId>,
 }
 
 impl Default for HistoryInnerWidget {
@@ -458,9 +558,12 @@ impl HistoryInnerWidget {
             layout_width: 0,
             layout_wide: false,
             scroll_offset_y: 0.0,
+            bottom_stretch: 0.0,
             pending_scroll_y: None,
             pending_scroll_to_bottom: true,
+            pending_open: None,
             pending_jump_msg: None,
+            pending_scroll_to_unread_bar: false,
             last_viewport_h: 600.0,
             painted_msg_ids: Vec::new(),
             reactions_read_for: Vec::new(),
@@ -469,6 +572,7 @@ impl HistoryInnerWidget {
             marking_as_read: true,
             host_overlay_open: false,
             scrolled_up: false,
+            last_scroll_metrics: ScrollMetrics::default(),
             unread_count: 0,
             assets: MediaAssetCache::new(),
             media_runtime: HistoryMediaRuntime::new(false),
@@ -499,7 +603,71 @@ impl HistoryInnerWidget {
             reduced_motion: false,
             bubble_hover_quick_actions:
                 crate::history::quick_action::BubbleHoverQuickActions::default(),
+            media_backlog: HashSet::new(),
+            media_watch: MediaWatch::default(),
+            read_gate: BackendReadGate::default(),
+            reaction_userpics: None,
+            paint_cache_order: VecDeque::new(),
+            paint_cache_painted: Vec::new(),
         }
+    }
+
+    /// Drops the prepared text of messages painted long ago, keeping it for the
+    /// [`PAINT_CACHES_KEPT`] most recently shown ones and for everything painted this frame.
+    /// The layouts stay; only the galleys and strings kept for painting go.
+    fn trim_paint_caches(&mut self) {
+        if self.painted_msg_ids == self.paint_cache_painted {
+            // The same messages as on the last frame: nothing new holds prepared text.
+            return;
+        }
+        self.paint_cache_painted.clone_from(&self.painted_msg_ids);
+        for id in &self.painted_msg_ids {
+            if !self.paint_cache_order.contains(id) {
+                self.paint_cache_order.push_back(*id);
+            }
+        }
+        let mut checks = self.paint_cache_order.len();
+        while self.paint_cache_order.len() > PAINT_CACHES_KEPT && checks > 0 {
+            checks -= 1;
+            let Some(id) = self.paint_cache_order.pop_front() else {
+                break;
+            };
+            if self.painted_msg_ids.contains(&id) {
+                self.paint_cache_order.push_back(id);
+            } else if let Some(cached) = self.layout_cache.get_mut(&id) {
+                cached.paint = MessagePaintCache::default();
+            }
+        }
+    }
+
+    /// The messages painted on the last frame (tests).
+    #[cfg(test)]
+    pub(crate) fn painted_message_ids(&self) -> &[MsgId] {
+        &self.painted_msg_ids
+    }
+
+    /// How many messages hold prepared text (tests).
+    #[cfg(test)]
+    pub(crate) fn prepared_message_count(&self) -> usize {
+        self.layout_cache
+            .values()
+            .filter(|cached| cached.paint.holds_text())
+            .count()
+    }
+
+    /// Index of `id` among the loaded messages.
+    ///
+    /// Server ids are loaded in ascending order with local ids (drafts, messages being sent)
+    /// after them, so a binary search finds a loaded server message in `O(log n)`. Whatever it
+    /// does not find is looked up by a scan, so the result never depends on that order.
+    fn index_of(&self, id: MsgId) -> Option<usize> {
+        if id.0 > 0 {
+            let guess = self.messages.partition_point(|m| m.id.0 > 0 && m.id < id);
+            if self.messages.get(guess).is_some_and(|m| m.id == id) {
+                return Some(guess);
+            }
+        }
+        self.messages.iter().position(|m| m.id == id)
     }
 
     /// Invalidates cached layout for `msg_id` so the next frame re-measures it.
@@ -600,16 +768,18 @@ impl HistoryInnerWidget {
         if !self.list.loaded_at_bottom {
             return;
         }
-        let existing_drafts: Vec<&HistoryMessage> =
-            self.messages.iter().filter(|m| m.id.0 < 0).collect();
-        if existing_drafts.len() == drafts.len()
-            && existing_drafts.iter().zip(drafts.iter()).all(|(a, b)| {
+        // Called on every frame: compare in place, without collecting the drafts.
+        let mut existing = self.messages.iter().filter(|m| m.id.is_streamed_draft());
+        let unchanged = drafts.iter().all(|b| {
+            existing.next().is_some_and(|a| {
                 a.id == b.id && a.text == b.text && a.extra.rich_message == b.extra.rich_message
             })
-        {
+        }) && existing.next().is_none();
+        if unchanged {
             return;
         }
-        self.messages.retain(|m| m.id.0 >= 0);
+        self.media_watch.dirty = true;
+        self.messages.retain(|m| !m.id.is_streamed_draft());
         for d in drafts {
             self.layout_cache.remove(&d.id);
             self.messages.push(d);
@@ -667,6 +837,8 @@ impl HistoryInnerWidget {
 
     /// Returns mutable access to the inline media playback runtime.
     pub fn media_runtime_mut(&mut self) -> &mut HistoryMediaRuntime {
+        // The caller may register or change a descriptor: look at the list again.
+        self.media_watch.dirty = true;
         &mut self.media_runtime
     }
 
@@ -891,10 +1063,38 @@ impl HistoryInnerWidget {
         self.last_painted_bubble_rects.get(&msg_id).copied()
     }
 
+    /// Returns the cached message layout of `msg_id` (tests).
+    #[cfg(test)]
+    pub(crate) fn cached_message_layout(&self, msg_id: MsgId) -> Option<&MessageLayout> {
+        match &self.layout_cache.get(&msg_id)?.layout {
+            CachedItemLayout::Message(layout) => Some(layout),
+            CachedItemLayout::Service(_) => None,
+        }
+    }
+
+    /// What the scroll bar of the last frame was drawn from: its thumb sits at
+    /// `offset / (content_height - viewport_height)` of the track.
+    #[must_use]
+    pub const fn last_scroll_metrics(&self) -> ScrollMetrics {
+        self.last_scroll_metrics
+    }
+
+    /// Current vertical scroll offset in logical pixels (tests).
+    #[cfg(test)]
+    pub(crate) const fn scroll_offset_y(&self) -> f32 {
+        self.scroll_offset_y
+    }
+
     /// Requests scrolling to the newest message at the bottom.
     pub fn request_scroll_to_bottom(&mut self) {
         self.list.scroll_top_state = tg_history::ScrollTopState::default();
+        // Back at the bottom the chat holds what a fresh open holds; the pages read while
+        // scrolled up are paged in again if the user scrolls back (TGB-2952).
+        if self.list.loaded_at_bottom {
+            self.unload_oldest_messages(OPEN_PAGE_BEFORE + 1);
+        }
         self.pending_scroll_to_bottom = true;
+        self.pending_scroll_to_unread_bar = false;
         self.pending_jump_msg = None;
     }
 
@@ -914,19 +1114,106 @@ impl HistoryInnerWidget {
         peer_kind: PeerKind,
         now_ms: i64,
     ) {
-        let loaded = self.messages.iter().any(|m| m.id == msg_id);
+        let loaded = self.index_of(msg_id).is_some();
         if !loaded {
             let slice = backend.load_slice_around(self.peer_id, msg_id, 40, 40);
+            self.register_media_descriptors(self.peer_id, &slice.messages, backend);
             self.apply_slice(self.peer_id, slice, peer_kind, false);
         }
         self.pending_jump_msg = Some(msg_id);
         self.pending_scroll_to_bottom = false;
+        self.pending_scroll_to_unread_bar = false;
         let full = to_hist_full(FullMsgId {
             peer: self.peer_id,
             msg: msg_id,
         });
         self.highlighter
             .highlight(HighlightTarget::whole_message(full), now_ms);
+    }
+
+    /// Finds the loaded messages whose registered media is still arriving.
+    fn scan_media_watch(&mut self, now_ms: i64) {
+        use tg_app_core::core_types::dto::inline_media::PhotoLoadState;
+        // A photo still being read from the disk cache is re-polled on the next frame (the
+        // cache repaints when the read lands), not after the download poll interval.
+        let mut cache_reads = false;
+        let loading: Vec<MsgId> = self
+            .messages
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| {
+                match self
+                    .media_runtime
+                    .descriptor(*id)
+                    .and_then(|d| d.photo_load.as_ref())
+                {
+                    Some(PhotoLoadState::Loading { .. }) => true,
+                    Some(PhotoLoadState::Pending) => {
+                        cache_reads = true;
+                        true
+                    }
+                    _ => false,
+                }
+            })
+            .collect();
+        // Round videos registered while their bytes were still downloading (the descriptor is
+        // otherwise read once per chat load, so the circle never got its video).
+        let pending_rounds: Vec<MsgId> = self
+            .messages
+            .iter()
+            .filter(|m| matches!(m.media, Some(HistoryMedia::RoundVideo(_))))
+            .map(|m| m.id)
+            .filter(|id| {
+                self.media_runtime
+                    .descriptor(*id)
+                    .is_some_and(|d| d.video_data.is_none())
+            })
+            .collect();
+        self.media_watch = MediaWatch {
+            loading,
+            pending_rounds,
+            cache_reads,
+            dirty: false,
+            scanned_list: Some(self.media_watch_list_key()),
+            scanned_ms: now_ms,
+        };
+    }
+
+    fn media_watch_list_key(&self) -> (usize, Option<MsgId>, Option<MsgId>) {
+        (
+            self.messages.len(),
+            self.messages.first().map(|m| m.id),
+            self.messages.last().map(|m| m.id),
+        )
+    }
+
+    /// Hands the download clicks of the last frame to `backend` (cancel / download on a photo,
+    /// the first play of a voice message) and reads the new state back at once, and asks for
+    /// the voice message that waits for its file until it is there.
+    fn apply_media_downloads(&mut self, ctx: &egui::Context, backend: &dyn HistoryBackend) {
+        use crate::history::inline_media::MediaDownloadAction;
+        self.media_runtime.guard_unloaded_voice();
+        for (id, action) in self.media_runtime.take_download_actions() {
+            match action {
+                MediaDownloadAction::Start => backend.start_media_download(self.peer_id, id),
+                MediaDownloadAction::Cancel => backend.cancel_media_download(self.peer_id, id),
+            }
+            if let Some(desc) = backend.inline_media_descriptor(self.peer_id, id) {
+                match desc.photo_load {
+                    Some(state) => self.media_runtime.set_photo_load_state(id, state),
+                    None => self.media_runtime.register_descriptor(id, desc),
+                }
+            }
+            self.media_watch.dirty = true;
+        }
+        if let Some(id) = self.media_runtime.pending_voice_msg() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            if let Some(desc) = backend.inline_media_descriptor(self.peer_id, id)
+                && desc.audio_bytes.is_some()
+            {
+                self.media_runtime.register_descriptor(id, desc);
+            }
+        }
     }
 
     /// Re-polls photos that are still downloading so they replace their blurred thumbnail as
@@ -939,29 +1226,49 @@ impl HistoryInnerWidget {
         now_ms: i64,
     ) {
         const POLL_MS: i64 = 250;
-        let loading: Vec<MsgId> = self
-            .messages
-            .iter()
-            .map(|m| m.id)
-            .filter(|id| {
-                matches!(
-                    self.media_runtime
-                        .descriptor(*id)
-                        .and_then(|d| d.photo_load.as_ref()),
-                    Some(
-                        tg_app_core::core_types::dto::inline_media::PhotoLoadState::Loading { .. }
-                    )
-                )
-            })
-            .collect();
-        if loading.is_empty() {
+        self.apply_media_downloads(ctx, backend);
+        // The watched messages only change when the list or a descriptor changes; a scan at
+        // least once per poll interval covers a change this widget was not told about.
+        let watch = &self.media_watch;
+        if watch.dirty
+            || watch.scanned_list != Some(self.media_watch_list_key())
+            || now_ms - watch.scanned_ms >= POLL_MS
+            || now_ms < watch.scanned_ms
+        {
+            self.scan_media_watch(now_ms);
+        }
+        if self.media_watch.loading.is_empty() && self.media_watch.pending_rounds.is_empty() {
             return;
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(POLL_MS as u64));
-        if now_ms - self.last_media_poll_ms < POLL_MS && now_ms >= self.last_media_poll_ms {
+        if !self.media_watch.cache_reads
+            && now_ms - self.last_media_poll_ms < POLL_MS
+            && now_ms >= self.last_media_poll_ms
+        {
             return;
         }
         self.last_media_poll_ms = now_ms;
+        // The poll changes descriptors, so the next frame scans again.
+        self.media_watch.dirty = true;
+        let pending_rounds = std::mem::take(&mut self.media_watch.pending_rounds);
+        let loading = std::mem::take(&mut self.media_watch.loading);
+        for id in pending_rounds {
+            let thumb_ready =
+                |d: &tg_app_core::core_types::dto::inline_media::InlineMediaDescriptor| {
+                    matches!(
+                        d.photo_load,
+                        Some(
+                            tg_app_core::core_types::dto::inline_media::PhotoLoadState::Ready { .. }
+                        )
+                    )
+                };
+            let had_thumb = self.media_runtime.descriptor(id).is_some_and(thumb_ready);
+            if let Some(desc) = backend.inline_media_descriptor(self.peer_id, id)
+                && (desc.video_data.is_some() || (!had_thumb && thumb_ready(&desc)))
+            {
+                self.media_runtime.register_descriptor(id, desc);
+            }
+        }
         for id in loading {
             if let Some(state) = backend
                 .inline_media_descriptor(self.peer_id, id)
@@ -973,6 +1280,18 @@ impl HistoryInnerWidget {
     }
 
     /// Loads or reloads a peer's initial slice from `backend`.
+    ///
+    /// The slice can hold a hundred messages, and asking for a message's inline media reads its
+    /// cached file, so only what the audio playlists need is asked for here. The media of the
+    /// other messages is asked for from the first frame on, the ones near the viewport first
+    /// ([`Self::request_backlog_media`]): every message of the slice still requests (and so
+    /// starts) its media, the chat just does not wait for all of them before it paints.
+    ///
+    /// `around_id` may be [`MsgId::SHOW_AT_END`] (the bottom), [`MsgId::SHOW_AT_UNREAD`] (the
+    /// "Unread messages" bar at the top when the chat has unread messages, else the bottom) or
+    /// a message. The page is requested without waiting (TGB-2926): until it arrives a new chat
+    /// shows an empty list, like tdesktop before its first `messages.getHistory` answers, and
+    /// the anchor is applied when the page is there.
     pub fn load_peer(
         &mut self,
         peer_id: PeerId,
@@ -980,13 +1299,192 @@ impl HistoryInnerWidget {
         backend: &dyn HistoryBackend,
         peer_kind: PeerKind,
     ) {
-        let slice = backend.load_slice_around(peer_id, around_id, 60, 40);
-        for msg in &slice.messages {
-            if let Some(desc) = backend.inline_media_descriptor(peer_id, msg.id) {
-                self.media_runtime.register_descriptor(msg.id, desc);
+        let switching = self.peer_id != peer_id;
+        match backend.try_load_slice_around(peer_id, around_id, OPEN_PAGE_BEFORE, OPEN_PAGE_AFTER) {
+            Loadable::Ready(slice) => {
+                self.pending_open = None;
+                self.finish_load_peer(peer_id, around_id, slice, backend, peer_kind, switching);
+            }
+            // A failed first load keeps what is shown, like a page that never arrives.
+            Loadable::Failed => {
+                if switching {
+                    self.apply_slice(peer_id, HistorySlice::default(), peer_kind, false);
+                }
+                self.pending_open = None;
+            }
+            Loadable::Loading => {
+                if switching {
+                    self.apply_slice(peer_id, HistorySlice::default(), peer_kind, false);
+                }
+                // A reload of the open chat keeps showing what it has until the page is there.
+                let switching = switching || self.pending_open.is_some_and(|p| p.switching);
+                self.pending_open = Some(PendingOpen {
+                    around_id,
+                    peer_kind,
+                    switching,
+                });
             }
         }
-        self.apply_slice(peer_id, slice, peer_kind, around_id == MsgId::SHOW_AT_END);
+    }
+
+    /// `true` while the first page of the open chat is loading (`HistoryWidget::_firstLoadRequest`).
+    #[must_use]
+    pub const fn is_loading_peer(&self) -> bool {
+        self.pending_open.is_some()
+    }
+
+    /// Asks again for the page [`Self::load_peer`] is waiting for and applies it once it is
+    /// there. Called every frame; the backend answers from its request state without waiting.
+    pub fn poll_pending_open(&mut self, backend: &dyn HistoryBackend) {
+        let Some(pending) = self.pending_open else {
+            return;
+        };
+        if self.peer_id.is_zero() {
+            self.pending_open = None;
+            return;
+        }
+        match backend.try_load_slice_around(
+            self.peer_id,
+            pending.around_id,
+            OPEN_PAGE_BEFORE,
+            OPEN_PAGE_AFTER,
+        ) {
+            Loadable::Ready(slice) => {
+                self.pending_open = None;
+                self.finish_load_peer(
+                    self.peer_id,
+                    pending.around_id,
+                    slice,
+                    backend,
+                    pending.peer_kind,
+                    pending.switching,
+                );
+            }
+            Loadable::Failed => self.pending_open = None,
+            Loadable::Loading => {}
+        }
+    }
+
+    fn finish_load_peer(
+        &mut self,
+        peer_id: PeerId,
+        around_id: MsgId,
+        slice: HistorySlice,
+        backend: &dyn HistoryBackend,
+        peer_kind: PeerKind,
+        switching: bool,
+    ) {
+        let mut later = HashSet::with_capacity(slice.messages.len());
+        for msg in &slice.messages {
+            if media_feeds_audio_playlist(msg) {
+                self.request_media_descriptor(peer_id, msg.id, backend);
+            } else {
+                later.insert(msg.id);
+            }
+        }
+        // The first page of a chat opened while it loaded counts as the switch to that chat
+        // (its scroll goes to the unread bar or the bottom, `countInitialScrollTop`).
+        self.apply_slice_opening(
+            peer_id,
+            slice,
+            peer_kind,
+            around_id == MsgId::SHOW_AT_END,
+            switching,
+        );
+        self.media_backlog = later;
+    }
+
+    /// Asks `backend` for the inline media of `msg_id` (which also starts its automatic
+    /// download, `PhotoMedia::automaticLoad`) and registers what it returns.
+    pub fn request_media_descriptor(
+        &mut self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+        backend: &dyn HistoryBackend,
+    ) {
+        if let Some(desc) = backend.inline_media_descriptor(peer_id, msg_id) {
+            self.media_runtime.register_descriptor(msg_id, desc);
+            self.media_watch.dirty = true;
+        }
+    }
+
+    /// Asks `backend` for the inline media of `messages`, for the slices that enter the list
+    /// after the chat opened: older / newer preloads and jumps (`HistoryView::Photo` creates its
+    /// media view when the element is created, whichever slice brought it).
+    fn register_media_descriptors(
+        &mut self,
+        peer_id: PeerId,
+        messages: &[HistoryMessage],
+        backend: &dyn HistoryBackend,
+    ) {
+        for msg in messages {
+            self.request_media_descriptor(peer_id, msg.id, backend);
+        }
+    }
+
+    /// Asks for the inline media `load_peer` left for later: every backlog message within one
+    /// viewport of the visible range now (before it is painted), then a few more per frame,
+    /// walking outward from the viewport, until the whole slice has been asked for.
+    fn request_backlog_media(
+        &mut self,
+        ctx: &egui::Context,
+        vis_top: i32,
+        vis_bottom: i32,
+        backend: &dyn HistoryBackend,
+    ) {
+        if self.media_backlog.is_empty() {
+            return;
+        }
+        let reach = (vis_bottom - vis_top).max(400);
+        let near = self
+            .list
+            .visible_items_top_to_bottom((vis_top - reach).max(0), vis_bottom + reach);
+        let (Some(first), Some(last)) =
+            (near.first().map(|v| v.index), near.last().map(|v| v.index))
+        else {
+            // Nothing is loaded: the backlog is about messages that left the list.
+            self.media_backlog.clear();
+            return;
+        };
+        for index in first..=last {
+            let Some(id) = self.messages.get(index).map(|m| m.id) else {
+                break;
+            };
+            if self.media_backlog.remove(&id) {
+                self.request_media_descriptor(self.peer_id, id, backend);
+            }
+        }
+
+        let started = Instant::now();
+        let mut asked = 0usize;
+        let (mut above, mut below) = (first, last + 1);
+        let mut take_above = true;
+        while !self.media_backlog.is_empty()
+            && asked < MEDIA_BACKLOG_MAX_PER_FRAME
+            && (asked == 0 || started.elapsed() < MEDIA_BACKLOG_BUDGET)
+        {
+            let len = self.messages.len();
+            let index = if above > 0 && (take_above || below >= len) {
+                above -= 1;
+                above
+            } else if below < len {
+                below += 1;
+                below - 1
+            } else {
+                // Walked the whole list: what is left is no longer loaded.
+                self.media_backlog.clear();
+                break;
+            };
+            take_above = !take_above;
+            let id = self.messages[index].id;
+            if self.media_backlog.remove(&id) {
+                self.request_media_descriptor(self.peer_id, id, backend);
+                asked += 1;
+            }
+        }
+        if !self.media_backlog.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     /// Replaces loaded messages with `slice` and rebuilds `HistoryList` metadata + estimated heights.
@@ -997,11 +1495,34 @@ impl HistoryInnerWidget {
         peer_kind: PeerKind,
         scroll_to_bottom: bool,
     ) {
-        let switching_peer = self.peer_id != peer_id;
+        let switching = self.peer_id != peer_id;
+        self.apply_slice_opening(peer_id, slice, peer_kind, scroll_to_bottom, switching);
+    }
+
+    /// [`Self::apply_slice`] that may treat the slice as the switch to `peer_id` even when the
+    /// view already shows that (still empty) chat while its first page loaded.
+    fn apply_slice_opening(
+        &mut self,
+        peer_id: PeerId,
+        slice: HistorySlice,
+        peer_kind: PeerKind,
+        scroll_to_bottom: bool,
+        switching_peer: bool,
+    ) {
+        // A new page of the open chat (a reload) keeps the message at the top of the view where
+        // it is, like `HistoryWidget` keeps `scrollTopItem` (TGB-2952).
+        let reload_anchor = if switching_peer || scroll_to_bottom || self.pending_scroll_to_bottom {
+            tg_history::ScrollTopState::default()
+        } else {
+            self.current_scroll_state()
+        };
         self.peer_id = peer_id;
         self.messages = slice.messages;
         self.unread_count = slice.unread_count;
         self.layout_cache.clear();
+        // A backlog belongs to the slice `load_peer` applied; it sets its own after this call.
+        self.media_backlog.clear();
+        self.media_watch.dirty = true;
         if switching_peer {
             self.list.selection.clear();
             self.highlighter.clear();
@@ -1043,17 +1564,31 @@ impl HistoryInnerWidget {
         self.list.loaded_at_bottom = slice.loaded_at_bottom;
         self.list.set_items(items);
 
-        let unread_idx = slice
-            .first_unread_id
-            .and_then(|uid| self.messages.iter().position(|m| m.id == uid));
+        let unread_idx = slice.first_unread_id.and_then(|uid| self.index_of(uid));
         self.list.set_unread_bar(unread_idx);
         self.update_date_and_unread_heights();
         self.media_runtime
             .sync_peer_audio_tracks(peer_id, &self.messages);
 
-        if scroll_to_bottom || switching_peer {
+        // `HistoryWidget::countInitialScrollTop`: a chat opened at its unread messages starts at
+        // the "Unread messages" bar; every other open starts at the bottom.
+        self.pending_scroll_to_unread_bar =
+            switching_peer && !scroll_to_bottom && unread_idx.is_some();
+        if scroll_to_bottom || (switching_peer && !self.pending_scroll_to_unread_bar) {
             self.pending_scroll_to_bottom = true;
+        } else if self.pending_scroll_to_unread_bar {
+            self.pending_scroll_to_bottom = false;
+        } else {
+            self.restore_scroll_state(reload_anchor);
         }
+    }
+
+    /// The message at the top of the view, for a reload that should keep it in place.
+    #[must_use]
+    pub fn top_visible_message(&self) -> Option<MsgId> {
+        let state = self.current_scroll_state();
+        tg_history::is_message_position_valid(state.item)
+            .then_some(MsgId(state.item.full_id.msg.0 as i32))
     }
 
     /// Removes the `"Unread messages"` divider bar and invalidates the cached layout of the item
@@ -1073,7 +1608,7 @@ impl HistoryInnerWidget {
         if !self.list.loaded_at_bottom && !self.messages.is_empty() {
             return;
         }
-        if self.messages.iter().any(|m| m.id == msg.id) {
+        if self.index_of(msg.id).is_some() {
             self.update_message_in_place(msg);
             return;
         }
@@ -1101,8 +1636,9 @@ impl HistoryInnerWidget {
     ///
     /// Deduplicates existing IDs in place, keeps the user's scroll position when scrolled up,
     /// and auto-scrolls to bottom only when already at bottom (or for outgoing messages).
+    /// Returns `true` when the message is in the list afterwards.
     pub fn apply_live_added_message(&mut self, msg: HistoryMessage, peer_kind: PeerKind) -> bool {
-        if self.messages.iter().any(|m| m.id == msg.id) {
+        if self.index_of(msg.id).is_some() {
             self.update_message_in_place(msg);
             return true;
         }
@@ -1121,7 +1657,39 @@ impl HistoryInnerWidget {
         self.list.loaded_at_bottom = true;
         let was_at_bottom = !self.scrolled_up;
         let is_group = matches!(peer_kind, PeerKind::Group);
-        let inserted_idx = if self.messages.last().is_none_or(|last| msg.id > last.id) {
+        // A local message (being sent) always goes to the bottom, like any message newer than
+        // the last one; tdesktop keeps local messages after the server ones they follow.
+        let goes_last = msg.id.is_local()
+            || self
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.id.0 > 0)
+                .is_none_or(|last_server| msg.id > last_server.id);
+        // The session stores a history page through `Session::insert_message`, which announces
+        // each of its messages as a new one. A message older than the loaded range belongs to
+        // such a page: the preload hands the page out and prepends it with the scroll anchor
+        // kept (`HistoryWidget::addMessagesToFront`). Splicing it in here would push the view
+        // down by the page's height and leave a gap in the loaded range (TGB-2952).
+        if !goes_last
+            && !self.list.loaded_at_top
+            && self
+                .messages
+                .iter()
+                .find(|m| m.id.0 > 0)
+                .is_some_and(|first_server| msg.id < first_server.id)
+        {
+            return false;
+        }
+        // A message that lands above the view keeps what is on screen in place
+        // (`ListWidget::rememberScrollAnchor` / `HistoryWidget::updateHistoryGeometry`).
+        let keep_anchor = !goes_last && !was_at_bottom && !is_outgoing;
+        let anchor = if keep_anchor {
+            self.current_scroll_state()
+        } else {
+            tg_history::ScrollTopState::default()
+        };
+        let inserted_idx = if goes_last {
             if let Some(prev_last) = self.messages.last() {
                 self.layout_cache.remove(&prev_last.id);
             }
@@ -1131,7 +1699,13 @@ impl HistoryInnerWidget {
             self.list.push_back(item);
             idx
         } else {
-            let idx = self.messages.partition_point(|m| m.id < msg.id);
+            // Before the first newer server message; local messages and drafts at the bottom
+            // are not in id order, so this is a scan rather than a binary search.
+            let idx = self
+                .messages
+                .iter()
+                .position(|m| m.id.0 > 0 && m.id > msg.id)
+                .unwrap_or(self.messages.len());
             if idx > 0 {
                 self.layout_cache.remove(&self.messages[idx - 1].id);
             }
@@ -1142,12 +1716,10 @@ impl HistoryInnerWidget {
                 .list
                 .unread_bar_index
                 .map(|u| if u >= idx { u + 1 } else { u });
+            // The other items keep their measured heights; only the new one is estimated.
+            let mut items = self.list.items().to_vec();
+            items.insert(idx, build_list_item(&msg, is_group));
             self.messages.insert(idx, msg);
-            let items: Vec<HistoryListItem> = self
-                .messages
-                .iter()
-                .map(|m| build_list_item(m, is_group))
-                .collect();
             self.list.set_items(items);
             self.list.set_unread_bar(prev_unread_bar);
             idx
@@ -1164,7 +1736,7 @@ impl HistoryInnerWidget {
             self.unread_count = self.unread_count.max(1);
         }
         if (was_at_bottom || is_outgoing) && self.messages.len() > MAX_LOADED_AT_BOTTOM {
-            self.unload_oldest_messages(is_group);
+            self.unload_oldest_messages(KEEP_LOADED_AFTER_UNLOAD);
         }
 
         self.update_date_and_unread_heights();
@@ -1173,16 +1745,70 @@ impl HistoryInnerWidget {
 
         if was_at_bottom || is_outgoing {
             self.pending_scroll_to_bottom = true;
+        } else if keep_anchor {
+            self.restore_scroll_state(anchor);
         }
         true
     }
 
-    /// Drops the oldest loaded messages down to [`KEEP_LOADED_AFTER_UNLOAD`] while the chat sits at
-    /// the bottom, so a busy chat left open does not grow without bound
-    /// (`History::unloadBlocks` / `HistoryWidget::preloadHistoryIfNeeded`). Scrolling up loads
-    /// them again from the backend.
-    fn unload_oldest_messages(&mut self, is_group: bool) {
-        let Some(drop_count) = self.messages.len().checked_sub(KEEP_LOADED_AFTER_UNLOAD) else {
+    /// Where the next frame starts drawing: a scroll target already asked for, else the
+    /// offset the last frame ended with.
+    fn effective_scroll_top(&self) -> f32 {
+        self.pending_scroll_y.unwrap_or(self.scroll_offset_y)
+    }
+
+    /// The message at the top of the view and how far into it the view starts
+    /// (`ListWidget::countScrollState`); empty at the bottom of a chat loaded to its end.
+    fn current_scroll_state(&self) -> tg_history::ScrollTopState {
+        let top = self.effective_scroll_top();
+        let vis_top = top.round() as i32;
+        let vis_bot = (top + self.last_viewport_h).round() as i32;
+        self.list.count_scroll_state(vis_top, vis_bot)
+    }
+
+    /// The anchor for rows measured this frame: the first row that starts at or below the top
+    /// of the view. The row cut by the top edge may itself have just been measured (an
+    /// estimate replaced by its real height); anchoring on it would keep its top still and
+    /// push everything on screen down by its growth. Uses the positions from before the
+    /// measured heights are laid out.
+    fn anchor_below_top(&self, vis_top: i32, vis_bottom: i32) -> tg_history::ScrollTopState {
+        let items = self.list.items();
+        let items_top = self.list.items_top();
+        let index = items.partition_point(|item| items_top + item.y < vis_top);
+        match items.get(index) {
+            Some(item) if items_top + item.y < vis_bottom && !item.attach_meta.is_sponsored => {
+                tg_history::ScrollTopState {
+                    item: item.position,
+                    shift: vis_top - (items_top + item.y),
+                }
+            }
+            _ => self.list.count_scroll_state(vis_top, vis_bottom),
+        }
+    }
+
+    /// Scrolls so the message of `state` is where it was (`ListWidget::restoreScrollState`).
+    /// Returns `false` when `state` names no message or the message is gone.
+    fn restore_scroll_state(&mut self, state: tg_history::ScrollTopState) -> bool {
+        if !tg_history::is_message_position_valid(state.item) {
+            return false;
+        }
+        self.list.scroll_top_state = state;
+        let Some(restored) = self.list.restore_scroll_top() else {
+            return false;
+        };
+        self.scroll_offset_y = restored as f32;
+        self.pending_scroll_y = Some(restored as f32);
+        true
+    }
+
+    /// Drops the oldest loaded messages down to the newest `keep` while the chat sits at the
+    /// bottom, so a busy chat left open, or one scrolled far up and brought back down, holds
+    /// about what it held when it was opened and the scroll bar is sized from that (owner,
+    /// TGB-2952; tdesktop drops a history's blocks with `History::clear(ClearType::Unload)`).
+    /// Scrolling up pages them in again from the backend. The kept messages keep their
+    /// measured heights.
+    fn unload_oldest_messages(&mut self, keep: usize) {
+        let Some(drop_count) = self.messages.len().checked_sub(keep) else {
             return;
         };
         if drop_count == 0 {
@@ -1192,7 +1818,9 @@ impl HistoryInnerWidget {
         for id in &dropped {
             self.layout_cache.remove(id);
             self.last_painted_bubble_rects.remove(id);
+            self.media_backlog.remove(id);
         }
+        // The new first message may now show its date above it.
         if let Some(first) = self.messages.first() {
             self.layout_cache.remove(&first.id);
         }
@@ -1200,11 +1828,7 @@ impl HistoryInnerWidget {
             .list
             .unread_bar_index
             .and_then(|u| u.checked_sub(drop_count));
-        let items: Vec<HistoryListItem> = self
-            .messages
-            .iter()
-            .map(|m| build_list_item(m, is_group))
-            .collect();
+        let items = self.list.items()[drop_count..].to_vec();
         self.list.set_items(items);
         self.list.set_unread_bar(unread_bar);
         self.list
@@ -1212,6 +1836,10 @@ impl HistoryInnerWidget {
             .selected_items
             .retain(|id| !dropped.contains(&MsgId(id.msg.0 as i32)));
         self.list.loaded_at_top = false;
+        self.list.scroll_top_state = tg_history::ScrollTopState::default();
+        self.update_date_and_unread_heights();
+        self.media_runtime
+            .sync_peer_audio_tracks(self.peer_id, &self.messages);
     }
 
     /// Marks loaded outgoing messages up to `max_id` as read (`updateReadHistoryOutbox` /
@@ -1254,11 +1882,80 @@ impl HistoryInnerWidget {
         }
     }
 
+    /// Puts the sent version of local message `local_id` in its place (the position, height and
+    /// unread bar stay), like tdesktop's `HistoryItem::setRealId`. When the sent message is
+    /// already listed (a reload brought it), the local one is removed instead. Returns `true`
+    /// when the local message was listed.
+    pub fn replace_local_message(
+        &mut self,
+        local_id: MsgId,
+        sent: HistoryMessage,
+        peer_kind: PeerKind,
+    ) -> bool {
+        let Some(index) = self.index_of(local_id) else {
+            self.update_message_in_place(sent);
+            return false;
+        };
+        if sent.id != local_id && self.index_of(sent.id).is_some() {
+            self.remove_messages(&[local_id], peer_kind);
+            self.update_message_in_place(sent);
+            return true;
+        }
+        self.layout_cache.remove(&local_id);
+        self.media_backlog.remove(&local_id);
+        self.media_watch.dirty = true;
+        let is_group = matches!(peer_kind, PeerKind::Group);
+        let fresh = build_list_item(&sent, is_group);
+        if let Some(slot) = self.list.items_mut().get_mut(index) {
+            *slot = HistoryListItem {
+                y: slot.y,
+                height: slot.height,
+                has_unread_bar: slot.has_unread_bar,
+                displayed_date_height: slot.displayed_date_height,
+                ..fresh
+            };
+        }
+        if let Some(anchor) = self.last_bubble_anchors.remove(&local_id) {
+            self.last_bubble_anchors.insert(sent.id, anchor);
+        }
+        let local_full = to_hist_full(FullMsgId {
+            peer: self.peer_id,
+            msg: local_id,
+        });
+        let sent_full = to_hist_full(FullMsgId {
+            peer: self.peer_id,
+            msg: sent.id,
+        });
+        for selected in &mut self.list.selection.selected_items {
+            if *selected == local_full {
+                *selected = sent_full;
+            }
+        }
+        self.messages[index] = sent;
+        self.list.recount_attachments();
+        self.list.relayout_positions();
+        true
+    }
+
+    /// Shows local message `local_id` as failed (`HistoryItem::sendFailed`): it keeps the clock
+    /// (`BottomInfo`, `Flag::Sending`) and stays in the list.
+    pub fn mark_local_message_failed(&mut self, local_id: MsgId) -> bool {
+        let Some(index) = self.index_of(local_id) else {
+            return false;
+        };
+        let msg = &mut self.messages[index];
+        msg.is_sending = true;
+        msg.extra.send_failed = true;
+        self.layout_cache.remove(&local_id);
+        true
+    }
+
     /// Updates an edited or reaction-changed message in place and invalidates its cached layout.
     pub fn update_message_in_place(&mut self, updated: HistoryMessage) {
-        if let Some(slot) = self.messages.iter_mut().find(|m| m.id == updated.id) {
+        if let Some(index) = self.index_of(updated.id) {
             self.layout_cache.remove(&updated.id);
-            *slot = updated;
+            self.media_watch.dirty = true;
+            self.messages[index] = updated;
         }
     }
 
@@ -1271,6 +1968,7 @@ impl HistoryInnerWidget {
         }
         for id in msg_ids {
             self.layout_cache.remove(id);
+            self.media_backlog.remove(id);
         }
         let is_group = matches!(peer_kind, PeerKind::Group);
         let items: Vec<HistoryListItem> = self
@@ -1286,15 +1984,49 @@ impl HistoryInnerWidget {
         self.update_date_and_unread_heights();
     }
 
+    /// Loads the slice before the first loaded message (`HistoryList::check_preload` top) and
+    /// prepends it, starting the media of its messages.
+    pub fn load_older_slice(&mut self, backend: &dyn HistoryBackend, peer_kind: PeerKind) {
+        let Some(first) = self.messages.first() else {
+            return;
+        };
+        // While the page is requested the list stays as it is; the preload check asks again on
+        // a later frame (the backend wakes the UI when the page lands).
+        let Some(older) = backend
+            .try_load_slice_before(self.peer_id, first.id, 40)
+            .ready()
+        else {
+            return;
+        };
+        self.register_media_descriptors(self.peer_id, &older.messages, backend);
+        self.prepend_older_slice(older, peer_kind);
+    }
+
+    /// Loads the slice after the last loaded message (`HistoryList::check_preload` bottom) and
+    /// appends it, starting the media of its messages.
+    pub fn load_newer_slice(&mut self, backend: &dyn HistoryBackend, peer_kind: PeerKind) {
+        let Some(last) = self.messages.last() else {
+            return;
+        };
+        let Some(newer) = backend
+            .try_load_slice_after(self.peer_id, last.id, 40)
+            .ready()
+        else {
+            return;
+        };
+        self.register_media_descriptors(self.peer_id, &newer.messages, backend);
+        self.append_newer_slice(newer, peer_kind);
+    }
+
     /// Prepends older messages while keeping the user's viewport anchored to the exact same message!
     pub fn prepend_older_slice(&mut self, older: HistorySlice, peer_kind: PeerKind) {
         if older.messages.is_empty() {
             self.list.loaded_at_top = true;
             return;
         }
-        let vis_top = self.scroll_offset_y.round() as i32;
-        let vis_bot = (self.scroll_offset_y + self.last_viewport_h).round() as i32;
-        self.list.save_scroll_state(vis_top, vis_bot);
+        let vis_bot = (self.effective_scroll_top() + self.last_viewport_h).round() as i32;
+        let was_at_bottom = self.is_at_loaded_bottom(vis_bot);
+        let anchor = self.current_scroll_state();
 
         let is_group = matches!(peer_kind, PeerKind::Group);
         let older_items: Vec<HistoryListItem> = older
@@ -1313,10 +2045,35 @@ impl HistoryInnerWidget {
         self.list.prepend_older(older_items);
         self.update_date_and_unread_heights();
 
-        if let Some(restored) = self.list.restore_scroll_top() {
-            self.scroll_offset_y = restored as f32;
-            self.pending_scroll_y = Some(restored as f32);
+        // A view at the newest message stays there while older messages fill in above
+        // (`HistoryWidget::updateHistoryGeometry` keeps `wasAtBottom` at the new bottom); a chat
+        // opened with only its top message loaded otherwise drifts up as each page arrives.
+        if was_at_bottom {
+            self.pending_scroll_to_bottom = true;
+        } else {
+            self.restore_scroll_state(anchor);
         }
+    }
+
+    /// Lifts the painted rows by `px` above their place: the list stretched past its bottom
+    /// (`Ui::ElasticScroll` real overscroll plus `setContentBottomInset`). `0.0` at rest.
+    pub fn set_bottom_stretch(&mut self, px: f32) {
+        self.bottom_stretch = px.max(0.0);
+    }
+
+    /// `true` when the last frame showed the very end of a history loaded to its newest message
+    /// (`scrollTop() >= scrollTopMax()` with `History::loadedAtBottom`).
+    #[must_use]
+    pub fn is_at_history_bottom(&self) -> bool {
+        let m = self.last_scroll_metrics;
+        self.list.loaded_at_bottom
+            && m.viewport_height > 0.0
+            && m.offset + m.viewport_height + 2.0 >= m.content_height
+    }
+
+    /// `true` when `vis_bottom` reaches the end of a list that ends at the newest message.
+    fn is_at_loaded_bottom(&self, vis_bottom: i32) -> bool {
+        self.list.loaded_at_bottom && vis_bottom + 2 >= self.list.total_height()
     }
 
     /// Appends newer messages when scrolling downward in a jumped-to historical slice.
@@ -1422,7 +2179,7 @@ impl HistoryInnerWidget {
                 self.list.items_mut()[v.index].height = new_h;
                 heights_changed = true;
             }
-            self.layout_cache.insert(msg.id, cached);
+            self.layout_cache.insert(msg.id, CachedItem::new(cached));
             laid_out += 1;
         }
         if heights_changed {
@@ -1488,7 +2245,9 @@ impl HistoryInnerWidget {
 
         let now_ms = (ui.ctx().input(|i| i.time) * 1000.0).max(0.0) as i64;
         self.last_now_ms = now_ms;
+        self.poll_pending_open(&*backend);
         self.refresh_loading_media(ui.ctx(), &*backend, now_ms);
+        self.assets.reply_previews.poll(ui.ctx(), &*backend, now_ms);
         self.highlighter.tick(now_ms);
         if self.highlighter.is_animating(now_ms) || self.inline_kb_state.loading_count() > 0 {
             ui.ctx().request_repaint();
@@ -1596,7 +2355,7 @@ impl HistoryInnerWidget {
 
         // Resolve pending jump-to-message scroll target.
         if let Some(target_id) = self.pending_jump_msg.take()
-            && let Some(idx) = self.messages.iter().position(|m| m.id == target_id)
+            && let Some(idx) = self.index_of(target_id)
         {
             // Ensure target item is laid out so centering is exact.
             let fc_extra_h = self.factcheck_extra_height(target_id, backend);
@@ -1625,6 +2384,47 @@ impl HistoryInnerWidget {
             }
         }
 
+        // `unreadBarTop`: lay out the bar's item and one screen below it, then put the bar at the
+        // top of the view (`ScrollArea` clamps it when the rest is shorter than the viewport).
+        if self.pending_scroll_to_unread_bar {
+            self.pending_scroll_to_unread_bar = false;
+            if let Some(idx) = self
+                .list
+                .unread_bar_index
+                .filter(|&i| i < self.messages.len())
+            {
+                let mut changed = false;
+                let mut filled = 0;
+                let mut i = idx;
+                while i < self.messages.len() && filled < viewport_h.ceil() as i32 {
+                    let id = self.messages[i].id;
+                    let fc_extra_h = self.factcheck_extra_height(id, backend);
+                    let summary_entry = backend.message_summary(self.peer_id, id);
+                    changed |= self.ensure_item_laid_out(
+                        ui,
+                        i,
+                        viewport_w,
+                        is_chat_wide,
+                        peer,
+                        colors,
+                        &fonts,
+                        fc_extra_h,
+                        summary_entry.as_ref(),
+                    );
+                    filled += self.list.items()[i].height;
+                    i += 1;
+                }
+                if changed {
+                    self.list.relayout_positions();
+                    let items_top =
+                        ((viewport_h as i32) - self.list.items_height() - content_pad_bottom)
+                            .max(0);
+                    self.list.set_items_top(items_top);
+                }
+                self.pending_scroll_y = Some(unread_bar_scroll_top(&self.list, idx) as f32);
+            }
+        }
+
         // Resolve pending scroll-to-bottom target.
         let mut pinning_to_bottom = false;
         if self.pending_scroll_to_bottom {
@@ -1649,18 +2449,42 @@ impl HistoryInnerWidget {
         let search_q = search_filter.trim().to_lowercase();
         let show_selection_checks = self.list.selection.has_selected_items();
         let show_sender_in_chat = matches!(peer.summary.kind, PeerKind::Group);
-        let reaction_userpics = (matches!(peer.summary.kind, PeerKind::User)
-            && !peer.summary.is_saved_messages)
-            .then(|| {
-                let (self_id, self_name) = backend.self_peer();
-                ReactionUserpics {
-                    peer: (peer.summary.id, peer.summary.title.clone()),
-                    me: (self_id, self_name),
+        // The own name comes from the backend: it is read again when the chat's version (or the
+        // peer shown) changes, not on every frame. The kept value is moved out of `self` for
+        // the frame so the paint loop can borrow it, and put back after the list is painted.
+        let mut reaction_userpics_slot = self.reaction_userpics.take();
+        let reaction_userpics: Option<&ReactionUserpics> =
+            if matches!(peer.summary.kind, PeerKind::User) && !peer.summary.is_saved_messages {
+                let generation = self.read_gate.begin_frame(
+                    ui.ctx(),
+                    self.peer_id,
+                    backend.chat_version(self.peer_id),
+                );
+                if !reaction_userpics_slot.as_ref().is_some_and(|kept| {
+                    let (id, title) = &kept.value().peer;
+                    *id == peer.summary.id && *title == peer.summary.title
+                }) {
+                    reaction_userpics_slot = None;
                 }
-            });
+                Some(Gated::get_or_read(
+                    &mut reaction_userpics_slot,
+                    generation,
+                    || {
+                        let (self_id, self_name) = backend.self_peer();
+                        ReactionUserpics {
+                            peer: (peer.summary.id, peer.summary.title.clone()),
+                            me: (self_id, self_name),
+                        }
+                    },
+                ))
+            } else {
+                None
+            };
 
         self.last_painted_bubble_rects.clear();
 
+        // How far this frame moved the view to keep its top message in place.
+        let mut anchor_shift = 0i32;
         let scroll_out = ui.scope_builder(egui::UiBuilder::new().max_rect(list_rect), |ui| {
             // Clear stale ScrollArea physics state (`max_offset`, `vel`, `offset_target`) before
             // an explicit programmatic scroll jump. Otherwise egui's `ScrollArea::begin` compares
@@ -1674,13 +2498,18 @@ impl HistoryInnerWidget {
                 egui::scroll_area::State::default().store(ui.ctx(), expected_scroll_id);
             }
             let out = scroll_area.show_viewport(ui, |ui, viewport| {
-                let vis_top = viewport.min.y.floor() as i32;
-                let vis_bottom = viewport.max.y.ceil() as i32;
+                let mut vis_top = viewport.min.y.floor() as i32;
+                let mut vis_bottom = viewport.max.y.ceil() as i32;
+                let was_at_bottom = self.is_at_loaded_bottom(vis_bottom);
                 let overscan = 160;
                 let visible = self.list.visible_items_top_to_bottom(
                     (vis_top - overscan).max(0),
                     vis_bottom + overscan,
                 );
+
+                // Media `load_peer` left for the first frames: what is near the viewport is
+                // asked for before it is painted.
+                self.request_backlog_media(ui.ctx(), vis_top, vis_bottom, &*backend);
 
                 // Sync live voice/round-video transcription state and limits for visible items.
                 self.voice_state.transcribe_limits = backend.transcribe_limits(Some(self.peer_id));
@@ -1690,33 +2519,45 @@ impl HistoryInnerWidget {
                 }
 
                 // Phase 1: Lazily compute exact layouts ONLY for visible items (+ small overscan).
-                let mut heights_changed = false;
-                let anchor_top = vis_top;
-                let anchor_bot = vis_bottom;
-                for v in &visible {
-                    let msg_id = self.messages[v.index].id;
-                    if !self.layout_cache.contains_key(&msg_id) {
-                        let fc_extra_h = self.factcheck_extra_height(msg_id, backend);
-                        let summary_entry = backend.message_summary(self.peer_id, msg_id);
-                        let changed = self.ensure_item_laid_out(
-                            ui,
-                            v.index,
-                            viewport_w,
-                            is_chat_wide,
-                            peer,
-                            colors,
-                            &fonts,
-                            fc_extra_h,
-                            summary_entry.as_ref(),
-                        );
-                        if changed {
-                            heights_changed = true;
-                        }
-                        laid_out_this_frame += 1;
-                    }
+                // A measured height above the view moves what is on screen; the view follows its
+                // top message in this same frame (`HistoryWidget::updateHistoryGeometry` keeps
+                // `scrollTopItem` in place synchronously), so the frame never shows the content
+                // shifted and the next frame does not snap back (TGB-2952).
+                let pinned = pinning_to_bottom || was_at_bottom;
+                if pinned {
+                    // A view held at the bottom has no anchor; one left from a resize would be
+                    // applied later, at a place the user has scrolled away from.
+                    self.list.scroll_top_state = tg_history::ScrollTopState::default();
                 }
-                if heights_changed {
-                    if pinning_to_bottom {
+                let mut to_measure = visible;
+                for _ in 0..3 {
+                    let mut heights_changed = false;
+                    for v in &to_measure {
+                        let msg_id = self.messages[v.index].id;
+                        if !self.layout_cache.contains_key(&msg_id) {
+                            let fc_extra_h = self.factcheck_extra_height(msg_id, backend);
+                            let summary_entry = backend.message_summary(self.peer_id, msg_id);
+                            let changed = self.ensure_item_laid_out(
+                                ui,
+                                v.index,
+                                viewport_w,
+                                is_chat_wide,
+                                peer,
+                                colors,
+                                &fonts,
+                                fc_extra_h,
+                                summary_entry.as_ref(),
+                            );
+                            if changed {
+                                heights_changed = true;
+                            }
+                            laid_out_this_frame += 1;
+                        }
+                    }
+                    if !heights_changed {
+                        break;
+                    }
+                    if pinned {
                         self.list.relayout_positions();
                         let items_top = ((viewport_h as i32)
                             - self.list.items_height()
@@ -1725,18 +2566,37 @@ impl HistoryInnerWidget {
                         self.list.set_items_top(items_top);
                         self.pending_scroll_to_bottom = true;
                         ui.ctx().request_repaint();
-                    } else {
-                        self.list.save_scroll_state(anchor_top, anchor_bot);
-                        self.list.relayout_positions();
-                        let items_top = ((viewport_h as i32)
-                            - self.list.items_height()
-                            - content_pad_bottom)
-                            .max(0);
-                        self.list.set_items_top(items_top);
-                        if let Some(restored) = self.list.restore_scroll_top() {
-                            self.pending_scroll_y = Some(restored as f32);
-                        }
+                        break;
                     }
+                    // An anchor saved before a resize dropped the layouts wins over this one.
+                    if !tg_history::is_message_position_valid(self.list.scroll_top_state.item) {
+                        self.list.scroll_top_state = self.anchor_below_top(vis_top, vis_bottom);
+                    }
+                    self.list.relayout_positions();
+                    let items_top =
+                        ((viewport_h as i32) - self.list.items_height() - content_pad_bottom)
+                            .max(0);
+                    self.list.set_items_top(items_top);
+                    if let Some(restored) = self.list.restore_scroll_top() {
+                        let max_top = (self.list.total_height() - viewport_h as i32).max(0);
+                        let shift = restored.min(max_top) - vis_top;
+                        vis_top += shift;
+                        vis_bottom += shift;
+                        anchor_shift += shift;
+                    }
+                    to_measure = self.list.visible_items_top_to_bottom(
+                        (vis_top - overscan).max(0),
+                        vis_bottom + overscan,
+                    );
+                }
+                // A resize anchor no height change used is applied now; left in place it would
+                // stop the preloads and be applied later, far from where the view is.
+                if let Some(restored) = self.list.restore_scroll_top() {
+                    let max_top = (self.list.total_height() - viewport_h as i32).max(0);
+                    let shift = restored.min(max_top) - vis_top;
+                    vis_top += shift;
+                    vis_bottom += shift;
+                    anchor_shift += shift;
                 }
 
                 // Allocate the full content area AFTER Phase 1 so `ScrollArea::end` records the
@@ -1744,6 +2604,18 @@ impl HistoryInnerWidget {
                 let total_h = (self.list.total_height() as f32).max(viewport_h);
                 let (content_rect, bg_resp) =
                     ui.allocate_exact_size(Vec2::new(list_rect.width(), total_h), Sense::click());
+                // Rows are placed as if the scroll area already stood at the corrected offset.
+                // A pull past the bottom lifts the rows; the wallpaper and the scroll stay.
+                let paint_top = content_rect.min.y - anchor_shift as f32 - self.bottom_stretch;
+                // Rows are painted in a child that adds nothing to the scrolled content: the
+                // scroll bar is sized from the list height alone (`HistoryInner::height` in
+                // tdesktop), whatever a row's widgets allocate (TGB-2952).
+                let mut rows_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(content_rect)
+                        .layout(*ui.layout()),
+                );
+                let ui = &mut rows_ui;
 
                 if bg_resp.clicked() && !self.list.selection.has_selected_items() {
                     self.list.selection.clear();
@@ -1789,6 +2661,10 @@ impl HistoryInnerWidget {
                 }
                 rm.start_batch(vis_top, vis_bottom, now_ms_u64);
 
+                // Layouts invalidated by an action taken while painting: dropped after the
+                // loop, so the paint can borrow the cache instead of cloning each layout.
+                let mut invalidated: Vec<MsgId> = Vec::new();
+
                 // Phase 2: Paint visible items only!
                 for v in &visible_paint {
                     let msg = &self.messages[v.index];
@@ -1803,14 +2679,22 @@ impl HistoryInnerWidget {
                         );
                     }
                     let row_origin =
-                        Pos2::new(content_rect.min.x, content_rect.min.y + v.top as f32);
+                        Pos2::new(content_rect.min.x, paint_top + v.top as f32);
                     let row_rect = Rect::from_min_size(
                         row_origin,
                         Vec2::new(content_rect.width(), item.height as f32),
                     );
 
                     // Optional search filter highlight tint.
-                    if !search_q.is_empty() && msg.text.text.to_lowercase().contains(&search_q) {
+                    let search_hit = !search_q.is_empty()
+                        && match self.layout_cache.get_mut(&msg.id) {
+                            // The lowercase text is kept with the message, not rebuilt per frame.
+                            Some(cached) => cached
+                                .paint
+                                .contains_lowercase(&msg.text.text, &search_q),
+                            None => msg.text.text.to_lowercase().contains(&search_q),
+                        };
+                    if search_hit {
                         ui.painter().rect_filled(
                             row_rect,
                             CornerRadius::ZERO,
@@ -1900,16 +2784,30 @@ impl HistoryInnerWidget {
                         });
                     }
 
-                    // Paint cached message or service layout.
-                    if let Some(cached) = self.layout_cache.get(&msg.id).cloned() {
-                        match cached {
+                    // Paint cached message or service layout, borrowed from the cache. A
+                    // layout invalidated earlier on this frame is treated as already gone.
+                    let cached = if invalidated.contains(&msg.id) {
+                        None
+                    } else {
+                        self.layout_cache.get_mut(&msg.id)
+                    };
+                    if let Some(CachedItem {
+                        layout: cached_layout,
+                        paint: paint_cache,
+                    }) = cached
+                    {
+                        match cached_layout {
                             CachedItemLayout::Service(svc_layout) => {
-                                let action_taken =
-                                    backend.is_no_forwards_request_acted(self.peer_id, msg.id);
+                                // Only the no-forwards request card has an "acted" state.
+                                let action_taken = matches!(
+                                    msg.service,
+                                    Some(ServiceAction::NoForwardsRequest { .. })
+                                ) && backend
+                                    .is_no_forwards_request_acted(self.peer_id, msg.id);
                                 if let Some(svc_act) = paint_service_message_interactive(
                                     ui,
                                     msg,
-                                    &svc_layout,
+                                    svc_layout,
                                     row_origin,
                                     action_taken,
                                     &peer.summary.title,
@@ -1919,14 +2817,14 @@ impl HistoryInnerWidget {
                                     match svc_act {
                                         ServiceCardAction::NoForwards(nfr_act) => match nfr_act {
                                             crate::history::no_forwards_request::NoForwardsRequestAction::Accept(mid) => {
-                                                self.layout_cache.remove(&mid);
+                                                invalidated.push(mid);
                                                 events.push(InnerEvent::RespondNoForwardsRequest {
                                                     msg_id: mid,
                                                     accept: true,
                                                 });
                                             }
                                             crate::history::no_forwards_request::NoForwardsRequestAction::Decline(mid) => {
-                                                self.layout_cache.remove(&mid);
+                                                invalidated.push(mid);
                                                 events.push(InnerEvent::RespondNoForwardsRequest {
                                                     msg_id: mid,
                                                     accept: false,
@@ -2041,7 +2939,7 @@ impl HistoryInnerWidget {
                                     ui,
                                     self.peer_id,
                                     msg,
-                                    &msg_layout,
+                                    msg_layout,
                                     row_origin,
                                     sel,
                                     hl.opacity,
@@ -2062,7 +2960,8 @@ impl HistoryInnerWidget {
                                     }),
                                     summary_entry.as_ref(),
                                     paused_chat_effects,
-                                    reaction_userpics.as_ref(),
+                                    reaction_userpics,
+                                    paint_cache,
                                 );
                                 if msg.is_post
                                     && matches!(peer.summary.kind, PeerKind::Channel)
@@ -2071,13 +2970,46 @@ impl HistoryInnerWidget {
                                 {
                                     events.push(InnerEvent::Forward(vec![msg.id]));
                                 }
+                                if msg.is_post
+                                    && matches!(peer.summary.kind, PeerKind::Channel)
+                                    && !msg_layout.has_bubble
+                                    && !msg_layout.media_rect.is_empty()
+                                {
+                                    let anchor = unwrapped_right_action_anchor(
+                                        msg_layout,
+                                        row_origin,
+                                    );
+                                    match msg.extra.replies_count {
+                                        Some(count) => {
+                                            if paint_side_comments_button(
+                                                ui, msg.id, count, anchor, colors,
+                                            ) {
+                                                events.push(InnerEvent::OpenComments(msg.id));
+                                            }
+                                        }
+                                        None => {
+                                            if paint_fast_share_button(ui, msg.id, anchor, colors)
+                                            {
+                                                events.push(InnerEvent::Forward(vec![msg.id]));
+                                            }
+                                        }
+                                    }
+                                }
                                 for ev in paint_events {
                                     match ev {
                                         MessagePaintEvent::JumpToMessage(tid) => {
                                             jump_to_msg = Some(tid);
                                         }
                                         MessagePaintEvent::OpenLink(url) => {
-                                            events.push(InnerEvent::OpenLink(url));
+                                            events.push(
+                                                match tg_ui::entity_link::EntityLink::parse(&url) {
+                                                    Some(link) => InnerEvent::EntityLink {
+                                                        msg_id: msg.id,
+                                                        link,
+                                                    },
+                                                    None => InnerEvent::OpenLink(url),
+                                                },
+                                            );
                                         }
                                         MessagePaintEvent::OpenHiddenLink(url) => {
                                             events.push(InnerEvent::OpenHiddenLink(url));
@@ -2144,7 +3076,7 @@ impl HistoryInnerWidget {
                                                 duration_secs,
                                                 is_round_video,
                                             } => {
-                                                self.layout_cache.remove(&msg_id);
+                                                invalidated.push(msg_id);
                                                 events.push(InnerEvent::ToggleTranscribe {
                                                     msg_id,
                                                     duration_secs,
@@ -2284,7 +3216,7 @@ impl HistoryInnerWidget {
                                             });
                                         }
                                         MessagePaintEvent::ToggleSummary(mid) => {
-                                            self.layout_cache.remove(&mid);
+                                            invalidated.push(mid);
                                             events.push(InnerEvent::ToggleSummary(mid));
                                         }
                                         MessagePaintEvent::AboutAiSummary(mid) => {
@@ -2346,7 +3278,7 @@ impl HistoryInnerWidget {
                                                 if !self.expanded_factchecks.remove(&mid) {
                                                     self.expanded_factchecks.insert(mid);
                                                 }
-                                                self.layout_cache.remove(&mid);
+                                                invalidated.push(mid);
                                             }
                                             crate::history::factcheck::FactCheckFooterAction::Edit(mid) => {
                                                 events.push(InnerEvent::EditFactCheck(mid));
@@ -2384,12 +3316,18 @@ impl HistoryInnerWidget {
                         if row_hovered && self.bubble_hover_quick_actions.is_animating() {
                             ui.ctx().request_repaint();
                         }
+                        let has_right_layout = !invalidated.contains(&msg.id)
+                            && matches!(
+                                self.layout_cache.get(&msg.id).map(|cached| &cached.layout),
+                                Some(CachedItemLayout::Message(l)) if l.has_right_layout
+                            );
                         if qa_opacity > 0.02
                             && let Some(qa_out) =
                                 crate::history::quick_action::show_bubble_hover_quick_actions(
                                     ui,
                                     bubble_rect,
                                     row_rect,
+                                    has_right_layout,
                                     msg,
                                     self.corner_reply,
                                     self.corner_reaction,
@@ -2467,6 +3405,11 @@ impl HistoryInnerWidget {
                     painted_this_frame += 1;
                 }
 
+                for id in invalidated {
+                    self.layout_cache.remove(&id);
+                }
+                self.trim_paint_caches();
+
                 // Pause any inline GIFs / round videos / stickers that scrolled offscreen.
                 self.media_runtime.finish_frame(now_ms);
                 if let Some(ref mut tracker) = self.read_metrics {
@@ -2485,33 +3428,76 @@ impl HistoryInnerWidget {
                             let avatar_rect = Rect::from_min_size(
                                 Pos2::new(
                                     content_rect.min.x + HISTORY_PHOTO_LEFT as f32,
-                                    content_rect.min.y + up.top as f32,
+                                    paint_top + up.top as f32,
                                 ),
                                 Vec2::splat(MSG_PHOTO_SIZE as f32),
                             );
-                            EmptyUserpic::for_peer(
-                                msg.from_id.bare(),
-                                &msg.sender_name,
-                                &ui_colors,
-                            )
-                            .paint_circle(ui.painter(), avatar_rect);
+                            if !tg_ui::userpic_images::paint_userpic_image(
+                                ui.painter(),
+                                avatar_rect,
+                                msg.from_id.0,
+                            ) {
+                                EmptyUserpic::for_peer(
+                                    msg.from_id.bare(),
+                                    &msg.sender_name,
+                                    &ui_colors,
+                                )
+                                .paint_circle(ui.painter(), avatar_rect);
+                            }
                         }
                     }
+                }
+                let spilled = ui.min_rect();
+                if spilled.min.y < content_rect.min.y - 1.0
+                    || spilled.max.y > content_rect.max.y + 1.0
+                {
+                    tracing::debug!(
+                        ?spilled,
+                        ?content_rect,
+                        painted = ?self.painted_msg_ids,
+                        "history rows placed widgets outside the list"
+                    );
                 }
             });
             debug_assert_eq!(out.id, expected_scroll_id);
             out
         });
 
+        self.reaction_userpics = reaction_userpics_slot;
         self.last_frame_laid_out_count = laid_out_this_frame;
         self.last_frame_painted_count = painted_this_frame;
 
         // Track scroll state & bottom-edge detection before read-marking checks so `scrolled_up`
         // reflects this frame's actual scroll position.
         self.scroll_offset_y = scroll_out.inner.state.clamped_offset().y;
+        if anchor_shift != 0 {
+            // The scroll area takes the correction on the next frame, on top of whatever the
+            // wheel added this frame.
+            self.scroll_offset_y = (self.scroll_offset_y + anchor_shift as f32).max(0.0);
+            self.pending_scroll_y = Some(self.scroll_offset_y);
+        }
         let vis_top = self.scroll_offset_y.round() as i32;
         let vis_bot = (self.scroll_offset_y + viewport_h).round() as i32;
+        // Coming back down to the bottom of a chat with many pages loaded drops the oldest of
+        // them, so the scroll bar is sized from what is around the bottom again (TGB-2952).
+        if self.scrolled_up
+            && self.messages.len() > MAX_LOADED_AT_BOTTOM
+            && self.is_at_loaded_bottom(vis_bot)
+            && !self.pending_scroll_to_bottom
+            && self.pending_scroll_y.is_none()
+        {
+            self.unload_oldest_messages(KEEP_LOADED_AFTER_UNLOAD);
+            self.pending_scroll_to_bottom = true;
+            ui.ctx().request_repaint();
+        }
         let total_h = self.list.total_height();
+        self.last_scroll_metrics = ScrollMetrics {
+            offset: self.scroll_offset_y,
+            content_height: scroll_out.inner.content_size.y,
+            viewport_height: scroll_out.inner.inner_rect.height(),
+            list_height: total_h,
+            loaded_messages: self.messages.len(),
+        };
         self.scrolled_up = (total_h - vis_bot) > 120;
 
         // `markingContentsRead`: the window is focused and the user can see the chat (no box,
@@ -2557,16 +3543,10 @@ impl HistoryInnerWidget {
 
         // Automatic preload triggers (`HistoryList::check_preload`).
         let preload = self.list.check_preload(vis_top, vis_bot);
-        if preload.preload_top
-            && let Some(first) = self.messages.first()
-        {
-            let older = backend.load_slice_before(self.peer_id, first.id, 40);
-            self.prepend_older_slice(older, peer.summary.kind);
-        } else if preload.preload_bottom
-            && let Some(last) = self.messages.last()
-        {
-            let newer = backend.load_slice_after(self.peer_id, last.id, 40);
-            self.append_newer_slice(newer, peer.summary.kind);
+        if preload.preload_top {
+            self.load_older_slice(backend, peer.summary.kind);
+        } else if preload.preload_bottom {
+            self.load_newer_slice(backend, peer.summary.kind);
         }
 
         // Handle reply-header jump clicks.
@@ -2581,7 +3561,10 @@ impl HistoryInnerWidget {
         if let Some((mid, pos)) = open_context_menu_for {
             self.context_menu_msg = Some(mid);
             self.context_menu_pos = pos;
-            self.context_menu_engagement = self.messages.iter().find(|m| m.id == mid).map(|m| {
+            let menu_msg = self
+                .index_of(mid)
+                .and_then(|index| self.messages.get(index));
+            self.context_menu_engagement = menu_msg.map(|m| {
                 crate::history::read_receipts::ContextMenuEngagementInfo::resolve(
                     peer,
                     m,
@@ -2594,7 +3577,10 @@ impl HistoryInnerWidget {
         }
 
         if let Some(target_id) = self.context_menu_msg
-            && let Some(target_msg) = self.messages.iter().find(|m| m.id == target_id).cloned()
+            && let Some(target_msg) = self
+                .index_of(target_id)
+                .and_then(|index| self.messages.get(index))
+                .cloned()
         {
             let has_quote_sel = self.selected_quote_for_msg(target_id).is_some();
             let ref_now_unix = now_unix_secs.max(i64::from(target_msg.date_unix) + 60);
@@ -2795,7 +3781,7 @@ impl HistoryInnerWidget {
                 0
             };
             if let Some(cached) = self.layout_cache.get(&msg.id) {
-                item.height = cached_layout_height(cached);
+                item.height = cached_layout_height(&cached.layout);
                 continue;
             }
             // Re-estimate height so date badges and unread bars are accounted for before first paint.
@@ -2809,6 +3795,12 @@ impl HistoryInnerWidget {
             item.height = est;
         }
         self.list.relayout_positions();
+    }
+
+    /// Whether the next paint puts the "Unread messages" bar at the top of the view.
+    #[must_use]
+    pub const fn opens_at_unread_bar(&self) -> bool {
+        self.pending_scroll_to_unread_bar
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2846,7 +3838,7 @@ impl HistoryInnerWidget {
         if changed {
             self.list.items_mut()[index].height = new_h;
         }
-        self.layout_cache.insert(msg.id, cached);
+        self.layout_cache.insert(msg.id, CachedItem::new(cached));
         changed
     }
 
@@ -2982,7 +3974,7 @@ fn estimate_initial_height(msg: &HistoryMessage) -> i32 {
         Some(HistoryMedia::Poll(p)) => 110 + (p.options.len() as i32) * 38,
         Some(HistoryMedia::Location(_)) => 176,
         Some(HistoryMedia::Contact(_)) => 68,
-        Some(HistoryMedia::RoundVideo(rv)) => rv.diameter_px.max(180),
+        Some(HistoryMedia::RoundVideo(rv)) => rv.diameter_px.clamp(180, 240),
         Some(HistoryMedia::Game(_)) => 265,
         Some(HistoryMedia::TodoList(todo)) => {
             crate::history::todo::measure_todo_list_size(todo, 340).1
@@ -3028,10 +4020,10 @@ fn expanded_transcribe_height(msg: &HistoryMessage, voice_state: &VoicePlaybackS
         if !entry.shown {
             return 0;
         }
-        let text = if entry.too_long {
-            "Audio is too long to transcribe."
-        } else if entry.failed {
-            "Transcription unavailable."
+        let failure;
+        let text = if entry.failed || entry.too_long {
+            failure = tg_app_core::user_error::transcribe_bubble_text(entry.too_long);
+            failure.as_str()
         } else if entry.pending && entry.text.is_empty() {
             "Transcribing..."
         } else {
@@ -3055,21 +4047,34 @@ fn expanded_transcribe_height(msg: &HistoryMessage, voice_state: &VoicePlaybackS
     0
 }
 
+/// `Element::textualMaxWidth` (`history_view_element.cpp:2935`): the caption's single-line width
+/// with the bubble paddings, `0` without a caption. A caption under displayed media carries no
+/// date skip block (`Message::validateTextSkipBlock`), so the time is not counted here.
+fn media_textual_max_width(has_text: bool, text_max_width: i32) -> i32 {
+    if has_text {
+        MSG_PADDING.left + text_max_width.max(0) + MSG_PADDING.right
+    } else {
+        0
+    }
+}
+
 fn build_media_input(
     msg: &HistoryMessage,
     has_header: bool,
     has_text: bool,
+    text_max_width: i32,
     bottom_info_w: i32,
     transcribe_text_height: i32,
 ) -> Option<MediaInput> {
     let media = msg.media.as_ref()?;
+    let caption_w = media_textual_max_width(has_text, text_max_width);
     Some(match media {
         HistoryMedia::Photo(p) => MediaInput::Photo(PhotoInput {
             dimensions: Size::new(p.width, p.height),
             service_width: 0,
             has_bubble: has_header || has_text,
             min_width_for_media: bottom_info_w + 24,
-            textual_max_width: if has_text { 320 } else { 0 },
+            textual_max_width: caption_w,
             is_extended_video: false,
             hosted_instant_view: false,
         }),
@@ -3096,7 +4101,7 @@ fn build_media_input(
             min_width_for_media: bottom_info_w + 24,
             info_width: bottom_info_w,
             hides_bottom_info: false,
-            textual_max_width: if has_text { 320 } else { 0 },
+            textual_max_width: caption_w,
             max_status_width: 110,
             is_streaming: false,
             unwrapped_additional_width: 0,
@@ -3194,11 +4199,35 @@ fn build_media_input(
             skip_block_width: bottom_info_w + 12,
             bottom_info_first_line_width: bottom_info_w,
         }),
-        HistoryMedia::RoundVideo(rv) => MediaInput::Sticker(StickerInput {
-            kind: StickerKind::Regular,
-            dimensions: Size::new(rv.diameter_px, rv.diameter_px + transcribe_text_height),
-            custom_size: (rv.diameter_px + transcribe_text_height).clamp(160, 380),
-            option_sticker_size: None,
+        HistoryMedia::RoundVideo(rv) if transcribe_text_height > 0 => {
+            let side = rv
+                .diameter_px
+                .min(tg_history::consts::MAX_VIDEO_MESSAGE_SIZE);
+            MediaInput::Sticker(StickerInput {
+                kind: StickerKind::Regular,
+                dimensions: Size::new(side, side + transcribe_text_height),
+                custom_size: side + transcribe_text_height,
+                option_sticker_size: None,
+            })
+        }
+        // `HistoryView::Gif` for a video message: a bare circle of `st::maxVideoMessageSize`.
+        HistoryMedia::RoundVideo(rv) => MediaInput::Gif(GifInput {
+            kind: GifKind::VideoMessage,
+            dimensions: Size::new(rv.diameter_px.max(1), rv.diameter_px.max(1)),
+            has_bubble: has_text,
+            min_width_for_media: 0,
+            info_width: bottom_info_w,
+            hides_bottom_info: false,
+            textual_max_width: 0,
+            max_status_width: 0,
+            is_streaming: true,
+            unwrapped_additional_width: 0,
+            reactions_optimal_width: measure_reactions_size(
+                &msg.reactions,
+                matches!(msg.peer_id.kind(), PeerKind::User),
+            )
+            .width,
+            hosted_instant_view: false,
         }),
         HistoryMedia::Game(g) => {
             let (tw, th) = estimate_text_metrics(&g.game.title, 280);
@@ -3318,9 +4347,6 @@ fn build_bottom_info_input(msg: &HistoryMessage) -> BottomInfoInput {
     let mut time_chars = message_time_text(msg).len() as i32;
     if msg.edited {
         time_chars += 8;
-    }
-    if let Some(ref bot) = msg.extra.via_bot {
-        time_chars += (bot.chars().count() as i32) + 6;
     }
     let views_w = msg
         .views
@@ -3507,21 +4533,18 @@ fn compute_item_layout_egui(
         show_sender_in_chat,
         item.attach_state.attached_to_previous,
     );
-    let from_name_width = show_name.then(|| {
-        ui.painter()
-            .layout_no_wrap(
-                msg.sender_name.clone(),
-                FontId::new(13.0, tg_ui::fonts::family_semibold()),
-                colors.text_fg,
-            )
-            .size()
-            .x
-            .ceil() as i32
-    });
+    // `performCountOptimalSize`: the name with the status room, and the rank badge.
+    let (name_line_w, right_badge_width) = if show_name {
+        crate::history::name_line::name_line_widths(ui.painter(), msg)
+    } else {
+        (0, 0)
+    };
+    let from_name_width = show_name.then_some(name_line_w);
+    let via_bot_width = crate::history::name_line::via_bot_width(ui.painter(), msg, show_name);
     let forwarded_width = msg.forward.as_ref().map(|f| {
         ui.painter()
             .layout_no_wrap(
-                format!("Forwarded from {}", f.from_name),
+                crate::history::name_line::forwarded_header_text(msg, f),
                 FontId::proportional(12.5),
                 colors.text_fg,
             )
@@ -3541,8 +4564,14 @@ fn compute_item_layout_egui(
     });
 
     let has_header = from_name_width.is_some() || forwarded_width.is_some() || reply.is_some();
-    let bottom_info = build_bottom_info_input(msg);
-    let bottom_info_w = bottom_info.author_edited_date_width + bottom_info.views_text_width + 24;
+    let bottom_info = crate::history::bubble_info::bottom_info_input(ui.painter(), msg);
+    let bottom_info_w =
+        build_bottom_info_input(msg).author_edited_date_width + bottom_info.views_text_width + 24;
+    let info_skip_w = tg_history::skip_block_width(
+        tg_history::BottomInfoLayout::compute(&bottom_info, i32::MAX, fonts)
+            .optimal_size
+            .width,
+    );
     let lp_extra_h = msg
         .extra
         .link_preview
@@ -3564,6 +4593,7 @@ fn compute_item_layout_egui(
         msg,
         has_header,
         has_body_text,
+        text_max_w,
         bottom_info_w,
         transcribe_text_height,
     );
@@ -3580,15 +4610,21 @@ fn compute_item_layout_egui(
             let last = last_line_width(ui, active_text, &text_pal, colors.text_fg, max_text_wrap);
             (last, text_real_w)
         };
-        last_w + MSG_DATE_SPACE + bottom_info_w <= row_w
+        last_w + info_skip_w <= row_w
     };
-    let adjusted_text_h = if needs_date_line_room
-        && (has_rich_body || has_lp || summary_h > 0 || !time_fits_last_line())
-    {
-        text_wrapped_h + summary_h + lp_extra_h + 18 + factcheck_extra_h
-    } else {
-        text_wrapped_h + summary_h + lp_extra_h + factcheck_extra_h
+    let text_block_h = |wrapped_h: i32, time_fits: bool| {
+        let date_line =
+            if needs_date_line_room && (has_rich_body || has_lp || summary_h > 0 || !time_fits) {
+                fonts.normal.height
+            } else {
+                0
+            };
+        wrapped_h + summary_h + lp_extra_h + date_line + factcheck_extra_h
     };
+    let adjusted_text_h = text_block_h(
+        text_wrapped_h,
+        !needs_date_line_room || time_fits_last_line(),
+    );
 
     let inline_keyboard = msg
         .extra
@@ -3623,6 +4659,8 @@ fn compute_item_layout_egui(
         attach: item.attach_state,
         has_unread_bar: item.has_unread_bar,
         from_name_width,
+        right_badge_width,
+        via_bot_width,
         forwarded_width,
         reply,
         text_max_width: text_max_w,
@@ -3644,9 +4682,13 @@ fn compute_item_layout_egui(
             )
         ),
         bottom_info,
-        reactions_size: measure_reactions_size(
+        reaction_button_widths: crate::history::bubble_info::reaction_chip_widths(
+            ui.painter(),
             &msg.reactions,
-            matches!(msg.peer_id.kind(), PeerKind::User),
+            matches!(msg.peer_id.kind(), PeerKind::User).then_some(
+                &crate::history::bubble::reaction_userpics_chip_width
+                    as &dyn Fn(&crate::history::backend::ReactionCounter) -> i32,
+            ),
         ),
         reactions_in_bubble: true,
         has_comments_button: msg.is_post && msg.extra.replies_count.is_some(),
@@ -3662,7 +4704,67 @@ fn compute_item_layout_egui(
         ..MessageInput::default()
     };
 
-    CachedItemLayout::Message(Box::new(layout_message(&input, viewport_w, fonts)))
+    let mut layout = layout_message(&input, viewport_w, fonts);
+    // tdesktop measures the text height at the width the bubble really got
+    // (`Message::resizeGetHeight` -> `Ui::Text::String::countHeight(textWidth)`). The first pass
+    // above wrapped at the widest possible bubble, but media (a photo caption) or a reply can
+    // make the bubble narrower, so the painted caption wraps into more lines than were measured
+    // and spills below the bubble. Re-measure at the painted width and lay out again; the
+    // width does not depend on the text height, so the second pass keeps the same geometry.
+    let painted_wrap = layout.text_rect.width;
+    if !has_rich_body && !active_text.is_empty() && painted_wrap > 0 && painted_wrap < max_text_wrap
+    {
+        let (_, wrapped_h, _) = measure_rich_text(
+            ui,
+            active_text,
+            &text_pal,
+            colors.text_fg,
+            painted_wrap as f32,
+        );
+        let time_fits = !needs_date_line_room
+            || last_line_fits_time(
+                ui,
+                active_text,
+                &text_pal,
+                colors.text_fg,
+                painted_wrap,
+                wrapped_h,
+                text_max_w,
+                info_skip_w,
+            );
+        let painted_h = text_block_h(wrapped_h, time_fits);
+        if painted_h != input.text_wrapped_height {
+            let input = MessageInput {
+                text_wrapped_height: painted_h,
+                ..input
+            };
+            layout = layout_message(&input, viewport_w, fonts);
+        }
+    }
+    CachedItemLayout::Message(Box::new(layout))
+}
+
+/// Whether the bottom info (time, ticks) fits after the last line of `text` wrapped at `wrap`
+/// px, like tdesktop's skip block (`Ui::Text::String::updateSkipBlock`): otherwise the time gets
+/// a line of its own.
+#[allow(clippy::too_many_arguments)]
+fn last_line_fits_time(
+    ui: &Ui,
+    text: &tg_text::TextWithEntities,
+    palette: &tg_ui::stand_in::TextPalette,
+    base_color: Color32,
+    wrap: i32,
+    wrapped_h: i32,
+    single_line_w: i32,
+    info_skip_w: i32,
+) -> bool {
+    let line_h = message_text_style().line_height.round() as i32;
+    let last_w = if wrapped_h <= line_h + 1 {
+        single_line_w
+    } else {
+        last_line_width(ui, text, palette, base_color, wrap)
+    };
+    last_w + info_skip_w <= wrap
 }
 
 fn compute_item_layout_headless(
@@ -3760,10 +4862,14 @@ fn compute_item_layout_headless(
         item.attach_state.attached_to_previous,
     );
     let from_name_width = show_name.then(|| (msg.sender_name.chars().count() as i32) * 8);
-    let forwarded_width = msg
-        .forward
-        .as_ref()
-        .map(|f| ((f.from_name.chars().count() + 15) as i32) * 7);
+    let via_bot_width =
+        crate::history::name_line::via_text(msg).map(|t| (t.chars().count() as i32) * 8);
+    let forwarded_width = msg.forward.as_ref().map(|f| {
+        (crate::history::name_line::forwarded_header_text(msg, f)
+            .chars()
+            .count() as i32)
+            * 7
+    });
     let reply = msg.reply.as_ref().map(|r| ReplyInput {
         name_width: (r.author_name.chars().count() as i32) * 7,
         text_width: (r.preview_text.chars().count() as i32) * 7,
@@ -3787,7 +4893,7 @@ fn compute_item_layout_headless(
         tw
     };
     let th = th + lp_extra_h + if has_lp { 18 } else { 0 };
-    let media = build_media_input(msg, has_header, has_body_text, bottom_info_w, 0);
+    let media = build_media_input(msg, has_header, has_body_text, tw, bottom_info_w, 0);
 
     let inline_keyboard = msg
         .extra
@@ -3815,6 +4921,7 @@ fn compute_item_layout_headless(
         attach: item.attach_state,
         has_unread_bar: item.has_unread_bar,
         from_name_width,
+        via_bot_width,
         forwarded_width,
         reply,
         text_max_width: tw,
@@ -3886,6 +4993,49 @@ pub fn is_replies_chat_peer(peer: &HistoryPeerInfo) -> bool {
 }
 
 /// `st::reactStripHeight`, `st::reactStripSize`, `st::reactStripImage`, `st::reactStripSkip`.
+/// The scroll state one frame of the message list ended with (`Ui::ScrollArea` thumb inputs).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ScrollMetrics {
+    /// Scroll offset from the top of the content, logical pixels.
+    pub offset: f32,
+    /// Height of the scrolled content the thumb is sized against.
+    pub content_height: f32,
+    /// Height of the visible part of the list.
+    pub viewport_height: f32,
+    /// Height of the laid-out message list (`HistoryList::total_height`).
+    pub list_height: i32,
+    /// Messages held by the list.
+    pub loaded_messages: usize,
+}
+
+impl ScrollMetrics {
+    /// Where the thumb sits on the track: `0.0` at the top, `1.0` at the bottom.
+    #[must_use]
+    pub fn thumb_position(&self) -> f32 {
+        let range = self.content_height - self.viewport_height;
+        if range <= 0.0 {
+            1.0
+        } else {
+            (self.offset / range).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Thumb length as a share of the track (`viewport / content`).
+    #[must_use]
+    pub fn thumb_share(&self) -> f32 {
+        if self.content_height <= 0.0 {
+            1.0
+        } else {
+            (self.viewport_height / self.content_height).min(1.0)
+        }
+    }
+}
+
+/// Messages before the anchor in the page a chat opens with (`load_peer`).
+pub const OPEN_PAGE_BEFORE: usize = 60;
+/// Messages after the anchor in the page a chat opens with (`load_peer`).
+pub const OPEN_PAGE_AFTER: usize = 40;
+
 /// More loaded messages than this while the open chat sits at the bottom unloads the oldest page.
 pub const MAX_LOADED_AT_BOTTOM: usize = 500;
 /// Messages kept after unloading the oldest page (one 100-message page below the cap).
@@ -4286,6 +5436,114 @@ fn paint_fast_share_button(
     resp.clicked()
 }
 
+/// Bottom-right anchor of a bubble-less message's right action (`Gif::draw` / `UnwrappedMedia`
+/// `fullRight` / `fullBottom`): past the round video's info pill, or the media's right edge.
+pub(crate) fn unwrapped_right_action_anchor(layout: &MessageLayout, origin: Pos2) -> Rect {
+    let media = hist_rect_to_egui(layout.media_rect, origin.x, origin.y);
+    let right = if layout.bottom_info_rect.is_empty() {
+        media.right()
+    } else {
+        hist_rect_to_egui(layout.bottom_info_rect, origin.x, origin.y)
+            .right()
+            .max(media.left() + media.width().min(media.height()))
+    };
+    Rect::from_min_max(media.min, Pos2::new(right, media.bottom()))
+}
+
+/// `st::historyFastShareSize`.
+pub(crate) const HISTORY_FAST_SHARE_SIZE_F: f32 = 31.0;
+/// `st::historyFastShareLeft`.
+pub(crate) const HISTORY_FAST_SHARE_LEFT_F: f32 = 13.0;
+/// `st::historyFastShareBottom`.
+pub(crate) const HISTORY_FAST_SHARE_BOTTOM_F: f32 = 5.0;
+
+/// Short replies count under the side comments icon (`HistoryMessageViews::repliesSmall`).
+fn side_comments_count_galley(
+    ui: &Ui,
+    count: u32,
+    colors: &HistoryColors,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    (count > 0).then(|| {
+        ui.painter().layout_no_wrap(
+            crate::history::bubble::format_compact_views(count),
+            FontId::new(13.0, tg_ui::fonts::family_semibold()),
+            colors.service_fg,
+        )
+    })
+}
+
+/// `Message::rightActionSize` for the comments action (with or without the count line).
+fn side_action_size(count_galley: Option<&std::sync::Arc<egui::Galley>>) -> Vec2 {
+    count_galley.map_or(Vec2::splat(HISTORY_FAST_SHARE_SIZE_F), |g| {
+        Vec2::new(
+            HISTORY_FAST_SHARE_SIZE_F.max(2.0 * HISTORY_FAST_SHARE_BOTTOM_F + g.size().x.ceil()),
+            HISTORY_FAST_SHARE_SIZE_F + HISTORY_FAST_SHARE_BOTTOM_F + g.size().y.ceil(),
+        )
+    })
+}
+
+/// Height of a bubble-less message's right action (comments or fast share), `0` without one.
+pub(crate) fn unwrapped_right_action_height(
+    ui: &Ui,
+    msg: &HistoryMessage,
+    colors: &HistoryColors,
+) -> f32 {
+    if !(msg.is_post && matches!(msg.peer_id.kind(), PeerKind::Channel)) {
+        return 0.0;
+    }
+    let count = msg.extra.replies_count.unwrap_or(0);
+    side_action_size(side_comments_count_galley(ui, count, colors).as_ref()).y
+}
+
+/// Paints the comments right action of a bubble-less channel post (`Message::drawRightAction`
+/// with `displayRightActionComments`: `historyFastCommentsIcon` plus the short replies count).
+/// Returns `true` on click.
+fn paint_side_comments_button(
+    ui: &mut Ui,
+    msg_id: MsgId,
+    count: u32,
+    anchor: Rect,
+    colors: &HistoryColors,
+) -> bool {
+    use tg_ui::tg_style::st;
+    const SIZE: f32 = HISTORY_FAST_SHARE_SIZE_F;
+    let count_galley = side_comments_count_galley(ui, count, colors);
+    let size = side_action_size(count_galley.as_ref());
+    let rect = Rect::from_min_size(
+        Pos2::new(
+            anchor.right() + HISTORY_FAST_SHARE_LEFT_F,
+            anchor.bottom() - HISTORY_FAST_SHARE_BOTTOM_F - size.y,
+        ),
+        size,
+    );
+    let resp = ui.interact(
+        rect,
+        Id::unique(("tg_side_comments", msg_id.0)),
+        Sense::click(),
+    );
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{count} comments"))
+    });
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let radius = (SIZE / 2.0).round() as u8;
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(radius), colors.service_bg);
+    tg_app_core::ui_icons::paint_style_tinted(
+        ui.painter(),
+        Rect::from_min_size(rect.min, Vec2::new(rect.width(), SIZE)),
+        st::history_fast_comments_icon,
+        colors.service_fg,
+    );
+    if let Some(galley) = count_galley {
+        let x = rect.center().x - galley.size().x / 2.0;
+        ui.painter()
+            .galley(Pos2::new(x, rect.top() + SIZE), galley, colors.service_fg);
+    }
+    resp.clicked()
+}
+
 /// Builds the message context menu in Telegram Desktop 7.4.6 order
 /// (`HistoryInner::showContextMenu`): Reply, Edit, Pin, Copy Text, Copy Link, media actions,
 /// Forward, Delete, Report, Select. Reactions are chosen from the strip above the menu.
@@ -4295,6 +5553,21 @@ fn build_context_menu_items(
     has_quote_selection: bool,
 ) -> Vec<MenuItem> {
     let mut items = Vec::new();
+    if msg.id.is_local() {
+        // `HistoryInner::showContextMenu`: a message being sent (or whose send failed) is not
+        // regular, so it can only be copied and deleted.
+        if !msg.text.is_empty() || msg.extra.rich_message.is_some() {
+            items.push(MenuItem::action(
+                "copy_text",
+                tg_lang::tr::lng_context_copy_text(),
+            ));
+        }
+        items.push(MenuItem::action(
+            "delete",
+            tg_lang::tr::lng_context_delete_msg(),
+        ));
+        return items;
+    }
     let is_group_like = matches!(peer.summary.kind, PeerKind::Group | PeerKind::Channel);
 
     if !msg.reactions.is_empty() && is_group_like {
@@ -4602,4 +5875,30 @@ fn format_civil_date(date: CivilDate) -> String {
 fn bubble_content_max_width(viewport_w: i32, has_from_photo: bool) -> i32 {
     let photo_skip = if has_from_photo { MSG_PHOTO_SKIP } else { 0 };
     (viewport_w - MSG_MARGIN.left - MSG_MARGIN.right - photo_skip).min(MSG_MAX_WIDTH)
+}
+
+#[cfg(test)]
+#[path = "inner_caption_tests.rs"]
+mod caption_tests;
+
+#[cfg(test)]
+#[path = "inner_bubble_layout_tests.rs"]
+mod bubble_layout_tests;
+
+#[cfg(test)]
+#[path = "inner_font_evidence.rs"]
+mod font_evidence;
+
+/// `HistoryWidget::unreadBarTop`: the scroll top that puts the "Unread messages" bar of item
+/// `idx` at the top of the view (below the item's date badge, at the offset the bar is painted).
+fn unread_bar_scroll_top(list: &tg_history::HistoryList, idx: usize) -> i32 {
+    // `countInitialScrollTop`: the whole history is unread and loaded from its start.
+    if idx == 0 && list.loaded_at_top {
+        return 0;
+    }
+    let Some(item) = list.items().get(idx) else {
+        return 0;
+    };
+    let bar_offset = ((LINE_WIDTH + HISTORY_UNREAD_BAR_MARGIN) as f32 * 0.5).round() as i32;
+    (list.item_top(idx) + item.displayed_date_height + bar_offset).max(0)
 }

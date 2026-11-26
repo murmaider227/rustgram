@@ -630,6 +630,31 @@ impl NotifySettingsStore {
         changed
     }
 
+    /// Applies a server snapshot to a forum topic's notification settings
+    /// (`NotifySettings::apply(topic)`). Returns `true` if changed.
+    pub fn apply_topic(
+        &mut self,
+        peer_id: PeerId,
+        topic_root_id: MsgId,
+        snapshot: Option<PeerNotifySettingsValue>,
+        now_unix: i64,
+    ) -> bool {
+        let key = (peer_id.0, topic_root_id.0);
+        let changed = self
+            .topics
+            .entry(key)
+            .or_insert_with(PeerNotifySettings::unknown)
+            .apply_snapshot(snapshot);
+        if changed {
+            if self.is_topic_muted(peer_id, topic_root_id, now_unix) {
+                self.muted_topics.insert(key);
+            } else {
+                self.muted_topics.remove(&key);
+            }
+        }
+        changed
+    }
+
     /// Marks a peer's settings explicitly unknown (useful for testing delayed resolution).
     pub fn mark_peer_unknown(&mut self, peer_id: PeerId) {
         self.peers.insert(peer_id.0, PeerNotifySettings::unknown());

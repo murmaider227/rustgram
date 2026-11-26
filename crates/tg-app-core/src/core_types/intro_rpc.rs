@@ -28,6 +28,27 @@ pub trait DynIntroRpc: Send + Sync {
     /// Calls `help.getNearestDc`.
     fn help_get_nearest_dc(&self) -> IntroBoxFuture<'_, InvokeResult<tl_types::NearestDc>>;
 
+    /// Calls `help.getConfig` (read for `suggested_lang_code`).
+    fn help_get_config(&self) -> IntroBoxFuture<'_, InvokeResult<tl_enums::Config>>;
+
+    /// Calls `langpack.getStrings` (the intro language link's `lng_switch_to_this`).
+    fn langpack_get_strings(
+        &self,
+        req: tl_fns::langpack::GetStrings,
+    ) -> IntroBoxFuture<'_, InvokeResult<Vec<tl_enums::LangPackString>>>;
+
+    /// Calls `langpack.getLanguage`.
+    fn langpack_get_language(
+        &self,
+        req: tl_fns::langpack::GetLanguage,
+    ) -> IntroBoxFuture<'_, InvokeResult<tl_types::LangPackLanguage>>;
+
+    /// Calls `langpack.getLangPack`.
+    fn langpack_get_lang_pack(
+        &self,
+        req: tl_fns::langpack::GetLangPack,
+    ) -> IntroBoxFuture<'_, InvokeResult<tl_types::LangPackDifference>>;
+
     /// Calls `auth.sendCode`.
     fn auth_send_code(
         &self,
@@ -153,6 +174,35 @@ impl<C: RpcClient> DynIntroRpc for C {
 
     fn help_get_nearest_dc(&self) -> IntroBoxFuture<'_, InvokeResult<tl_types::NearestDc>> {
         Box::pin(Invoker::help_get_nearest_dc(self))
+    }
+
+    fn help_get_config(&self) -> IntroBoxFuture<'_, InvokeResult<tl_enums::Config>> {
+        Box::pin(async move {
+            RpcClient::invoke(self, &tl_fns::help::GetConfig)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn langpack_get_strings(
+        &self,
+        req: tl_fns::langpack::GetStrings,
+    ) -> IntroBoxFuture<'_, InvokeResult<Vec<tl_enums::LangPackString>>> {
+        Box::pin(Invoker::langpack_get_strings(self, req))
+    }
+
+    fn langpack_get_language(
+        &self,
+        req: tl_fns::langpack::GetLanguage,
+    ) -> IntroBoxFuture<'_, InvokeResult<tl_types::LangPackLanguage>> {
+        Box::pin(Invoker::langpack_get_language(self, req))
+    }
+
+    fn langpack_get_lang_pack(
+        &self,
+        req: tl_fns::langpack::GetLangPack,
+    ) -> IntroBoxFuture<'_, InvokeResult<tl_types::LangPackDifference>> {
+        Box::pin(Invoker::langpack_get_lang_pack(self, req))
     }
 
     fn auth_send_code(

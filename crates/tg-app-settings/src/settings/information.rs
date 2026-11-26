@@ -100,7 +100,8 @@ pub fn render_information_section(
         let (av_rect, av_resp) = ui.allocate_exact_size(Vec2::splat(photo_size), Sense::click());
         let userpic =
             EmptyUserpic::for_color_index(profile.photo_color_index, &profile.full_name(), colors);
-        userpic.paint_circle(ui.painter(), av_rect);
+        // A user's full peer id is its bare id (`peerFromUser`).
+        userpic.paint_circle_or_photo(ui.painter(), av_rect, profile.user_id as i64);
 
         // Camera / Edit photo badge on bottom-right corner using real `st::menu_icon_photo_set`.
         let badge_r = 14.0_f32;

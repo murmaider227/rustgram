@@ -259,7 +259,7 @@ impl ShareBoxState {
                     EmptyUserpic::paint_saved_messages(ui.painter(), av_rect, colors);
                 } else {
                     EmptyUserpic::for_color_index(peer.color_index, &peer.title, colors)
-                        .paint_circle(ui.painter(), av_rect);
+                        .paint_circle_or_photo(ui.painter(), av_rect, peer.id.0);
                 }
 
                 if selected {
@@ -393,7 +393,7 @@ impl ShareBoxState {
                 EmptyUserpic::paint_saved_messages(ui.painter(), av_rect, colors);
             } else {
                 EmptyUserpic::for_color_index(peer.color_index, &peer.title, colors)
-                    .paint_circle(ui.painter(), av_rect);
+                    .paint_circle_or_photo(ui.painter(), av_rect, peer.id.0);
             }
             if selected {
                 let badge_c = Pos2::new(av_rect.max.x - 4.0, av_rect.max.y - 4.0);

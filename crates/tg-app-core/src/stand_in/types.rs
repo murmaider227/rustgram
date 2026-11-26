@@ -86,6 +86,47 @@ impl MsgId {
     pub const SHOW_AT_UNREAD: Self = Self(0);
     /// Sentinel to jump to the very bottom of a history.
     pub const SHOW_AT_END: Self = Self(i32::MAX);
+
+    /// Lowest id of a local message: a message being sent (or whose send failed) that has no
+    /// server id yet (tdesktop's client ids, `StartClientMsgId`). Local ids fill
+    /// `[LOCAL_MIN, LOCAL_MIN + LOCAL_COUNT)`, far below the streamed bot drafts (`-100_000`
+    /// and down), so neither is mistaken for the other, and every server id is positive.
+    const LOCAL_MIN: i32 = i32::MIN + 1;
+    /// How many local ids exist (client indices `0..LOCAL_COUNT`).
+    pub const LOCAL_COUNT: i32 = 1 << 30;
+
+    /// The local id of client index `index` (`0..LOCAL_COUNT`), ascending with the index so
+    /// local messages keep the order they were sent in.
+    #[must_use]
+    pub const fn local(index: i32) -> Option<Self> {
+        if index >= 0 && index < Self::LOCAL_COUNT {
+            Some(Self(Self::LOCAL_MIN + index))
+        } else {
+            None
+        }
+    }
+
+    /// The client index of a local id.
+    #[must_use]
+    pub const fn local_index(self) -> Option<i32> {
+        if self.is_local() {
+            Some(self.0 - Self::LOCAL_MIN)
+        } else {
+            None
+        }
+    }
+
+    /// `true` for a local message id (see [`Self::local`]).
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        self.0 >= Self::LOCAL_MIN && self.0 < Self::LOCAL_MIN + Self::LOCAL_COUNT
+    }
+
+    /// `true` for a streamed bot draft id (negative, not local).
+    #[must_use]
+    pub const fn is_streamed_draft(self) -> bool {
+        self.0 < 0 && !self.is_local()
+    }
 }
 
 /// Globally unique message reference `(peer, msg)`.

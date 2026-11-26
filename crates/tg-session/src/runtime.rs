@@ -9,6 +9,7 @@
 //! callers (such as CLI tools and tests), exposing a channel/async command API plus a
 //! live [`tg_data::ChangeEvent`] broadcast stream.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -18,11 +19,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tg_api::convert::{apply_tl_users_and_chats, entities_from_tl_with_self, input_peer_for};
+use tg_api::messaging::{DueRead, PreparedTextChunk};
+use tg_api::updates::{SessionAccess, SharedSession};
 use tg_api::{
-    DialogsLoader, DialogsPageResult, DraftManager, FlushedRead, HistoryLoader, HistorySlice,
-    Invoker, LoadDirection, MessageSender, PresenceUpdateResult, ReadHistoryManager, RpcClient,
-    SendMessageOutcome, SendOptions, SendProgressKind, SendProgressManager, SendProgressUpdate,
-    TypingPeerInfo, UpdateEvent, UpdatesHandler,
+    DialogsLoader, DialogsPageResult, DraftManager, FlushedRead, HistorySlice, InvocationError,
+    Invoker, LoadDirection, MessageSender, PendingMessage, PresenceUpdateResult,
+    ReadHistoryManager, RpcClient, SendMessageOutcome, SendOptions, SendProgressKind,
+    SendProgressManager, SendProgressUpdate, TypingPeerInfo, UpdateEvent, UpdatesHandler,
 };
 use tg_data::{
     ChangeEvent, ChannelId, DialogKey, FolderId, FullMsgId, Message, MessageFlags,
@@ -31,11 +34,12 @@ use tg_data::{
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 use tokio::runtime::Handle;
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 
 use crate::error::{Result, SessionError};
 use crate::rpc::MtprotoRpc;
-use crate::updates_store::{FileUpdatesStateStore, UpdatesStateStore};
+use crate::updates_store::{FileUpdatesStateStore, UpdatesStatePersister, UpdatesStateStore};
 
 /// Periodic tick interval for gap timers, throttled inbox reads, and debounced cloud drafts.
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -45,6 +49,36 @@ const SLEEP_DETECT_JUMP_SECS: i64 = 15;
 
 /// Capacity of the high-level [`SessionEvent`] broadcast channel.
 const SESSION_EVENTS_CAPACITY: usize = 64;
+
+/// Updates state changes are written at most this often (and always on shutdown). A crash loses
+/// at most this much `pts`; the next start recovers it with `updates.getDifference`.
+const PERSIST_DEBOUNCE: Duration = Duration::from_secs(1);
+
+/// How long shutdown waits for in-flight sends/edits/deletes and the last state write.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Tokio worker threads for a session runtime: the actor only applies state, network requests
+/// run as separate tasks and disk writes on the blocking pool, so a few workers are enough;
+/// two (the old fixed count) let one slow task stall all networking.
+#[must_use]
+pub fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .clamp(2, 4)
+}
+
+/// Runs `$body` with `$access` bound to a [`SharedSession`] over the actor's session (the write
+/// lock is taken only for in-memory steps and released around every network request), then
+/// counts unread for newly added incoming messages under the same guard.
+macro_rules! with_shared_session {
+    ($self:ident, $access:ident => $body:expr) => {{
+        let mut $access = SharedSession::new(&$self.session);
+        let mut change_rx = $access.get().await.subscribe();
+        let out = $body;
+        increment_unread_for_new_incoming_messages($access.get().await, &mut change_rx);
+        out
+    }};
+}
 
 /// Configuration for starting a [`SessionRuntime`].
 #[derive(Clone)]
@@ -156,6 +190,27 @@ impl SessionRuntimeConfig {
     }
 }
 
+/// Why a [`SessionEvent::ForceLogout`] happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogoutReason {
+    /// A main-DC request failed with a fatal `401` ([`tg_api::RpcError::is_unauthorized`]).
+    /// tdesktop logs out silently (`Main::Account::startMtp`, `main/main_account.cpp:469-473`).
+    Unauthorized {
+        /// The error name (`AUTH_KEY_UNREGISTERED`, `SESSION_REVOKED`, ...), for the log only.
+        error: String,
+    },
+    /// The server sent an `AUTH_KEY_DROP_*` service notification
+    /// (`Application::forceLogOut`, `core/application.cpp:1080`).
+    ServerDrop {
+        /// The raw notification type, for the log only.
+        notification_type: String,
+        /// The server's explanation, shown in the forced-logout box.
+        message: String,
+        /// The explanation's entities (its links stay clickable in the box).
+        entities: Vec<tg_data::TextEntity>,
+    },
+}
+
 /// High-level lifecycle/side-effect event emitted by [`SessionRuntime`] alongside
 /// [`tg_data::ChangeEvent`].
 #[derive(Debug, Clone, PartialEq)]
@@ -164,10 +219,10 @@ pub enum SessionEvent {
     Ready,
     /// Startup or background sync encountered an error.
     SyncError(String),
-    /// Server sent `AUTH_KEY_DROP_*`, requesting immediate forced logout.
+    /// The account was logged out without the user asking; the UI goes to the intro screen.
     ForceLogout {
-        /// Raw notification type string from Telegram.
-        notification_type: String,
+        /// What logged it out; decides what the UI shows on the way.
+        reason: LogoutReason,
     },
     /// Channel difference returned `channelDifferenceTooLong`; UI should reload bottom slice.
     ChannelTooLong {
@@ -298,6 +353,9 @@ struct SendMessageCommand {
     entities: Vec<tl_enums::MessageEntity>,
     reply_to: Option<tl_enums::InputReplyTo>,
     options: SendOptions,
+    /// Chunks the caller already prepared, with their local messages stored in the session and
+    /// their random ids registered (see [`SessionRuntime::queue_prepared_send`]).
+    prepared: Option<Vec<PreparedTextChunk>>,
     reply: oneshot::Sender<Result<SendMessageOutcome>>,
 }
 
@@ -308,6 +366,10 @@ enum SessionCommand {
     LoadDialogsPage {
         folder_id: FolderId,
         reply: oneshot::Sender<Result<Option<DialogsPageResult>>>,
+    },
+    LoadFilterExceptions {
+        filters: Option<tl_types::messages::DialogFilters>,
+        reply: oneshot::Sender<Result<bool>>,
     },
     OpenHistory {
         peer_id: PeerId,
@@ -543,7 +605,6 @@ impl<C: RpcClient + Clone + 'static> SessionRuntime<C> {
             session: Arc::clone(&session),
             updates: UpdatesHandler::new(),
             dialogs: DialogsLoader::new(),
-            history: HistoryLoader::new(),
             sender: MessageSender::default(),
             read_manager: ReadHistoryManager::new(),
             progress_manager: SendProgressManager::new(),
@@ -563,6 +624,16 @@ impl<C: RpcClient + Clone + 'static> SessionRuntime<C> {
             ready_waiters: Vec::new(),
             refresh_self_after_startup: false,
             self_refresh: None,
+            dialog_entries: None,
+            in_flight: JoinSet::new(),
+            in_flight_kinds: HashMap::new(),
+            history_requests: HashSet::new(),
+            ping_in_flight: false,
+            mutations: VecDeque::new(),
+            mutation_task: None,
+            active_send: None,
+            persister: None,
+            persist_deadline: None,
         };
 
         handle.spawn(actor.run());
@@ -681,6 +752,24 @@ impl<C: RpcClient + Clone + 'static> SessionRuntime<C> {
         rx.await.map_err(|_| SessionError::RuntimeClosed)?
     }
 
+    /// Loads the next batch of chat-folder include/pinned peers whose dialogs are not known yet
+    /// with `messages.getPeerDialogs` and applies them to [`tg_data::Session`]
+    /// (`Data::ChatFilters::loadNextExceptions`, `data/data_chat_filters.cpp:942-990`).
+    ///
+    /// `filters` replaces the loader's filter list (and its queue of filters to check) when given.
+    /// Returns `Ok(true)` when a batch was requested and applied, `Ok(false)` when nothing is left
+    /// to load or the main list has fewer than `LOAD_EXCEPTIONS_AFTER` chats and is not done yet.
+    pub async fn load_filter_exceptions(
+        &self,
+        filters: Option<tl_types::messages::DialogFilters>,
+    ) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::LoadFilterExceptions { filters, reply: tx })
+            .map_err(|_| SessionError::RuntimeClosed)?;
+        rx.await.map_err(|_| SessionError::RuntimeClosed)?
+    }
+
     /// Loads a history slice for `peer_id` (`Before`, `Around`, or `After` `around_id`) and
     /// applies the messages and `no_skip_range` to [`tg_data::Session`].
     pub async fn open_history(
@@ -730,10 +819,46 @@ impl<C: RpcClient + Clone + 'static> SessionRuntime<C> {
                 entities,
                 reply_to,
                 options,
+                prepared: None,
                 reply: tx,
             })))
             .map_err(|_| SessionError::RuntimeClosed)?;
         rx.await.map_err(|_| SessionError::RuntimeClosed)?
+    }
+
+    /// Queues a text send whose chunks the caller prepared, without waiting for anything.
+    ///
+    /// The caller has already stored each chunk's local message in the session and registered
+    /// its random id (`ApiWrap::sendMessage` creates the local item on the UI thread). The send
+    /// enters the send / edit / delete lane before this returns, so sends queued one after
+    /// another reach the server in that order. The returned future resolves like
+    /// [`Self::send_message_with_entities`]; dropping it does not cancel the send.
+    pub fn queue_prepared_send(
+        &self,
+        peer_id: PeerId,
+        chunks: Vec<PreparedTextChunk>,
+        reply_to: Option<tl_enums::InputReplyTo>,
+        options: SendOptions,
+    ) -> impl Future<Output = Result<SendMessageOutcome>> + Send + 'static {
+        let (tx, rx) = oneshot::channel();
+        let queued = self
+            .cmd_tx
+            .send(SessionCommand::SendMessage(Box::new(SendMessageCommand {
+                peer_id,
+                text: String::new(),
+                entities: Vec::new(),
+                reply_to,
+                options,
+                prepared: Some(chunks),
+                reply: tx,
+            })))
+            .is_ok();
+        async move {
+            if !queued {
+                return Err(SessionError::RuntimeClosed);
+            }
+            rx.await.map_err(|_| SessionError::RuntimeClosed)?
+        }
     }
 
     /// Marks messages in `peer_id` as read up to `max_id` (throttled unless `force == true`).
@@ -1285,7 +1410,7 @@ fn spawn_owned_tokio_runtime() -> Result<RuntimeOwner> {
         .name("tg-session-rt".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(default_worker_threads())
                 .enable_all()
                 .build()
             {
@@ -1322,7 +1447,6 @@ struct SessionActor<C: RpcClient> {
     session: Arc<RwLock<Session>>,
     updates: UpdatesHandler,
     dialogs: DialogsLoader,
-    history: HistoryLoader,
     sender: MessageSender,
     read_manager: ReadHistoryManager,
     progress_manager: SendProgressManager,
@@ -1345,7 +1469,135 @@ struct SessionActor<C: RpcClient> {
     /// (`main_session.cpp:195`), without delaying the first chat list.
     refresh_self_after_startup: bool,
     self_refresh: Option<SelfRefreshFuture>,
+    /// In-flight `messages.getPeerDialogs` for histories whose folder is unknown
+    /// ([`Self::start_dialog_entries_request`]).
+    dialog_entries: Option<DialogEntriesFuture>,
+    /// Independent network requests (history pages, typing, read receipts, keepalive pings):
+    /// they run beside the loop and come back as [`Completion`]s, so incoming updates and other
+    /// commands are not queued behind them.
+    in_flight: JoinSet<Completion>,
+    in_flight_kinds: HashMap<tokio::task::Id, InFlightKind>,
+    /// `(peer, message, direction)` history requests in flight (`ApiWrap::requestHistory`
+    /// deduplication): a repeated request answers `Ok(None)`.
+    history_requests: HashSet<HistoryKey>,
+    ping_in_flight: bool,
+    /// Sends, edits and deletes run one at a time in the order they were asked for, beside the
+    /// loop, so the server sees them in the same order as before.
+    mutations: VecDeque<Mutation>,
+    mutation_task: Option<JoinHandle<MutationDone>>,
+    active_send: Option<Box<ActiveSend>>,
+    persister: Option<UpdatesStatePersister>,
+    persist_deadline: Option<tokio::time::Instant>,
 }
+
+type HistoryKey = (PeerId, MsgId, LoadDirection);
+
+/// The fatal main-DC authorization error behind a failed request, if it was one. tdesktop logs
+/// the account out on every such `401` (`Instance::Private::onErrorDefault`,
+/// `mtproto/mtp_instance.cpp:1666-1679`, then `Main::Account::startMtp`,
+/// `main/main_account.cpp:469-473`).
+fn fatal_auth_error(err: &SessionError) -> Option<&tg_api::RpcError> {
+    match err {
+        SessionError::Api(tg_api::ApiError::Invocation(tg_api::InvocationError::Rpc(rpc)))
+        | SessionError::Invocation(tg_api::InvocationError::Rpc(rpc))
+            if rpc.is_unauthorized() =>
+        {
+            Some(rpc)
+        }
+        _ => None,
+    }
+}
+
+fn unauthorized_logout(error: String) -> SessionEvent {
+    SessionEvent::ForceLogout {
+        reason: LogoutReason::Unauthorized { error },
+    }
+}
+
+enum InFlightKind {
+    History(HistoryKey),
+    Ping,
+    Other,
+}
+
+/// Result of a request started with [`SessionActor::spawn_request`].
+enum Completion {
+    History {
+        key: HistoryKey,
+        result: std::result::Result<tl_enums::messages::Messages, InvocationError>,
+        reply: oneshot::Sender<Result<Option<HistorySlice>>>,
+    },
+    Typing {
+        peer_id: PeerId,
+        kind: SendProgressKind,
+        sent_at: Instant,
+        result: std::result::Result<bool, InvocationError>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    Reads {
+        flushed: Vec<FlushedRead>,
+        failed: Option<(DueRead, InvocationError)>,
+        unsent: Vec<DueRead>,
+        reply: Option<oneshot::Sender<Result<Vec<FlushedRead>>>>,
+    },
+    Ping {
+        result: std::result::Result<(), InvocationError>,
+    },
+}
+
+/// A send, edit or delete waiting for its turn in the mutation lane.
+enum Mutation {
+    Send(Box<SendMessageCommand>),
+    Edit {
+        req: Box<tl_fns::messages::EditMessage>,
+        reply: oneshot::Sender<Result<Option<tl_enums::Updates>>>,
+    },
+    Delete {
+        peer_id: PeerId,
+        ids: Vec<MsgId>,
+        revoke: bool,
+        reply: oneshot::Sender<Result<tl_types::messages::AffectedMessages>>,
+    },
+}
+
+/// A multi-chunk text send in progress: chunks go out one after another.
+struct ActiveSend {
+    peer_id: PeerId,
+    input_peer: tl_enums::InputPeer,
+    prepared: Vec<PreparedTextChunk>,
+    next: usize,
+    reply_to: Option<tl_enums::InputReplyTo>,
+    options: SendOptions,
+    out_messages: Vec<PendingMessage>,
+    out_updates: Vec<tl_enums::Updates>,
+    reply: oneshot::Sender<Result<SendMessageOutcome>>,
+}
+
+enum MutationDone {
+    SendChunk(std::result::Result<tl_enums::Updates, InvocationError>),
+    Edit {
+        peer_channel: Option<ChannelId>,
+        result: std::result::Result<tl_enums::Updates, tg_api::ApiError>,
+        reply: oneshot::Sender<Result<Option<tl_enums::Updates>>>,
+    },
+    Delete {
+        peer_id: PeerId,
+        ids: Vec<MsgId>,
+        result: std::result::Result<tl_types::messages::AffectedMessages, tg_api::ApiError>,
+        reply: oneshot::Sender<Result<tl_types::messages::AffectedMessages>>,
+    },
+}
+
+type DialogEntriesFuture = Pin<
+    Box<
+        dyn Future<
+                Output = std::result::Result<
+                    Vec<tl_types::messages::PeerDialogs>,
+                    tg_api::InvocationError,
+                >,
+            > + Send,
+    >,
+>;
 
 type SelfRefreshFuture = Pin<
     Box<
@@ -1356,6 +1608,11 @@ type SelfRefreshFuture = Pin<
 
 impl<C: RpcClient + Clone + 'static> SessionActor<C> {
     async fn run(mut self) {
+        self.persister = self
+            .config
+            .updates_state_store
+            .clone()
+            .map(UpdatesStatePersister::spawn);
         let startup_res = self.run_startup().await;
         match &startup_res {
             Ok(()) => {
@@ -1377,7 +1634,16 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 let msg = err.to_string();
                 warn!(error = %msg, "session startup sync failed");
                 self.ready_result = Some(Err(msg.clone()));
-                let _ = self.session_events_tx.send(SessionEvent::SyncError(msg));
+                // A revoked or unregistered key logs out at once instead of reporting a sync
+                // error: a client whose `RpcClient` has no auth-failure stream (or whose stream
+                // has not been read yet) gets the same logout as `MtprotoRpc`.
+                if let Some(rpc) = fatal_auth_error(err) {
+                    let _ = self
+                        .session_events_tx
+                        .send(unauthorized_logout(rpc.name.clone()));
+                } else {
+                    let _ = self.session_events_tx.send(SessionEvent::SyncError(msg));
+                }
             }
         }
         let cached_err = match &startup_res {
@@ -1398,14 +1664,19 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            if self.dialog_entries.is_none() {
+                self.start_dialog_entries_request().await;
+            }
             let next_updates_deadline = self.updates.next_deadline().map(|deadline_ms| {
                 tokio::time::Instant::from_std(self.started_at + Duration::from_millis(deadline_ms))
             });
+            let persist_deadline = self.persist_deadline;
             tokio::select! {
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
                         None => break,
                         Some(SessionCommand::Shutdown { reply }) => {
+                            self.drain_requests_before_shutdown().await;
                             let _ = self.flush_before_shutdown().await;
                             let _ = reply.send(());
                             break;
@@ -1419,40 +1690,32 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                     match upd {
                         Some(Ok(updates)) => {
                             let now_ms = self.now_ms();
-                            let mut session = self.session.write().await;
-                            let mut change_rx = session.subscribe();
-                            if let Err(err) = self
+                            let res = with_shared_session!(self, access => self
                                 .updates
-                                .handle_updates(&self.rpc, &mut session, updates, None, now_ms)
-                                .await
-                            {
+                                .handle_updates(&self.rpc, &mut access, updates, None, now_ms)
+                                .await);
+                            if let Err(err) = res {
                                 warn!(error = %err, "failed to process incoming update");
                             }
-                            increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                            drop(session);
                             self.drain_update_events().await;
                             self.persist_updates_state_if_changed();
                         }
                         Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                             warn!(skipped, "updates receiver lagged; running getDifference");
                             let now_ms = self.now_ms();
-                            let mut session = self.session.write().await;
-                            let mut change_rx = session.subscribe();
-                            if let Err(err) = self
+                            let res = with_shared_session!(self, access => self
                                 .updates
                                 .handle_updates(
                                     &self.rpc,
-                                    &mut session,
+                                    &mut access,
                                     tl_enums::Updates::TooLong,
                                     None,
                                     now_ms,
                                 )
-                                .await
-                            {
+                                .await);
+                            if let Err(err) = res {
                                 warn!(error = %err, "getDifference after lag failed");
                             }
-                            increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                            drop(session);
                             self.drain_update_events().await;
                             self.persist_updates_state_if_changed();
                         }
@@ -1467,31 +1730,23 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                             if dc_id == self.rpc.main_dc_id() {
                                 debug!(dc_id, "main DC new_session_created; calling getDifference");
                                 let now_ms = self.now_ms();
-                                let mut session = self.session.write().await;
-                                let mut change_rx = session.subscribe();
-                                if let Err(err) = self
+                                let res = with_shared_session!(self, access => self
                                     .updates
-                                    .on_new_session_created(&self.rpc, &mut session, now_ms)
-                                    .await
-                                {
+                                    .on_new_session_created(&self.rpc, &mut access, now_ms)
+                                    .await);
+                                if let Err(err) = res {
                                     warn!(error = %err, "getDifference on new_session_created failed");
                                 }
-                                increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                                drop(session);
                                 self.drain_update_events().await;
                                 self.persist_updates_state_if_changed();
                             }
                         }
                         Some(Err(broadcast::error::RecvError::Lagged(_))) => {
                             let now_ms = self.now_ms();
-                            let mut session = self.session.write().await;
-                            let mut change_rx = session.subscribe();
-                            let _ = self
+                            let _ = with_shared_session!(self, access => self
                                 .updates
-                                .on_new_session_created(&self.rpc, &mut session, now_ms)
-                                .await;
-                            increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                            drop(session);
+                                .on_new_session_created(&self.rpc, &mut access, now_ms)
+                                .await);
                             self.drain_update_events().await;
                             self.persist_updates_state_if_changed();
                         }
@@ -1507,14 +1762,12 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                     match auth_fail {
                         Some(Ok(err)) => {
                             warn!(code = err.code, name = %err.name, "fatal main-DC 401 received; emitting ForceLogout");
-                            let _ = self.session_events_tx.send(SessionEvent::ForceLogout {
-                                notification_type: err.name,
-                            });
+                            let _ = self.session_events_tx.send(unauthorized_logout(err.name));
                         }
                         Some(Err(broadcast::error::RecvError::Lagged(_))) => {
-                            let _ = self.session_events_tx.send(SessionEvent::ForceLogout {
-                                notification_type: "AUTH_KEY_UNREGISTERED".to_string(),
-                            });
+                            let _ = self
+                                .session_events_tx
+                                .send(unauthorized_logout("AUTH_KEY_UNREGISTERED".to_string()));
                         }
                         Some(Err(broadcast::error::RecvError::Closed)) | None => {
                             self.auth_fail_rx = None;
@@ -1527,9 +1780,27 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 _ = tick.tick() => {
                     self.handle_tick().await;
                 }
+                done = self.in_flight.join_next_with_id(), if !self.in_flight.is_empty() => {
+                    if let Some(done) = done {
+                        self.on_request_done(done).await;
+                    }
+                }
+                done = poll_optional(&mut self.mutation_task), if self.mutation_task.is_some() => {
+                    self.mutation_task = None;
+                    if let Some(done) = done {
+                        self.on_mutation_done(done).await;
+                    }
+                }
+                _ = sleep_until_optional(persist_deadline), if persist_deadline.is_some() => {
+                    self.flush_persist();
+                }
                 refreshed = poll_optional(&mut self.self_refresh), if self.self_refresh.is_some() => {
                     self.self_refresh = None;
                     self.apply_self_refresh(refreshed).await;
+                }
+                entries = poll_optional(&mut self.dialog_entries), if self.dialog_entries.is_some() => {
+                    self.dialog_entries = None;
+                    self.apply_dialog_entries(entries).await;
                 }
             }
         }
@@ -1587,6 +1858,8 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
         // 4. Load the first page of main dialogs (`limit = 20`) + pinned dialogs.
         // Like tdesktop (`Api::Updates` and `ApiWrap::requestDialogs` start independently), the
         // dialogs requests do not wait for the updates sync: both run concurrently.
+        // The session is locked only while results are applied, never while a request is in
+        // flight, so the UI can read it meanwhile.
         let persisted = if self.config.init_updates_state {
             self.load_initial_persisted_state()
         } else {
@@ -1610,34 +1883,37 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 updates.restore_state(&PersistedUpdatesState::default(), now_ms);
                 return Ok(());
             }
-            let ran_difference =
-                if let Some(saved) = persisted.filter(PersistedUpdatesState::is_valid) {
-                    let mut session = session_lock.write().await;
+            // Messages the startup `getDifference` brings arrived while the app was closed:
+            // add them like history so they never raise desktop notifications.
+            updates.set_startup_catch_up(true);
+            let ran_difference = async {
+                let mut access = SharedSession::new(session_lock);
+                let ran = if let Some(saved) = persisted.filter(PersistedUpdatesState::is_valid) {
                     updates
-                        .resume_from_state(rpc, &mut session, &saved, now_ms)
+                        .resume_from_state(rpc, &mut access, &saved, now_ms)
                         .await?;
                     true
                 } else {
-                    {
-                        // The session stays unlocked while `updates.getState` (and, on a cold
-                        // start, the auth key exchange before it) is in flight, so the UI can
-                        // read it meanwhile.
-                        let state = rpc.updates_get_state().await?;
-                        let mut session = session_lock.write().await;
-                        updates
-                            .initialize_with_state(rpc, &mut session, &state, now_ms)
-                            .await?;
-                    }
+                    // `updates.getState` (and, on a cold start, the auth key exchange before
+                    // it) runs with the session unlocked.
+                    let state = rpc.updates_get_state().await?;
+                    updates
+                        .initialize_with_state(rpc, &mut access, &state, now_ms)
+                        .await?;
                     // 3. Call `updates.getDifference` on start to catch up any gap since last session.
                     if run_get_difference_on_start {
-                        let mut session = session_lock.write().await;
                         let started_ms = started_at.elapsed().as_millis() as u64;
                         updates
-                            .on_new_session_created(rpc, &mut session, started_ms)
+                            .on_new_session_created(rpc, &mut access, started_ms)
                             .await?;
                     }
                     run_get_difference_on_start
                 };
+                Ok::<bool, tg_api::ApiError>(ran)
+            }
+            .await;
+            updates.set_startup_catch_up(false);
+            let ran_difference = ran_difference?;
             // The startup `getDifference` was answered after any `new_session_created` the server
             // sent for this session, so a queued notification would only repeat it.
             if ran_difference && let Some(rx) = new_session_rx.as_mut() {
@@ -1715,168 +1991,43 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 };
                 let _ = reply.send(res);
             }
+            SessionCommand::LoadFilterExceptions { filters, reply } => {
+                if let Some(filters) = filters {
+                    self.dialogs.apply_dialog_filters(filters);
+                }
+                let res = match self.dialogs.load_next_filter_exceptions(&self.rpc).await {
+                    Ok(Some(resp)) => {
+                        let now_unix = now_unix_secs();
+                        let mut session = self.session.write().await;
+                        tg_api::convert::apply_tl_peer_dialogs_for_folder(
+                            &mut session,
+                            &resp,
+                            None,
+                            false,
+                            now_unix,
+                        );
+                        drop(session);
+                        self.init_channel_pts_from_dialogs(&resp.dialogs);
+                        self.persist_updates_state_if_changed();
+                        Ok(true)
+                    }
+                    Ok(None) => Ok(false),
+                    Err(err) => Err(SessionError::Api(err)),
+                };
+                let _ = reply.send(res);
+            }
             SessionCommand::OpenHistory {
                 peer_id,
                 around_id,
                 direction,
                 reply,
             } => {
-                let input_peer = {
-                    let session = self.session.read().await;
-                    input_peer_for(&session, peer_id)
-                };
-                if matches!(input_peer, tl_enums::InputPeer::Empty) {
-                    let _ = reply.send(Err(SessionError::InvalidPeer(peer_id)));
-                    return;
-                }
-                let res = match self
-                    .history
-                    .request_history(&self.rpc, input_peer, around_id, direction)
-                    .await
-                {
-                    Ok(Some(slice)) => {
-                        self.dialogs
-                            .register_peers_from_tl(&slice.users, &slice.chats);
-                        if let Some(ch_id) = peer_id.to_channel()
-                            && let Some(pts) = slice.channel_pts
-                        {
-                            self.updates.init_channel_pts(ch_id, pts);
-                            self.persist_updates_state_if_changed();
-                        }
-                        let mut session = self.session.write().await;
-                        slice.apply_to_session(&mut session, peer_id);
-                        Ok(Some(slice))
-                    }
-                    Ok(None) => Ok(None),
-                    Err(err) => Err(SessionError::Api(err)),
-                };
-                let _ = reply.send(res);
+                self.start_history_request(peer_id, around_id, direction, reply)
+                    .await;
             }
             SessionCommand::SendMessage(cmd) => {
-                let SendMessageCommand {
-                    peer_id,
-                    text,
-                    entities,
-                    reply_to,
-                    options,
-                    reply,
-                } = *cmd;
-                let (input_peer, self_user_id, self_peer_id) = {
-                    let session = self.session.read().await;
-                    (
-                        input_peer_for(&session, peer_id),
-                        session.self_user_id(),
-                        session.self_peer_id(),
-                    )
-                };
-                if matches!(input_peer, tl_enums::InputPeer::Empty) {
-                    let _ = reply.send(Err(SessionError::InvalidPeer(peer_id)));
-                    return;
-                }
-
-                // Match `ApiWrap::sendMessage` (`apiwrap.cpp:4866-4995`):
-                // allocate local pending messages and register `random_id -> local_id` in
-                // `Session` BEFORE invoking `messages.sendMessage` so both `UpdateMessageID` +
-                // `UpdateNewMessage` and `UpdateShortSentMessage` merge into the local message,
-                // and RPC failures mark it `SENDING_FAILED` (or destroy it on `MESSAGE_EMPTY`).
-                let prepared = self.sender.prepare_text_chunks(peer_id, &text, &entities);
-                let now_secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as TimeId;
-                {
-                    let mut session = self.session.write().await;
-                    for chunk in &prepared {
-                        let mut local_msg = Message::new_text(
-                            peer_id,
-                            chunk.local_id.msg,
-                            Some(self_peer_id),
-                            now_secs,
-                            tg_data::TextWithEntities::new(
-                                chunk.text.clone(),
-                                entities_from_tl_with_self(&chunk.entities, self_user_id),
-                            ),
-                        );
-                        local_msg
-                            .flags
-                            .insert(MessageFlags::OUTGOING | MessageFlags::BEING_SENT);
-                        local_msg.flags.set(MessageFlags::SILENT, options.silent);
-                        local_msg
-                            .flags
-                            .set(MessageFlags::NO_FORWARDS, options.noforwards);
-                        local_msg
-                            .flags
-                            .set(MessageFlags::INVERT_MEDIA, options.invert_media);
-                        session.register_random_id(chunk.random_id, chunk.local_id);
-                        session.insert_message(local_msg);
-                    }
-                }
-
-                let mut out_messages = Vec::with_capacity(prepared.len());
-                let mut out_updates = Vec::with_capacity(prepared.len());
-                let mut send_err = None;
-
-                for (idx, chunk) in prepared.iter().enumerate() {
-                    match self
-                        .sender
-                        .send_prepared_chunk(
-                            &self.rpc,
-                            input_peer.clone(),
-                            chunk,
-                            reply_to.clone(),
-                            &options,
-                        )
-                        .await
-                    {
-                        Ok((pending, batch)) => {
-                            let now_ms = self.now_ms();
-                            let mut session = self.session.write().await;
-                            if let Err(err) = self
-                                .updates
-                                .handle_updates(
-                                    &self.rpc,
-                                    &mut session,
-                                    batch.clone(),
-                                    Some(chunk.random_id),
-                                    now_ms,
-                                )
-                                .await
-                            {
-                                warn!(error = %err, "failed to apply sendMessage updates");
-                            }
-                            out_messages.push(pending);
-                            out_updates.push(batch);
-                        }
-                        Err(kind) => {
-                            // Mark this chunk (and any remaining unsent chunks) failed or
-                            // destroy on `MESSAGE_EMPTY` (`apiwrap.cpp:545-580,4988-4991`).
-                            let mut session = self.session.write().await;
-                            for failed_chunk in &prepared[idx..] {
-                                session.unregister_random_id(failed_chunk.random_id);
-                                if kind == tg_api::SendMessageErrorKind::MessageEmpty {
-                                    session.delete_messages(peer_id, &[failed_chunk.local_id.msg]);
-                                } else if let Some(msg) = session.message_mut(failed_chunk.local_id)
-                                {
-                                    msg.flags.remove(MessageFlags::BEING_SENT);
-                                    msg.flags.insert(MessageFlags::SENDING_FAILED);
-                                }
-                            }
-                            send_err = Some(kind);
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(kind) = send_err {
-                    let _ = reply.send(Err(SessionError::SendMessage(kind)));
-                } else {
-                    self.drain_update_events().await;
-                    self.persist_updates_state_if_changed();
-                    let _ = reply.send(Ok(SendMessageOutcome {
-                        messages: out_messages,
-                        updates: out_updates,
-                    }));
-                }
+                self.mutations.push_back(Mutation::Send(cmd));
+                self.start_next_mutation().await;
             }
             SessionCommand::MarkRead {
                 peer_id,
@@ -1899,15 +2050,7 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                     self.read_manager
                         .read_inbox_till(input_peer, max_id, still_unread, force, now);
                 if due_now {
-                    match self.read_manager.flush_due(&self.rpc, now).await {
-                        Ok(flushed) => {
-                            self.apply_flushed_reads(&flushed).await;
-                            let _ = reply.send(Ok(flushed));
-                        }
-                        Err(err) => {
-                            let _ = reply.send(Err(SessionError::Api(err)));
-                        }
-                    }
+                    self.start_read_requests(now, Some(reply));
                 } else {
                     let _ = reply.send(Ok(Vec::new()));
                 }
@@ -1929,33 +2072,43 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                     let _ = reply.send(Err(SessionError::InvalidPeer(peer_id)));
                     return;
                 }
-                let res = self
-                    .progress_manager
-                    .update(
-                        &self.rpc,
-                        SendProgressUpdate {
-                            peer: input_peer,
-                            info,
-                            top_msg_id,
-                            kind,
-                            progress,
-                        },
-                        Instant::now(),
-                        now_unix_secs(),
-                    )
-                    .await
-                    .map_err(SessionError::Api);
-                let _ = reply.send(res);
+                let sent_at = Instant::now();
+                let typing_peer = info.peer_id;
+                let prepared = self.progress_manager.prepare(
+                    SendProgressUpdate {
+                        peer: input_peer,
+                        info,
+                        top_msg_id,
+                        kind,
+                        progress,
+                    },
+                    sent_at,
+                    now_unix_secs(),
+                );
+                let Some(req) = prepared else {
+                    let _ = reply.send(Ok(false));
+                    return;
+                };
+                let rpc = self.rpc.clone();
+                self.spawn_request(InFlightKind::Other, async move {
+                    Completion::Typing {
+                        peer_id: typing_peer,
+                        kind,
+                        sent_at,
+                        result: rpc.messages_set_typing(req).await,
+                        reply,
+                    }
+                });
             }
             SessionCommand::TriggerDifference { reply } => {
                 let now_ms = self.now_ms();
-                let mut session = self.session.write().await;
+                let mut access = SharedSession::new(&self.session);
                 let res = self
                     .updates
-                    .on_new_session_created(&self.rpc, &mut session, now_ms)
+                    .on_new_session_created(&self.rpc, &mut access, now_ms)
                     .await
                     .map_err(SessionError::Api);
-                drop(session);
+                drop(access);
                 self.drain_update_events().await;
                 self.persist_updates_state_if_changed();
                 let _ = reply.send(res);
@@ -1976,14 +2129,12 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 reply,
             } => {
                 let now_ms = self.now_ms();
-                let mut session = self.session.write().await;
-                let mut change_rx = session.subscribe();
-                let res = match peer_id.and_then(PeerId::to_channel) {
+                let res = with_shared_session!(self, access => match peer_id.and_then(PeerId::to_channel) {
                     Some(channel_id) => self
                         .updates
                         .apply_channel_pts(
                             &self.rpc,
-                            &mut session,
+                            &mut access,
                             channel_id,
                             pts,
                             pts_count,
@@ -1993,12 +2144,10 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                         .map_err(SessionError::Api),
                     None => self
                         .updates
-                        .apply_pts_only(&self.rpc, &mut session, None, pts, pts_count, now_ms)
+                        .apply_pts_only(&self.rpc, &mut access, None, pts, pts_count, now_ms)
                         .await
                         .map_err(SessionError::Api),
-                };
-                increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                drop(session);
+                });
                 self.drain_update_events().await;
                 self.persist_updates_state_if_changed();
                 let _ = reply.send(res);
@@ -2011,15 +2160,11 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 // Match `ApiWrap::applyUpdates` (`apiwrap.cpp:2332-2336`) ->
                 // `Api::Updates::applyUpdates` (`api/api_updates.cpp:1518-1560`).
                 let now_ms = self.now_ms();
-                let mut session = self.session.write().await;
-                let mut change_rx = session.subscribe();
-                let res = self
+                let res = with_shared_session!(self, access => self
                     .updates
-                    .handle_updates(&self.rpc, &mut session, *updates, sent_random_id, now_ms)
+                    .handle_updates(&self.rpc, &mut access, *updates, sent_random_id, now_ms)
                     .await
-                    .map_err(SessionError::Api);
-                increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                drop(session);
+                    .map_err(SessionError::Api));
                 self.drain_update_events().await;
                 self.persist_updates_state_if_changed();
                 let _ = reply.send(res);
@@ -2030,134 +2175,17 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 revoke,
                 reply,
             } => {
-                // Match `Data::Histories::deleteMessages` (`data/data_histories.cpp:975-1065`)
-                // and `ApiWrap::applyAffectedMessages` (`apiwrap.cpp:2350-2358`).
-                let input_peer = {
-                    let session = self.session.read().await;
-                    input_peer_for(&session, peer_id)
-                };
-                if matches!(input_peer, tl_enums::InputPeer::Empty) {
-                    let _ = reply.send(Err(SessionError::InvalidPeer(peer_id)));
-                    return;
-                }
-                match self
-                    .sender
-                    .delete_messages(&self.rpc, input_peer, ids.clone(), revoke)
-                    .await
-                {
-                    Ok(affected) => {
-                        let now_ms = self.now_ms();
-                        let mut session = self.session.write().await;
-                        let mut change_rx = session.subscribe();
-                        session.delete_messages(peer_id, &ids);
-                        let pts_res = match peer_id.to_channel() {
-                            Some(channel_id) => self
-                                .updates
-                                .apply_channel_pts(
-                                    &self.rpc,
-                                    &mut session,
-                                    channel_id,
-                                    affected.pts,
-                                    affected.pts_count,
-                                    now_ms,
-                                )
-                                .await
-                                .map_err(SessionError::Api),
-                            None => self
-                                .updates
-                                .apply_pts_only(
-                                    &self.rpc,
-                                    &mut session,
-                                    None,
-                                    affected.pts,
-                                    affected.pts_count,
-                                    now_ms,
-                                )
-                                .await
-                                .map_err(SessionError::Api),
-                        };
-                        increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                        drop(session);
-                        self.drain_update_events().await;
-                        self.persist_updates_state_if_changed();
-                        let _ = reply.send(pts_res.map(|()| affected));
-                    }
-                    Err(err) => {
-                        let _ = reply.send(Err(SessionError::Api(err)));
-                    }
-                }
+                self.mutations.push_back(Mutation::Delete {
+                    peer_id,
+                    ids,
+                    revoke,
+                    reply,
+                });
+                self.start_next_mutation().await;
             }
             SessionCommand::EditMessage { req, reply } => {
-                // Match `Api::EditMessage` (`api/api_editing.cpp:356, 426`) and
-                // `HistoryWidget::saveEdit` (`history/history_widget.cpp:5736`): apply returned
-                // `Updates` via `UpdatesHandler`, and treat `MESSAGE_NOT_MODIFIED` (which also
-                // occurs when MTProto retries a `500 RPC_CALL_FAIL` whose first attempt committed
-                // on the server, per `mtproto/mtp_instance.cpp:1606`) as non-fatal while syncing
-                // difference so `Session` converges to the server state.
-                let peer_channel = match &req.peer {
-                    tl_enums::InputPeer::Channel(ch) => Some(ChannelId::from_tl(ch.channel_id)),
-                    _ => None,
-                };
-                match self.sender.edit_message(&self.rpc, *req).await {
-                    Ok(updates) => {
-                        let now_ms = self.now_ms();
-                        let mut session = self.session.write().await;
-                        let mut change_rx = session.subscribe();
-                        let apply_res = self
-                            .updates
-                            .handle_updates(&self.rpc, &mut session, updates.clone(), None, now_ms)
-                            .await
-                            .map_err(SessionError::Api);
-                        increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                        drop(session);
-                        self.drain_update_events().await;
-                        self.persist_updates_state_if_changed();
-                        let _ = reply.send(apply_res.map(|()| Some(updates)));
-                    }
-                    Err(tg_api::ApiError::Invocation(tg_api::InvocationError::Rpc(ref r)))
-                        if r.name == "MESSAGE_NOT_MODIFIED" =>
-                    {
-                        let now_ms = self.now_ms();
-                        let mut session = self.session.write().await;
-                        let mut change_rx = session.subscribe();
-                        let sync_res = if let Some(ch_id) = peer_channel {
-                            if self.updates.channel_pts(ch_id).is_some() {
-                                let too_long =
-                                    tl_enums::Updates::UpdateShort(tl_types::UpdateShort {
-                                        update: tl_enums::Update::ChannelTooLong(
-                                            tl_types::UpdateChannelTooLong {
-                                                channel_id: ch_id.to_tl(),
-                                                pts: None,
-                                            },
-                                        ),
-                                        date: now_unix_secs(),
-                                    });
-                                self.updates
-                                    .handle_updates(&self.rpc, &mut session, too_long, None, now_ms)
-                                    .await
-                                    .map_err(SessionError::Api)
-                            } else {
-                                Ok(())
-                            }
-                        } else {
-                            self.updates
-                                .on_new_session_created(&self.rpc, &mut session, now_ms)
-                                .await
-                                .map_err(SessionError::Api)
-                        };
-                        increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                        drop(session);
-                        self.drain_update_events().await;
-                        self.persist_updates_state_if_changed();
-                        if let Err(err) = sync_res {
-                            warn!(error = %err, "difference sync after MESSAGE_NOT_MODIFIED failed");
-                        }
-                        let _ = reply.send(Ok(None));
-                    }
-                    Err(err) => {
-                        let _ = reply.send(Err(SessionError::Api(err)));
-                    }
-                }
+                self.mutations.push_back(Mutation::Edit { req, reply });
+                self.start_next_mutation().await;
             }
             SessionCommand::InitChannelPts {
                 channel_id,
@@ -2175,15 +2203,11 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 reply,
             } => {
                 let now_ms = self.now_ms();
-                let mut session = self.session.write().await;
-                let mut change_rx = session.subscribe();
-                let res = self
+                let res = with_shared_session!(self, access => self
                     .updates
-                    .apply_channel_pts(&self.rpc, &mut session, channel_id, pts, pts_count, now_ms)
+                    .apply_channel_pts(&self.rpc, &mut access, channel_id, pts, pts_count, now_ms)
                     .await
-                    .map_err(SessionError::Api);
-                increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                drop(session);
+                    .map_err(SessionError::Api));
                 self.drain_update_events().await;
                 self.persist_updates_state_if_changed();
                 let _ = reply.send(res);
@@ -2202,18 +2226,14 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                     self.rpc.restart_sessions();
                 }
                 let now_ms = self.now_ms();
-                let mut session = self.session.write().await;
-                let mut change_rx = session.subscribe();
-                let res = self
-                    .updates
-                    .on_reconnect(&self.rpc, &mut session, now_ms)
-                    .await
-                    .map_err(SessionError::Api);
                 // Match `Api::Updates::applyDifferenceSlice` -> `History::addNewMessage`
                 // (`api/api_updates.cpp`, `history/history.cpp`): incoming messages recovered
                 // via `getDifference` on reconnect must update unread counters too.
-                increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                drop(session);
+                let res = with_shared_session!(self, access => self
+                    .updates
+                    .on_reconnect(&self.rpc, &mut access, now_ms)
+                    .await
+                    .map_err(SessionError::Api));
                 self.drain_update_events().await;
                 self.persist_updates_state_if_changed();
                 let _ = reply.send(res);
@@ -2244,12 +2264,12 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             } => {
                 let now_ms = self.now_ms();
                 let last_non_idle_ms = now_ms.saturating_sub(idle_ms);
-                let mut session = self.session.write().await;
+                let mut access = SharedSession::new(&self.session);
                 let res = self
                     .updates
                     .update_online_timed(
                         &self.rpc,
-                        &mut session,
+                        &mut access,
                         window_active,
                         last_non_idle_ms,
                         now_ms,
@@ -2266,15 +2286,648 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
         }
     }
 
-    async fn handle_updates_deadline(&mut self) {
-        let now_ms = self.now_ms();
+    /// Starts a request beside the actor loop; its [`Completion`] comes back through
+    /// [`Self::on_request_done`].
+    fn spawn_request<F>(&mut self, kind: InFlightKind, fut: F)
+    where
+        F: Future<Output = Completion> + Send + 'static,
+    {
+        let handle = self.in_flight.spawn(fut);
+        self.in_flight_kinds.insert(handle.id(), kind);
+    }
+
+    /// `messages.getHistory` for `OpenHistory`, deduplicated by `(peer, message, direction)`
+    /// like `HistoryLoader::request_history`.
+    async fn start_history_request(
+        &mut self,
+        peer_id: PeerId,
+        around_id: MsgId,
+        direction: LoadDirection,
+        reply: oneshot::Sender<Result<Option<HistorySlice>>>,
+    ) {
+        let input_peer = {
+            let session = self.session.read().await;
+            input_peer_for(&session, peer_id)
+        };
+        if matches!(input_peer, tl_enums::InputPeer::Empty) {
+            let _ = reply.send(Err(SessionError::InvalidPeer(peer_id)));
+            return;
+        }
+        let key = (peer_id, around_id, direction);
+        if !self.history_requests.insert(key) {
+            let _ = reply.send(Ok(None));
+            return;
+        }
+        let req = tg_api::prepare_history_request(input_peer, around_id, direction);
+        let rpc = self.rpc.clone();
+        self.spawn_request(InFlightKind::History(key), async move {
+            Completion::History {
+                key,
+                result: rpc.messages_get_history(req).await,
+                reply,
+            }
+        });
+    }
+
+    /// Sends the inbox reads due at `now` beside the loop, one after another in the order
+    /// `ReadHistoryManager::flush_due` sends them.
+    fn start_read_requests(
+        &mut self,
+        now: Instant,
+        reply: Option<oneshot::Sender<Result<Vec<FlushedRead>>>>,
+    ) {
+        let due = self.read_manager.take_due(now);
+        if due.is_empty() {
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(Vec::new()));
+            }
+            return;
+        }
+        let rpc = self.rpc.clone();
+        self.spawn_request(InFlightKind::Other, async move {
+            let mut flushed = Vec::with_capacity(due.len());
+            let mut failed = None;
+            let mut pending = due.into_iter();
+            for item in pending.by_ref() {
+                match item.send(&rpc).await {
+                    Ok(read) => flushed.push(read),
+                    Err(err) => {
+                        failed = Some((item, err));
+                        break;
+                    }
+                }
+            }
+            Completion::Reads {
+                flushed,
+                failed,
+                unsent: pending.collect(),
+                reply,
+            }
+        });
+    }
+
+    async fn on_request_done(
+        &mut self,
+        done: std::result::Result<(tokio::task::Id, Completion), tokio::task::JoinError>,
+    ) {
+        let completion = match done {
+            Ok((id, completion)) => {
+                self.in_flight_kinds.remove(&id);
+                completion
+            }
+            Err(err) => {
+                warn!(error = %err, "session request task failed");
+                match self.in_flight_kinds.remove(&err.id()) {
+                    Some(InFlightKind::History(key)) => {
+                        self.history_requests.remove(&key);
+                    }
+                    Some(InFlightKind::Ping) => self.ping_in_flight = false,
+                    Some(InFlightKind::Other) | None => {}
+                }
+                return;
+            }
+        };
+        match completion {
+            Completion::History { key, result, reply } => {
+                self.history_requests.remove(&key);
+                let (peer_id, around_id, direction) = key;
+                let res = match result {
+                    Ok(response) => {
+                        let slice = tg_api::parse_history_result(around_id, direction, response);
+                        self.dialogs
+                            .register_peers_from_tl(&slice.users, &slice.chats);
+                        if let Some(ch_id) = peer_id.to_channel()
+                            && let Some(pts) = slice.channel_pts
+                        {
+                            self.updates.init_channel_pts(ch_id, pts);
+                            self.persist_updates_state_if_changed();
+                        }
+                        let mut session = self.session.write().await;
+                        slice.apply_to_session(&mut session, peer_id);
+                        Ok(Some(slice))
+                    }
+                    Err(err) => Err(SessionError::Api(tg_api::ApiError::Invocation(err))),
+                };
+                let _ = reply.send(res);
+            }
+            Completion::Typing {
+                peer_id,
+                kind,
+                sent_at,
+                result,
+                reply,
+            } => {
+                let res = match result {
+                    Ok(_) => {
+                        self.progress_manager.finish_sent(peer_id, kind, sent_at);
+                        Ok(true)
+                    }
+                    Err(err) => Err(SessionError::Api(tg_api::ApiError::Invocation(err))),
+                };
+                let _ = reply.send(res);
+            }
+            Completion::Reads {
+                flushed,
+                failed,
+                unsent,
+                reply,
+            } => {
+                // A failed read and the ones after it go back to the manager and are retried
+                // (`data/data_histories.cpp:763-770`); the ones that went through are applied.
+                for item in unsent.iter().chain(failed.iter().map(|(item, _)| item)) {
+                    self.read_manager.restore_failed(item);
+                }
+                if !flushed.is_empty() {
+                    self.apply_flushed_reads(&flushed).await;
+                }
+                match failed {
+                    Some((_, err)) => {
+                        if reply.is_none() {
+                            warn!(error = %err, "flushing inbox read requests failed");
+                        }
+                        if let Some(reply) = reply {
+                            let _ = reply
+                                .send(Err(SessionError::Api(tg_api::ApiError::Invocation(err))));
+                        }
+                    }
+                    None => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(flushed));
+                        }
+                    }
+                }
+            }
+            Completion::Ping { result } => {
+                self.ping_in_flight = false;
+                match result {
+                    Ok(()) => self.updates.mark_ping_sent(self.now_ms()),
+                    Err(err) => {
+                        warn!(error = %err, "idle updates keepalive ping failed; triggering resync");
+                        let now_ms = self.now_ms();
+                        // Match `Api::Updates::applyDifferenceSlice` -> `History::addNewMessage`
+                        // (`api/api_updates.cpp`, `history/history.cpp`).
+                        let res = with_shared_session!(self, access => self
+                            .updates
+                            .on_reconnect(&self.rpc, &mut access, now_ms)
+                            .await);
+                        if let Err(resync_err) = res {
+                            warn!(error = %resync_err, "updates resync after failed ping failed");
+                        }
+                        self.drain_update_events().await;
+                        self.persist_updates_state_if_changed();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Starts the next queued send, edit or delete if none is running.
+    async fn start_next_mutation(&mut self) {
+        while self.mutation_task.is_none() && self.active_send.is_none() {
+            let Some(next) = self.mutations.pop_front() else {
+                return;
+            };
+            match next {
+                Mutation::Send(cmd) => self.start_send(*cmd).await,
+                Mutation::Edit { req, reply } => {
+                    // Match `Api::EditMessage` (`api/api_editing.cpp:356, 426`).
+                    let peer_channel = match &req.peer {
+                        tl_enums::InputPeer::Channel(ch) => Some(ChannelId::from_tl(ch.channel_id)),
+                        _ => None,
+                    };
+                    let rpc = self.rpc.clone();
+                    self.spawn_mutation(async move {
+                        MutationDone::Edit {
+                            peer_channel,
+                            result: <MessageSender>::default().edit_message(&rpc, *req).await,
+                            reply,
+                        }
+                    });
+                }
+                Mutation::Delete {
+                    peer_id,
+                    ids,
+                    revoke,
+                    reply,
+                } => {
+                    // Match `Data::Histories::deleteMessages` (`data/data_histories.cpp:975-1065`).
+                    let input_peer = {
+                        let session = self.session.read().await;
+                        input_peer_for(&session, peer_id)
+                    };
+                    if matches!(input_peer, tl_enums::InputPeer::Empty) {
+                        let _ = reply.send(Err(SessionError::InvalidPeer(peer_id)));
+                        continue;
+                    }
+                    let rpc = self.rpc.clone();
+                    self.spawn_mutation(async move {
+                        let result = <MessageSender>::default()
+                            .delete_messages(&rpc, input_peer, ids.clone(), revoke)
+                            .await;
+                        MutationDone::Delete {
+                            peer_id,
+                            ids,
+                            result,
+                            reply,
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn spawn_mutation<F>(&mut self, fut: F)
+    where
+        F: Future<Output = MutationDone> + Send + 'static,
+    {
+        self.mutation_task = Some(tokio::spawn(fut));
+    }
+
+    async fn start_send(&mut self, cmd: SendMessageCommand) {
+        let SendMessageCommand {
+            peer_id,
+            text,
+            entities,
+            reply_to,
+            options,
+            prepared: prepared_by_caller,
+            reply,
+        } = cmd;
+        let (input_peer, self_user_id, self_peer_id) = {
+            let session = self.session.read().await;
+            (
+                input_peer_for(&session, peer_id),
+                session.self_user_id(),
+                session.self_peer_id(),
+            )
+        };
+        if matches!(input_peer, tl_enums::InputPeer::Empty) {
+            let _ = reply.send(Err(SessionError::InvalidPeer(peer_id)));
+            return;
+        }
+
+        // Match `ApiWrap::sendMessage` (`apiwrap.cpp:4866-4995`):
+        // allocate local pending messages and register `random_id -> local_id` in
+        // `Session` BEFORE invoking `messages.sendMessage` so both `UpdateMessageID` +
+        // `UpdateNewMessage` and `UpdateShortSentMessage` merge into the local message,
+        // and RPC failures mark it `SENDING_FAILED` (or destroy it on `MESSAGE_EMPTY`).
+        if let Some(prepared) = prepared_by_caller {
+            // The caller stored the local messages and registered their random ids already.
+            self.sender.adopt_prepared_chunks(&prepared);
+            let send = Box::new(ActiveSend {
+                peer_id,
+                input_peer,
+                out_messages: Vec::with_capacity(prepared.len()),
+                out_updates: Vec::with_capacity(prepared.len()),
+                prepared,
+                next: 0,
+                reply_to,
+                options,
+                reply,
+            });
+            self.send_next_chunk(send).await;
+            return;
+        }
+        let prepared = self.sender.prepare_text_chunks(peer_id, &text, &entities);
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as TimeId;
         {
             let mut session = self.session.write().await;
-            let mut change_rx = session.subscribe();
-            if let Err(err) = self.updates.on_tick(&self.rpc, &mut session, now_ms).await {
-                warn!(error = %err, "updates deadline tick failed");
+            for chunk in &prepared {
+                let mut local_msg = Message::new_text(
+                    peer_id,
+                    chunk.local_id.msg,
+                    Some(self_peer_id),
+                    now_secs,
+                    tg_data::TextWithEntities::new(
+                        chunk.text.clone(),
+                        entities_from_tl_with_self(&chunk.entities, self_user_id),
+                    ),
+                );
+                local_msg
+                    .flags
+                    .insert(MessageFlags::OUTGOING | MessageFlags::BEING_SENT);
+                local_msg.flags.set(MessageFlags::SILENT, options.silent);
+                local_msg
+                    .flags
+                    .set(MessageFlags::NO_FORWARDS, options.noforwards);
+                local_msg
+                    .flags
+                    .set(MessageFlags::INVERT_MEDIA, options.invert_media);
+                session.register_random_id(chunk.random_id, chunk.local_id);
+                if peer_id == self_peer_id {
+                    tracing::info!(
+                        target: tg_api::saved_side_log::TARGET,
+                        stage = "pending",
+                        msg_id = chunk.local_id.msg.0,
+                        random_id = chunk.random_id,
+                        out = local_msg.is_outgoing(),
+                        from = tg_api::saved_side_log::from_kind(
+                            local_msg.from_id,
+                            self_peer_id
+                        ),
+                        saved_peer = false,
+                        fwd = local_msg.forward_from.is_some(),
+                        "saved messages: local pending message"
+                    );
+                }
+                session.insert_message(local_msg);
             }
-            increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
+        }
+
+        let send = Box::new(ActiveSend {
+            peer_id,
+            input_peer,
+            out_messages: Vec::with_capacity(prepared.len()),
+            out_updates: Vec::with_capacity(prepared.len()),
+            prepared,
+            next: 0,
+            reply_to,
+            options,
+            reply,
+        });
+        self.send_next_chunk(send).await;
+    }
+
+    /// Sends the next chunk of `send`, or finishes it when every chunk went through.
+    async fn send_next_chunk(&mut self, send: Box<ActiveSend>) {
+        let Some(chunk) = send.prepared.get(send.next) else {
+            let ActiveSend {
+                out_messages,
+                out_updates,
+                reply,
+                ..
+            } = *send;
+            self.drain_update_events().await;
+            self.persist_updates_state_if_changed();
+            let _ = reply.send(Ok(SendMessageOutcome {
+                messages: out_messages,
+                updates: out_updates,
+            }));
+            return;
+        };
+        let req = <MessageSender>::prepared_chunk_request(
+            send.input_peer.clone(),
+            chunk,
+            send.reply_to.clone(),
+            &send.options,
+        );
+        let rpc = self.rpc.clone();
+        self.spawn_mutation(async move {
+            MutationDone::SendChunk(rpc.messages_send_message(req).await)
+        });
+        self.active_send = Some(send);
+    }
+
+    async fn on_mutation_done(
+        &mut self,
+        done: std::result::Result<MutationDone, tokio::task::JoinError>,
+    ) {
+        let done = match done {
+            Ok(done) => done,
+            Err(err) => {
+                warn!(error = %err, "send/edit/delete task failed");
+                if let Some(send) = self.active_send.take() {
+                    self.fail_send(*send, tg_api::SendMessageErrorKind::Other(err.to_string()))
+                        .await;
+                }
+                self.start_next_mutation().await;
+                return;
+            }
+        };
+        match done {
+            MutationDone::SendChunk(result) => {
+                if let Some(send) = self.active_send.take() {
+                    self.on_send_chunk_done(send, result).await;
+                }
+            }
+            MutationDone::Edit {
+                peer_channel,
+                result,
+                reply,
+            } => self.on_edit_done(peer_channel, result, reply).await,
+            MutationDone::Delete {
+                peer_id,
+                ids,
+                result,
+                reply,
+            } => self.on_delete_done(peer_id, ids, result, reply).await,
+        }
+        self.start_next_mutation().await;
+    }
+
+    async fn on_send_chunk_done(
+        &mut self,
+        mut send: Box<ActiveSend>,
+        result: std::result::Result<tl_enums::Updates, InvocationError>,
+    ) {
+        let idx = send.next;
+        let Some(chunk) = send.prepared.get(idx) else {
+            return;
+        };
+        let random_id = chunk.random_id;
+        match self.sender.finish_prepared_chunk(chunk, result) {
+            Ok((pending, batch)) => {
+                let now_ms = self.now_ms();
+                let mut access = SharedSession::new(&self.session);
+                if let Err(err) = self
+                    .updates
+                    .handle_updates(
+                        &self.rpc,
+                        &mut access,
+                        batch.clone(),
+                        Some(random_id),
+                        now_ms,
+                    )
+                    .await
+                {
+                    warn!(error = %err, "failed to apply sendMessage updates");
+                }
+                drop(access);
+                send.out_messages.push(pending);
+                send.out_updates.push(batch);
+                send.next += 1;
+                self.send_next_chunk(send).await;
+            }
+            Err(kind) => self.fail_send(*send, kind).await,
+        }
+    }
+
+    /// Marks the current chunk of `send` and every later one failed (or destroys them on
+    /// `MESSAGE_EMPTY`, `apiwrap.cpp:545-580,4988-4991`) and answers the caller.
+    async fn fail_send(&mut self, send: ActiveSend, kind: tg_api::SendMessageErrorKind) {
+        {
+            let mut session = self.session.write().await;
+            for failed_chunk in send.prepared.get(send.next..).unwrap_or_default() {
+                session.unregister_random_id(failed_chunk.random_id);
+                if kind == tg_api::SendMessageErrorKind::MessageEmpty {
+                    session.delete_messages(send.peer_id, &[failed_chunk.local_id.msg]);
+                } else if let Some(msg) = session.message_mut(failed_chunk.local_id) {
+                    msg.flags.remove(MessageFlags::BEING_SENT);
+                    msg.flags.insert(MessageFlags::SENDING_FAILED);
+                }
+            }
+        }
+        let _ = send.reply.send(Err(SessionError::SendMessage(kind)));
+    }
+
+    async fn on_edit_done(
+        &mut self,
+        peer_channel: Option<ChannelId>,
+        result: std::result::Result<tl_enums::Updates, tg_api::ApiError>,
+        reply: oneshot::Sender<Result<Option<tl_enums::Updates>>>,
+    ) {
+        // Match `HistoryWidget::saveEdit` (`history/history_widget.cpp:5736`): apply returned
+        // `Updates` via `UpdatesHandler`, and treat `MESSAGE_NOT_MODIFIED` (which also occurs
+        // when MTProto retries a `500 RPC_CALL_FAIL` whose first attempt committed on the
+        // server, per `mtproto/mtp_instance.cpp:1606`) as non-fatal while syncing difference so
+        // `Session` converges to the server state.
+        match result {
+            Ok(updates) => {
+                let now_ms = self.now_ms();
+                let apply_res = with_shared_session!(self, access => self
+                    .updates
+                    .handle_updates(&self.rpc, &mut access, updates.clone(), None, now_ms)
+                    .await
+                    .map_err(SessionError::Api));
+                self.drain_update_events().await;
+                self.persist_updates_state_if_changed();
+                let _ = reply.send(apply_res.map(|()| Some(updates)));
+            }
+            Err(tg_api::ApiError::Invocation(tg_api::InvocationError::Rpc(ref r)))
+                if r.name == "MESSAGE_NOT_MODIFIED" =>
+            {
+                let now_ms = self.now_ms();
+                let sync_res = with_shared_session!(self, access => if let Some(ch_id) = peer_channel {
+                    if self.updates.channel_pts(ch_id).is_some() {
+                        let too_long = tl_enums::Updates::UpdateShort(tl_types::UpdateShort {
+                            update: tl_enums::Update::ChannelTooLong(
+                                tl_types::UpdateChannelTooLong {
+                                    channel_id: ch_id.to_tl(),
+                                    pts: None,
+                                },
+                            ),
+                            date: now_unix_secs(),
+                        });
+                        self.updates
+                            .handle_updates(&self.rpc, &mut access, too_long, None, now_ms)
+                            .await
+                            .map_err(SessionError::Api)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    self.updates
+                        .on_new_session_created(&self.rpc, &mut access, now_ms)
+                        .await
+                        .map_err(SessionError::Api)
+                });
+                self.drain_update_events().await;
+                self.persist_updates_state_if_changed();
+                if let Err(err) = sync_res {
+                    warn!(error = %err, "difference sync after MESSAGE_NOT_MODIFIED failed");
+                }
+                let _ = reply.send(Ok(None));
+            }
+            Err(err) => {
+                let _ = reply.send(Err(SessionError::Api(err)));
+            }
+        }
+    }
+
+    async fn on_delete_done(
+        &mut self,
+        peer_id: PeerId,
+        ids: Vec<MsgId>,
+        result: std::result::Result<tl_types::messages::AffectedMessages, tg_api::ApiError>,
+        reply: oneshot::Sender<Result<tl_types::messages::AffectedMessages>>,
+    ) {
+        // Match `ApiWrap::applyAffectedMessages` (`apiwrap.cpp:2350-2358`).
+        match result {
+            Ok(affected) => {
+                let now_ms = self.now_ms();
+                let pts_res = with_shared_session!(self, access => {
+                    access.get().await.delete_messages(peer_id, &ids);
+                    match peer_id.to_channel() {
+                        Some(channel_id) => self
+                            .updates
+                            .apply_channel_pts(
+                                &self.rpc,
+                                &mut access,
+                                channel_id,
+                                affected.pts,
+                                affected.pts_count,
+                                now_ms,
+                            )
+                            .await
+                            .map_err(SessionError::Api),
+                        None => self
+                            .updates
+                            .apply_pts_only(
+                                &self.rpc,
+                                &mut access,
+                                None,
+                                affected.pts,
+                                affected.pts_count,
+                                now_ms,
+                            )
+                            .await
+                            .map_err(SessionError::Api),
+                    }
+                });
+                self.drain_update_events().await;
+                self.persist_updates_state_if_changed();
+                let _ = reply.send(pts_res.map(|()| affected));
+            }
+            Err(err) => {
+                let _ = reply.send(Err(SessionError::Api(err)));
+            }
+        }
+    }
+
+    /// Lets in-flight sends, edits, deletes and reads finish (bounded by
+    /// [`SHUTDOWN_DRAIN_TIMEOUT`]) before the shutdown flush, as the serial actor did for
+    /// commands that were already accepted.
+    async fn drain_requests_before_shutdown(&mut self) {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+        loop {
+            if self.mutation_task.is_none() && self.active_send.is_none() {
+                self.start_next_mutation().await;
+            }
+            let has_mutation = self.mutation_task.is_some();
+            if !has_mutation && self.in_flight.is_empty() {
+                return;
+            }
+            tokio::select! {
+                done = poll_optional(&mut self.mutation_task), if has_mutation => {
+                    self.mutation_task = None;
+                    if let Some(done) = done {
+                        self.on_mutation_done(done).await;
+                    }
+                }
+                done = self.in_flight.join_next_with_id(), if !self.in_flight.is_empty() => {
+                    if let Some(done) = done {
+                        self.on_request_done(done).await;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    warn!("shutdown: requests still in flight after the drain timeout");
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn handle_updates_deadline(&mut self) {
+        let now_ms = self.now_ms();
+        let res = with_shared_session!(self, access => self
+            .updates
+            .on_tick(&self.rpc, &mut access, now_ms)
+            .await);
+        if let Err(err) = res {
+            warn!(error = %err, "updates deadline tick failed");
         }
         self.drain_update_events().await;
         self.persist_updates_state_if_changed();
@@ -2296,17 +2949,14 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             }
         }
         if force_resync || ping_failed {
-            let mut session = self.session.write().await;
-            let mut change_rx = session.subscribe();
-            let res = self
-                .updates
-                .on_reconnect(&self.rpc, &mut session, self.now_ms())
-                .await
-                .map_err(SessionError::Api);
+            let now_ms = self.now_ms();
             // Match `Api::Updates::applyDifferenceSlice` -> `History::addNewMessage`
             // (`api/api_updates.cpp`, `history/history.cpp`).
-            increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-            drop(session);
+            let res = with_shared_session!(self, access => self
+                .updates
+                .on_reconnect(&self.rpc, &mut access, now_ms)
+                .await
+                .map_err(SessionError::Api));
             self.drain_update_events().await;
             self.persist_updates_state_if_changed();
             res?;
@@ -2327,41 +2977,28 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
         self.last_tick_mono_ms = now_ms;
 
         // 1. Advance updates gap / short-poll / backoff timers.
-        {
-            let mut session = self.session.write().await;
-            let mut change_rx = session.subscribe();
-            if let Err(err) = self.updates.on_tick(&self.rpc, &mut session, now_ms).await {
-                warn!(error = %err, "updates tick failed");
-            }
-            increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
+        let res = with_shared_session!(self, access => self
+            .updates
+            .on_tick(&self.rpc, &mut access, now_ms)
+            .await);
+        if let Err(err) = res {
+            warn!(error = %err, "updates tick failed");
         }
         self.drain_update_events().await;
 
-        // 2. Idle keepalive ping (`kNoUpdatesTimeout` / `kNoUpdatesAfterSleepTimeout`).
-        if self.config.idle_ping_enabled && self.updates.check_last_update(detected_sleep, now_ms) {
-            match self.rpc.ping().await {
-                Ok(()) => {
-                    self.updates.mark_ping_sent(self.now_ms());
+        // 2. Idle keepalive ping (`kNoUpdatesTimeout` / `kNoUpdatesAfterSleepTimeout`), sent
+        //    beside the loop; a failure resyncs in `on_request_done`.
+        if self.config.idle_ping_enabled
+            && !self.ping_in_flight
+            && self.updates.check_last_update(detected_sleep, now_ms)
+        {
+            self.ping_in_flight = true;
+            let rpc = self.rpc.clone();
+            self.spawn_request(InFlightKind::Ping, async move {
+                Completion::Ping {
+                    result: rpc.ping().await.map_err(Into::into),
                 }
-                Err(err) => {
-                    let mapped: tg_api::InvocationError = err.into();
-                    warn!(error = %mapped, "idle updates keepalive ping failed; triggering resync");
-                    let mut session = self.session.write().await;
-                    let mut change_rx = session.subscribe();
-                    if let Err(resync_err) = self
-                        .updates
-                        .on_reconnect(&self.rpc, &mut session, self.now_ms())
-                        .await
-                    {
-                        warn!(error = %resync_err, "updates resync after failed ping failed");
-                    }
-                    // Match `Api::Updates::applyDifferenceSlice` -> `History::addNewMessage`
-                    // (`api/api_updates.cpp`, `history/history.cpp`).
-                    increment_unread_for_new_incoming_messages(&mut session, &mut change_rx);
-                    drop(session);
-                    self.drain_update_events().await;
-                }
-            }
+            });
         }
 
         self.persist_updates_state_if_changed();
@@ -2372,15 +3009,7 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             .next_deadline()
             .is_some_and(|deadline| deadline <= now)
         {
-            match self.read_manager.flush_due(&self.rpc, now).await {
-                Ok(flushed) if !flushed.is_empty() => {
-                    self.apply_flushed_reads(&flushed).await;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(error = %err, "flushing inbox read requests failed");
-                }
-            }
+            self.start_read_requests(now, None);
         }
 
         // 4. Flush due cloud drafts.
@@ -2408,6 +3037,12 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             self.apply_flushed_reads(&flushed).await;
         }
         self.persist_updates_state_if_changed();
+        self.flush_persist();
+        if let Some(persister) = self.persister.as_mut()
+            && !persister.flush(SHUTDOWN_DRAIN_TIMEOUT).await
+        {
+            warn!("shutdown: the last updates state write did not finish in time");
+        }
     }
 
     fn load_initial_persisted_state(&self) -> Option<PersistedUpdatesState> {
@@ -2424,23 +3059,112 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
         }
     }
 
+    /// Schedules a write of the updates state within [`PERSIST_DEBOUNCE`]; the state is read
+    /// and compared when the timer fires ([`Self::flush_persist`]).
     fn persist_updates_state_if_changed(&mut self) {
-        let Some(store) = self.config.updates_state_store.as_ref() else {
+        if self.config.updates_state_store.is_none() || self.persist_deadline.is_some() {
+            return;
+        }
+        self.persist_deadline = Some(tokio::time::Instant::now() + PERSIST_DEBOUNCE);
+    }
+
+    /// Hands the current updates state to the persistence worker if it changed since the last
+    /// write (or the last write failed). The file write itself runs on the blocking pool.
+    fn flush_persist(&mut self) {
+        self.persist_deadline = None;
+        let Some(persister) = self.persister.as_mut() else {
             return;
         };
+        if persister.take_failed() {
+            self.last_persisted_state = None;
+        }
         let current = self.updates.export_state();
-        if !current.is_valid() {
+        if !current.is_valid() || self.last_persisted_state.as_ref() == Some(&current) {
             return;
         }
-        if self.last_persisted_state.as_ref() == Some(&current) {
+        persister.submit(current.clone());
+        self.last_persisted_state = Some(current);
+    }
+
+    /// Requests the dialog entries of histories that got new messages while their folder was
+    /// unknown (`Histories::sendDialogRequests`, `data/data_histories.cpp:448-494`), so a chat
+    /// from the archive is not shown in the main list and a new chat appears in the right one.
+    /// The request runs beside the actor loop; [`Self::apply_dialog_entries`] applies it.
+    async fn start_dialog_entries_request(&mut self) {
+        if !self.session.read().await.has_dialog_entry_requests() {
             return;
         }
-        match store.save(&current) {
-            Ok(()) => {
-                self.last_persisted_state = Some(current);
+        let peers: Vec<tl_enums::InputDialogPeer> = {
+            let mut session = self.session.write().await;
+            let pending = session.take_dialog_entry_requests();
+            pending
+                .into_iter()
+                .map(|pid| input_peer_for(&session, pid))
+                .filter(|peer| !matches!(peer, tl_enums::InputPeer::Empty))
+                .map(|peer| {
+                    tl_enums::InputDialogPeer::InputDialogPeer(tl_types::InputDialogPeer { peer })
+                })
+                .collect()
+        };
+        if peers.is_empty() {
+            return;
+        }
+        let rpc = self.rpc.clone();
+        self.dialog_entries = Some(Box::pin(async move {
+            let mut out = Vec::new();
+            for chunk in peers.chunks(tg_api::LOAD_EXCEPTIONS_PER_REQUEST) {
+                out.push(
+                    rpc.messages_get_peer_dialogs(tl_fns::messages::GetPeerDialogs {
+                        peers: chunk.to_vec(),
+                    })
+                    .await?,
+                );
             }
-            Err(err) => {
-                warn!(error = %err, "failed to persist updates state");
+            Ok(out)
+        }));
+    }
+
+    async fn apply_dialog_entries(
+        &mut self,
+        res: Option<
+            std::result::Result<Vec<tl_types::messages::PeerDialogs>, tg_api::InvocationError>,
+        >,
+    ) {
+        let responses = match res {
+            Some(Ok(responses)) => responses,
+            Some(Err(err)) => {
+                debug!(error = %err, "messages.getPeerDialogs for new chats failed");
+                return;
+            }
+            None => return,
+        };
+        for resp in responses {
+            self.dialogs
+                .register_peers_from_tl(&resp.users, &resp.chats);
+            let now_unix = now_unix_secs();
+            let mut session = self.session.write().await;
+            tg_api::convert::apply_tl_peer_dialogs_for_folder(
+                &mut session,
+                &resp,
+                None,
+                false,
+                now_unix,
+            );
+            drop(session);
+            self.init_channel_pts_from_dialogs(&resp.dialogs);
+        }
+        self.persist_updates_state_if_changed();
+        self.drain_update_events().await;
+    }
+
+    fn init_channel_pts_from_dialogs(&mut self, dialogs: &[tl_enums::Dialog]) {
+        for dialog in dialogs {
+            if let tl_enums::Dialog::Dialog(d) = dialog
+                && let tl_enums::Peer::Channel(ch) = &d.peer
+                && let Some(pts) = d.pts
+            {
+                self.updates
+                    .init_channel_pts(ChannelId::from_tl(ch.channel_id), pts);
             }
         }
     }
@@ -2471,12 +3195,13 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
 
     async fn apply_flushed_reads(&mut self, flushed: &[FlushedRead]) {
         let now_ms = self.now_ms();
-        let mut session = self.session.write().await;
+        let mut access = SharedSession::new(&self.session);
         for item in flushed {
             // Match `Data::Histories::readInboxTill` (`data/data_histories.cpp:273-284`):
             // only force `still_unread = Some(0)` when reading up to or past the known top
             // message; otherwise let `History::inbox_read_with_filter` count remaining
             // unread incoming messages locally.
+            let session = access.get().await;
             let still_unread = session
                 .history(item.peer_id)
                 .and_then(|h| h.top_message_id)
@@ -2486,11 +3211,11 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             if let Some(affected) = &item.affected {
                 let _ = self
                     .updates
-                    .apply_affected_messages(&self.rpc, &mut session, None, affected, now_ms)
+                    .apply_affected_messages(&self.rpc, &mut access, None, affected, now_ms)
                     .await;
             }
         }
-        drop(session);
+        drop(access);
         self.drain_update_events().await;
         self.persist_updates_state_if_changed();
     }
@@ -2516,10 +3241,18 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                         .session_events_tx
                         .send(SessionEvent::DifferenceTooLong { pts });
                 }
-                UpdateEvent::ForceLogout { notification_type } => {
-                    let _ = self
-                        .session_events_tx
-                        .send(SessionEvent::ForceLogout { notification_type });
+                UpdateEvent::ForceLogout {
+                    notification_type,
+                    message,
+                    entities,
+                } => {
+                    let _ = self.session_events_tx.send(SessionEvent::ForceLogout {
+                        reason: LogoutReason::ServerDrop {
+                            notification_type,
+                            message,
+                            entities,
+                        },
+                    });
                 }
                 UpdateEvent::LangPackDifference(diff) => {
                     let _ = self

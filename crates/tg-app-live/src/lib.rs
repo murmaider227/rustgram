@@ -1,6 +1,7 @@
 //! `tg-app-live`: Layer-1 live MTProto/RPC session backend crate (depends ONLY on `tg-app-core`).
 
 pub mod admin;
+pub mod auto_download_gate;
 pub mod bots;
 pub mod bridge;
 pub mod business;
@@ -9,6 +10,7 @@ pub mod channel_mgmt;
 pub mod chat_helpers;
 pub mod chat_import;
 pub mod chat_l233;
+pub mod chat_search;
 pub mod chatlists;
 pub mod cloud_blob_source;
 pub mod communities;
@@ -16,14 +18,17 @@ pub mod compose_ai;
 pub mod compose_extras;
 pub mod contacts_extras;
 pub mod convert;
+mod custom_emoji_loader;
 pub mod deep_links;
 pub mod dialogs_actions;
 mod dialogs_delete;
+mod dialogs_loading;
 pub mod dice_pack;
 pub mod emoji_pack;
 pub mod engagement;
 pub mod export;
 pub mod geo_map;
+mod gift_stickers;
 pub mod history_sections;
 pub mod inline_bot_query;
 pub mod langpack;
@@ -31,20 +36,28 @@ pub mod layer233_extras;
 pub mod live_extras;
 pub mod media;
 pub mod media_cache;
+pub mod media_download;
 pub mod music_send;
+mod notify_sync;
+mod open_at_unread;
 mod open_chat_prefetch;
+mod optimistic_send;
 pub mod paid_messages;
 pub mod passkeys;
 pub mod passport_upload;
 pub mod payments;
+pub mod peer_emoji_status;
 pub mod polls_stats;
 pub mod preview_text;
 pub mod profile_extras;
 pub mod profile_info_extras;
 pub mod proxy;
 pub mod read_metrics;
+pub mod reply_preview;
+pub mod reply_targets;
 pub mod rich_message;
 pub mod search_and_info;
+pub mod sender_badge;
 pub mod session;
 pub mod settings_extra;
 pub mod settings_sync;
@@ -58,10 +71,15 @@ pub mod summary;
 pub mod themes;
 pub mod toggling_media;
 pub mod transcribe;
+mod ui_reads;
+mod ui_rpc_queue;
 pub mod upload;
+pub mod userpic_images;
 pub mod video_userpic;
 pub mod wallet;
+pub mod web_page_view;
 pub mod web_proxy_carrier;
+pub mod web_thumb;
 pub mod webview;
 pub mod widgets;
 pub mod wp40_polish;
@@ -69,6 +87,8 @@ pub mod wp52_ux_extras;
 
 #[cfg(test)]
 mod tests_account_conformance;
+#[cfg(test)]
+mod tests_alpha2_photo_size;
 #[cfg(test)]
 mod tests_bots_miniapps;
 #[cfg(test)]
@@ -84,9 +104,17 @@ mod tests_communities;
 #[cfg(test)]
 mod tests_contacts_extras;
 #[cfg(test)]
+mod tests_custom_emoji_loader;
+#[cfg(test)]
+mod tests_dialogs_paging;
+#[cfg(test)]
 mod tests_engagement;
 #[cfg(test)]
+mod tests_existing_pages;
+#[cfg(test)]
 mod tests_fu7a_pts_pagination;
+#[cfg(test)]
+mod tests_history_clear_ticks;
 #[cfg(test)]
 mod tests_history_sections;
 #[cfg(test)]
@@ -98,6 +126,10 @@ mod tests_media_cache;
 #[cfg(test)]
 mod tests_music_attach;
 #[cfg(test)]
+mod tests_nonblocking;
+#[cfg(test)]
+mod tests_optimistic_send;
+#[cfg(test)]
 mod tests_payments_passport;
 #[cfg(test)]
 mod tests_peer_management;
@@ -108,11 +140,19 @@ mod tests_profile_info_extras;
 #[cfg(test)]
 mod tests_pts_feed_remaining;
 #[cfg(test)]
+mod tests_reply_preview;
+#[cfg(test)]
+mod tests_reply_preview_wave4;
+#[cfg(test)]
+mod tests_reply_targets;
+#[cfg(test)]
 mod tests_rich_ai_paid_msgs;
 #[cfg(test)]
 mod tests_rich_message;
 #[cfg(test)]
 mod tests_rpc_updates_routing;
+#[cfg(test)]
+mod tests_saved_messages_side;
 #[cfg(test)]
 mod tests_search_and_info;
 #[cfg(test)]
@@ -131,6 +171,8 @@ mod tests_storage_wiring;
 mod tests_stories_channels_conformance;
 #[cfg(test)]
 mod tests_transcribe;
+#[cfg(test)]
+mod tests_ui_reads;
 #[cfg(test)]
 mod tests_uip4_f;
 #[cfg(test)]

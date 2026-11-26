@@ -131,19 +131,47 @@ pub enum TypingAction {
     Cancel,
 }
 
+/// Media thumbnail of the replied-to message, drawn 32x32 at the left of the reply header
+/// (`Data::ReplyPreview`, `Reply::_hasPreview`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplyThumb {
+    /// Inline (`photoStrippedSize`) thumbnail bytes, drawn blurred until the real thumbnail
+    /// arrives through [`HistoryBackend::reply_preview_thumb`].
+    pub stripped: Option<Vec<u8>>,
+    /// Round video message: the thumbnail is a circle (`Images::Option::RoundCircle`).
+    pub round: bool,
+    /// Media under a spoiler (`Media::hasSpoilerForPreview`): the thumbnail stays blurred,
+    /// whether it comes from the inline bytes or from the downloaded file.
+    pub spoiler: bool,
+    /// The animated spoiler particles are drawn over the blurred thumbnail (`Reply::_spoiler`,
+    /// only for the media of a resolved message).
+    pub spoiler_animation: bool,
+    /// Identity of the image (the photo, document or web file and its spoiler flag): the
+    /// downloaded thumbnail is cached per message and this key, so an edit of the replied-to
+    /// media loads the new one.
+    pub key: u64,
+}
+
 /// Reply reference header displayed inside a message bubble (`HistoryView::Reply`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyHeader {
     /// Target message id being replied to.
     pub reply_to_msg_id: MsgId,
-    /// Display name of the replied-to message author.
+    /// Display name of the replied-to message author. Empty while the target is loading or
+    /// deleted: `preview_text` then holds that one-line state (`Reply::_stateText`).
     pub author_name: String,
     /// Bare sender id for deterministic peer accent color.
     pub author_color_id: u64,
     /// Short preview text of the replied-to message.
     pub preview_text: String,
-    /// Optional 32x32 media preview tint RGB.
+    /// `Some` when the header reserves the 32x32 media preview (`Reply::_hasPreview`); the RGB
+    /// fills it while no thumbnail image is available.
     pub preview_thumb_rgb: Option<[u8; 3]>,
+    /// Thumbnail of the replied-to message's media. Set together with `preview_thumb_rgb`.
+    pub preview_thumb: Option<ReplyThumb>,
+    /// Leading bytes of `preview_text` drawn in the reply's name colour instead of the text
+    /// colour (`Ui::Text::Colorized`: a media type such as "Photo", a service action).
+    pub preview_colored_len: usize,
     /// Optional quoted excerpt if replying to a specific quote.
     pub quote_text: Option<String>,
 }
@@ -432,6 +460,8 @@ pub struct VoiceAttachment {
     pub duration_secs: u32,
     /// Telegram 5-bit packed waveform bytes (decoded via `tg_media::audio::waveform_decode_5bit`).
     pub waveform_5bit: Vec<u8>,
+    /// File size in bytes (`DocumentData::size`), `0` when not known.
+    pub size_bytes: u64,
     /// Whether this voice note has not yet been listened to (renders unread blue dot).
     pub is_unread: bool,
     /// Optional speech-to-text transcription snippet.
@@ -893,6 +923,45 @@ pub struct MessageExtra {
     /// Optional source language code indicating the server supports `messages.summarizeText`
     /// (`Message::summary_from_language` in Layer 233).
     pub summary_from_language: Option<String>,
+    /// True when sending this outgoing message failed (`HistoryItem::hasFailed`). It keeps the
+    /// clock like a message still being sent (`BottomInfo` `Flag::Sending`).
+    pub send_failed: bool,
+    /// Rank or role badge right of the sender name (`HistoryView::RightBadge`).
+    pub sender_badge: Option<SenderBadge>,
+    /// Premium star or emoji status after the sender name (`Message::FromNameStatus`).
+    pub sender_status: Option<SenderNameStatus>,
+}
+
+/// Who a sender is in a group, which picks the badge colour (`HistoryView::BadgeRole`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SenderBadgeRole {
+    /// A member rank (`fromRank`, a basic-group rank): plain grey text (`rankUserFg`).
+    #[default]
+    User,
+    /// An administrator: a green pill (`rankAdminFg`).
+    Admin,
+    /// The group owner: a purple pill (`rankOwnerFg`).
+    Creator,
+}
+
+/// Text shown right of the sender name in a group (`Message::refreshRightBadge`): the custom
+/// rank, or "admin" / "owner" for administrators without one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SenderBadge {
+    /// Single-line badge text without emoji (`TextUtilities::RemoveEmoji`).
+    pub text: String,
+    /// Badge role and colour.
+    pub role: SenderBadgeRole,
+}
+
+/// The icon after a sender's name: the custom emoji status, or the premium star when the
+/// sender has Premium but no status (`Message::paintFromName`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SenderNameStatus {
+    /// Custom emoji document id of the emoji status, if one is set.
+    pub emoji_status_id: Option<u64>,
+    /// True when the sender has Telegram Premium.
+    pub premium: bool,
 }
 
 /// Rich chat history message item owned by the history view.
@@ -1209,6 +1278,45 @@ pub struct HistorySlice {
     pub unread_count: u32,
 }
 
+/// Result of a read that may need the network first: either the data is known now, or it is
+/// being fetched in the background and the backend wakes the UI when it arrives (the caller asks
+/// again then; the version methods change at the same time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Loadable<T> {
+    /// The request is in flight; show what the view shows while loading and ask again later.
+    Loading,
+    /// The data is known.
+    Ready(T),
+    /// The request failed; the caller keeps what it shows.
+    Failed,
+}
+
+impl<T> Loadable<T> {
+    /// The data, if it is known.
+    pub fn ready(self) -> Option<T> {
+        match self {
+            Self::Ready(value) => Some(value),
+            Self::Loading | Self::Failed => None,
+        }
+    }
+
+    /// `true` while the request is in flight.
+    #[must_use]
+    pub const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+}
+
+static UNVERSIONED_BACKEND_VERSION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Value returned by the default `dialogs_version` / `chat_version` of backends that do not track
+/// changes: a new number on every call, so a version-keyed cache never reuses stale data.
+#[must_use]
+pub fn unversioned_backend_version() -> u64 {
+    UNVERSIONED_BACKEND_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Incremental live change event pushed from a session backend to an already-open history view.
 ///
 /// Port origin: `History::addNewMessage` / `HistoryWidget::newItemAdded`,
@@ -1237,6 +1345,21 @@ pub enum HistoryLiveUpdate {
     },
     /// The underlying live change stream lagged or overflowed; reload the open slice.
     ReloadRequired,
+    /// A local message (`MsgId::is_local`) was sent: `message` (with its server id) takes its
+    /// place in the list (`Data::Session::itemIdChanged`).
+    LocalMessageSent {
+        /// Id of the local message.
+        local_id: MsgId,
+        /// The sent message.
+        message: Box<HistoryMessage>,
+    },
+    /// Sending a local message failed (`HistoryItem::sendFailed`); it stays in the list.
+    LocalMessageFailed {
+        /// Id of the local message.
+        local_id: MsgId,
+        /// Error to show, once per failed send.
+        error: Option<String>,
+    },
 }
 
 /// Extended peer metadata consumed by the history top bar and status banners.
@@ -1316,7 +1439,69 @@ impl MediaUploadStatus {
 /// Kept independent from `crate::stand_in::backend::Backend` so parallel agents editing
 /// other `tg-app` modules never conflict. Implemented for `MockBackend` and `MockHistoryStore`
 /// in [`crate::history::mock`].
+/// One page of in-chat search results ([`HistoryBackend::search_chat_messages`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatSearchPage {
+    /// Matching message ids, newest first.
+    pub ids: Vec<MsgId>,
+    /// Total number of matches in the chat (`messages.messagesSlice.count`).
+    pub total: usize,
+    /// `offset_id` for the next (older) page, `None` once every match is loaded.
+    pub next_offset: Option<MsgId>,
+}
+
 pub trait HistoryBackend: Send {
+    /// Version of what the read methods return for `peer`'s chat view (`peer_info`, the slices,
+    /// pinned bar, typing, drafts, ...): it changes whenever their result may have changed, so a
+    /// caller may keep the last result while the version stays the same. Read it *before* the
+    /// data it guards. Drain-style calls (`drain_history_updates`) must still be drained, and
+    /// text derived from the clock is not covered.
+    ///
+    /// The default never repeats a value, so callers that cache by it always reload.
+    fn chat_version(&self, peer: PeerId) -> u64 {
+        let _ = peer;
+        unversioned_backend_version()
+    }
+
+    /// Tells the backend whether `peer`'s history is shown in a chat view, so the messages of
+    /// chats nobody looks at may be unloaded (`History::unloadBlocks`). Never waits.
+    fn set_history_open(&self, peer: PeerId, open: bool) {
+        let _ = (peer, open);
+    }
+
+    /// Non-blocking [`Self::load_slice_around`]: [`Loadable::Loading`] while the messages are
+    /// requested in the background (the chat version changes and the UI is woken when they
+    /// arrive). The default calls the blocking method.
+    fn try_load_slice_around(
+        &self,
+        peer_id: PeerId,
+        around_id: MsgId,
+        limit_before: usize,
+        limit_after: usize,
+    ) -> Loadable<HistorySlice> {
+        Loadable::Ready(self.load_slice_around(peer_id, around_id, limit_before, limit_after))
+    }
+
+    /// Non-blocking [`Self::load_slice_before`] (see [`Self::try_load_slice_around`]).
+    fn try_load_slice_before(
+        &self,
+        peer_id: PeerId,
+        before_id: MsgId,
+        limit: usize,
+    ) -> Loadable<HistorySlice> {
+        Loadable::Ready(self.load_slice_before(peer_id, before_id, limit))
+    }
+
+    /// Non-blocking [`Self::load_slice_after`] (see [`Self::try_load_slice_around`]).
+    fn try_load_slice_after(
+        &self,
+        peer_id: PeerId,
+        after_id: MsgId,
+        limit: usize,
+    ) -> Loadable<HistorySlice> {
+        Loadable::Ready(self.load_slice_after(peer_id, after_id, limit))
+    }
+
     /// Returns the authenticated user's peer id and display name.
     fn self_peer(&self) -> (PeerId, String);
 
@@ -1754,6 +1939,51 @@ pub trait HistoryBackend: Send {
             .and_then(|iso2| crate::core_types::country_bounds::country_center(&iso2))
     }
 
+    /// Searches messages inside `peer_id` (`messages.search` via `Api::MessagesSearch`, the
+    /// in-chat search of `HistoryView::ComposeSearch`): one page of matches newest first,
+    /// starting below `offset_id` (`MsgId(0)` = newest), optionally only from `from`.
+    ///
+    /// The default scans the locally available history, which is what mock backends offer.
+    fn search_chat_messages(
+        &self,
+        peer_id: PeerId,
+        query: &str,
+        from: Option<PeerId>,
+        offset_id: MsgId,
+        limit: i32,
+    ) -> Result<ChatSearchPage, String> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() && from.is_none() {
+            return Ok(ChatSearchPage::default());
+        }
+        let slice = self.load_slice_around(peer_id, MsgId::SHOW_AT_END, 100_000, 0);
+        let mut ids: Vec<MsgId> = slice
+            .messages
+            .iter()
+            .filter(|m| !m.is_service())
+            .filter(|m| from.is_none_or(|f| m.from_id == f))
+            .filter(|m| needle.is_empty() || m.text.text.to_lowercase().contains(&needle))
+            .map(|m| m.id)
+            .collect();
+        ids.sort_by_key(|id| std::cmp::Reverse(id.0));
+        let total = ids.len();
+        let start = if offset_id.0 > 0 {
+            ids.iter()
+                .position(|id| id.0 < offset_id.0)
+                .unwrap_or(total)
+        } else {
+            0
+        };
+        let end = (start + limit.max(1) as usize).min(total);
+        let page: Vec<MsgId> = ids[start..end].to_vec();
+        let next_offset = (end < total).then(|| page.last().copied()).flatten();
+        Ok(ChatSearchPage {
+            ids: page,
+            total,
+            next_offset,
+        })
+    }
+
     /// Loads per-day message counts & anchor message IDs for `(year, month)` inside `peer_id`
     /// (`messages.getSearchResultsCalendar`).
     fn search_results_calendar(
@@ -2041,6 +2271,27 @@ pub trait HistoryBackend: Send {
     fn chat_mention_candidates(&self, _peer_id: PeerId) -> Vec<MentionCandidate> {
         Vec::new()
     }
+
+    /// Thumbnail the reply header of `msg_id` (the message that holds the reply) shows: the
+    /// media of the replied-to message, story, poll answer or message from another chat
+    /// (`Reply::paint`, `PhotoData::getReplyPreview` / `DocumentData::getReplyPreview`). Never
+    /// blocks: a thumbnail that is not cached starts downloading and reports `Loading`.
+    fn reply_preview_thumb(
+        &self,
+        _peer_id: PeerId,
+        _msg_id: MsgId,
+    ) -> crate::info::backend::SharedMediaThumb {
+        crate::info::backend::SharedMediaThumb::Unavailable
+    }
+
+    /// Starts the download of `msg_id`'s media file that is not downloaded automatically or
+    /// whose download was cancelled (`PhotoSaveClickHandler`, the first play of a voice
+    /// message). Never blocks; the progress arrives through [`Self::inline_media_descriptor`].
+    fn start_media_download(&self, _peer_id: PeerId, _msg_id: MsgId) {}
+
+    /// Cancels the running download of `msg_id`'s media file (`PhotoCancelClickHandler`). It
+    /// stays not downloaded until [`Self::start_media_download`].
+    fn cancel_media_download(&self, _peer_id: PeerId, _msg_id: MsgId) {}
 
     /// Returns optional inline media descriptor (video bytes/path, spoiler flag, photo loading
     /// state, WebM video sticker, or audio stream) for `msg_id`.

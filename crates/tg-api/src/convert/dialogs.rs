@@ -270,12 +270,10 @@ pub fn apply_tl_dialog_in_folder(
                 return None;
             }
             let notify = peer_notify_settings_from_tl(&d.notify_settings);
-            let is_muted = notify.is_muted(now);
-            if let Some(peer) = session.peer_mut(peer_id) {
-                peer.common_mut().notify = notify;
-                if let Some(ttl) = d.ttl_period {
-                    peer.common_mut().messages_ttl = ttl;
-                }
+            if let Some(ttl) = d.ttl_period
+                && let Some(peer) = session.peer_mut(peer_id)
+            {
+                peer.common_mut().messages_ttl = ttl;
             }
             // Match `History::applyDialog` (`history/history.cpp:3521-3526`):
             // when `d.folder_id` is omitted, inherit `request_folder`.
@@ -292,7 +290,6 @@ pub fn apply_tl_dialog_in_folder(
             {
                 let history = session.ensure_history(peer_id);
                 history.in_chat_list = true;
-                history.muted = is_muted;
                 if d.top_message > 0 {
                     let top = MsgId(i64::from(d.top_message));
                     if history.top_message_id.is_none_or(|cur| top >= cur) {
@@ -321,6 +318,9 @@ pub fn apply_tl_dialog_in_folder(
                 history.unread_poll_votes_count = d.unread_poll_votes_count.max(0);
                 history.folder = Some(target_folder);
             }
+            // The mute state comes from the dialog's own settings or the per-type default, and
+            // reaches change subscribers (the notification system) through `NOTIFICATIONS`.
+            session.set_peer_notify(peer_id, notify, now);
             if let Some(draft_tl) = &d.draft {
                 let cloud_key = DraftKey::cloud(MsgId::ZERO, PeerId::ZERO);
                 match draft_from_tl(draft_tl) {
@@ -398,11 +398,7 @@ pub fn apply_tl_dialog_in_folder(
         tl_enums::Dialog::Community(c) => {
             let peer_id = PeerId::from_channel(ChannelId::from_tl(c.community_id));
             let notify = peer_notify_settings_from_tl(&c.notify_settings);
-            let is_muted = notify.is_muted(now);
-            if let Some(peer) = session.peer_mut(peer_id) {
-                peer.common_mut().notify = notify;
-            }
-            session.set_history_muted(peer_id, is_muted);
+            session.set_peer_notify(peer_id, notify, now);
             let key = DialogKey::History(peer_id);
             session.add_pinned_from_entry_list(key, false, c.pinned);
             Some(key)

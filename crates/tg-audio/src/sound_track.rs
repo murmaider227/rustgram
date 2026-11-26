@@ -227,6 +227,27 @@ impl SoundTrack {
             / f64::from(self.peak_value_max - self.peak_value_min)
     }
 
+    /// Normalized peak value in `[0.0, 1.0]` at `position_ms` of a looped playback, whether or
+    /// not this copy of the track is the one playing.
+    ///
+    /// Same lookup as [`Self::get_peak_value`], for a caller that knows when the loop started
+    /// and keeps its own decoded copy while a clone plays in the mixer.
+    #[must_use]
+    pub fn peak_value_at_ms(&self, position_ms: i64) -> f64 {
+        if self.frame_count == 0
+            || self.peaks.is_empty()
+            || self.peak_each_frame == 0
+            || self.peak_value_min == self.peak_value_max
+        {
+            return 0.0;
+        }
+        let frames = (position_ms * i64::from(DEFAULT_FREQUENCY)) / 1000;
+        let sample_index = frames.rem_euclid(self.frame_count as i64) as usize;
+        let peak_index = (sample_index / self.peak_each_frame) % self.peaks.len();
+        f64::from(self.peaks[peak_index] - self.peak_value_min)
+            / f64::from(self.peak_value_max - self.peak_value_min)
+    }
+
     /// Mixes stereo frames into `out_stereo` (additive), advancing the cursor.
     /// Returns `true` if playback finished during this render call.
     pub fn mix_into(&mut self, out_stereo: &mut [f32]) -> bool {

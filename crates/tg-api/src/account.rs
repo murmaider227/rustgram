@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use tg_crypto::srp::{self, PasswordKdfAlgoModPow, SecureSecretAlgo};
 use tg_data::{
-    Birthday, ChannelId, DialogKey, MsgId, Peer, PeerId, PeerNotifySettings, PeerUpdateFlags,
-    Session, TimeId, UserFlags, UserId,
+    Birthday, ChannelId, MsgId, Peer, PeerId, PeerNotifySettings, PeerUpdateFlags, Session, TimeId,
+    UserFlags, UserId,
 };
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 
@@ -1174,44 +1174,16 @@ impl WebAuthorizationsManager {
 // 3. Notification Settings & Exceptions (`data/notify/data_*notify_settings.cpp`)
 // ============================================================================
 
-/// Default notification scope (`Data::DefaultNotify`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum DefaultNotifyScope {
-    /// Private chats (`inputNotifyUsers` / `notifyUsers`).
-    Users,
-    /// Basic groups & supergroups/megagroups (`inputNotifyChats` / `notifyChats`).
-    Chats,
-    /// Broadcast channels (`inputNotifyBroadcasts` / `notifyBroadcasts`).
-    Broadcasts,
-}
+pub use tg_data::DefaultNotifyScope;
 
-impl DefaultNotifyScope {
-    /// Classifies `peer` into its default notification scope (`Data::DefaultNotifyType`,
-    /// `data/notify/data_notify_settings.cpp:71-77`).
-    #[must_use]
-    pub fn for_peer(peer: &Peer) -> Self {
-        match peer {
-            Peer::User(_) => Self::Users,
-            Peer::Chat(_) => Self::Chats,
-            Peer::Channel(ch) => {
-                if ch.is_megagroup() {
-                    Self::Chats
-                } else {
-                    Self::Broadcasts
-                }
-            }
-        }
-    }
-
-    /// Converts to TL `InputNotifyPeer` (`Data::DefaultNotifyToMTP`,
-    /// `data/notify/data_notify_settings.cpp:79-86`).
-    #[must_use]
-    pub const fn to_tl(self) -> tl_enums::InputNotifyPeer {
-        match self {
-            Self::Users => tl_enums::InputNotifyPeer::InputNotifyUsers,
-            Self::Chats => tl_enums::InputNotifyPeer::InputNotifyChats,
-            Self::Broadcasts => tl_enums::InputNotifyPeer::InputNotifyBroadcasts,
-        }
+/// Converts a default scope to TL `InputNotifyPeer` (`Data::DefaultNotifyToMTP`,
+/// `data/notify/data_notify_settings.cpp:79-86`).
+#[must_use]
+pub const fn default_notify_scope_to_tl(scope: DefaultNotifyScope) -> tl_enums::InputNotifyPeer {
+    match scope {
+        DefaultNotifyScope::Users => tl_enums::InputNotifyPeer::InputNotifyUsers,
+        DefaultNotifyScope::Chats => tl_enums::InputNotifyPeer::InputNotifyChats,
+        DefaultNotifyScope::Broadcasts => tl_enums::InputNotifyPeer::InputNotifyBroadcasts,
     }
 }
 
@@ -1243,7 +1215,7 @@ impl NotifyTarget {
                     peer: input_peer_for(session, peer_id),
                 })
             }
-            Self::Scope(scope) => scope.to_tl(),
+            Self::Scope(scope) => default_notify_scope_to_tl(scope),
             Self::ForumTopic { peer, top_msg_id } => {
                 tl_enums::InputNotifyPeer::InputNotifyForumTopic(tl_types::InputNotifyForumTopic {
                     peer: input_peer_for(session, peer),
@@ -1634,7 +1606,7 @@ impl NotifySettingsManager {
             .invoke(&tl_fns::account::GetNotifyExceptions {
                 compare_sound,
                 compare_stories,
-                peer: scope.map(DefaultNotifyScope::to_tl),
+                peer: scope.map(default_notify_scope_to_tl),
             })
             .await
             .map_err(map_rpc)?;
@@ -1714,27 +1686,8 @@ impl NotifySettingsManager {
         match target {
             NotifyTarget::Scope(scope) => {
                 self.defaults.insert(scope, parsed);
-                // Re-evaluate muted state for loaded peers in this scope that inherit defaults
-                // (`NotifySettings::updateLocal(DefaultNotify)`, `data_notify_settings.cpp:431-457`).
-                let peer_ids: Vec<PeerId> = session
-                    .main_dialogs()
-                    .iter()
-                    .chain(session.archive_dialogs().iter())
-                    .filter_map(|k| match k {
-                        DialogKey::History(pid) => Some(*pid),
-                        _ => None,
-                    })
-                    .collect();
-                for pid in peer_ids {
-                    let matches_scope = session
-                        .peer(pid)
-                        .is_some_and(|p| DefaultNotifyScope::for_peer(p) == scope);
-                    let inherits_mute = self.peers.get(&pid).is_none_or(|s| s.mute_until.is_none());
-                    if matches_scope && inherits_mute {
-                        let muted = self.is_peer_muted(session, pid, now_secs);
-                        session.set_history_muted(pid, muted);
-                    }
-                }
+                // `NotifySettings::updateLocal(DefaultNotify)` (`data_notify_settings.cpp:431-457`).
+                session.set_notify_default(scope, Some(data_settings), now_secs);
             }
             NotifyTarget::Peer(peer_id) => {
                 let has_mute_override = parsed.mute_until.is_some();

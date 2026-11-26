@@ -72,6 +72,8 @@ struct InlineClipEntry {
     paused_at_ms: i64,
     last_touched_ms: i64,
     last_error: Option<String>,
+    /// Set by [`InlinePlayback::seek_item`] so a paused clip uploads the frame at the new spot.
+    texture_stale: bool,
 }
 
 /// Manager for inline GIF autoplay and round-video previews in the chat history list.
@@ -156,6 +158,34 @@ impl InlinePlayback {
         }
     }
 
+    /// Seeks `id` to `position_ms` within the stream and restarts its clock there, so a round
+    /// video switched to sound plays from the start in step with its audio
+    /// (`Gif::playAnimation` -> `Media::Streaming` round instance restarting at 0).
+    pub fn seek_item(&mut self, id: MediaItemId, position_ms: i64, now_ms: i64) {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return;
+        };
+        let position_ms = position_ms.max(0);
+        if let Some(reader) = &mut entry.reader {
+            match reader.inspect_at(position_ms) {
+                Ok(_) => entry.last_error = None,
+                Err(err) => entry.last_error = Some(err.to_string()),
+            }
+        }
+        entry.start_ms = now_ms - position_ms;
+        entry.paused_at_ms = position_ms;
+        entry.texture_stale = true;
+    }
+
+    /// Returns the stream-relative position (`frameRealTime`) of the frame shown for `id`.
+    #[must_use]
+    pub fn item_position_ms(&self, id: MediaItemId) -> Option<i64> {
+        self.entries
+            .get(&id)
+            .and_then(|entry| entry.reader.as_ref())
+            .map(ClipReader::frame_real_time_ms)
+    }
+
     /// Returns `true` if `id` is currently tracked and paused.
     #[must_use]
     pub fn is_item_paused(&self, id: MediaItemId) -> bool {
@@ -219,7 +249,7 @@ impl InlinePlayback {
             autoplay_allowed && !global_paused && !entry.paused && entry.reader.is_some();
 
         if let Some(reader) = &mut entry.reader {
-            let need_first_frame = entry.texture.is_none();
+            let need_first_frame = entry.texture.is_none() || entry.texture_stale;
             if is_playing || need_first_frame {
                 let target_ms = if is_playing {
                     (now_ms - entry.start_ms).max(0)
@@ -245,6 +275,7 @@ impl InlinePlayback {
                             }
                         }
                         entry.last_error = None;
+                        entry.texture_stale = false;
                     }
                     Err(err) => {
                         entry.last_error = Some(err.to_string());
@@ -311,6 +342,7 @@ impl InlinePlayback {
                     paused_at_ms: 0,
                     last_touched_ms: now_ms,
                     last_error: None,
+                    texture_stale: false,
                 }
             }
             Err(err) => InlineClipEntry {
@@ -323,6 +355,7 @@ impl InlinePlayback {
                 paused_at_ms: 0,
                 last_touched_ms: now_ms,
                 last_error: Some(err.to_string()),
+                texture_stale: false,
             },
         }
     }
@@ -360,6 +393,7 @@ mod tests {
                 paused_at_ms: 0,
                 last_touched_ms: start_ms,
                 last_error: None,
+                texture_stale: false,
             },
         );
     }

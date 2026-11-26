@@ -5,13 +5,13 @@
 //! request), so their round trips overlap. Rustgram's history view asks for them through
 //! synchronous backend calls (bot info, then the pinned list), each waiting for its own reply.
 //! When the window shows a chat (`AppSession::prepare_open_chat`) both requests start on worker
-//! threads; the backend calls then wait for the request they need instead of sending it again,
-//! so the replies arrive after one round trip instead of two and the data each call returns is
-//! unchanged.
+//! threads. The backend calls do not wait for them: while one runs they answer from the cache
+//! (no bot description, no pinned bar yet, as tdesktop shows before `requestFullPeer` and the
+//! pinned slice answer) and the finished request wakes the UI, which asks again. A call whose
+//! request was never started still loads it itself.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
 
 use tg_data::PeerId as DataPeerId;
 
@@ -19,7 +19,8 @@ use crate::session::LiveSession;
 
 /// Upper bound for waiting on a request another thread started; the requests themselves time
 /// out sooner (`LIVE_RPC_TIMEOUT`, `BOTS_RPC_TIMEOUT`, `SEARCH_RPC_TIMEOUT`).
-const WAIT_LIMIT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// One of the requests started together for an opened chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,6 +29,9 @@ pub(crate) enum OpenChatRequest {
     BotInfo,
     /// `messages.search` with `inputMessagesFilterPinned` (the pinned bar).
     Pinned,
+    /// `channels.getParticipants(channelParticipantsAdmins)` for a supergroup: the admin and
+    /// owner badges by sender names (`ChatParticipants::requestAdmins`).
+    GroupAdmins,
 }
 
 #[derive(Default)]
@@ -44,6 +48,7 @@ impl Done {
         self.signal.notify_all();
     }
 
+    #[cfg(test)]
     fn wait(&self) {
         let Ok(guard) = self.finished.lock() else {
             return;
@@ -51,6 +56,10 @@ impl Done {
         let _ = self
             .signal
             .wait_timeout_while(guard, WAIT_LIMIT, |finished| !*finished);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.lock().is_ok_and(|f| *f)
     }
 }
 
@@ -68,23 +77,33 @@ fn take_in_flight(live: &LiveSession, peer: DataPeerId, req: OpenChatRequest) ->
         .and_then(|c| c.open_chat.in_flight.get(&(peer, req)).cloned())
 }
 
-/// Waits for `needed` if [`start`] sent it for `peer` and it has not been collected yet.
-/// Returns `true` when it was handled that way (its result is now cached), `false` when the
+/// `true` when [`start`] sent `needed` for `peer` and it has not been collected yet: the caller
+/// answers from the cache and does not send it again (while it runs the cache may still be
+/// empty; the finished request wakes the UI). Collects it once it finished. `false` when the
 /// caller has to load it itself.
-pub(crate) fn wait_in_flight(
+pub(crate) fn started_in_background(
     live: &LiveSession,
     peer: DataPeerId,
     needed: OpenChatRequest,
 ) -> bool {
     match take_in_flight(live, peer, needed) {
         Some(done) => {
-            done.wait();
-            if let Ok(mut c) = live.cache.lock() {
+            if done.is_finished()
+                && let Ok(mut c) = live.cache.lock()
+            {
                 c.open_chat.in_flight.remove(&(peer, needed));
             }
             true
         }
         None => false,
+    }
+}
+
+/// Blocks until the request `needed` for `peer` started by [`start`] finished (tests only).
+#[cfg(test)]
+pub(crate) fn wait_for_test(live: &LiveSession, peer: DataPeerId, needed: OpenChatRequest) {
+    if let Some(done) = take_in_flight(live, peer, needed) {
+        done.wait();
     }
 }
 
@@ -105,6 +124,9 @@ pub(crate) fn start(live: &LiveSession, peer: DataPeerId) {
     }
     if !crate::search_and_info::pinned_loaded(live, peer) {
         list.push(OpenChatRequest::Pinned);
+    }
+    if crate::sender_badge::group_admins_needed(live, peer) {
+        list.push(OpenChatRequest::GroupAdmins);
     }
     let requests = {
         let Ok(mut c) = live.cache.lock() else {
@@ -129,8 +151,12 @@ pub(crate) fn start(live: &LiveSession, peer: DataPeerId) {
                     OpenChatRequest::Pinned => {
                         crate::search_and_info::load_pinned_now(&session, peer)
                     }
+                    OpenChatRequest::GroupAdmins => {
+                        crate::sender_badge::load_group_admins_now(&session, peer)
+                    }
                 }
                 worker_done.finish();
+                session.bridge_state().notify_ui();
             });
         if spawned.is_err() {
             if let Ok(mut c) = live.cache.lock() {

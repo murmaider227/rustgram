@@ -14,8 +14,8 @@ use tg_data::{
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 
 use crate::convert::{
-    apply_tl_message, apply_tl_users_and_chats, draft_from_tl, input_peer_for, peer_id_from_tl,
-    peer_notify_settings_from_tl,
+    apply_tl_existing_message, apply_tl_users_and_chats, draft_from_tl, input_peer_for,
+    peer_id_from_tl, peer_notify_settings_from_tl,
 };
 use crate::error::ApiError;
 use crate::rpc::{InvocationError, RpcClient};
@@ -186,7 +186,7 @@ pub fn apply_tl_forum_topics_response(
 ) -> (Vec<MsgId>, Vec<MsgId>, ForumOffsets) {
     apply_tl_users_and_chats(session, &resp.users, &resp.chats);
     for msg in &resp.messages {
-        apply_tl_message(session, msg);
+        apply_tl_existing_message(session, msg);
     }
     if let Some(ch_id) = peer_id.to_channel()
         && resp.pts > 0

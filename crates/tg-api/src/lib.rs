@@ -26,6 +26,7 @@ pub mod login;
 pub mod messaging;
 pub mod rpc;
 pub mod saved;
+pub mod saved_side_log;
 pub mod scheduled;
 pub mod search;
 pub mod stickers;

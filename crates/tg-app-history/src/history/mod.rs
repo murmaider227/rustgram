@@ -11,12 +11,15 @@ pub use tg_app_core::history::backend;
 pub mod bars;
 pub mod birthday_cake;
 pub mod bubble;
+pub mod bubble_info;
 pub mod compose;
 pub mod compose_boxes;
 pub mod compose_extras;
+pub mod compose_search;
 pub mod compose_stash;
 pub mod edit_caption;
 pub mod emoji_interactions;
+mod entity_clicks;
 pub mod factcheck;
 pub mod inline_media;
 pub mod inner;
@@ -25,10 +28,15 @@ pub mod media;
 pub mod mock;
 pub mod mock_ext;
 pub mod monoforum;
+pub mod name_line;
 pub mod no_forwards_request;
+pub mod paint_cache;
+pub mod photo_frame;
 pub mod pull_to_next_channel;
 pub mod quick_action;
+mod read_gate;
 pub mod read_receipts;
+pub mod reply_preview;
 pub mod rich_compose;
 pub use tg_app_core::history::sections_model;
 pub mod sections_ui;
@@ -40,9 +48,11 @@ pub mod text_bridge;
 pub use tg_app_core::history::theme;
 pub mod todo;
 pub mod unread_things;
+pub mod user_errors;
 pub mod video_cover;
 pub mod video_editor;
 pub mod video_message_seek;
+pub mod voice_view;
 pub use tg_app_info::boxes::welcome_messages;
 
 #[cfg(test)]
@@ -56,11 +66,57 @@ mod sections_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_alpha2_bubble_media;
+#[cfg(test)]
+mod tests_alpha2_slice_media;
+#[cfg(test)]
+mod tests_bubble_layout_snap;
+#[cfg(test)]
+mod tests_chat_search;
+#[cfg(test)]
+mod tests_chat_search_snap;
+#[cfg(test)]
+mod tests_emoji_status_snap;
+#[cfg(test)]
+mod tests_local_and_unread;
+#[cfg(test)]
+mod tests_message_links;
+#[cfg(test)]
+mod tests_open_at_bottom;
+#[cfg(test)]
+mod tests_open_at_unread;
+#[cfg(test)]
+mod tests_perf_frame;
+#[cfg(test)]
+mod tests_perf_prepared;
+#[cfg(test)]
+mod tests_photo_layout;
+#[cfg(test)]
+mod tests_photo_snap;
+#[cfg(test)]
+mod tests_round_video;
+#[cfg(test)]
+mod tests_round_video_snap;
+#[cfg(test)]
 mod tests_scroll_bottom;
+#[cfg(test)]
+mod tests_scroll_paging;
 #[cfg(test)]
 mod tests_sec3a;
 #[cfg(test)]
+mod tests_tgb2971_pull;
+#[cfg(test)]
+mod tests_transcribe_failure_snap;
+#[cfg(test)]
+mod tests_user_errors;
+#[cfg(test)]
 mod tests_video_editor_wire2;
+#[cfg(test)]
+mod tests_w4_text;
+#[cfg(test)]
+mod tests_w4_text_snap;
+#[cfg(test)]
+mod tests_wave4_media;
 #[cfg(test)]
 mod tests_wp75_media_refresh;
 #[cfg(test)]
@@ -71,9 +127,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use egui::{
-    Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, RichText, Stroke, TextEdit, Ui, Vec2,
-};
+use egui::{Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, RichText, Stroke, Ui, Vec2};
 
 use tg_bots::callback::{
     AcceptUrlAuthDecision, BotButtonAction, CallbackAnswerAction, CallbackAnswerCache,
@@ -105,8 +159,9 @@ use crate::business::model::{
 use crate::business::premium::{PremiumLimitsView, PremiumSettingsAction};
 use crate::history::backend::{
     AlbumItem, DocumentAttachment, HistoryBackend, HistoryMedia, HistoryMessage, HistoryPeerInfo,
-    PhotoAttachment, SendMessageExtended, SendMessageRequest, TranscribeToggleOutcome,
-    VideoAttachment, VoiceAttachment, to_bot_full, to_bot_peer, to_bot_peer_kind,
+    PhotoAttachment, PinnedMessageSummary, SendMessageExtended, SendMessageRequest,
+    TranscribeToggleOutcome, VideoAttachment, VoiceAttachment, to_bot_full, to_bot_peer,
+    to_bot_peer_kind,
 };
 use crate::history::bars::{
     BOT_START_BAR_HEIGHT, BUSINESS_BOT_BAR_HEIGHT, BusinessBotBarEvent, CONTACT_STATUS_HEIGHT,
@@ -130,6 +185,7 @@ use crate::history::compose_extras::{
 };
 use crate::history::inner::{HistoryInnerWidget, InnerEvent};
 use crate::history::mock::MockHistoryStore;
+use crate::history::read_gate::{BackendReadGate, Gated};
 use crate::history::rich_compose::{find_last_editable_outgoing, step_reply_target};
 use crate::history::sections_model::ThreadKey;
 use crate::history::sections_ui::{
@@ -364,10 +420,18 @@ pub struct HistoryWidget {
     compose: ComposeControls,
     embedded_store: MockHistoryStore,
     active_peer: PeerId,
+    /// Version gate for the backend reads repeated on every frame (`read_gate`).
+    read_gate: BackendReadGate,
+    /// `backend.peer_info` of the open chat, kept while the gate allows.
+    peer_info_read: Option<Gated<Option<Arc<HistoryPeerInfo>>>>,
+    /// `backend.pinned_messages` of the open chat, kept while the gate allows.
+    pinned_read: Option<Gated<Arc<[PinnedMessageSummary]>>>,
     pinned_bar_index: usize,
     search_open: bool,
     search_query: String,
+    compose_search: compose_search::ComposeSearch,
     status_toast: Option<(String, f64)>,
+    pending_user_errors: Vec<tg_app_core::user_error::UserFacingError>,
     on_emoji_panel_toggle: Option<EmojiPanelCallback>,
     emoji_panel_open: bool,
     last_compose_rect: Rect,
@@ -548,10 +612,15 @@ impl HistoryWidget {
             compose: ComposeControls::new(),
             embedded_store: MockHistoryStore::new(),
             active_peer: PeerId::ZERO,
+            read_gate: BackendReadGate::default(),
+            peer_info_read: None,
+            pinned_read: None,
             pinned_bar_index: 0,
             search_open: false,
             search_query: String::new(),
+            compose_search: compose_search::ComposeSearch::default(),
             status_toast: None,
+            pending_user_errors: Vec::new(),
             on_emoji_panel_toggle: None,
             emoji_panel_open: false,
             last_compose_rect: Rect::NOTHING,
@@ -902,7 +971,10 @@ impl HistoryWidget {
                 false
             }
             Err(err) => {
-                self.show_toast(format!("Location lookup failed: {err}"), now_secs);
+                if let Some(text) = tg_app_core::user_error::location_unavailable(&err).into_text()
+                {
+                    self.show_toast(text, now_secs);
+                }
                 false
             }
         }
@@ -939,7 +1011,7 @@ impl HistoryWidget {
                 true
             }
             Err(err) => {
-                self.show_toast(format!("Could not share location: {err}"), now_secs);
+                self.show_send_failure(&err, PeerKind::User, now_secs);
                 false
             }
         }
@@ -1273,7 +1345,16 @@ impl HistoryWidget {
 
     /// Opens the inline chat message search bar (`Ctrl+F`).
     pub fn open_chat_search(&mut self) {
+        if !self.search_open {
+            self.compose_search.open("");
+        }
         self.search_open = true;
+    }
+
+    /// Returns the in-chat search state (`HistoryView::ComposeSearch`).
+    #[must_use]
+    pub const fn chat_search(&self) -> &compose_search::ComposeSearch {
+        &self.compose_search
     }
 
     /// Closes the inline chat message search bar; returns `true` if it was open.
@@ -1281,6 +1362,7 @@ impl HistoryWidget {
         if self.search_open {
             self.search_open = false;
             self.search_query.clear();
+            self.compose_search = compose_search::ComposeSearch::default();
             true
         } else {
             false
@@ -1326,12 +1408,14 @@ impl HistoryWidget {
         for upd in updates {
             match upd {
                 tg_app_core::history::backend::HistoryLiveUpdate::ReloadRequired => {
+                    // A view scrolled up reloads the page around its top message and keeps it in
+                    // place (TGB-2952); the last loaded message could be far below the view.
                     let was_scrolled_up = self.inner.show_scroll_down_button();
                     let anchor = if was_scrolled_up {
                         self.inner
-                            .messages()
-                            .last()
-                            .map_or(MsgId::SHOW_AT_END, |m| m.id)
+                            .top_visible_message()
+                            .or_else(|| self.inner.messages().last().map(|m| m.id))
+                            .unwrap_or(MsgId::SHOW_AT_END)
                     } else {
                         MsgId::SHOW_AT_END
                     };
@@ -1355,23 +1439,24 @@ impl HistoryWidget {
                     reply_markup_dirty = true;
                 }
                 tg_app_core::history::backend::HistoryLiveUpdate::MessageAdded(msg) => {
-                    if let Some(desc) = backend.inline_media_descriptor(peer_id, msg.id) {
+                    // Only a message that enters the list asks for its media (and starts its
+                    // download): one of an older page stays out until the preload brings it.
+                    let msg_id = msg.id;
+                    let has_markup = msg.extra.reply_markup.is_some();
+                    if self
+                        .inner
+                        .apply_live_added_message(*msg, peer_info.summary.kind)
+                    {
                         self.inner
-                            .media_runtime_mut()
-                            .register_descriptor(msg.id, desc);
+                            .request_media_descriptor(peer_id, msg_id, backend);
+                        if has_markup {
+                            reply_markup_dirty = true;
+                        }
                     }
-                    if msg.extra.reply_markup.is_some() {
-                        reply_markup_dirty = true;
-                    }
-                    self.inner
-                        .apply_live_added_message(*msg, peer_info.summary.kind);
                 }
                 tg_app_core::history::backend::HistoryLiveUpdate::MessageEdited(msg) => {
-                    if let Some(desc) = backend.inline_media_descriptor(peer_id, msg.id) {
-                        self.inner
-                            .media_runtime_mut()
-                            .register_descriptor(msg.id, desc);
-                    }
+                    self.inner
+                        .request_media_descriptor(peer_id, msg.id, backend);
                     if msg.extra.reply_markup.is_some() {
                         reply_markup_dirty = true;
                     }
@@ -1385,6 +1470,40 @@ impl HistoryWidget {
                     inbox_read_till,
                 } => {
                     self.inner.apply_unread_state(unread_count, inbox_read_till);
+                }
+                tg_app_core::history::backend::HistoryLiveUpdate::LocalMessageSent {
+                    local_id,
+                    message,
+                } => {
+                    let sent_id = message.id;
+                    if message.extra.effect_id.is_some() {
+                        // The effect played when the local message appeared; the sent message
+                        // must not play it again.
+                        let mark = self.effect_watermark.entry(peer_id).or_default();
+                        *mark = (*mark).max(sent_id);
+                    }
+                    for effect in &mut self.compose.effects.active_effects {
+                        if effect.msg_id == local_id {
+                            effect.msg_id = sent_id;
+                        }
+                    }
+                    if message.extra.reply_markup.is_some() {
+                        reply_markup_dirty = true;
+                    }
+                    self.inner
+                        .request_media_descriptor(peer_id, sent_id, backend);
+                    self.inner
+                        .replace_local_message(local_id, *message, peer_info.summary.kind);
+                }
+                tg_app_core::history::backend::HistoryLiveUpdate::LocalMessageFailed {
+                    local_id,
+                    error,
+                } => {
+                    self.inner.mark_local_message_failed(local_id);
+                    if let Some(error) = error {
+                        let now_secs = ctx.input(|i| i.time);
+                        self.show_send_failure(&error, peer_info.summary.kind, now_secs);
+                    }
                 }
             }
         }
@@ -1584,6 +1703,8 @@ impl HistoryWidget {
     /// audio speed/volume, and send-shortcut preferences.
     pub fn apply_core_settings(&mut self, settings: &tg_core::settings::CoreSettings) {
         self.inner.apply_core_settings(settings);
+        self.pull_next_channel
+            .set_enabled(settings.pull_to_next_channel);
         let ps = if settings.power_saving_force_all && !settings.ignore_battery_saving {
             tg_core::settings::PowerSavingFlags::ALL
         } else {
@@ -1762,6 +1883,7 @@ impl HistoryWidget {
                 QuickReplyAttachment::Voice => Some(HistoryMedia::Voice(VoiceAttachment {
                     duration_secs: 14,
                     waveform_5bit: vec![8, 16, 24, 18, 28, 22, 14, 10, 20, 26, 16, 12],
+                    size_bytes: 56_000,
                     is_unread: false,
                     transcription: None,
                 })),
@@ -1845,7 +1967,16 @@ impl HistoryWidget {
         palette: &Palette,
         strings: &dyn Strings,
     ) -> Option<HistoryAction> {
-        let Some(peer_info) = backend.peer_info(peer_id) else {
+        // `peer_info` and the pinned bar returned the same values frame after frame; they are
+        // read again when the chat's version moves, once per second, and around input
+        // (`BackendReadGate`). The version is read before the data it guards.
+        let read_generation =
+            self.read_gate
+                .begin_frame(ui.ctx(), peer_id, backend.chat_version(peer_id));
+        let Some(peer_info) = Gated::get_or_read(&mut self.peer_info_read, read_generation, || {
+            backend.peer_info(peer_id).map(Arc::new)
+        })
+        .clone() else {
             return self.render_empty_placeholder(ui, palette, strings);
         };
 
@@ -1990,10 +2121,16 @@ impl HistoryWidget {
                     self.compose.current_rich_draft(),
                 );
             }
+            // Only the chat on screen keeps its messages loaded (`History::unloadBlocks`).
+            if !self.active_peer.is_zero() {
+                backend.set_history_open(self.active_peer, false);
+            }
+            backend.set_history_open(peer_id, true);
             self.active_peer = peer_id;
             self.pinned_bar_index = 0;
             self.search_open = false;
             self.search_query.clear();
+            self.compose_search = compose_search::ComposeSearch::default();
             self.translate_bar.reset_for_peer(peer_id);
             self.who_reacted_modal = None;
             self.seen_by_modal = None;
@@ -2008,8 +2145,13 @@ impl HistoryWidget {
                 self.compose.mode = fwd;
                 self.compose.focus_requested = true;
             }
-            self.inner
-                .load_peer(peer_id, MsgId::SHOW_AT_END, backend, peer_info.summary.kind);
+            // `ShowAtUnreadMsgId`: a chat with unread messages opens at the first of them.
+            self.inner.load_peer(
+                peer_id,
+                MsgId::SHOW_AT_UNREAD,
+                backend,
+                peer_info.summary.kind,
+            );
             // Messages already in history on open never replay their effects; when the slice
             // arrives later, the first frame that sees it seeds the watermark instead.
             match self.inner.messages().iter().map(|m| m.id).max() {
@@ -2021,10 +2163,11 @@ impl HistoryWidget {
             self.last_compose_text_for_hint = self.compose.text.clone();
             self.stash_hint
                 .track_change(&self.compose.text, false, true, now_ms_u64);
-        } else {
+        } else if !self.inner.is_loading_peer() {
             // Pull live MTProto updates (incoming/outgoing messages, edits, deletions,
             // read receipts) into the already-open history view (`History::addNewMessage` /
-            // `HistoryWidget::newItemAdded`, `itemEdited`, `itemRemoved`).
+            // `HistoryWidget::newItemAdded`, `itemEdited`, `itemRemoved`). While the first page
+            // loads they wait: the page includes them.
             self.sync_live_history_updates(peer_id, &peer_info, backend, ui.ctx());
         }
 
@@ -2174,6 +2317,16 @@ impl HistoryWidget {
             Rect::from_min_size(rect.min, Vec2::new(rect.width(), HISTORY_TOP_BAR_HEIGHT));
         let top_event = if self.inner.selected_count() > 0 {
             paint_selection_top_bar(ui, top_rect, self.inner.selected_count(), &colors)
+        } else if self.search_open {
+            // `ComposeSearch`'s top bar replaces the chat's top bar while searching.
+            if self
+                .compose_search
+                .show_top_bar(ui, top_rect, &colors, now_secs)
+                == Some(compose_search::ComposeSearchEvent::Close)
+            {
+                self.close_chat_search();
+            }
+            None
         } else {
             paint_top_bar(
                 ui,
@@ -2190,9 +2343,10 @@ impl HistoryWidget {
                 TopBarEvent::Back => action = Some(HistoryAction::Back),
                 TopBarEvent::ToggleInfo => action = Some(HistoryAction::TogglePeerInfo(peer_id)),
                 TopBarEvent::ToggleSearch => {
-                    self.search_open = !self.search_open;
-                    if !self.search_open {
-                        self.search_query.clear();
+                    if self.search_open {
+                        self.close_chat_search();
+                    } else {
+                        self.open_chat_search();
                     }
                 }
                 TopBarEvent::ToggleMute => {
@@ -2293,58 +2447,12 @@ impl HistoryWidget {
             list_top = player_rect.bottom();
         }
 
-        // 2. Optional inline chat search bar (`Ctrl+F` or Search button) + Calendar jump button.
-        if self.search_open {
-            let search_rect = Rect::from_min_size(
-                Pos2::new(rect.left(), list_top),
-                Vec2::new(rect.width(), 40.0),
-            );
-            ui.painter()
-                .rect_filled(search_rect, CornerRadius::ZERO, colors.bar_bg);
-            ui.scope_builder(
-                egui::UiBuilder::new().max_rect(search_rect.shrink2(Vec2::new(14.0, 6.0))),
-                |ui| {
-                    ui.horizontal(|ui| {
-                        let avail_w = (ui.available_width() - 96.0).max(120.0);
-                        ui.add(
-                            TextEdit::singleline(&mut self.search_query)
-                                .desired_width(avail_w)
-                                .hint_text("Search messages in this chat..."),
-                        );
-                        if ui
-                            .button(
-                                RichText::new("📅 Date")
-                                    .size(12.0)
-                                    .color(colors.active_text_fg),
-                            )
-                            .on_hover_text("Jump to date")
-                            .clicked()
-                        {
-                            let now_unix = backend
-                                .current_unix_time()
-                                .unwrap_or(i64::from(DEFAULT_SECTION_NOW_UNIX))
-                                as i32;
-                            self.calendar_box = Some(CalendarBoxState::new(
-                                peer_id,
-                                peer_info.summary.title.clone(),
-                                now_unix,
-                            ));
-                        }
-                    });
-                },
-            );
-            ui.painter().line_segment(
-                [
-                    Pos2::new(search_rect.left(), search_rect.bottom()),
-                    Pos2::new(search_rect.right(), search_rect.bottom()),
-                ],
-                Stroke::new(1.0, colors.divider),
-            );
-            list_top = search_rect.bottom();
-        }
-
         // 3. Pinned messages bar (`history_view_pinned_bar.cpp`).
-        let pinned = backend.pinned_messages(peer_id);
+        let pinned = Arc::clone(Gated::get_or_read(
+            &mut self.pinned_read,
+            read_generation,
+            || backend.pinned_messages(peer_id).into(),
+        ));
         if !pinned.is_empty() {
             let pin_rect = Rect::from_min_size(
                 Pos2::new(rect.left(), list_top),
@@ -2429,7 +2537,13 @@ impl HistoryWidget {
                                     now_secs,
                                 );
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::chat_silent(
+                                    "contacts.acceptContact",
+                                    &err,
+                                ),
+                                now_secs,
+                            ),
                         }
                     }
                     ContactStatusEvent::ToggleBlock => {
@@ -2447,7 +2561,10 @@ impl HistoryWidget {
                                 backend.dismiss_contact_status(peer_id);
                                 self.show_toast(tg_lang::tr::lng_report_spam_done(), now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::chat_silent("messages.reportSpam", &err),
+                                now_secs,
+                            ),
                         }
                     }
                     ContactStatusEvent::CancelReportSpam => {
@@ -2506,7 +2623,13 @@ impl HistoryWidget {
                             }
                             Err(err) => {
                                 self.translate_bar.translated = false;
-                                self.show_toast(err, now_secs);
+                                self.show_user_error(
+                                    tg_app_core::user_error::chat_silent(
+                                        "messages.translateText",
+                                        &err,
+                                    ),
+                                    now_secs,
+                                );
                             }
                         }
                     }
@@ -2528,7 +2651,13 @@ impl HistoryWidget {
                     }
                     TranslateBarAction::HideForPeer => {
                         if let Err(err) = backend.toggle_peer_translations(peer_id, true) {
-                            self.show_toast(err, now_secs);
+                            self.show_user_error(
+                                tg_app_core::user_error::chat_silent(
+                                    "messages.togglePeerTranslations",
+                                    &err,
+                                ),
+                                now_secs,
+                            );
                         } else {
                             self.show_toast("Translation hidden for this chat", now_secs);
                         }
@@ -2665,7 +2794,13 @@ impl HistoryWidget {
                             Ok(()) => {
                                 self.show_toast(format!("Paused {}", biz_bot.bot_name), now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::chat_silent(
+                                    "account.toggleConnectedBotPaused",
+                                    &err,
+                                ),
+                                now_secs,
+                            ),
                         }
                     }
                     BusinessBotBarEvent::Resume => {
@@ -2673,14 +2808,26 @@ impl HistoryWidget {
                             Ok(()) => {
                                 self.show_toast(format!("Resumed {}", biz_bot.bot_name), now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::chat_silent(
+                                    "account.toggleConnectedBotPaused",
+                                    &err,
+                                ),
+                                now_secs,
+                            ),
                         }
                     }
                     BusinessBotBarEvent::Remove => match backend.disable_business_bot(peer_id) {
                         Ok(()) => {
                             self.show_toast(format!("Disconnected {}", biz_bot.bot_name), now_secs);
                         }
-                        Err(err) => self.show_toast(err, now_secs),
+                        Err(err) => self.show_user_error(
+                            tg_app_core::user_error::chat_silent(
+                                "account.disablePeerConnectedBot",
+                                &err,
+                            ),
+                            now_secs,
+                        ),
                     },
                     BusinessBotBarEvent::Manage(url) => {
                         action = Some(HistoryAction::OpenLink(url));
@@ -2727,9 +2874,12 @@ impl HistoryWidget {
         let is_bot_chat = bot_snapshot
             .as_ref()
             .is_some_and(|s| s.peer_kind == tg_bots::stand_in::PeerKind::Bot);
+        // While the first page loads the history is not known to be empty: no START bar yet
+        // (`HistoryWidget::isBotStart` checks `_history->isEmpty() && !lastMessage()`).
         let bot_start = peer_info.summary.can_send
             && is_bot_chat
-            && (self.bot_start_tokens.contains_key(&peer_id) || self.inner.messages().is_empty());
+            && (self.bot_start_tokens.contains_key(&peer_id)
+                || (self.inner.messages().is_empty() && !self.inner.is_loading_peer()));
         self.bot_start_shown = bot_start;
 
         // 5. Compute bottom reply keyboard & compose controls heights & rects.
@@ -2743,7 +2893,9 @@ impl HistoryWidget {
             Pos2::new(content_bounds.left(), content_bounds.bottom() - reply_kb_h),
             Vec2::new(content_bounds.width(), reply_kb_h),
         );
-        let compose_h = if bot_start {
+        let compose_h = if self.search_open {
+            compose_search::SEARCH_BOTTOM_BAR_HEIGHT
+        } else if bot_start {
             BOT_START_BAR_HEIGHT
         } else {
             self.compose
@@ -2806,22 +2958,7 @@ impl HistoryWidget {
             }
         }
 
-        // 5d. Broadcast channel Pull-to-Next-Unread-Channel footer strip (`history_view_pull_to_next_channel.cpp`).
-        // tdesktop shows it only while the list is over-scrolled past its bottom, drawn over the
-        // list; at rest nothing sits between the messages and the bottom bar.
         let is_broadcast_channel = peer_info.summary.kind == PeerKind::Channel;
-        let show_pull_footer = is_broadcast_channel
-            && !self.inner.show_scroll_down_button()
-            && self.pull_next_channel.pull_px() > 0.0;
-        let pull_footer_h = if show_pull_footer {
-            pull_to_next_channel::PULL_NEXT_FOOTER_HEIGHT
-        } else {
-            0.0
-        };
-        let pull_footer_rect = Rect::from_min_size(
-            Pos2::new(content_bounds.left(), stop_draft_rect.top() - pull_footer_h),
-            Vec2::new(content_bounds.width(), pull_footer_h),
-        );
 
         // 6. Scrollable virtualized message list between header bars and the stop/upload/compose controls.
         let list_rect = Rect::from_min_max(
@@ -2858,6 +2995,7 @@ impl HistoryWidget {
 
         // 6b. Empty bot chat info header ("What can this bot do?" + START button).
         if self.inner.messages().is_empty()
+            && !self.inner.is_loading_peer()
             && is_bot_chat
             && let Some(ref snap) = bot_snapshot
         {
@@ -2982,13 +3120,14 @@ impl HistoryWidget {
             }
         }
 
-        // 7a2. Broadcast channel Pull-to-Next-Unread-Channel indicator & footer strip.
+        // 7a2. Broadcast channel pull to the next unread channel: the gesture and its indicator
+        //      (`history_view_pull_to_next_channel.cpp`). The hint is painted over the bottom
+        //      bar, after the bar itself.
         if is_broadcast_channel {
             if let Some(next_peer_id) = self.pull_next_channel.show(
                 ui,
                 list_rect,
-                pull_footer_rect,
-                !show_scroll_btn,
+                self.inner.is_at_history_bottom(),
                 self.next_unread_channel.as_ref(),
                 &colors,
                 self.inner.reduced_motion(),
@@ -2998,6 +3137,9 @@ impl HistoryWidget {
         } else {
             self.pull_next_channel.reset();
         }
+        // The stretch lifts the messages on the next frame, clearing room for the indicator.
+        self.inner
+            .set_bottom_stretch(self.pull_next_channel.content_shift(now_secs));
 
         // 7b. Floating compose-stash corner button & Ctrl+S shortcut (`history_view_compose_stash`).
         let stash_key = compose_stash::ComposeStashKey::main(peer_id);
@@ -3111,7 +3253,7 @@ impl HistoryWidget {
                             }
                             Err(err) => {
                                 backend.set_compose_stash(stash_key, Some(stashed));
-                                self.show_toast(err, now_secs);
+                                self.show_send_failure_to(&err, peer_id, &*backend, now_secs);
                             }
                         }
                     } else if let Some(ref fwd) = stashed.forward
@@ -3193,7 +3335,52 @@ impl HistoryWidget {
             use_rich_inline_results: has_bots_backend,
             palette,
         };
-        let compose_events = if bot_start {
+        let compose_events = if self.search_open {
+            let members = || backend.chat_mention_candidates(peer_id);
+            let can_choose_from =
+                matches!(peer_info.summary.kind, PeerKind::Group | PeerKind::Channel);
+            let search_ev = self.compose_search.show_bottom_bar(
+                ui,
+                compose_rect,
+                &colors,
+                can_choose_from,
+                &members,
+                backend,
+                peer_id,
+                now_secs,
+            );
+            let polled = self.compose_search.poll(now_secs, backend, peer_id);
+            if self.search_open {
+                // Matches are shown by jumping to and highlighting them (`ComposeSearch`
+                // activations); the list gets no row tint for the query.
+                self.search_query.clear();
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(150));
+            }
+            for ev in [search_ev, polled].into_iter().flatten() {
+                match ev {
+                    compose_search::ComposeSearchEvent::Jump(target) => {
+                        self.inner
+                            .jump_to_message(target, backend, peer_info.summary.kind, now_ms);
+                    }
+                    compose_search::ComposeSearchEvent::ShowCalendar => {
+                        let now_unix = backend
+                            .current_unix_time()
+                            .unwrap_or(i64::from(DEFAULT_SECTION_NOW_UNIX))
+                            as i32;
+                        self.calendar_box = Some(CalendarBoxState::new(
+                            peer_id,
+                            peer_info.summary.title.clone(),
+                            now_unix,
+                        ));
+                    }
+                    compose_search::ComposeSearchEvent::Close => {
+                        self.close_chat_search();
+                    }
+                }
+            }
+            Vec::new()
+        } else if bot_start {
             if paint_bot_start_bar(ui, compose_rect, &colors)
                 && let Some(text) = self.send_bot_start(peer_id, backend, now_secs)
             {
@@ -3216,6 +3403,14 @@ impl HistoryWidget {
                 Some(bot_chrome),
             )
         };
+        if is_broadcast_channel {
+            // `PullToNextChannel::HintOverlay` covers everything below the list.
+            let below_list = Rect::from_min_max(
+                Pos2::new(content_bounds.left(), list_rect.bottom()),
+                content_bounds.right_bottom(),
+            );
+            self.pull_next_channel.paint_hint(ui, below_list, &colors);
+        }
         if self.compose.text != self.last_compose_text_for_hint {
             self.last_compose_text_for_hint = self.compose.text.clone();
             // The field cleared by a send / edit / forward is not a user cut
@@ -3343,7 +3538,10 @@ impl HistoryWidget {
                                 self.inner.update_message_in_place(edited);
                                 self.show_toast("Message updated", now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::edit_message(&err),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -3377,7 +3575,7 @@ impl HistoryWidget {
                             self.show_toast("Messages forwarded", now_secs);
                         }
                     }
-                    Err(err) => self.show_toast(err, now_secs),
+                    Err(err) => self.show_send_failure_to(&err, peer_id, &*backend, now_secs),
                 },
                 ComposeEvent::SubmitForwardWithOptions {
                     from_peer,
@@ -3624,7 +3822,13 @@ impl HistoryWidget {
                 }
                 ComposeEvent::SaveDefaultSendAs(chosen_sa) => {
                     if let Err(err) = backend.save_default_send_as(peer_id, chosen_sa) {
-                        self.show_toast(err, now_secs);
+                        self.show_user_error(
+                            tg_app_core::user_error::chat_silent(
+                                "messages.saveDefaultSendAs",
+                                &err,
+                            ),
+                            now_secs,
+                        );
                     }
                 }
                 ComposeEvent::SlowModeBlocked(remaining) => {
@@ -3727,7 +3931,13 @@ impl HistoryWidget {
                             Ok(_) => {
                                 self.show_toast(format!("Updated tag label for {emoji}"), now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::chat_silent(
+                                    "messages.updateSavedReactionTag",
+                                    &err,
+                                ),
+                                now_secs,
+                            ),
                         }
                     }
                     SelfForwardsTaggerAction::OpenSavedMessages(saved_peer_id) => {
@@ -3818,7 +4028,13 @@ impl HistoryWidget {
                         Ok(()) => {
                             self.show_toast(format!("Default reaction set to {emoji}"), now_secs);
                         }
-                        Err(err) => self.show_toast(err, now_secs),
+                        Err(err) => self.show_user_error(
+                            tg_app_core::user_error::chat_silent(
+                                "messages.setDefaultReaction",
+                                &err,
+                            ),
+                            now_secs,
+                        ),
                     }
                 }
             }
@@ -4012,7 +4228,7 @@ impl HistoryWidget {
                 )
             }
             Err(err) => {
-                self.show_toast(format!("Callback error: {err}"), now_secs);
+                let _ = tg_app_core::user_error::bot_callback(&err);
                 None
             }
         }
@@ -4371,7 +4587,7 @@ impl HistoryWidget {
                         })
                     }
                     Err(err) => {
-                        self.show_toast(err, now_secs);
+                        self.show_send_failure_to(&err, peer_id, &*backend, now_secs);
                         None
                     }
                 }
@@ -4843,7 +5059,7 @@ impl HistoryWidget {
                                 }
                             }
                             Some(Err(err)) => {
-                                self.show_toast(format!("Login failed: {err}"), now_secs);
+                                let _ = tg_app_core::user_error::accept_url_auth_button(&err);
                                 None
                             }
                             None => None,
@@ -4911,7 +5127,10 @@ impl HistoryWidget {
                 if let Some(bots_be) = backend.as_bots_backend_mut() {
                     match bots_be.share_game_score(message_id, target_peer) {
                         Ok(summary) => self.show_toast(summary, now_secs),
-                        Err(err) => self.show_toast(err, now_secs),
+                        Err(err) => self.show_user_error(
+                            tg_app_core::user_error::forward_media(&err, ""),
+                            now_secs,
+                        ),
                     }
                 }
                 None
@@ -5160,6 +5379,13 @@ impl HistoryWidget {
                 InnerEvent::OpenLink(url) => {
                     out_action = Some(HistoryAction::OpenLink(url));
                 }
+                InnerEvent::EntityLink { msg_id, link } => {
+                    if let Some(action) =
+                        self.handle_entity_link(msg_id, link, peer_id, peer_info, backend, now_secs)
+                    {
+                        out_action = Some(action);
+                    }
+                }
                 InnerEvent::OpenHiddenLink(url) => {
                     out_action = Some(HistoryAction::OpenHiddenLink {
                         url,
@@ -5270,7 +5496,10 @@ impl HistoryWidget {
                     Ok(()) => {
                         self.show_toast("Birthday updated on your profile", now_secs);
                     }
-                    Err(err) => self.show_toast(err, now_secs),
+                    Err(err) => self.show_user_error(
+                        tg_app_core::user_error::suggested_birthday(&err),
+                        now_secs,
+                    ),
                 },
                 InnerEvent::ApplySuggestedUserpic {
                     msg_id,
@@ -5329,7 +5558,13 @@ impl HistoryWidget {
                                     self.inner.update_message_in_place(copy);
                                 }
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::chat_silent(
+                                    "messages.translateText",
+                                    &err,
+                                ),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -5422,7 +5657,10 @@ impl HistoryWidget {
                                 .with_paid_privacy(paid_privacy);
                             self.who_reacted_modal = Some(modal);
                         }
-                        Err(err) => self.show_toast(err, now_secs),
+                        Err(err) => self.show_user_error(
+                            tg_app_core::user_error::reactions_list(&err),
+                            now_secs,
+                        ),
                     }
                 }
                 InnerEvent::TogglePaidReactionPrivacy(msg_id) => {
@@ -5448,7 +5686,10 @@ impl HistoryWidget {
                                 };
                                 self.show_toast(label, now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::paid_reaction_privacy(&err),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -5468,7 +5709,10 @@ impl HistoryWidget {
                     {
                         match ch.report_reaction(peer_id, msg_id, reaction_peer_id) {
                             Ok(_) => self.show_toast(tg_lang::tr::lng_report_spam_done(), now_secs),
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::report_reaction(&err),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -5491,7 +5735,10 @@ impl HistoryWidget {
                             Ok(_) => {
                                 self.show_toast("Removed participant reactions", now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::delete_participant_reactions(&err),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -5569,7 +5816,10 @@ impl HistoryWidget {
                                 self.poll_voters_modal =
                                     Some(PollVotersWidget::new(peer_id, msg_id, poll_clone, page));
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::poll_votes(&err),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -5584,7 +5834,9 @@ impl HistoryWidget {
                             }
                             self.show_toast("Vote retracted", now_secs);
                         }
-                        Err(err) => self.show_toast(err, now_secs),
+                        Err(err) => {
+                            self.show_user_error(tg_app_core::user_error::poll_vote(&err), now_secs)
+                        }
                     }
                 }
                 InnerEvent::StopPoll(msg_id) => match backend.stop_poll(peer_id, msg_id) {
@@ -5677,7 +5929,13 @@ impl HistoryWidget {
                         match ex.toggle_todo_completed(peer_id, msg_id, &comp, &incomp) {
                             Ok(Some(updated)) => self.inner.update_message_in_place(updated),
                             Ok(None) => {}
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::chat_silent(
+                                    "messages.toggleTodoCompleted",
+                                    &err,
+                                ),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -5727,18 +5985,17 @@ impl HistoryWidget {
                                 now_secs,
                             );
                         }
-                        TranscribeToggleOutcome::TooLong { max_secs } => {
-                            self.show_toast(
-                                format!(
-                                    "Audio is longer than the {max_secs}s free transcription limit. Telegram Premium removes this limit."
-                                ),
+                        // The trial length check before any request
+                        // (`history_view_transcribe_button.cpp:398-410`).
+                        TranscribeToggleOutcome::TooLong { .. } => {
+                            self.show_toast(tg_lang::tr::lng_audio_transcribe_long(), now_secs);
+                        }
+                        // A failed request shows its text in the bubble, not a toast.
+                        TranscribeToggleOutcome::Failed(err) => {
+                            self.show_user_error(
+                                tg_app_core::user_error::transcribe_audio(&err),
                                 now_secs,
                             );
-                        }
-                        TranscribeToggleOutcome::Failed(err)
-                            if !err.contains("not available for this backend") =>
-                        {
-                            self.show_toast(format!("Transcription failed: {err}"), now_secs);
                         }
                         _ => {}
                     }
@@ -6022,7 +6279,7 @@ impl HistoryWidget {
                             self.inner.append_message(msg, peer_info.summary.kind);
                             self.show_toast("Poll created", now_secs);
                         }
-                        Err(err) => self.show_toast(err, now_secs),
+                        Err(err) => self.show_send_failure_to(&err, peer_id, &*backend, now_secs),
                     }
                 }
                 CreatePollBoxAction::SubmitWithExtras(req, extras) => {
@@ -6036,7 +6293,7 @@ impl HistoryWidget {
                             self.inner.append_message(msg, peer_info.summary.kind);
                             self.show_toast("Poll created", now_secs);
                         }
-                        Err(err) => self.show_toast(err, now_secs),
+                        Err(err) => self.show_send_failure_to(&err, peer_id, &*backend, now_secs),
                     }
                 }
                 CreatePollBoxAction::Cancelled => {}
@@ -6053,7 +6310,8 @@ impl HistoryWidget {
                         self.inner.update_message_in_place(updated);
                         self.show_toast("Poll option added", now_secs);
                     }
-                    Err(err) => self.show_toast(err, now_secs),
+                    Err(err) => self
+                        .show_user_error(tg_app_core::user_error::add_poll_option(&err), now_secs),
                 }
             }
             self.add_poll_option_box = None;
@@ -6415,7 +6673,10 @@ impl HistoryWidget {
                         }
                         self.show_toast(format!("Blocked {sender_name} from Replies"), now_secs);
                     }
-                    Err(err) => self.show_toast(err, now_secs),
+                    Err(err) => self.show_user_error(
+                        tg_app_core::user_error::chat_silent("contacts.blockFromReplies", &err),
+                        now_secs,
+                    ),
                 }
             }
             self.block_from_replies_box = None;
@@ -6434,7 +6695,9 @@ impl HistoryWidget {
                                 self.inner.append_message(sent, peer_info.summary.kind);
                                 self.show_toast("Checklist created", now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => {
+                                self.show_send_failure_to(&err, peer_id, &*backend, now_secs)
+                            }
                         }
                     }
                 }
@@ -6445,7 +6708,10 @@ impl HistoryWidget {
                                 self.inner.update_message_in_place(updated);
                                 self.show_toast("Checklist updated", now_secs);
                             }
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::edit_message(&err),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -6533,7 +6799,9 @@ impl HistoryWidget {
                         self.inner.update_message_in_place(updated);
                         self.show_toast("Caption updated", now_secs);
                     }
-                    Err(err) => self.show_toast(err, now_secs),
+                    Err(err) => {
+                        self.show_user_error(tg_app_core::user_error::edit_message(&err), now_secs)
+                    }
                 }
             }
             self.edit_caption_box = None;
@@ -6547,7 +6815,10 @@ impl HistoryWidget {
                     if let Some(ex) = backend.as_layer233_extras_mut() {
                         match ex.edit_factcheck(peer_id, msg_id, text) {
                             Ok(_) => self.show_toast("Fact-check saved", now_secs),
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::factcheck(&err),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -6559,7 +6830,10 @@ impl HistoryWidget {
                             tg_text::TextWithEntities::simple(""),
                         ) {
                             Ok(_) => self.show_toast("Fact-check removed", now_secs),
-                            Err(err) => self.show_toast(err, now_secs),
+                            Err(err) => self.show_user_error(
+                                tg_app_core::user_error::factcheck(&err),
+                                now_secs,
+                            ),
                         }
                     }
                 }
@@ -6738,7 +7012,9 @@ impl HistoryWidget {
                         PEER_LIST_PAGE_LIMIT,
                     ) {
                         Ok(page) => modal.apply_filter_page(filter, page),
-                        Err(err) => modal.error = Some(err),
+                        Err(err) => {
+                            modal.error = tg_app_core::user_error::reactions_list(&err).into_text()
+                        }
                     }
                     self.who_reacted_modal = Some(modal);
                 }
@@ -6751,7 +7027,9 @@ impl HistoryWidget {
                         PEER_LIST_PAGE_LIMIT,
                     ) {
                         Ok(page) => modal.append_page(page),
-                        Err(err) => modal.error = Some(err),
+                        Err(err) => {
+                            modal.error = tg_app_core::user_error::reactions_list(&err).into_text()
+                        }
                     }
                     self.who_reacted_modal = Some(modal);
                 }
@@ -6774,7 +7052,10 @@ impl HistoryWidget {
                                 };
                                 self.show_toast(label, now_secs);
                             }
-                            Err(err) => modal.error = Some(err),
+                            Err(err) => {
+                                modal.error =
+                                    tg_app_core::user_error::paid_reaction_privacy(&err).into_text()
+                            }
                         }
                     }
                     self.who_reacted_modal = Some(modal);
@@ -6785,7 +7066,10 @@ impl HistoryWidget {
                             Ok(_) => {
                                 self.show_toast(tg_lang::tr::lng_report_spam_done(), now_secs);
                             }
-                            Err(err) => modal.error = Some(err),
+                            Err(err) => {
+                                modal.error =
+                                    tg_app_core::user_error::report_reaction(&err).into_text()
+                            }
                         }
                     }
                     self.who_reacted_modal = Some(modal);
@@ -6801,7 +7085,11 @@ impl HistoryWidget {
                                 modal.remove_participant_entries(participant_id);
                                 self.show_toast("Reaction removed", now_secs);
                             }
-                            Err(err) => modal.error = Some(err),
+                            Err(err) => {
+                                modal.error =
+                                    tg_app_core::user_error::delete_participant_reactions(&err)
+                                        .into_text()
+                            }
                         }
                     }
                     self.who_reacted_modal = Some(modal);
@@ -6813,7 +7101,11 @@ impl HistoryWidget {
                                 modal.remove_participant_entries(participant_id);
                                 self.show_toast("Removed participant reactions", now_secs);
                             }
-                            Err(err) => modal.error = Some(err),
+                            Err(err) => {
+                                modal.error =
+                                    tg_app_core::user_error::delete_participant_reactions(&err)
+                                        .into_text()
+                            }
                         }
                     }
                     self.who_reacted_modal = Some(modal);
@@ -6947,7 +7239,9 @@ impl HistoryWidget {
                         PEER_LIST_PAGE_LIMIT,
                     ) {
                         Ok(page) => modal.apply_option_page(opt_idx, page),
-                        Err(err) => modal.error = Some(err),
+                        Err(err) => {
+                            modal.error = tg_app_core::user_error::poll_votes(&err).into_text()
+                        }
                     }
                     self.poll_voters_modal = Some(modal);
                 }
@@ -6960,7 +7254,9 @@ impl HistoryWidget {
                         PEER_LIST_PAGE_LIMIT,
                     ) {
                         Ok(page) => modal.append_page(page),
-                        Err(err) => modal.error = Some(err),
+                        Err(err) => {
+                            modal.error = tg_app_core::user_error::poll_votes(&err).into_text()
+                        }
                     }
                     self.poll_voters_modal = Some(modal);
                 }
@@ -6981,7 +7277,10 @@ impl HistoryWidget {
                         Ok(None) => {
                             self.show_toast("Poll results up to date", now_secs);
                         }
-                        Err(err) => modal.error = Some(err),
+                        Err(err) => {
+                            modal.error =
+                                tg_app_core::user_error::reload_poll_results(&err).into_text()
+                        }
                     }
                     self.poll_voters_modal = Some(modal);
                 }
@@ -6990,7 +7289,8 @@ impl HistoryWidget {
                         Ok(graph) => modal.apply_poll_stats(graph, dark),
                         Err(err) => {
                             modal.show_stats = true;
-                            modal.stats_error = Some(err);
+                            modal.stats_error =
+                                Some(tg_app_core::user_error::poll_stats_label(&err));
                         }
                     }
                     self.poll_voters_modal = Some(modal);
@@ -7008,7 +7308,10 @@ impl HistoryWidget {
     }
 
     fn show_toast(&mut self, message: impl Into<String>, now_secs: f64) {
-        self.status_toast = Some((message.into(), now_secs + 2.6));
+        let Some(message) = tg_app_core::user_error::visible_toast_text(message.into()) else {
+            return;
+        };
+        self.status_toast = Some((message, now_secs + 2.6));
     }
 
     fn paint_status_toast(&mut self, ui: &mut Ui, list_rect: Rect, now_secs: f64) {

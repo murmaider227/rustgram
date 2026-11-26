@@ -161,3 +161,210 @@ pub fn paint_static_loading(painter: &Painter, rect: Rect, stroke: f32, color: C
         ));
     }
 }
+
+/// `st::radialDuration` (`lib_ui/ui/basic.style`): arc catch-up and fade time, in ms.
+pub const RADIAL_DURATION_MS: f64 = 350.0;
+/// `st::radialPeriod` (`lib_ui/ui/basic.style`): one full turn of the arc start, in ms.
+pub const RADIAL_PERIOD_MS: f64 = 3000.0;
+/// `arc::kFullLength`: Qt arc units (1/16 degree) in a full circle.
+const ARC_FULL: f64 = 360.0 * 16.0;
+const ARC_QUARTER: f64 = ARC_FULL / 4.0;
+const ARC_MIN: f64 = ARC_FULL / 360.0;
+const ARC_ALMOST_FULL: f64 = ARC_FULL - ARC_MIN;
+
+/// `anim::value` with linear interpolation: `current` moves from `from` to `to`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ArcValue {
+    from: f64,
+    to: f64,
+    current: f64,
+}
+
+impl ArcValue {
+    const fn new(from: f64, to: f64) -> Self {
+        Self {
+            from,
+            to,
+            current: from,
+        }
+    }
+
+    const fn start(&mut self, to: f64) {
+        self.from = self.current;
+        self.to = to;
+    }
+
+    fn update(&mut self, dt: f64) {
+        self.current = (self.to - self.from).mul_add(dt, self.from);
+    }
+}
+
+/// Determinate progress arc that also turns while it waits for progress
+/// (`Ui::RadialAnimation`, `lib_ui/ui/effects/radial_animation.cpp`).
+///
+/// The owner calls [`Self::update`] every frame while [`Self::animating`] and repaints: the arc
+/// start turns once per [`RADIAL_PERIOD_MS`], the arc end eases toward the progress, and after
+/// the load finishes the arc completes and fades out over [`RADIAL_DURATION_MS`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RadialAnimation {
+    first_start_ms: f64,
+    last_start_ms: f64,
+    last_time_ms: f64,
+    arc_end: ArcValue,
+    arc_start: f64,
+    opacity: f64,
+    finished: bool,
+    animating: bool,
+}
+
+impl RadialAnimation {
+    /// `RadialAnimation::start(prg)`.
+    pub fn start(&mut self, progress: f64, now_ms: f64) {
+        self.first_start_ms = now_ms;
+        self.last_start_ms = now_ms;
+        self.last_time_ms = now_ms;
+        let iprg = (progress.max(0.0001) * ARC_ALMOST_FULL).round();
+        let strict = (progress * ARC_ALMOST_FULL).round();
+        self.arc_end = ArcValue::new(strict, iprg);
+        self.arc_start = 0.0;
+        self.opacity = 0.0;
+        self.finished = false;
+        self.animating = true;
+    }
+
+    /// `RadialAnimation::update(prg, finished, ms)`; returns whether the target changed.
+    pub fn update(&mut self, progress: f64, finished: bool, now_ms: f64) -> bool {
+        let iprg = (progress.max(0.0001) * ARC_ALMOST_FULL).round();
+        let result = iprg != self.arc_end.to.round() || self.finished != finished;
+        if self.finished != finished {
+            self.arc_end.start(iprg);
+            self.finished = finished;
+            self.last_start_ms = self.last_time_ms;
+        } else if result {
+            self.arc_end.start(iprg);
+            self.last_start_ms = self.last_time_ms;
+        }
+        self.last_time_ms = now_ms;
+
+        let dt = now_ms - self.last_start_ms;
+        let fulldt = now_ms - self.first_start_ms;
+        let opacitydt = if self.finished {
+            self.last_start_ms - self.first_start_ms
+        } else {
+            fulldt
+        };
+        self.opacity = (opacitydt / RADIAL_DURATION_MS).min(1.0);
+        if disabled() {
+            self.arc_end.update(1.0);
+            if finished {
+                self.stop();
+            }
+        } else if !finished {
+            self.arc_end
+                .update(1.0 - RADIAL_DURATION_MS / (RADIAL_DURATION_MS + dt));
+        } else if dt >= RADIAL_DURATION_MS {
+            self.arc_end.update(1.0);
+            self.stop();
+        } else {
+            let r = dt / RADIAL_DURATION_MS;
+            self.arc_end.update(r);
+            self.opacity *= 1.0 - r;
+        }
+        let fromstart = fulldt / RADIAL_PERIOD_MS;
+        self.arc_start = fromstart - fromstart.floor();
+        result
+    }
+
+    /// `RadialAnimation::stop()`.
+    pub fn stop(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Whether the arc is still shown and needs frames.
+    #[must_use]
+    pub const fn animating(&self) -> bool {
+        self.animating
+    }
+
+    /// Current opacity (fades in on start and out after the finish).
+    #[must_use]
+    pub const fn opacity(&self) -> f64 {
+        self.opacity
+    }
+
+    /// `RadialAnimation::computeState()` in radians for [`paint_arc`] (screen angles, y down).
+    #[must_use]
+    pub fn compute_state(&self) -> RadialState {
+        let length = ARC_MIN + self.arc_end.current.round();
+        let shift = if disabled() {
+            0.0
+        } else {
+            (self.arc_start * ARC_FULL).round()
+        };
+        let from = ARC_QUARTER - length - shift;
+        let to_rad = |units: f64| units / ARC_FULL * TAU;
+        // Qt draws from `from` counter-clockwise (y up) by `length`; on screen (y down) that is
+        // the clockwise sweep from `-(from + length)` to `-from`.
+        RadialState {
+            shown: self.opacity,
+            arc_from_rad: -to_rad(from + length),
+            arc_length_rad: to_rad(length),
+        }
+    }
+
+    /// `RadialAnimation::draw`: paints the arc inside `rect` with the current opacity.
+    pub fn draw(&self, painter: &Painter, rect: Rect, thickness: f32, color: Color32) {
+        let state = self.compute_state();
+        paint_arc(
+            painter,
+            rect,
+            state.arc_from_rad,
+            state.arc_length_rad,
+            thickness,
+            with_alpha(color, state.shown),
+        );
+    }
+}
+
+#[cfg(test)]
+mod determinate_tests {
+    use super::*;
+
+    #[test]
+    fn the_arc_turns_while_progress_does_not_change() {
+        let mut radial = RadialAnimation::default();
+        radial.start(0.3, 1000.0);
+        radial.update(0.3, false, 1500.0);
+        let a = radial.compute_state();
+        radial.update(0.3, false, 2000.0);
+        let b = radial.compute_state();
+        assert!(radial.animating());
+        assert!(
+            (a.arc_from_rad - b.arc_from_rad).abs() > 0.5,
+            "the start turns 60 degrees in 500 ms: {} vs {}",
+            a.arc_from_rad,
+            b.arc_from_rad
+        );
+        assert!((a.arc_length_rad - b.arc_length_rad).abs() < 0.05);
+    }
+
+    #[test]
+    fn the_arc_eases_toward_progress_and_fades_out_after_the_finish() {
+        let mut radial = RadialAnimation::default();
+        radial.start(0.0, 0.0);
+        radial.update(0.0, false, 400.0);
+        assert!((radial.opacity() - 1.0).abs() < f64::EPSILON);
+        radial.update(0.5, false, 450.0);
+        radial.update(0.5, false, 2000.0);
+        let half = radial.compute_state().arc_length_rad;
+        assert!(
+            half > PI * 0.7 && half < PI * 1.05,
+            "eased to ~half: {half}"
+        );
+        radial.update(1.0, true, 2100.0);
+        radial.update(1.0, true, 2200.0);
+        assert!(radial.animating() && radial.opacity() < 1.0);
+        radial.update(1.0, true, 2100.0 + RADIAL_DURATION_MS);
+        assert!(!radial.animating(), "stops after radialDuration");
+    }
+}

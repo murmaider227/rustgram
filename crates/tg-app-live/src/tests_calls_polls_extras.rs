@@ -733,6 +733,7 @@ fn reload_poll_results_applies_min_update_and_caches_poll_hash() {
                     recent_voters: Vec::new(),
                     solution: None,
                 },
+                ..PollData::default()
             })),
         };
         s.insert_message(msg);

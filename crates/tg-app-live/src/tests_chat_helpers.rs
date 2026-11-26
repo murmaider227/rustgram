@@ -390,6 +390,13 @@ fn make_tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
     buf
 }
 
+/// Calls a panel getter, waits for the background refresh it starts, and calls it again.
+fn settled<T>(live: &LiveSession, get: impl Fn(&LiveSession) -> T) -> T {
+    let _ = get(live);
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+    get(live)
+}
+
 fn start_live_harness() -> (FakeRpcClient, LiveSession) {
     let self_uid = 700_001i64;
     let self_user = synthetic_tl_user(self_uid, "Kestrel", "kestrel_self", true, false, false);
@@ -572,7 +579,7 @@ fn test_get_all_stickers_and_get_sticker_set_with_hash_refresh() {
         }),
     );
 
-    let sections = live.sticker_sections();
+    let sections = settled(&live, |l| l.sticker_sections());
     assert_eq!(sections.len(), 3);
     assert_eq!(sections[0].id, FAVED_SET_ID);
     assert_eq!(sections[0].stickers, vec![ChatDocId(1001)]);
@@ -621,7 +628,7 @@ fn test_get_all_stickers_and_get_sticker_set_with_hash_refresh() {
         &tl_enums::messages::AllStickers::NotModified,
     );
 
-    let sections_after = live.sticker_sections();
+    let sections_after = settled(&live, |l| l.sticker_sections());
     assert_eq!(sections_after.len(), 3);
 
     // Verify GetAllStickers sent the exact computed hash (123_456).
@@ -690,7 +697,7 @@ fn test_faved_and_recent_stickers_mutations() {
             documents: vec![doc],
         }),
     );
-    let _ = live.sticker_sections();
+    let _ = settled(&live, |l| l.sticker_sections());
     assert!(!live.is_sticker_faved(ChatDocId(2001)));
 
     // Fave sticker
@@ -755,7 +762,7 @@ fn test_featured_stickers_and_read_featured_stickers() {
         ),
     );
 
-    let featured = live.featured_sticker_sections();
+    let featured = settled(&live, |l| l.featured_sticker_sections());
     assert_eq!(featured.len(), 1);
     assert_eq!(featured[0].id, StickerSetId(30_001));
     assert_eq!(featured[0].stickers, vec![ChatDocId(3001)]);
@@ -850,7 +857,7 @@ fn test_install_uninstall_and_reorder_sticker_sets() {
             },
         ),
     );
-    let _ = live.featured_sticker_sections();
+    let _ = settled(&live, |l| l.featured_sticker_sections());
     assert!(!live.is_set_installed(StickerSetId(40_002)));
 
     // Install s2 -> InstallStickerSet + GetStickerSet (since only cover was loaded)
@@ -998,7 +1005,7 @@ fn test_saved_gifs_save_gif_and_at_gif_inline_search() {
         }),
     );
 
-    let saved = live.saved_gifs();
+    let saved = settled(&live, |l| l.saved_gifs());
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].id, ChatDocId(6001));
     assert!(saved[0].saved);
@@ -1728,7 +1735,7 @@ fn test_install_sticker_set_archive_result_archives_evicted_set() {
             },
         ),
     );
-    let _ = live.featured_sticker_sections();
+    let _ = settled(&live, |l| l.featured_sticker_sections());
 
     // Server returns StickerSetInstallResult::Archive evicting `old_id`.
     fake.enqueue_ok(
@@ -2005,7 +2012,7 @@ fn test_read_featured_stickers_retains_unread_on_rpc_failure_and_recovers() {
             },
         ),
     );
-    let _ = live.featured_sticker_sections();
+    let _ = settled(&live, |l| l.featured_sticker_sections());
     assert_eq!(live.featured_stickers_unread_count(), 1);
 
     // Queue read and invoke without an enqueued response -> fails and preserves UNREAD state.
@@ -2036,7 +2043,7 @@ fn test_hash_not_modified_for_saved_gifs_emoji_stickers_and_search_sets() {
             gifs: vec![gif_doc],
         }),
     );
-    assert_eq!(live.saved_gifs().len(), 1);
+    assert_eq!(settled(&live, |l| l.saved_gifs()).len(), 1);
 
     // Advance past 1-hour TTL -> sends saved-gifs hash (6201) and preserves cache on NotModified.
     fake.clear_recorded();
@@ -2045,7 +2052,7 @@ fn test_hash_not_modified_for_saved_gifs_emoji_stickers_and_search_sets() {
         tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID,
         &tl_enums::messages::SavedGifs::NotModified,
     );
-    assert_eq!(live.saved_gifs().len(), 1);
+    assert_eq!(settled(&live, |l| l.saved_gifs()).len(), 1);
     let gif_reqs = fake.recorded_requests_of(tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID);
     assert_eq!(gif_reqs.len(), 1);
     let parsed_gif = tl_fns::messages::GetSavedGifs::from_bytes(&gif_reqs[0]).expect("deser");
@@ -2135,4 +2142,308 @@ fn test_hash_not_modified_for_saved_gifs_emoji_stickers_and_search_sets() {
     let parsed_search =
         tl_fns::messages::SearchStickerSets::from_bytes(&search_reqs[0]).expect("deser");
     assert_eq!(parsed_search.hash, 7373);
+}
+
+// =============================================================================
+// Panel refreshes run in the background (TGB-2893)
+// =============================================================================
+
+/// Holds the fake server's answers to chosen requests until opened.
+#[derive(Clone, Default)]
+struct RpcGate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl RpcGate {
+    fn wait(&self) {
+        let (open, cv) = &*self.0;
+        let mut guard = open.lock().expect("gate lock");
+        while !*guard {
+            guard = cv.wait(guard).expect("gate wait");
+        }
+    }
+
+    fn open(&self) {
+        let (open, cv) = &*self.0;
+        *open.lock().expect("gate lock") = true;
+        cv.notify_all();
+    }
+}
+
+fn hold_requests(fake: &FakeRpcClient, gate: &RpcGate, held: Vec<u32>) {
+    let gate = gate.clone();
+    fake.set_dynamic_handler(Arc::new(move |ctor, _| {
+        if held.contains(&ctor) {
+            gate.wait();
+        }
+        None
+    }));
+}
+
+fn enqueue_panel_catalog(fake: &FakeRpcClient) {
+    let doc = synthetic_sticker_doc(7101, 71_001, 555, "🌊", "image/webp", false);
+    let set_header = synthetic_sticker_set(
+        71_001,
+        555,
+        77,
+        "Tide Pack",
+        "tide_pack",
+        1,
+        Some(1_750_000_000),
+        false,
+        false,
+    );
+    fake.enqueue_ok(
+        tl_fns::messages::GetFavedStickers::CONSTRUCTOR_ID,
+        &tl_enums::messages::FavedStickers::FavedStickers(tl_types::messages::FavedStickers {
+            hash: 0,
+            packs: Vec::new(),
+            stickers: Vec::new(),
+        }),
+    );
+    fake.enqueue_ok(
+        tl_fns::messages::GetRecentStickers::CONSTRUCTOR_ID,
+        &tl_enums::messages::RecentStickers::RecentStickers(tl_types::messages::RecentStickers {
+            hash: 0,
+            packs: Vec::new(),
+            stickers: Vec::new(),
+            dates: Vec::new(),
+        }),
+    );
+    fake.enqueue_ok(
+        tl_fns::messages::GetAllStickers::CONSTRUCTOR_ID,
+        &tl_enums::messages::AllStickers::AllStickers(tl_types::messages::AllStickers {
+            hash: 77,
+            sets: vec![set_header.clone()],
+        }),
+    );
+    fake.enqueue_ok(
+        tl_fns::messages::GetStickerSet::CONSTRUCTOR_ID,
+        &tl_enums::messages::StickerSet::StickerSet(tl_types::messages::StickerSet {
+            set: set_header,
+            packs: Vec::new(),
+            keywords: Vec::new(),
+            documents: vec![doc],
+        }),
+    );
+    fake.enqueue_ok(
+        tl_fns::messages::GetFeaturedStickers::CONSTRUCTOR_ID,
+        &tl_enums::messages::FeaturedStickers::FeaturedStickers(
+            tl_types::messages::FeaturedStickers {
+                premium: false,
+                hash: 5,
+                count: 0,
+                sets: Vec::new(),
+                unread: Vec::new(),
+            },
+        ),
+    );
+    fake.enqueue_ok(
+        tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID,
+        &tl_enums::messages::SavedGifs::SavedGifs(tl_types::messages::SavedGifs {
+            hash: 7201,
+            gifs: vec![synthetic_gif_doc(7201, 160, 90, "tide.mp4", None)],
+        }),
+    );
+    fake.enqueue_ok(
+        tl_fns::messages::GetEmojiGroups::CONSTRUCTOR_ID,
+        &tl_enums::messages::EmojiGroups::EmojiGroups(tl_types::messages::EmojiGroups {
+            hash: 31,
+            groups: vec![tl_enums::EmojiGroup::EmojiGroup(tl_types::EmojiGroup {
+                title: "Calm".to_owned(),
+                icon_emoji_id: 1,
+                emoticons: vec!["🌊".to_owned()],
+            })],
+        }),
+    );
+}
+
+const PANEL_REFRESH_CTORS: [u32; 6] = [
+    tl_fns::messages::GetFavedStickers::CONSTRUCTOR_ID,
+    tl_fns::messages::GetRecentStickers::CONSTRUCTOR_ID,
+    tl_fns::messages::GetAllStickers::CONSTRUCTOR_ID,
+    tl_fns::messages::GetFeaturedStickers::CONSTRUCTOR_ID,
+    tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID,
+    tl_fns::messages::GetEmojiGroups::CONSTRUCTOR_ID,
+];
+
+#[test]
+fn panel_getters_never_wait_for_the_server() {
+    let (fake, live) = start_live_harness();
+    let gate = RpcGate::default();
+    hold_requests(&fake, &gate, PANEL_REFRESH_CTORS.to_vec());
+    enqueue_panel_catalog(&fake);
+
+    // A second of panel frames while every refresh request is held by the server.
+    const FRAMES: u32 = 60;
+    let started = std::time::Instant::now();
+    for _ in 0..FRAMES {
+        assert!(live.sticker_sections().is_empty(), "nothing loaded yet");
+        assert!(live.featured_sticker_sections().is_empty());
+        assert!(live.saved_gifs().is_empty());
+        assert!(live.emoji_groups().expect("cached groups").is_empty());
+    }
+    let held = started.elapsed();
+    println!(
+        "measured: panel getters with the server held: {:.3} ms per frame",
+        held.as_secs_f64() * 1000.0 / f64::from(FRAMES)
+    );
+    assert!(held < std::time::Duration::from_millis(500), "{held:?}");
+
+    gate.open();
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+
+    let sections = live.sticker_sections();
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.id == StickerSetId(71_001) && s.stickers == vec![ChatDocId(7101)])
+    );
+    assert_eq!(live.saved_gifs().len(), 1);
+    let groups = live.emoji_groups().expect("groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].title, "Calm");
+    for ctor in PANEL_REFRESH_CTORS {
+        assert_eq!(
+            fake.recorded_requests_of(ctor).len(),
+            1,
+            "one request per refresh despite {FRAMES} frames of getters (ctor {ctor:#x})"
+        );
+    }
+}
+
+#[test]
+fn invalidation_during_a_panel_refresh_is_not_lost() {
+    let (fake, live) = start_live_harness();
+    let gate = RpcGate::default();
+    hold_requests(
+        &fake,
+        &gate,
+        vec![tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID],
+    );
+    fake.enqueue_ok(
+        tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID,
+        &tl_enums::messages::SavedGifs::SavedGifs(tl_types::messages::SavedGifs {
+            hash: 7301,
+            gifs: vec![synthetic_gif_doc(7301, 160, 90, "first.mp4", None)],
+        }),
+    );
+    assert!(live.saved_gifs().is_empty());
+    // An account change (`invalidate_all`) lands while the request is on the wire.
+    live.chat_helpers.state.invalidate_all();
+    gate.open();
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+    assert_eq!(live.saved_gifs().len(), 1, "the finished refresh is shown");
+
+    // The invalidation still forces the next refresh.
+    fake.enqueue_ok(
+        tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID,
+        &tl_enums::messages::SavedGifs::SavedGifs(tl_types::messages::SavedGifs {
+            hash: 7302,
+            gifs: vec![
+                synthetic_gif_doc(7302, 160, 90, "second.mp4", None),
+                synthetic_gif_doc(7301, 160, 90, "first.mp4", None),
+            ],
+        }),
+    );
+    let _ = live.saved_gifs();
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+    assert_eq!(
+        fake.recorded_requests_of(tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID)
+            .len(),
+        2
+    );
+    let ids: Vec<_> = live.saved_gifs().iter().map(|g| g.id).collect();
+    assert_eq!(
+        ids,
+        vec![ChatDocId(7302), ChatDocId(7301)],
+        "server order kept"
+    );
+}
+
+#[test]
+fn failed_panel_refresh_backs_off_and_keeps_the_cache() {
+    let (fake, live) = start_live_harness();
+    fake.enqueue_ok(
+        tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID,
+        &tl_enums::messages::SavedGifs::SavedGifs(tl_types::messages::SavedGifs {
+            hash: 7401,
+            gifs: vec![synthetic_gif_doc(7401, 160, 90, "kept.mp4", None)],
+        }),
+    );
+    let _ = live.saved_gifs();
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+    assert_eq!(live.saved_gifs().len(), 1);
+
+    // An hour later the refresh fails (no answer queued): the cached list stays, and frames
+    // within the back-off do not retry.
+    live.set_chat_helpers_now_ms(Some(1_750_000_000_000 + STICKERS_UPDATE_TIMEOUT_MS + 1));
+    fake.clear_recorded();
+    for _ in 0..20 {
+        assert_eq!(live.saved_gifs().len(), 1);
+        assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+    }
+    assert_eq!(
+        fake.recorded_requests_of(tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID)
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn gif_thumbnail_downloads_in_the_background() {
+    let (fake, live) = start_live_harness();
+    let thumb_doc = {
+        let tl_enums::Document::Document(mut d) =
+            synthetic_gif_doc(7501, 160, 90, "remote_thumb.mp4", None)
+        else {
+            unreachable!("synthetic_gif_doc builds a Document")
+        };
+        d.thumbs = Some(vec![tl_enums::PhotoSize::PhotoSize(tl_types::PhotoSize {
+            r#type: "m".to_owned(),
+            w: 4,
+            h: 4,
+            size: 64,
+        })]);
+        tl_enums::Document::Document(d)
+    };
+    fake.enqueue_ok(
+        tl_fns::messages::GetSavedGifs::CONSTRUCTOR_ID,
+        &tl_enums::messages::SavedGifs::SavedGifs(tl_types::messages::SavedGifs {
+            hash: 7501,
+            gifs: vec![thumb_doc],
+        }),
+    );
+    let _ = live.saved_gifs();
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+
+    let gate = RpcGate::default();
+    hold_requests(&fake, &gate, vec![tl_fns::upload::GetFile::CONSTRUCTOR_ID]);
+    fake.enqueue_ok(
+        tl_fns::upload::GetFile::CONSTRUCTOR_ID,
+        &tl_enums::upload::File::File(tl_types::upload::File {
+            r#type: tl_enums::storage::FileType::FilePng,
+            mtime: 1_750_000_000,
+            bytes: make_tiny_png(4, 4, [200, 40, 90, 255]),
+        }),
+    );
+    let started = std::time::Instant::now();
+    for frame in 0..30 {
+        assert!(
+            live.gif_frame_rgba(ChatDocId(7501), frame).is_none(),
+            "not downloaded yet"
+        );
+    }
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    gate.open();
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+    let (w, h, rgba) = live
+        .gif_frame_rgba(ChatDocId(7501), 0)
+        .expect("downloaded frame");
+    assert_eq!((w, h), (4, 4));
+    assert_eq!(&rgba[..4], &[200, 40, 90, 255]);
+    assert_eq!(
+        fake.recorded_requests_of(tl_fns::upload::GetFile::CONSTRUCTOR_ID)
+            .len(),
+        1,
+        "one download despite 30 frames asking"
+    );
 }

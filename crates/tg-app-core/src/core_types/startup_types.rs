@@ -20,6 +20,11 @@ pub struct StartupPrefs {
     /// Whether `tg://` and `tonsite://` URL handlers should be registered on first run.
     #[serde(default = "default_true")]
     pub register_url_schemes: bool,
+    /// Opt-in: whether Rustgram may make itself the system `tg://` / `tonsite://` handler.
+    /// Off by default (owner, 2026-11-26): while Rustgram is in testing, browser links keep opening
+    /// the user's own Telegram. The older `register_url_schemes` key is ignored for this reason.
+    #[serde(default)]
+    pub take_url_schemes: bool,
     /// Whether first-run URL scheme registration has already completed for this working dir.
     #[serde(default)]
     pub url_schemes_registered: bool,
@@ -41,6 +46,7 @@ impl Default for StartupPrefs {
             auto_update: true,
             install_beta: false,
             register_url_schemes: true,
+            take_url_schemes: false,
             url_schemes_registered: false,
             start_minimized_on_autostart: true,
             last_update_check_unix: 0,

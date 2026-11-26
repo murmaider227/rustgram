@@ -5,17 +5,17 @@
 //! valid Telegram stripped JPEG thumbnails, and 5-bit packed voice waveforms.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tg_media::audio::waveform_encode_5bit;
 use tg_text::TextWithEntities;
 
 use crate::history::backend::{
     AlbumItem, ContactStatusBanner, DocumentAttachment, DraftMessage, ForwardHeader,
-    HistoryBackend, HistoryMedia, HistoryMessage, HistoryPeerInfo, HistorySlice, MessageExtra,
-    MessageSummaryEntry, PhotoAttachment, PinnedMessageSummary, PollAttachment, PollOption,
-    ReactionCounter, ReplyHeader, SendMessageExtended, SendMessageRequest, ServiceAction,
-    StickerAttachment, ThreadDraft, TypingAction, VideoAttachment, VoiceAttachment,
+    HistoryBackend, HistoryMedia, HistoryMessage, HistoryPeerInfo, HistorySlice, Loadable,
+    MessageExtra, MessageSummaryEntry, PhotoAttachment, PinnedMessageSummary, PollAttachment,
+    PollOption, ReactionCounter, ReplyHeader, SendMessageExtended, SendMessageRequest,
+    ServiceAction, StickerAttachment, ThreadDraft, TypingAction, VideoAttachment, VoiceAttachment,
 };
 use crate::history::inline_media::InlineMediaDescriptor;
 use crate::history::mock_ext::MockSectionsData;
@@ -34,30 +34,67 @@ const BASE_UNIX_YESTERDAY: i32 = 1_795_255_200;
 /// Next-day timestamp (`2026-11-22 09:00:00 UTC`).
 const BASE_UNIX_TODAY: i32 = BASE_UNIX_YESTERDAY + 82_800;
 
-/// Valid 1x1 stripped JPEG payload (after the 623-byte Telegram header: 1-byte marker `0x01`,
-/// height `0x08`, width `0x08`, followed by minimal Huffman-coded DC/AC scan bytes).
+/// Stripped (`photoStrippedSize`) thumbnail of a small generated landscape: a sky gradient whose
+/// hue comes from `seed`, a sun and two hills. Demo photos have no full-size bytes, so this
+/// blurred picture is what their bubbles and album tiles show.
+///
+/// Built once per seed (the encoder runs a DCT per block) and cloned afterwards.
 #[must_use]
-pub fn synthetic_stripped_thumb(dc_seed: u8) -> Vec<u8> {
-    // Valid minimal scan stream for an 8x8 YCbCr 4:2:0 block with Telegram's standard Huffman tables.
-    // Decodes cleanly via `tg_media::image::inline::from_inline_bytes`.
-    let mut bytes = vec![0x01, 0x08, 0x08];
-    // Encode a compact deterministic valid scan payload; if JPEG decoder rejects a particular seed,
-    // `media.rs` gracefully falls back to the item's rich gradient thumbnail.
-    bytes.extend_from_slice(&[
-        0xF8,
-        dc_seed | 0x01,
-        0xA2,
-        0x8A,
-        0x28,
-        0x03,
-        0xFF,
-        0x00,
-        0xA2,
-        0x8A,
-        0x28,
-        0x00,
-    ]);
-    bytes
+pub fn synthetic_stripped_thumb(seed: u8) -> Vec<u8> {
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static CACHE: OnceLock<Mutex<HashMap<u8, Vec<u8>>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(seed)
+        .or_insert_with(|| {
+            tg_media::image::inline::encode_stripped_thumb(&synthetic_thumb_picture(seed))
+        })
+        .clone()
+}
+
+/// The 40x40 picture behind [`synthetic_stripped_thumb`].
+#[must_use]
+pub fn synthetic_thumb_picture(seed: u8) -> image::RgbaImage {
+    const SIDE: u32 = 40;
+    let hue = f32::from(seed) * (360.0 / 256.0);
+    let sky_top = hsv_rgb(hue, 0.55, 0.95);
+    let sky_low = hsv_rgb(hue + 40.0, 0.30, 1.0);
+    let hill_far = hsv_rgb(hue + 150.0, 0.45, 0.55);
+    let hill_near = hsv_rgb(hue + 170.0, 0.60, 0.35);
+    let sun = [255.0, 244.0, 200.0];
+    let sun_x = 8.0 + f32::from(seed % 24);
+    image::RgbaImage::from_fn(SIDE, SIDE, |x, y| {
+        let (fx, fy) = (x as f32, y as f32);
+        let t = fy / (SIDE - 1) as f32;
+        let mut px = [0usize, 1, 2].map(|k| sky_top[k] + (sky_low[k] - sky_top[k]) * t);
+        if (fx - sun_x).hypot(fy - 11.0) <= 5.0 {
+            px = sun;
+        }
+        if fy >= 26.0 - 6.0 * ((fx + f32::from(seed)) * 0.16).sin() {
+            px = hill_far;
+        }
+        if fy >= 32.0 - 4.0 * ((fx * 0.11) + f32::from(seed) * 0.3).cos() {
+            px = hill_near;
+        }
+        image::Rgba([px[0] as u8, px[1] as u8, px[2] as u8, 255])
+    })
+}
+
+fn hsv_rgb(hue: f32, s: f32, v: f32) -> [f32; 3] {
+    let h = hue.rem_euclid(360.0) / 60.0;
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [r, g, b].map(|k| (k + v - c) * 255.0)
 }
 
 /// Original procedural Lottie JSON animation of a bouncing golden star sticker (GPL-3.0).
@@ -183,9 +220,17 @@ pub struct MockHistoryStore {
     histories: HashMap<PeerId, Vec<HistoryMessage>>,
     pinned: HashMap<PeerId, Vec<MsgId>>,
     first_unread: HashMap<PeerId, Option<MsgId>>,
+    /// Chats whose first page is still "on the way" (`try_load_slice_around` says `Loading`).
+    pending_first_loads: HashSet<PeerId>,
     drafts: HashMap<PeerId, DraftMessage>,
     rich_drafts: HashMap<ThreadKey, RichThreadDraft>,
-    media_descriptors: HashMap<(PeerId, MsgId), InlineMediaDescriptor>,
+    media_descriptors: RefCell<HashMap<(PeerId, MsgId), InlineMediaDescriptor>>,
+    /// Voice files `start_media_download` "downloads" at once (tests).
+    voice_files: HashMap<(PeerId, MsgId), Vec<u8>>,
+    /// `(msg, started)` per `start_media_download` / `cancel_media_download` call (tests).
+    download_calls: RefCell<Vec<(MsgId, bool)>>,
+    /// Thumbnails served by `reply_preview_thumb` (tests and screenshots).
+    reply_preview_thumbs: HashMap<(PeerId, MsgId), Vec<u8>>,
     typing_log: Vec<(PeerId, TypingAction)>,
     next_msg_id: i32,
     pub(crate) ext: MockSectionsData,
@@ -692,6 +737,7 @@ impl MockHistoryStore {
                 media: Some(HistoryMedia::Voice(VoiceAttachment {
                     duration_secs: 37,
                     waveform_5bit: sample_voice_waveform_5bit(7),
+                    size_bytes: 148_300,
                     is_unread: true,
                     transcription: Some(
                         "Waveform bars decode cleanly from 5-bit packed bytes at 2px width with 1px skip."
@@ -809,6 +855,8 @@ impl MockHistoryStore {
                     preview_text: "Milestone 2 History Checklist — We now wire tg-history..."
                         .to_owned(),
                     preview_thumb_rgb: None,
+                    preview_thumb: None,
+                    preview_colored_len: 0,
                     quote_text: None,
                 }),
                 forward: None,
@@ -914,6 +962,8 @@ impl MockHistoryStore {
                         preview_text: "Hey! Can you test multi-select, right-click context menu..."
                             .to_owned(),
                         preview_thumb_rgb: None,
+                        preview_thumb: None,
+                        preview_colored_len: 0,
                         quote_text: None,
                     }),
                     forward: None,
@@ -1128,9 +1178,13 @@ impl MockHistoryStore {
             histories,
             pinned,
             first_unread,
+            pending_first_loads: HashSet::new(),
             drafts: HashMap::new(),
             rich_drafts: HashMap::new(),
-            media_descriptors: HashMap::new(),
+            media_descriptors: RefCell::new(HashMap::new()),
+            voice_files: HashMap::new(),
+            download_calls: RefCell::new(Vec::new()),
+            reply_preview_thumbs: HashMap::new(),
             typing_log: Vec::new(),
             next_msg_id: 2000,
             ext: MockSectionsData::new(),
@@ -1286,6 +1340,19 @@ impl HistoryBackend for MockHistoryStore {
         (self.self_peer_id, self.self_name.clone())
     }
 
+    fn try_load_slice_around(
+        &self,
+        peer_id: PeerId,
+        around_id: MsgId,
+        limit_before: usize,
+        limit_after: usize,
+    ) -> Loadable<HistorySlice> {
+        if self.pending_first_loads.contains(&peer_id) {
+            return Loadable::Loading;
+        }
+        Loadable::Ready(self.load_slice_around(peer_id, around_id, limit_before, limit_after))
+    }
+
     fn peer_info(&self, peer_id: PeerId) -> Option<HistoryPeerInfo> {
         self.peers.get(&peer_id).cloned()
     }
@@ -1404,6 +1471,8 @@ impl HistoryBackend for MockHistoryStore {
                     author_color_id: target.from_id.bare(),
                     preview_text: target.preview_snippet(),
                     preview_thumb_rgb: None,
+                    preview_thumb: None,
+                    preview_colored_len: 0,
                     quote_text: None,
                 })
         });
@@ -1871,6 +1940,8 @@ impl HistoryBackend for MockHistoryStore {
                 author_color_id,
                 preview_text,
                 preview_thumb_rgb: None,
+                preview_thumb: None,
+                preview_colored_len: 0,
                 quote_text: request.reply_quote.as_ref().map(|q| q.text.clone()),
             }
         });
@@ -2495,7 +2566,60 @@ impl HistoryBackend for MockHistoryStore {
         peer_id: PeerId,
         msg_id: MsgId,
     ) -> Option<InlineMediaDescriptor> {
-        self.media_descriptors.get(&(peer_id, msg_id)).cloned()
+        self.media_descriptors
+            .borrow()
+            .get(&(peer_id, msg_id))
+            .cloned()
+    }
+
+    fn start_media_download(&self, peer_id: PeerId, msg_id: MsgId) {
+        use tg_app_core::core_types::dto::inline_media::PhotoLoadState;
+        self.download_calls.borrow_mut().push((msg_id, true));
+        let mut descriptors = self.media_descriptors.borrow_mut();
+        let Some(desc) = descriptors.get_mut(&(peer_id, msg_id)) else {
+            return;
+        };
+        if matches!(desc.photo_load, Some(PhotoLoadState::NotLoaded)) {
+            desc.photo_load = Some(PhotoLoadState::Loading {
+                progress: Some(0.0),
+                bytes_loaded: 0,
+                total_bytes: 0,
+            });
+        }
+        if desc.voice_load.is_some()
+            && let Some(bytes) = self.voice_files.get(&(peer_id, msg_id))
+        {
+            desc.audio_bytes = Some(bytes.clone());
+            desc.audio_ext = Some("wav".to_owned());
+            desc.voice_load = None;
+        }
+    }
+
+    fn cancel_media_download(&self, peer_id: PeerId, msg_id: MsgId) {
+        use tg_app_core::core_types::dto::inline_media::PhotoLoadState;
+        self.download_calls.borrow_mut().push((msg_id, false));
+        if let Some(desc) = self
+            .media_descriptors
+            .borrow_mut()
+            .get_mut(&(peer_id, msg_id))
+            && matches!(desc.photo_load, Some(PhotoLoadState::Loading { .. }))
+        {
+            desc.photo_load = Some(PhotoLoadState::NotLoaded);
+        }
+    }
+
+    fn reply_preview_thumb(
+        &self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+    ) -> tg_app_core::info::backend::SharedMediaThumb {
+        use tg_app_core::info::backend::SharedMediaThumb;
+        self.reply_preview_thumbs.get(&(peer_id, msg_id)).map_or(
+            SharedMediaThumb::Unavailable,
+            |bytes| SharedMediaThumb::Ready {
+                bytes: bytes.clone(),
+            },
+        )
     }
 
     fn search_results_calendar(
@@ -2652,12 +2776,45 @@ impl MockHistoryStore {
         msg_id: MsgId,
         desc: InlineMediaDescriptor,
     ) {
-        self.media_descriptors.insert((peer_id, msg_id), desc);
+        self.media_descriptors
+            .get_mut()
+            .insert((peer_id, msg_id), desc);
+    }
+
+    /// Sets the file `start_media_download` delivers for the voice message `msg_id`.
+    pub fn set_voice_file(&mut self, peer_id: PeerId, msg_id: MsgId, bytes: Vec<u8>) {
+        self.voice_files.insert((peer_id, msg_id), bytes);
+    }
+
+    /// `(msg, started)` for every download start (`true`) and cancel (`false`) so far.
+    #[must_use]
+    pub fn download_calls(&self) -> Vec<(MsgId, bool)> {
+        self.download_calls.borrow().clone()
+    }
+
+    /// Sets the thumbnail `reply_preview_thumb` serves for replies to `msg_id`.
+    pub fn set_reply_preview_thumb(&mut self, peer_id: PeerId, msg_id: MsgId, bytes: Vec<u8>) {
+        self.reply_preview_thumbs.insert((peer_id, msg_id), bytes);
     }
 
     /// Appends a custom synthetic message directly to `peer_id` (used by tests & screenshots).
     pub fn push_message(&mut self, peer_id: PeerId, msg: HistoryMessage) {
         self.histories.entry(peer_id).or_default().push(msg);
+    }
+
+    /// Sets the first unread message of `peer_id` (tests).
+    pub fn set_first_unread(&mut self, peer_id: PeerId, first_unread: Option<MsgId>) {
+        self.first_unread.insert(peer_id, first_unread);
+    }
+
+    /// Makes the first page of `peer_id` load in the background (`Loadable::Loading`) until
+    /// called again with `false` (tests).
+    pub fn set_first_load_pending(&mut self, peer_id: PeerId, pending: bool) {
+        if pending {
+            self.pending_first_loads.insert(peer_id);
+        } else {
+            self.pending_first_loads.remove(&peer_id);
+        }
     }
 }
 

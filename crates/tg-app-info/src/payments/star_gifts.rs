@@ -20,6 +20,7 @@ use crate::payments::backend::{
     CatalogGiftItem, PaymentsBackend, ReceivedGiftAction, ReceivedGiftItem, StarGiftsBundle,
 };
 use crate::payments::credits::format_stars_count;
+use crate::payments::gift_box::{GiftBoxState, show_gift_box};
 use crate::payments::marketplace_backend::{StarGiftsMarketplaceBackend, UniqueGiftDetailBundle};
 use crate::payments::star_gifts_marketplace::{
     AuctionsView, CraftForgeView, ResaleMarketplaceView,
@@ -125,6 +126,12 @@ pub struct StarGiftsView {
     pub balance: CreditsAmount,
     /// Default recipient display name.
     pub default_recipient: String,
+    /// Default recipient peer id.
+    pub recipient_peer_id: i64,
+    /// Whether the default recipient is the current user.
+    pub recipient_is_self: bool,
+    /// "Send a Gift" box state (`GiftBox`).
+    pub gift_box: GiftBoxState,
     /// Catalog gifts list.
     pub catalog: Vec<CatalogGiftItem>,
     /// Received gifts list (filtered by `peer_filter` when loaded from marketplace backend).
@@ -169,6 +176,9 @@ impl StarGiftsView {
         Self {
             balance: bundle.balance,
             default_recipient: bundle.default_recipient,
+            recipient_peer_id: bundle.recipient_peer_id,
+            recipient_is_self: bundle.recipient_is_self,
+            gift_box: GiftBoxState::default(),
             catalog: bundle.catalog,
             received: bundle.received,
             active_tab: StarGiftsTab::AllCatalog,
@@ -406,6 +416,47 @@ impl StarGiftsView {
         }
 
         toast
+    }
+
+    /// Renders tdesktop's "Send a Gift" box (`GiftBox`) filling `ui`; a clicked gift opens the
+    /// send box over it. Returns a toast and whether "Back" was pressed.
+    pub fn show_gift_box(
+        &mut self,
+        ui: &mut Ui,
+        backend: &mut dyn PaymentsBackend,
+        palette: &Palette,
+        now_unix: i64,
+    ) -> (Option<String>, bool) {
+        if self.modal.is_some() {
+            let rect = ui.max_rect();
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, palette.window_bg);
+            let mut toast = None;
+            egui::ScrollArea::vertical()
+                .id_salt("tg_gift_box_modal_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    toast = self.show_modal_if_any(ui, backend, palette);
+                });
+            return (toast, false);
+        }
+        let outcome = show_gift_box(
+            ui,
+            &mut self.gift_box,
+            &self.catalog,
+            &self.default_recipient,
+            self.recipient_peer_id.unsigned_abs(),
+            self.recipient_is_self,
+            now_unix,
+            palette,
+        );
+        if let Some(entry) = outcome.clicked
+            && !entry.resale
+            && let Some(item) = self.catalog.get(entry.catalog_index).cloned()
+        {
+            self.open_send_gift(item);
+        }
+        (None, outcome.back)
     }
 
     fn show_peer_gifts_controls(
@@ -845,7 +896,7 @@ impl StarGiftsView {
                         } => {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new(format!("Send Gift: {}", item.title))
+                                    egui::RichText::new(tg_lang::tr::lng_gift_send_title())
                                         .size(15.0)
                                         .strong()
                                         .color(palette.window_bold_fg),

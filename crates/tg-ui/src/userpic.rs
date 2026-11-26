@@ -189,6 +189,24 @@ impl EmptyUserpic {
         self.paint_initials(painter, rect);
     }
 
+    /// Paint `peer_id`'s loaded photo as a circle at `rect`, or this empty userpic while the
+    /// peer has no loaded photo (`PeerData::paintUserpic`, `data/data_peer.cpp`).
+    ///
+    /// `peer_id` is the full peer id (`PeerId.0`); `0` always paints the empty userpic.
+    pub fn paint_circle_or_photo(&self, painter: &Painter, rect: Rect, peer_id: i64) {
+        if !crate::userpic_images::paint_userpic_image(painter, rect, peer_id) {
+            self.paint_circle(painter, rect);
+        }
+    }
+
+    /// Paints `peer_id`'s loaded photo as a rounded square with corner `radius`, or this empty
+    /// userpic with the same shape while there is none (`PeerUserpicShape::Forum`).
+    pub fn paint_rounded_or_photo(&self, painter: &Painter, rect: Rect, radius: f32, peer_id: i64) {
+        if !crate::userpic_images::paint_userpic_image_rounded(painter, rect, peer_id, radius) {
+            self.paint_rounded(painter, rect, radius);
+        }
+    }
+
     /// Paint a rounded-square userpic at `rect` with corner `radius`.
     pub fn paint_rounded(&self, painter: &Painter, rect: Rect, radius: f32) {
         paint_vertical_gradient_round_rect(
@@ -264,7 +282,65 @@ impl EmptyUserpic {
     }
 }
 
-/// Paint a smooth vertical-gradient circle using a vertex-colored triangle fan mesh.
+/// Paints a filled shape with a vertical gradient and an antialiased edge.
+///
+/// `inner` and `outer` are the same outline half a pixel inside and half a pixel outside the
+/// true edge. The fill is opaque up to `inner` and fades to nothing at `outer`, so a pixel the
+/// edge crosses gets about the share of it the shape covers. This is what QPainter's
+/// antialiasing gives tdesktop (`EmptyUserpic::paintCircle` with `PainterHighQualityEnabler`).
+fn paint_feathered_gradient(
+    painter: &Painter,
+    inner: &[Pos2],
+    outer: &[Pos2],
+    top: f32,
+    bottom: f32,
+    top_color: Color32,
+    bottom_color: Color32,
+) {
+    let n = inner.len().min(outer.len());
+    if n < 3 {
+        return;
+    }
+    let height = (bottom - top).max(f32::EPSILON);
+    let color_at = |y: f32| {
+        let t = ((y - top) / height).clamp(0.0, 1.0);
+        color_lerp(top_color, bottom_color, f64::from(t))
+    };
+    let mut mesh = Mesh::default();
+    mesh.vertices.reserve(1 + 2 * n);
+    mesh.indices.reserve(9 * n);
+    // The fan's hub: the middle of the shape, in the gradient's middle colour.
+    let mid_x = inner.iter().map(|p| p.x).sum::<f32>() / inner.len() as f32;
+    mesh.vertices.push(Vertex {
+        pos: Pos2::new(mid_x, (top + bottom) * 0.5),
+        uv: WHITE_UV,
+        color: color_lerp(top_color, bottom_color, 0.5),
+    });
+    for i in 0..n {
+        mesh.vertices.push(Vertex {
+            pos: inner[i],
+            uv: WHITE_UV,
+            color: color_at(inner[i].y),
+        });
+        mesh.vertices.push(Vertex {
+            pos: outer[i],
+            uv: WHITE_UV,
+            color: Color32::TRANSPARENT,
+        });
+    }
+    let n = n as u32;
+    for i in 0..n {
+        let next = (i + 1) % n;
+        let (in0, out0, in1, out1) = (1 + 2 * i, 2 + 2 * i, 1 + 2 * next, 2 + 2 * next);
+        mesh.indices.extend_from_slice(&[0, in0, in1]);
+        mesh.indices.extend_from_slice(&[in0, out0, out1]);
+        mesh.indices.extend_from_slice(&[in0, out1, in1]);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Paint a vertical-gradient circle with an antialiased edge at the painter's real
+/// pixels-per-point.
 pub fn paint_vertical_gradient_circle(
     painter: &Painter,
     rect: Rect,
@@ -276,38 +352,30 @@ pub fn paint_vertical_gradient_circle(
         return;
     }
     let center = rect.center();
-    const SEGMENTS: usize = 48;
-
-    let mut mesh = Mesh::default();
-    let mid_color = color_lerp(top_color, bottom_color, 0.5);
-    mesh.vertices.push(Vertex {
-        pos: center,
-        uv: WHITE_UV,
-        color: mid_color,
-    });
-
-    for i in 0..=SEGMENTS {
-        let angle = (i as f32 / SEGMENTS as f32) * TAU;
-        let x = center.x + radius * angle.cos();
-        let y = center.y + radius * angle.sin();
-        let t = ((y - (center.y - radius)) / (2.0 * radius)).clamp(0.0, 1.0);
-        let color = color_lerp(top_color, bottom_color, f64::from(t));
-        mesh.vertices.push(Vertex {
-            pos: Pos2::new(x, y),
-            uv: WHITE_UV,
-            color,
-        });
-    }
-
-    for i in 1..=SEGMENTS as u32 {
-        mesh.indices.push(0);
-        mesh.indices.push(i);
-        mesh.indices.push(i + 1);
-    }
-    painter.add(Shape::mesh(mesh));
+    let pixels_per_point = painter.pixels_per_point();
+    let half_pixel = 0.5 / pixels_per_point;
+    // One segment per two pixels of the edge keeps the polygon within 0.02 px of the circle.
+    let segments = ((TAU * radius * pixels_per_point / 2.0).ceil() as usize).clamp(32, 512);
+    let ring = |r: f32| -> Vec<Pos2> {
+        (0..segments)
+            .map(|i| {
+                let angle = (i as f32 / segments as f32) * TAU;
+                Pos2::new(center.x + r * angle.cos(), center.y + r * angle.sin())
+            })
+            .collect()
+    };
+    paint_feathered_gradient(
+        painter,
+        &ring((radius - half_pixel).max(0.0)),
+        &ring(radius + half_pixel),
+        center.y - radius,
+        center.y + radius,
+        top_color,
+        bottom_color,
+    );
 }
 
-/// Paint a vertical-gradient rounded rectangle using a vertex-colored mesh.
+/// Paint a vertical-gradient rounded rectangle with an antialiased edge.
 pub fn paint_vertical_gradient_round_rect(
     painter: &Painter,
     rect: Rect,
@@ -316,65 +384,58 @@ pub fn paint_vertical_gradient_round_rect(
     bottom_color: Color32,
 ) {
     let r = radius.clamp(0.0, rect.width().min(rect.height()) * 0.5);
-    let mut perimeter = Vec::new();
-    let corners = [
-        (
-            Pos2::new(rect.max.x - r, rect.min.y + r),
-            -std::f32::consts::FRAC_PI_2,
-            0.0,
-        ),
-        (
-            Pos2::new(rect.max.x - r, rect.max.y - r),
-            0.0,
-            std::f32::consts::FRAC_PI_2,
-        ),
-        (
-            Pos2::new(rect.min.x + r, rect.max.y - r),
-            std::f32::consts::FRAC_PI_2,
-            std::f32::consts::PI,
-        ),
-        (
-            Pos2::new(rect.min.x + r, rect.min.y + r),
-            std::f32::consts::PI,
-            1.5 * std::f32::consts::PI,
-        ),
-    ];
-    const STEPS: usize = 8;
-    for (c, a0, a1) in corners {
-        if r <= 0.1 {
-            perimeter.push(c);
-        } else {
-            for s in 0..=STEPS {
-                let a = a0 + (a1 - a0) * (s as f32 / STEPS as f32);
-                perimeter.push(Pos2::new(c.x + r * a.cos(), c.y + r * a.sin()));
+    let half_pixel = 0.5 / painter.pixels_per_point();
+    let steps = ((std::f32::consts::FRAC_PI_2 * r * painter.pixels_per_point() / 2.0).ceil()
+        as usize)
+        .clamp(4, 64);
+    // The outline of `rect` moved outwards by `grow` (inwards when negative), corner by corner.
+    let outline = |grow: f32| -> Vec<Pos2> {
+        let corner_r = (r + grow).max(0.0);
+        let corners = [
+            (
+                Pos2::new(rect.max.x - r, rect.min.y + r),
+                -std::f32::consts::FRAC_PI_2,
+            ),
+            (Pos2::new(rect.max.x - r, rect.max.y - r), 0.0),
+            (
+                Pos2::new(rect.min.x + r, rect.max.y - r),
+                std::f32::consts::FRAC_PI_2,
+            ),
+            (
+                Pos2::new(rect.min.x + r, rect.min.y + r),
+                std::f32::consts::PI,
+            ),
+        ];
+        let mut points = Vec::with_capacity(4 * (steps + 1));
+        for (c, start) in corners {
+            if r <= 0.1 {
+                // A square corner moves along its diagonal.
+                let (sin, cos) = (start + std::f32::consts::FRAC_PI_4).sin_cos();
+                points.push(Pos2::new(
+                    c.x + grow * cos.signum(),
+                    c.y + grow * sin.signum(),
+                ));
+                continue;
+            }
+            for s in 0..=steps {
+                let a = start + std::f32::consts::FRAC_PI_2 * (s as f32 / steps as f32);
+                points.push(Pos2::new(
+                    c.x + corner_r * a.cos(),
+                    c.y + corner_r * a.sin(),
+                ));
             }
         }
-    }
-
-    let h = rect.height().max(1.0);
-    let mut mesh = Mesh::default();
-    let center = rect.center();
-    mesh.vertices.push(Vertex {
-        pos: center,
-        uv: WHITE_UV,
-        color: color_lerp(top_color, bottom_color, 0.5),
-    });
-    for p in &perimeter {
-        let t = ((p.y - rect.min.y) / h).clamp(0.0, 1.0);
-        mesh.vertices.push(Vertex {
-            pos: *p,
-            uv: WHITE_UV,
-            color: color_lerp(top_color, bottom_color, f64::from(t)),
-        });
-    }
-    let n = perimeter.len() as u32;
-    for i in 0..n {
-        let next = (i + 1) % n;
-        mesh.indices.push(0);
-        mesh.indices.push(1 + i);
-        mesh.indices.push(1 + next);
-    }
-    painter.add(Shape::mesh(mesh));
+        points
+    };
+    paint_feathered_gradient(
+        painter,
+        &outline(-half_pixel),
+        &outline(half_pixel),
+        rect.min.y,
+        rect.max.y,
+        top_color,
+        bottom_color,
+    );
 }
 
 /// Allocate and draw an `EmptyUserpic` widget in an egui `Ui`.

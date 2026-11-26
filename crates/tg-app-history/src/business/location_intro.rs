@@ -189,7 +189,13 @@ impl LocationView {
                 {
                     match backend.save_location(self.location.clone()) {
                         Ok(()) => toast = Some("Business location saved.".to_owned()),
-                        Err(e) => toast = Some(e),
+                        Err(e) => {
+                            toast = tg_app_core::user_error::business_silent(
+                                "account.updateBusinessLocation",
+                                &e,
+                            )
+                            .into_text()
+                        }
                     }
                 }
                 if self.location.is_set() {
@@ -206,7 +212,13 @@ impl LocationView {
                         self.location = BusinessLocation::default();
                         match backend.save_location(BusinessLocation::default()) {
                             Ok(()) => toast = Some("Business location cleared.".to_owned()),
-                            Err(e) => toast = Some(e),
+                            Err(e) => {
+                                toast = tg_app_core::user_error::business_silent(
+                                    "account.updateBusinessLocation",
+                                    &e,
+                                )
+                                .into_text()
+                            }
                         }
                     }
                 }
@@ -586,7 +598,13 @@ impl ChatIntroView {
                 {
                     match backend.save_chat_intro(self.intro.clone()) {
                         Ok(()) => toast = Some("Start page saved.".to_owned()),
-                        Err(e) => toast = Some(e),
+                        Err(e) => {
+                            toast = tg_app_core::user_error::business_silent(
+                                "account.updateBusinessIntro",
+                                &e,
+                            )
+                            .into_text()
+                        }
                     }
                 }
                 if self.intro.is_set() {
@@ -603,7 +621,13 @@ impl ChatIntroView {
                         self.intro = ChatIntro::default();
                         match backend.save_chat_intro(ChatIntro::default()) {
                             Ok(()) => toast = Some("Start page reset to default.".to_owned()),
-                            Err(e) => toast = Some(e),
+                            Err(e) => {
+                                toast = tg_app_core::user_error::business_silent(
+                                    "account.updateBusinessIntro",
+                                    &e,
+                                )
+                                .into_text()
+                            }
                         }
                     }
                 }

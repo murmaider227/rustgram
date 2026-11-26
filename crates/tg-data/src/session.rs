@@ -3,7 +3,10 @@
 //! Provides the `Session` registry owning peers, histories, messages, dialog lists,
 //! archive folder, chat filters, and `tokio::sync::broadcast` change notifications.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use tokio::sync::broadcast;
 
@@ -23,7 +26,8 @@ use crate::id::{
 };
 use crate::lastseen::{LastseenStatus, UserStatusInput};
 use crate::message::{
-    Message, MessageContent, MessageFlags, MessageReactionsSummary, PhotoData, ServiceAction,
+    Message, MessageContent, MessageFlags, MessageMedia, MessageReactionsSummary, PhotoData,
+    ServiceAction,
 };
 use crate::peer::{Channel, ChannelFlags, Chat, ChatFlags, Peer, User};
 use crate::rights::{ChatBannedRights, SendCheckContext};
@@ -31,11 +35,28 @@ use crate::saved::{SavedMessagesState, SavedReactionTagsState};
 use crate::scheduled::{ScheduledMessagesStore, ShortcutMessagesStore};
 use crate::text::EntityKind;
 
+/// Messages kept in memory across all chats before the least recently loaded chats that are
+/// not open are unloaded down to their newest messages ([`Session::set_message_budget`]).
+pub const DEFAULT_MESSAGE_BUDGET: usize = 30_000;
+
+/// Newest loaded messages an unloaded chat keeps (with all its unread ones): more than a first
+/// screen asks for, so reopening it shows the same bottom of the chat at once and only older
+/// messages reload from the server on scroll, as on a first open.
+pub const UNLOAD_KEEP_TAIL: usize = 200;
+
 /// Default pinned dialogs limit for the main chats list.
 pub const DEFAULT_MAIN_PINNED_LIMIT: usize = 5;
 
 /// Default pinned dialogs limit for the archive folder and custom filters.
 pub const DEFAULT_FOLDER_PINNED_LIMIT: usize = 100;
+
+mod indices;
+mod notify_defaults;
+#[cfg(test)]
+mod tests_perf;
+mod unload;
+
+pub use notify_defaults::DefaultNotifyScope;
 
 /// Central TL-independent domain data registry for a Telegram account (`Data::Session`).
 #[derive(Debug)]
@@ -44,30 +65,79 @@ pub struct Session {
     send_context: SendCheckContext,
     badge_settings: BadgeSettings,
     dialogs_unread_on_top: bool,
-    peers: HashMap<PeerId, Peer>,
-    photos: HashMap<PhotoId, PhotoData>,
-    access_hashes: HashMap<PeerId, i64>,
+    peers: FxHashMap<PeerId, Peer>,
+    photos: FxHashMap<PhotoId, PhotoData>,
+    access_hashes: FxHashMap<PeerId, i64>,
     /// Tracks server messages that reference an unloaded or `min`-only peer so
     /// `inputPeerUserFromMessage` / `inputPeerChannelFromMessage` can be constructed
     /// (`_messagesWithPeer` in `data/data_session.h` / `data/data_session.cpp:6145-6282`).
-    messages_with_peer: HashMap<PeerId, Vec<FullMsgId>>,
+    messages_with_peer: FxHashMap<PeerId, Vec<FullMsgId>>,
     contacts_loaded: bool,
-    histories: HashMap<PeerId, History>,
-    messages: HashMap<FullMsgId, Message>,
-    non_channel_messages: HashMap<MsgId, PeerId>,
-    random_id_map: HashMap<i64, FullMsgId>,
-    typing_actions: HashMap<(PeerId, PeerId, Option<MsgId>), TypingAction>,
+    histories: FxHashMap<PeerId, History>,
+    messages: FxHashMap<FullMsgId, Message>,
+    non_channel_messages: FxHashMap<MsgId, PeerId>,
+    /// Histories that got a new message while their folder (main list or archive) is unknown;
+    /// their dialog entries must be requested with `messages.getPeerDialogs`
+    /// (`Histories::requestDialogEntry` from `History::addNewItem`, `history/history.cpp:1731`).
+    dialog_entry_requests: BTreeSet<PeerId>,
+    random_id_map: FxHashMap<i64, FullMsgId>,
+    typing_actions: FxHashMap<(PeerId, PeerId, Option<MsgId>), TypingAction>,
     main_list: MainList,
     archive: Folder,
     filters: ChatFilters,
-    forums: HashMap<PeerId, ForumState>,
+    forums: FxHashMap<PeerId, ForumState>,
     saved_messages: SavedMessagesState,
-    monoforums: HashMap<ChannelId, SavedMessagesState>,
+    monoforums: FxHashMap<ChannelId, SavedMessagesState>,
     saved_reaction_tags: SavedReactionTagsState,
     scheduled_messages: ScheduledMessagesStore,
     shortcut_messages: ShortcutMessagesStore,
     sort_shift: u32,
     changes: Changes,
+    /// Message ids present in `messages`, per peer, so per-chat queries never scan every
+    /// loaded message.
+    peer_message_ids: FxHashMap<PeerId, BTreeSet<MsgId>>,
+    /// Photo / document id -> messages showing it ([`Session::messages_with_media`]).
+    media_messages: FxHashMap<u64, Vec<FullMsgId>>,
+    /// Reverse of `media_messages`.
+    message_media: FxHashMap<FullMsgId, u64>,
+    /// Messages handed out by [`Session::message_mut`] since they were last indexed: their
+    /// media may have changed, so lookups check them and the next insert or delete reindexes.
+    media_dirty: FxHashSet<FullMsgId>,
+    /// Bumped by every accessor that can change a peer (usernames, loaded state).
+    peers_generation: u64,
+    /// Lowercased username -> peer, rebuilt on lookup when `peers_generation` moved.
+    username_index: Mutex<UsernameIndex>,
+    message_budget: Option<usize>,
+    /// Message count above which the next insert tries to unload chats.
+    next_unload_check: usize,
+    /// Last time each history got a loaded slice or was marked open (`touch_tick` order).
+    history_touch: FxHashMap<PeerId, u64>,
+    touch_tick: u64,
+    /// Histories the UI shows now; never unloaded.
+    open_histories: FxHashSet<PeerId>,
+    /// Per-type default notification settings ([`Session::notify_default`]).
+    notify_defaults: notify_defaults::NotifyDefaults,
+    /// Peers whose own notification settings were received ([`Session::peer_notify_known`]).
+    notify_known: FxHashSet<PeerId>,
+    /// Unloading runs only once the UI reports which chats are open
+    /// ([`Session::set_history_open`]) or a budget is set explicitly: a chat reopened from
+    /// memory loads no slice, so without that report it could look old while on screen.
+    unload_armed: bool,
+}
+
+#[derive(Debug, Default)]
+struct UsernameIndex {
+    generation: Option<u64>,
+    by_name: FxHashMap<String, PeerId>,
+}
+
+/// Photo or document id a message shows, the key of [`Session::messages_with_media`].
+fn message_media_key(message: &Message) -> Option<u64> {
+    match message.media()? {
+        MessageMedia::Photo(photo) => Some(photo.id.0),
+        MessageMedia::Document(document) => Some(document.id.0),
+        _ => None,
+    }
 }
 
 impl Session {
@@ -83,27 +153,42 @@ impl Session {
             send_context: SendCheckContext::default(),
             badge_settings: BadgeSettings::default(),
             dialogs_unread_on_top: false,
-            peers: HashMap::new(),
-            photos: HashMap::new(),
-            access_hashes: HashMap::new(),
-            messages_with_peer: HashMap::new(),
+            peers: FxHashMap::default(),
+            photos: FxHashMap::default(),
+            access_hashes: FxHashMap::default(),
+            messages_with_peer: FxHashMap::default(),
             contacts_loaded: false,
-            histories: HashMap::new(),
-            messages: HashMap::new(),
-            non_channel_messages: HashMap::new(),
-            random_id_map: HashMap::new(),
-            typing_actions: HashMap::new(),
+            histories: FxHashMap::default(),
+            messages: FxHashMap::default(),
+            non_channel_messages: FxHashMap::default(),
+            dialog_entry_requests: BTreeSet::new(),
+            random_id_map: FxHashMap::default(),
+            typing_actions: FxHashMap::default(),
             main_list: MainList::new(0, DEFAULT_MAIN_PINNED_LIMIT),
             archive: Folder::new(ARCHIVE_FOLDER_ID, DEFAULT_FOLDER_PINNED_LIMIT),
             filters: ChatFilters::new(DEFAULT_FOLDER_PINNED_LIMIT),
-            forums: HashMap::new(),
+            forums: FxHashMap::default(),
             saved_messages: SavedMessagesState::new(None),
-            monoforums: HashMap::new(),
+            monoforums: FxHashMap::default(),
             saved_reaction_tags: SavedReactionTagsState::default(),
             scheduled_messages: ScheduledMessagesStore::default(),
             shortcut_messages: ShortcutMessagesStore::default(),
             sort_shift: 0,
             changes: Changes::new(broadcast_capacity),
+            peer_message_ids: FxHashMap::default(),
+            media_messages: FxHashMap::default(),
+            message_media: FxHashMap::default(),
+            media_dirty: FxHashSet::default(),
+            peers_generation: 0,
+            username_index: Mutex::new(UsernameIndex::default()),
+            message_budget: Some(DEFAULT_MESSAGE_BUDGET),
+            next_unload_check: DEFAULT_MESSAGE_BUDGET,
+            history_touch: FxHashMap::default(),
+            touch_tick: 0,
+            open_histories: FxHashSet::default(),
+            notify_defaults: [None, None, None],
+            notify_known: FxHashSet::default(),
+            unload_armed: false,
         }
     }
 
@@ -177,6 +262,7 @@ impl Session {
 
     /// Inserts or updates a `Peer`, broadcasting `PeerUpdated` (and `NameUpdated` on rename).
     pub fn upsert_peer(&mut self, peer: Peer, update_flags: PeerUpdateFlags) {
+        self.peers_changed();
         let peer_id = peer.id();
         let hash = match &peer {
             Peer::User(u) if u.access_hash != 0 => Some(u.access_hash as i64),
@@ -241,6 +327,7 @@ impl Session {
     /// Returns a mutable reference to a loaded `User` by `UserId`.
     #[inline]
     pub fn user_mut(&mut self, id: UserId) -> Option<&mut User> {
+        self.peers_changed();
         self.peers
             .get_mut(&PeerId::from_user(id))
             .and_then(Peer::as_user_mut)
@@ -249,6 +336,7 @@ impl Session {
     /// Returns a mutable reference to a loaded `Chat` by `ChatId`.
     #[inline]
     pub fn chat_mut(&mut self, id: ChatId) -> Option<&mut Chat> {
+        self.peers_changed();
         self.peers
             .get_mut(&PeerId::from_chat(id))
             .and_then(Peer::as_chat_mut)
@@ -257,6 +345,7 @@ impl Session {
     /// Returns a mutable reference to a loaded `Channel` by `ChannelId`.
     #[inline]
     pub fn channel_mut(&mut self, id: ChannelId) -> Option<&mut Channel> {
+        self.peers_changed();
         self.peers
             .get_mut(&PeerId::from_channel(id))
             .and_then(Peer::as_channel_mut)
@@ -264,6 +353,7 @@ impl Session {
 
     /// Ensures a `User` entry exists for `id` and returns a mutable reference to it.
     pub fn ensure_user(&mut self, id: UserId) -> &mut User {
+        self.peers_changed();
         let is_self = id == self.self_user_id;
         let peer_id = PeerId::from_user(id);
         let entry = self
@@ -278,6 +368,7 @@ impl Session {
 
     /// Ensures a `Chat` entry exists for `id` and returns a mutable reference to it.
     pub fn ensure_chat(&mut self, id: ChatId) -> &mut Chat {
+        self.peers_changed();
         let peer_id = PeerId::from_chat(id);
         let entry = self
             .peers
@@ -291,6 +382,7 @@ impl Session {
 
     /// Ensures a `Channel` entry exists for `id` and returns a mutable reference to it.
     pub fn ensure_channel(&mut self, id: ChannelId) -> &mut Channel {
+        self.peers_changed();
         let peer_id = PeerId::from_channel(id);
         let entry = self
             .peers
@@ -314,7 +406,7 @@ impl Session {
         }
         let peer_id = PeerId::from_user(user_id);
         let changed = {
-            let Some(user) = self.user_mut(user_id) else {
+            let Some(user) = self.peers.get_mut(&peer_id).and_then(Peer::as_user_mut) else {
                 return false;
             };
             let next = LastseenStatus::from_api(status, user.lastseen);
@@ -389,19 +481,32 @@ impl Session {
         if needle.is_empty() {
             return None;
         }
-        for (&peer_id, peer) in &self.peers {
-            if !peer.is_loaded() {
-                continue;
+        let mut index = self
+            .username_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if index.generation != Some(self.peers_generation) {
+            index.by_name.clear();
+            for (&peer_id, peer) in &self.peers {
+                if !peer.is_loaded() {
+                    continue;
+                }
+                for username in peer.usernames() {
+                    index
+                        .by_name
+                        .entry(username.to_ascii_lowercase())
+                        .or_insert(peer_id);
+                }
             }
-            if peer
-                .usernames()
-                .iter()
-                .any(|u| u.eq_ignore_ascii_case(needle))
-            {
-                return Some(peer_id);
-            }
+            index.generation = Some(self.peers_generation);
         }
-        None
+        index.by_name.get(&needle.to_ascii_lowercase()).copied()
+    }
+
+    /// Marks the peers as possibly changed for [`Self::peer_by_username`].
+    #[inline]
+    fn peers_changed(&mut self) {
+        self.peers_generation = self.peers_generation.wrapping_add(1);
     }
 
     /// Records that `full_id` references `peer_id` when `peer_id` is not yet fully loaded
@@ -559,6 +664,7 @@ impl Session {
     /// Returns a mutable reference to a loaded peer by `PeerId`.
     #[inline]
     pub fn peer_mut(&mut self, id: PeerId) -> Option<&mut Peer> {
+        self.peers_changed();
         self.peers.get_mut(&id)
     }
 
@@ -624,6 +730,7 @@ impl Session {
     /// `ChannelFlags::MEGAGROUP` and `MegagroupInfo::migrated_from`, and emits
     /// `PeerUpdateFlags::MIGRATION`.
     pub fn apply_migration(&mut self, chat_id: ChatId, channel_id: ChannelId) {
+        self.peers_changed();
         let chat_peer_id = PeerId::from_chat(chat_id);
         let channel_peer_id = PeerId::from_channel(channel_id);
 
@@ -708,7 +815,47 @@ impl Session {
 
     /// Inserts a message into the session, updates its owning `History`'s loaded
     /// ranges and top message, refreshes dialog lists, and broadcasts notifications.
+    ///
+    /// Used for messages that come with history slices, dialogs pages and other loads
+    /// (`NewMessageType::Existing` / `Last`): they never raise desktop notifications.
     pub fn insert_message(&mut self, message: Message) {
+        self.insert_message_typed(message, false);
+    }
+
+    /// Inserts a message that arrived as a live update (`updateNewMessage`,
+    /// `updateShortMessage`, a `getDifference` during the session): like
+    /// [`Self::insert_message`], but a newly added message is also flagged
+    /// [`MessageUpdateFlags::NEW_UNREAD`] (`NewMessageType::Unread`) so the notifications
+    /// layer may show it (`data/data_session.cpp:3629-3661`, `history/history.cpp:674`).
+    pub fn insert_new_unread_message(&mut self, message: Message) {
+        self.insert_message_typed(message, true);
+    }
+
+    /// Stores a message loaded as part of a page that is not the chat's own bottom:
+    /// topic and comment pages, search results, unread-mention pages, refreshed references
+    /// (`NewMessageType::Existing`, `History::addNewMessage` returns right after `createItem`,
+    /// `history/history.cpp:669-700`).
+    ///
+    /// A message seen for the first time is only stored: no "new message" event, no unread,
+    /// mention or reaction counter change, no loaded-range, top-message or chat-list change.
+    /// A message the session already had is replaced and announced as edited, like
+    /// [`Self::insert_message`] does, so open views repaint it.
+    pub fn insert_existing_message(&mut self, message: Message) {
+        let full_id = message.full_id();
+        if self.messages.contains_key(&full_id) {
+            self.insert_message_typed(message, false);
+            return;
+        }
+        if !full_id.peer.is_channel() && full_id.msg.is_server() {
+            self.non_channel_messages.insert(full_id.msg, full_id.peer);
+        }
+        self.record_message_peers(&message);
+        self.store_message(message);
+        self.ensure_history(full_id.peer);
+        self.maybe_unload(full_id.peer);
+    }
+
+    fn insert_message_typed(&mut self, message: Message, unread_type: bool) {
         let full_id = message.full_id();
         let peer_id = message.peer_id;
         let msg_id = message.id;
@@ -721,7 +868,7 @@ impl Session {
 
         let is_new = !self.messages.contains_key(&full_id);
         self.record_message_peers(&message);
-        self.messages.insert(full_id, message);
+        self.store_message(message);
         if !peer_id.is_channel() && msg_id.is_server() {
             self.non_channel_messages.insert(msg_id, peer_id);
         }
@@ -767,20 +914,31 @@ impl Session {
 
         self.changes.message_updated(
             full_id,
-            if is_new {
+            if is_new && unread_type {
+                MessageUpdateFlags::NEW_ADDED
+                    | MessageUpdateFlags::NEW_UNREAD
+                    | MessageUpdateFlags::DIALOG_ROW_REFRESH
+            } else if is_new {
                 MessageUpdateFlags::NEW_ADDED | MessageUpdateFlags::DIALOG_ROW_REFRESH
             } else {
                 MessageUpdateFlags::EDITED | MessageUpdateFlags::DIALOG_ROW_REPAINT
             },
         );
         self.sync_dialog_lists(peer_id);
+        self.maybe_unload(peer_id);
     }
 
     /// Merges a server-confirmed `updateNewMessage` into an already-promoted local pending
     /// message if one exists at `message.full_id()`, otherwise inserts it normally
     /// (`data/data_session.cpp:3072-3087`, `Session::updateExistingMessage`;
     /// `history/history_item.cpp:2849-2944`, `HistoryItem::applySentMessage`).
-    pub fn apply_sent_or_new_message(&mut self, mut message: Message) {
+    pub fn apply_sent_or_new_message(&mut self, message: Message) {
+        self.apply_sent_or_new_message_typed(message, true);
+    }
+
+    /// Like [`Self::apply_sent_or_new_message`]; `unread_type == false` adds a new message
+    /// like history (`NewMessageType::Existing`), so it never raises a notification.
+    pub fn apply_sent_or_new_message_typed(&mut self, mut message: Message, unread_type: bool) {
         let full_id = message.full_id();
         if let Some(existing) = self.messages.get(&full_id)
             && existing
@@ -793,7 +951,56 @@ impl Session {
             self.insert_message(message);
             return;
         }
-        self.insert_message(message);
+        let peer_id = message.peer_id;
+        self.insert_message_typed(message, unread_type);
+        self.request_dialog_entry_if_folder_unknown(peer_id);
+    }
+
+    /// Queues `peer_id`'s dialog entry for `messages.getPeerDialogs` when a new message arrived
+    /// but the history's folder is not known yet (`History::addNewItem` ->
+    /// `Histories::requestDialogEntry`, `history/history.cpp:1731-1733`). Until the entry
+    /// arrives the history stays out of every chat list (`History::shouldBeInChatList`).
+    pub fn request_dialog_entry_if_folder_unknown(&mut self, peer_id: PeerId) {
+        let unknown = self
+            .histories
+            .get(&peer_id)
+            .is_some_and(|h| !h.folder_known());
+        let community = self
+            .peers
+            .get(&peer_id)
+            .and_then(Peer::as_channel)
+            .is_some_and(Channel::is_community);
+        if unknown && !community {
+            self.dialog_entry_requests.insert(peer_id);
+        }
+    }
+
+    /// Histories that belong in a chat list but stay out of every list until their folder is
+    /// known ([`Self::request_dialog_entry_if_folder_unknown`]), sorted by peer.
+    #[must_use]
+    pub fn histories_awaiting_folder(&self) -> Vec<PeerId> {
+        let mut out: Vec<PeerId> = self
+            .histories
+            .values()
+            .filter(|h| h.in_chat_list && !h.folder_known())
+            .map(|h| h.peer_id)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// `true` when [`Self::take_dialog_entry_requests`] has peers to return.
+    #[must_use]
+    pub fn has_dialog_entry_requests(&self) -> bool {
+        !self.dialog_entry_requests.is_empty()
+    }
+
+    /// Takes the queued dialog entry requests whose folder is still unknown.
+    pub fn take_dialog_entry_requests(&mut self) -> Vec<PeerId> {
+        std::mem::take(&mut self.dialog_entry_requests)
+            .into_iter()
+            .filter(|pid| self.histories.get(pid).is_some_and(|h| !h.folder_known()))
+            .collect()
     }
 
     /// Registers a `random_id -> FullMsgId` mapping for an outgoing local message.
@@ -822,7 +1029,7 @@ impl Session {
         let local_id = self.random_id_map.remove(&random_id)?;
         let peer_id = local_id.peer;
         let new_full_id = FullMsgId::new(peer_id, server_id);
-        if let Some(mut msg) = self.messages.remove(&local_id) {
+        if let Some(mut msg) = self.take_message(local_id) {
             if self.messages.contains_key(&new_full_id) {
                 // Server message already arrived (`updateNewMessage` before `updateMessageID`):
                 // preserve the authoritative server message and drop the local placeholder.
@@ -845,7 +1052,7 @@ impl Session {
             msg.flags
                 .remove(MessageFlags::BEING_SENT | MessageFlags::SENDING_FAILED);
             let date = msg.date;
-            self.messages.insert(new_full_id, msg);
+            self.store_message(msg);
             if !peer_id.is_channel() && server_id.is_server() {
                 self.non_channel_messages.insert(server_id, peer_id);
             }
@@ -882,7 +1089,6 @@ impl Session {
         let mut ids = Vec::with_capacity(messages.len());
         let mut newest: Option<(MsgId, crate::id::TimeId)> = None;
         for msg in messages {
-            let full_id = msg.full_id();
             let msg_id = msg.id;
             let date = msg.date;
             if msg.is_regular() {
@@ -895,7 +1101,7 @@ impl Session {
                 self.non_channel_messages.insert(msg_id, peer_id);
             }
             self.record_message_peers(&msg);
-            self.messages.insert(full_id, msg);
+            self.store_message(msg);
         }
         let history = self.ensure_history(peer_id);
         history.loaded_ranges.add_slice(ids, no_skip_range, count);
@@ -907,6 +1113,8 @@ impl Session {
                 history.chat_list_time_id = date;
             }
         }
+        self.touch_history(peer_id);
+        self.maybe_unload(peer_id);
     }
 
     /// Marks the bottom of `peer_id`'s history as needing reload (e.g. on
@@ -1082,13 +1290,15 @@ impl Session {
             ch.available_min_id = available_min_id;
         }
         let to_remove: Vec<MsgId> = self
-            .messages
-            .keys()
-            .filter_map(|fid| {
-                (fid.peer == peer_id && fid.msg.is_server() && fid.msg < available_min_id)
-                    .then_some(fid.msg)
+            .peer_message_ids
+            .get(&peer_id)
+            .map(|ids| {
+                ids.range(..available_min_id)
+                    .copied()
+                    .filter(|id| id.is_server())
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         if let Some(history) = self.histories.get_mut(&peer_id) {
             history.available_min_id = available_min_id;
         }
@@ -1106,7 +1316,9 @@ impl Session {
     /// Returns a mutable reference to a message by `FullMsgId`.
     #[inline]
     pub fn message_mut(&mut self, id: FullMsgId) -> Option<&mut Message> {
-        self.messages.get_mut(&id)
+        let message = self.messages.get_mut(&id)?;
+        self.media_dirty.insert(id);
+        Some(message)
     }
 
     /// Looks up a non-channel message by its globally unique `MsgId`
@@ -1131,7 +1343,7 @@ impl Session {
         let peer_id = updated.peer_id;
         let msg_id = updated.id;
 
-        self.messages.insert(full_id, updated);
+        self.store_message(updated);
 
         let mut badges_changed = false;
         if let Some(history) = self.histories.get_mut(&peer_id) {
@@ -1348,7 +1560,7 @@ impl Session {
         let mut top_changed = false;
         for &msg_id in ids {
             let full_id = FullMsgId::new(peer_id, msg_id);
-            let removed = self.messages.remove(&full_id);
+            let removed = self.take_message(full_id);
             if removed.is_some() {
                 deleted += 1;
                 if !peer_id.is_channel() {
@@ -1411,11 +1623,9 @@ impl Session {
                 .get(&peer_id)
                 .and_then(|h| h.loaded_ranges.max_id());
             let remaining_max = self
-                .messages
-                .keys()
-                .filter(|fid| fid.peer == peer_id)
-                .map(|fid| fid.msg)
-                .max();
+                .peer_message_ids
+                .get(&peer_id)
+                .and_then(|ids| ids.last().copied());
             let new_top = match (range_max, remaining_max) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (Some(a), None) => Some(a),
@@ -1439,7 +1649,7 @@ impl Session {
     /// Deletes non-channel messages by their globally unique `MsgId`s
     /// (`Data::Session::processNonChannelMessagesDeleted`).
     pub fn delete_non_channel_messages(&mut self, ids: &[MsgId]) -> usize {
-        let mut by_peer: HashMap<PeerId, Vec<MsgId>> = HashMap::new();
+        let mut by_peer: FxHashMap<PeerId, Vec<MsgId>> = FxHashMap::default();
         for &msg_id in ids {
             if let Some(&peer_id) = self.non_channel_messages.get(&msg_id) {
                 by_peer.entry(peer_id).or_default().push(msg_id);
@@ -1896,7 +2106,10 @@ impl Session {
         let Some(history) = self.histories.get(&peer_id) else {
             return;
         };
-        if !history.in_chat_list {
+        // `History::shouldBeInChatList` (`history/history.cpp:3464-3466`): a history whose
+        // folder is not known yet could belong to the archive, so it stays out of every list
+        // until its dialog entry arrives.
+        if !history.in_chat_list || !history.folder_known() {
             let key = DialogKey::History(peer_id);
             self.main_list.remove_entry(key);
             self.archive.chats_list.remove_entry(key);

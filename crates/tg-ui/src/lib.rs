@@ -17,6 +17,7 @@ pub use tg_theme;
 pub mod anim;
 pub mod custom_emoji;
 pub mod effects;
+pub mod entity_link;
 pub mod fonts;
 pub mod icons;
 pub mod layers;
@@ -29,6 +30,7 @@ pub mod theme;
 pub mod toast;
 pub mod unread_badge;
 pub mod userpic;
+pub mod userpic_images;
 pub mod widgets;
 
 /// Apply Telegram Desktop visuals and bundled Open Sans / Hack fonts to an `egui::Context`.
@@ -542,7 +544,10 @@ mod tests {
             assert_eq!(laid.links[1].kind, EntityType::Mention);
             assert_eq!(laid.links[1].target, mention_str);
             assert_eq!(laid.links[2].kind, EntityType::Hashtag);
-            assert_eq!(laid.links[2].target, tag_str);
+            assert_eq!(
+                laid.links[2].target,
+                crate::entity_link::EntityLink::Hashtag(tag_str.to_owned()).target()
+            );
 
             // Hit-test each link region center -> returns exact link!
             assert!(!laid.link_regions.is_empty());

@@ -15,3 +15,4 @@ tg-video = { path = "../tg-video" }
 
 [dev-dependencies]
 image = { version = "0.25.9", default-features = false, features = ["png"] }
+egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }

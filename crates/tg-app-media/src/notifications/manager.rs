@@ -500,6 +500,13 @@ struct PendingAlert {
     volume_pct: u8,
 }
 
+/// One account's notification settings, as last synced from its backend.
+#[derive(Debug, Clone)]
+struct AccountNotifyStore {
+    version: u64,
+    store: NotifySettingsStore,
+}
+
 #[derive(Debug, Clone)]
 struct PendingGrouped {
     thread: ThreadKey,
@@ -507,6 +514,12 @@ struct PendingGrouped {
     last_item: IncomingMessageNotification,
     forwarded_count: usize,
 }
+
+/// Returns a peer's loaded photo userpic by full peer id (`tg_ui::userpic_images::userpic_image`
+/// on the app's context); `None` while there is none or it is loading.
+pub type UserpicPhotoLookup = std::sync::Arc<
+    dyn Fn(i64) -> Option<std::sync::Arc<tg_ui::userpic_images::UserpicImage>> + Send + Sync,
+>;
 
 /// High-level notification system porting `Window::Notifications::System`.
 ///
@@ -520,11 +533,16 @@ struct PendingGrouped {
 pub struct NotificationSystem {
     prefs: NotificationPreferences,
     settings_store: NotifySettingsStore,
+    /// Per-account stores synced from [`NotifyBackend::notify_settings_versions`]; accounts
+    /// without one use `settings_store` (tdesktop: `thread->owner().notifySettings()`).
+    account_stores: BTreeMap<u64, AccountNotifyStore>,
     manager_type: ManagerType,
     native_supported: bool,
     native_backend: Option<NativeToastBackend>,
     custom_popups: CustomPopupManager,
     userpics: CachedUserpics,
+    /// Loaded photo userpics by full peer id, for native toasts.
+    userpic_photos: Option<UserpicPhotoLookup>,
     sound_player: NotificationSoundPlayer,
     suppression: Box<dyn SuppressionProvider>,
     flasher: Box<dyn WindowFlasher>,
@@ -596,6 +614,18 @@ impl NotificationSystem {
         system
     }
 
+    /// Sets where native toasts take loaded photo userpics from (the app's userpic source);
+    /// without one they show the empty userpic.
+    pub fn set_userpic_photo_lookup(&mut self, lookup: Option<UserpicPhotoLookup>) {
+        self.userpic_photos = lookup;
+    }
+
+    /// Whether [`Self::set_userpic_photo_lookup`] installed a lookup.
+    #[must_use]
+    pub fn has_userpic_photo_lookup(&self) -> bool {
+        self.userpic_photos.is_some()
+    }
+
     /// Constructs a [`NotificationSystem`] with explicit injected platform components.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -616,11 +646,13 @@ impl NotificationSystem {
         Self {
             prefs,
             settings_store,
+            account_stores: BTreeMap::new(),
             manager_type: ManagerType::Dummy,
             native_supported,
             native_backend,
             custom_popups,
             userpics,
+            userpic_photos: None,
             sound_player,
             suppression,
             flasher,
@@ -657,6 +689,48 @@ impl NotificationSystem {
     /// Returns mutable access to the per-peer / per-scope notification settings store.
     pub fn settings_store_mut(&mut self) -> &mut NotifySettingsStore {
         &mut self.settings_store
+    }
+
+    /// Returns the store synced for account `session_id`, if its backend provides one.
+    #[must_use]
+    pub fn account_settings_store(&self, session_id: u64) -> Option<&NotifySettingsStore> {
+        self.account_stores.get(&session_id).map(|a| &a.store)
+    }
+
+    /// The settings that decide notifications of account `session_id`.
+    fn store_for(&self, session_id: u64) -> &NotifySettingsStore {
+        self.account_settings_store(session_id)
+            .unwrap_or(&self.settings_store)
+    }
+
+    /// Re-syncs every account store whose settings version moved. A new account starts with
+    /// unknown defaults, so its notifications wait until the defaults are loaded. Returns `true`
+    /// if any store changed.
+    pub fn sync_account_stores(&mut self, backend: &dyn NotifyBackend, now_unix: i64) -> bool {
+        let versions = backend.notify_settings_versions();
+        self.account_stores
+            .retain(|session_id, _| versions.iter().any(|(id, _)| id == session_id));
+        let mut synced = false;
+        for (session_id, version) in versions {
+            let entry = self.account_stores.entry(session_id);
+            let account = match entry {
+                std::collections::btree_map::Entry::Occupied(o) => {
+                    let account = o.into_mut();
+                    if account.version == version {
+                        continue;
+                    }
+                    account
+                }
+                std::collections::btree_map::Entry::Vacant(v) => v.insert(AccountNotifyStore {
+                    version,
+                    store: NotifySettingsStore::empty_unknown(),
+                }),
+            };
+            account.version = version;
+            backend.sync_notify_settings(session_id, &mut account.store, now_unix);
+            synced = true;
+        }
+        synced
     }
 
     /// Returns the currently active manager type (`Native`, `Default`, or `Dummy`).
@@ -861,10 +935,12 @@ impl NotificationSystem {
         // Scheduled reminders notify even in muted chats (silently).
         let show_for_muted = is_message_like && notif.outgoing && notif.is_from_scheduled;
 
-        // Special notification peer: mentions or replies to me in non-private chats,
-        // or the reacting/voting sender (`HistoryItem::specialNotificationPeer`).
+        // Special notification peer: the author of a message that mentions me in a non-private
+        // chat, or the reacting/voting sender (`HistoryItem::specialNotificationPeer`,
+        // `history/history_item.cpp:2270-2274`). Replies to my messages count through the
+        // server's `mentioned` flag, as in tdesktop; a local reply guess does not.
         let notify_by: Option<PeerId> = if is_message_like {
-            if (notif.mentions_me || notif.is_reply_to_me) && notif.peer_kind != PeerKind::User {
+            if notif.mentions_me && notif.peer_kind != PeerKind::User {
                 Some(notif.sender_id)
             } else {
                 None
@@ -873,8 +949,8 @@ impl NotificationSystem {
             Some(notif.sender_id)
         };
 
-        let sound_none = self
-            .settings_store
+        let store = self.store_for(notif.session_id);
+        let sound_none = store
             .sound_for_topic(notif.peer_id, notif.topic_root_id, notif.is_self_chat)
             .none;
 
@@ -884,15 +960,10 @@ impl NotificationSystem {
 
         // 1. Check thread/chat mute status for regular/pinned messages.
         if is_message_like {
-            if self
-                .settings_store
-                .topic_mute_unknown(notif.peer_id, notif.topic_root_id)
-            {
+            if store.topic_mute_unknown(notif.peer_id, notif.topic_root_id) {
                 return SkipDecision::WaitForSettings;
             }
-            let thread_muted =
-                self.settings_store
-                    .is_topic_muted(notif.peer_id, notif.topic_root_id, now_unix);
+            let thread_muted = store.is_topic_muted(notif.peer_id, notif.topic_root_id, now_unix);
             if !thread_muted {
                 // Silent pinned messages still show a silent toast unless chat is muted.
                 return make_notify(false);
@@ -908,11 +979,11 @@ impl NotificationSystem {
             };
         };
 
-        if self.settings_store.mute_unknown(sender_peer) {
+        if store.mute_unknown(sender_peer) {
             return SkipDecision::WaitForSettings;
         }
 
-        let sender_muted = self.settings_store.is_peer_muted(sender_peer, now_unix);
+        let sender_muted = store.is_peer_muted(sender_peer, now_unix);
         let sender_allowed = !sender_muted && (is_message_like || !notif.sender_blocked);
         if sender_allowed {
             make_notify(false)
@@ -1010,15 +1081,16 @@ impl NotificationSystem {
                 let thread = ThreadKey::from_notification(&notif);
 
                 if !silent {
-                    let sound = self.settings_store.sound_for_topic(
+                    let store = self.store_for(notif.session_id);
+                    let sound = store.sound_for_topic(
                         notif.peer_id,
                         notif.topic_root_id,
                         notif.is_self_chat,
                     );
                     if !sound.none {
-                        let vol = self
-                            .settings_store
+                        let vol = store
                             .ringtone_volume_override(notif.peer_id)
+                            .or_else(|| self.settings_store.ringtone_volume_override(notif.peer_id))
                             .unwrap_or(self.prefs.notifications_volume_pct);
                         self.pending_alerts
                             .entry(thread)
@@ -1065,9 +1137,18 @@ impl NotificationSystem {
         // 1. Expire temporary global mute & per-peer timed mutes.
         let _ = self.prefs.expire_global_mute(now_unix);
         let _ = self.settings_store.unmute_by_finished(now_unix);
+        for account in self.account_stores.values_mut() {
+            let _ = account.store.unmute_by_finished(now_unix);
+        }
 
-        // 2. Drain incoming backend events.
-        for event in backend.poll_events() {
+        // 2. Drain incoming backend events, then bring each account's mute view up to date
+        // before judging them: a mute change that arrived before a message is always seen.
+        let events = backend.poll_events();
+        let settings_synced = self.sync_account_stores(&*backend, now_unix);
+        if settings_synced && !self.setting_waiters.is_empty() {
+            self.check_delayed(focus, now_ms, now_unix);
+        }
+        for event in events {
             match event {
                 IncomingNotifyEvent::Notification(n) => {
                     let _ = self.schedule(*n, focus, now_ms, now_unix);
@@ -1235,7 +1316,9 @@ impl NotificationSystem {
         focus: &WindowFocusState,
     ) -> NotificationDisplayOptions {
         let hide_everything = focus.passcode_locked || focus.screen_locked;
-        let peer_previews = self.settings_store.show_previews_for_peer(notif.peer_id);
+        let peer_previews = self
+            .store_for(notif.session_id)
+            .show_previews_for_peer(notif.peer_id);
         let hide_name_and_photo = hide_everything || self.prefs.notify_view > NotifyView::ShowName;
         let hide_message_text =
             hide_everything || !peer_previews || self.prefs.notify_view > NotifyView::ShowPreview;
@@ -1844,7 +1927,17 @@ impl NotificationSystem {
                     | u64::from(avatar_rgb[2]);
                 UserpicKey::for_peer(item.peer_id.0, color_rev)
             };
-            self.userpics.get(key, peer_info.as_ref(), now_ms).ok()
+            // `CachedUserpics::get(key, peer, view)`: the peer's photo once it is loaded, its
+            // empty userpic until then; a hidden sender gets the app placeholder.
+            let photo = (!options.hide_name_and_photo)
+                .then(|| self.userpic_photos.as_ref().and_then(|f| f(item.peer_id.0)))
+                .flatten();
+            let key = photo.as_ref().map_or(key, |p| {
+                UserpicKey::for_peer_photo(item.peer_id.0, p.photo_id)
+            });
+            self.userpics
+                .get_with_photo(key, peer_info.as_ref(), photo.as_deref(), now_ms)
+                .ok()
         } else {
             None
         };
@@ -1878,6 +1971,11 @@ impl NotificationSystem {
         suppression: NotificationSuppressionState,
         now_ms: i64,
     ) {
+        tracing::debug!(
+            msg_id = rendered.id.msg_id,
+            collapsed = rendered.collapsed_count,
+            "notification dispatched"
+        );
         self.dispatched_log.push(rendered.clone());
         match self.manager_type {
             ManagerType::Native => {

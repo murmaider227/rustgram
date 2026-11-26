@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tg_api::convert::{
-    admin_rights_from_tl, apply_tl_chat_full, apply_tl_message, apply_tl_users_and_chats,
+    admin_rights_from_tl, apply_tl_chat_full, apply_tl_existing_message, apply_tl_users_and_chats,
     banned_rights_from_tl, input_channel_for, input_peer_for, input_user_for, peer_id_from_tl,
 };
 use tg_api::{InvocationError, LoadDirection, RpcClient};
@@ -33,9 +33,9 @@ use tracing::{debug, warn};
 
 use crate::bridge::LiveBridgeState;
 use crate::convert::{
-    dialog_item_from_session, from_data_msg, from_data_peer, history_messages_ordered,
-    message_to_history_message, message_to_info_media_item, now_unix_i32, peer_dialog_kind,
-    peer_display_title, peer_primary_username, peer_status_text, to_data_msg, to_data_peer,
+    dialog_item_from_session, from_data_msg, from_data_peer, message_to_history_message,
+    message_to_info_media_item, now_unix_i32, peer_dialog_kind, peer_display_title,
+    peer_primary_username, peer_status_text, stored_messages_ordered, to_data_msg, to_data_peer,
     ui_text_to_data_text, ui_text_to_tl_entities, unix_to_local_datetime,
 };
 use crate::media::{block_on_runtime, with_rpc_timeout};
@@ -832,6 +832,7 @@ pub(crate) fn message_to_search_result(
         time: unix_to_local_datetime(msg.date),
         send_state: crate::convert::message_send_state(session, msg),
         archived,
+        media_preview: crate::preview_text::message_media_preview(msg),
     })
 }
 
@@ -1062,7 +1063,7 @@ impl LiveSession {
                 if let Some(dpid) = mpeer {
                     last_peer = Some(from_data_peer(dpid));
                 }
-                if let Some(full_id) = apply_tl_message(session, tl_msg) {
+                if let Some(full_id) = apply_tl_existing_message(session, tl_msg) {
                     inserted_ids.push(full_id);
                 }
             }
@@ -1229,7 +1230,7 @@ impl LiveSession {
         write_session(self, |session| {
             apply_tl_users_and_chats(session, &tl_users, &tl_chats);
             for tl_msg in &tl_messages {
-                if let Some(fid) = apply_tl_message(session, tl_msg) {
+                if let Some(fid) = apply_tl_existing_message(session, tl_msg) {
                     if params.filter == SharedMediaFilter::Pinned {
                         let _ = session.set_message_pinned(fid, true);
                     }
@@ -1976,7 +1977,7 @@ impl LiveSession {
         let data_peer = to_data_peer(peer_id);
         let target_topic = topic_root_id.map(to_data_msg);
         write_session(self, |session| {
-            let ids_to_unpin: Vec<DataFullMsgId> = history_messages_ordered(session, data_peer)
+            let ids_to_unpin: Vec<DataFullMsgId> = stored_messages_ordered(session, data_peer)
                 .into_iter()
                 .filter(|m| m.flags.contains(MessageFlags::PINNED))
                 .filter(|m| match target_topic {
@@ -2042,7 +2043,7 @@ impl LiveSession {
             write_session(self, |session| {
                 apply_tl_users_and_chats(session, &cal.users, &cal.chats);
                 for tl_msg in &cal.messages {
-                    let _ = apply_tl_message(session, tl_msg);
+                    let _ = apply_tl_existing_message(session, tl_msg);
                 }
             });
 
@@ -2223,7 +2224,7 @@ impl LiveSession {
                 if let Some(dpid) = mpeer {
                     last_peer = Some(from_data_peer(dpid));
                 }
-                if let Some(full_id) = apply_tl_message(session, tl_msg) {
+                if let Some(full_id) = apply_tl_existing_message(session, tl_msg) {
                     inserted_ids.push(full_id);
                 }
             }
@@ -2363,7 +2364,7 @@ impl LiveSession {
                 if let Some(dpid) = mpeer {
                     last_peer = Some(from_data_peer(dpid));
                 }
-                if let Some(fid) = apply_tl_message(session, tl_msg) {
+                if let Some(fid) = apply_tl_existing_message(session, tl_msg) {
                     inserted_ids.push(fid);
                 }
             }
@@ -3109,7 +3110,7 @@ pub(super) fn search_dialogs(
             if let Some(item) = dialog_item_from_session(session, pid, list, now)
                 && request.chat_type_filter.matches(item.kind)
             {
-                for msg in history_messages_ordered(session, pid).into_iter().rev() {
+                for msg in stored_messages_ordered(session, pid).into_iter().rev() {
                     let body = match &msg.content {
                         MessageContent::Regular { text, .. } => text.text.as_str(),
                         MessageContent::Empty | MessageContent::Service(_) => "",
@@ -3127,6 +3128,7 @@ pub(super) fn search_dialogs(
                             time: unix_to_local_datetime(msg.date),
                             send_state: crate::convert::message_send_state(session, msg),
                             archived: item.archived,
+                            media_preview: crate::preview_text::message_media_preview(msg),
                         });
                     }
                 }
@@ -3406,7 +3408,7 @@ pub(super) fn shared_media(
     let data_peer = to_data_peer(peer_id);
     let q_lower = trimmed.to_ascii_lowercase();
     read_session(live, |session| {
-        history_messages_ordered(session, data_peer)
+        stored_messages_ordered(session, data_peer)
             .into_iter()
             .rev()
             .filter_map(|m| message_to_info_media_item(session, m, tab))
@@ -3495,13 +3497,17 @@ pub(super) fn pinned_full_messages(
     let mut loaded = is_loaded();
     if !loaded
         && topic_root_id.is_none()
-        && crate::open_chat_prefetch::wait_in_flight(
+        && crate::open_chat_prefetch::started_in_background(
             live,
             to_data_peer(peer_id),
             crate::open_chat_prefetch::OpenChatRequest::Pinned,
         )
     {
         loaded = is_loaded();
+        if !loaded {
+            // Still loading in the background: no pinned bar until it lands (it wakes the UI).
+            return Vec::new();
+        }
     }
     if !loaded && let Some(messages) = load_pinned_into_cache(live, peer_id, topic_root_id) {
         return messages;
@@ -3526,7 +3532,7 @@ pub(super) fn pinned_full_messages(
     // Fallback to locally loaded pinned messages.
     let target_topic = topic_root_id.map(to_data_msg);
     read_session(live, |session| {
-        history_messages_ordered(session, data_peer)
+        stored_messages_ordered(session, data_peer)
             .into_iter()
             .rev()
             .filter(|m| m.flags.contains(MessageFlags::PINNED))
@@ -3723,7 +3729,7 @@ pub(super) fn global_media(
                 continue;
             };
             let title = peer_display_title(session, pid);
-            for msg in history_messages_ordered(session, pid).into_iter().rev() {
+            for msg in stored_messages_ordered(session, pid).into_iter().rev() {
                 if let Some(item) = message_to_info_media_item(session, msg, tab)
                     && (q_lower.is_empty()
                         || item.matches_query(&q_lower)

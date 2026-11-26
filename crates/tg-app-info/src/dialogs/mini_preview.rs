@@ -13,13 +13,12 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Color32, ColorImage, CornerRadius, FontId, Id, Painter, Pos2, Rect, TextureHandle, Vec2,
 };
-use tg_history::elide_text_right;
 use tg_ui::icons::paint_style_icon;
 use tg_ui::tg_style::structs::IconEmoji;
 use tg_ui::tg_style::{Scale, st};
 
 use crate::dialogs::backend::{DialogItem, DialogMediaPreview, DialogMediaPreviewKind};
-use crate::dialogs::layout::{DialogColors, measure_text_i32};
+use crate::dialogs::layout::{DialogColors, elide_text};
 
 /// Decoded thumbnails kept per egui context; older entries are dropped past this count.
 const MINI_PREVIEW_CACHE_LIMIT: usize = 512;
@@ -148,6 +147,82 @@ fn mini_preview_texture(ctx: &egui::Context, bytes: &[u8]) -> Option<(egui::Text
     decoded.map(|(tex, uv)| (tex.id(), uv))
 }
 
+/// Whether `preview` draws a 16 px mini image (its stripped thumbnail decodes).
+#[must_use]
+pub fn preview_has_image(ctx: &egui::Context, preview: Option<&DialogMediaPreview>) -> bool {
+    preview
+        .and_then(|p| p.stripped_thumb.as_deref())
+        .and_then(|bytes| mini_preview_texture(ctx, bytes))
+        .is_some()
+}
+
+/// Paints the mini image (`_imagesCache`) or, without one, the type `IconEmoji` of `preview` at
+/// `x` on the text line starting at `line_top`, and returns the horizontal advance for the text
+/// that follows (`MessageView::paint`). Nothing is drawn when it does not fit before `right`.
+pub fn paint_leading_media(
+    painter: &Painter,
+    x: f32,
+    line_top: f32,
+    right: f32,
+    preview: &DialogMediaPreview,
+    icon_tint: Color32,
+    colors: &DialogColors<'_>,
+) -> f32 {
+    let thumb = preview
+        .stripped_thumb
+        .as_deref()
+        .and_then(|bytes| mini_preview_texture(painter.ctx(), bytes));
+    if let Some((tex, uv)) = thumb {
+        let size = st::dialogs_mini_preview.0 as f32;
+        let step = size + st::dialogs_mini_preview_skip.0 as f32;
+        let mut advance = 0.0;
+        if right - x >= step {
+            let mini = Rect::from_min_size(
+                Pos2::new(x, line_top + st::dialogs_mini_preview_top.0 as f32),
+                Vec2::splat(size),
+            );
+            let radius = if preview.kind == DialogMediaPreviewKind::RoundVideo {
+                size * 0.5
+            } else {
+                st::dialogs_mini_preview_radius.0 as f32
+            };
+            painter.add(
+                egui::epaint::RectShape::filled(
+                    mini,
+                    CornerRadius::same(radius.round() as u8),
+                    Color32::WHITE,
+                )
+                .with_texture(tex, uv),
+            );
+            if preview_has_play_icon(preview.kind) {
+                paint_style_icon(painter, mini, st::dialogs_mini_play, colors, None);
+            }
+            advance += step;
+        }
+        return advance + st::dialogs_mini_preview_right.0 as f32;
+    }
+    let Some(icon) = preview_type_icon(preview.kind) else {
+        return 0.0;
+    };
+    let size = icon
+        .icon
+        .scaled_size_at(Scale::DEFAULT)
+        .map_or(Vec2::splat(18.0), |s| {
+            Vec2::new(s.width as f32, s.height as f32)
+        });
+    let pad = icon.padding;
+    let advance = pad.left.0 as f32 + size.x + pad.right.0 as f32;
+    if right - x <= advance {
+        return 0.0;
+    }
+    let icon_rect = Rect::from_min_size(
+        Pos2::new(x + pad.left.0 as f32, line_top + pad.top.0 as f32),
+        size,
+    );
+    paint_style_icon(painter, icon_rect, icon.icon, colors, Some(icon_tint));
+    advance
+}
+
 /// Colors of the preview line for the row state (`dialogsTextFg*` / `dialogsTextFgService*`).
 #[derive(Debug, Clone, Copy)]
 pub struct PreviewLineColors {
@@ -200,55 +275,13 @@ pub fn paint_preview_line(
     }
 
     let colored = colorized_prefix_len(preview, has_images, text);
-    if let (Some((tex, uv)), Some(p)) = (thumb, preview) {
-        let size = st::dialogs_mini_preview.0 as f32;
-        let step = size + st::dialogs_mini_preview_skip.0 as f32;
-        if r.right() - x >= step {
-            let mini = Rect::from_min_size(
-                Pos2::new(x, line_top + st::dialogs_mini_preview_top.0 as f32),
-                Vec2::splat(size),
-            );
-            let radius = if p.kind == DialogMediaPreviewKind::RoundVideo {
-                size * 0.5
-            } else {
-                st::dialogs_mini_preview_radius.0 as f32
-            };
-            painter.add(
-                egui::epaint::RectShape::filled(
-                    mini,
-                    CornerRadius::same(radius.round() as u8),
-                    Color32::WHITE,
-                )
-                .with_texture(tex, uv),
-            );
-            if preview_has_play_icon(p.kind) {
-                paint_style_icon(painter, mini, st::dialogs_mini_play, colors, None);
-            }
-            x += step;
-        }
-        x += st::dialogs_mini_preview_right.0 as f32;
-    } else if let Some(icon) = preview.and_then(|p| preview_type_icon(p.kind)) {
-        let size = icon
-            .icon
-            .scaled_size_at(Scale::DEFAULT)
-            .map_or(Vec2::splat(18.0), |s| {
-                Vec2::new(s.width as f32, s.height as f32)
-            });
-        let pad = icon.padding;
-        let advance = pad.left.0 as f32 + size.x + pad.right.0 as f32;
-        if r.right() - x > advance {
-            let icon_rect = Rect::from_min_size(
-                Pos2::new(x + pad.left.0 as f32, line_top + pad.top.0 as f32),
-                size,
-            );
-            let tint = if colored > 0 { fg.service } else { fg.text };
-            paint_style_icon(painter, icon_rect, icon.icon, colors, Some(tint));
-            x += advance;
-        }
+    if let Some(p) = preview {
+        let tint = if colored > 0 { fg.service } else { fg.text };
+        x += paint_leading_media(painter, x, line_top, r.right(), p, tint, colors);
     }
 
     let avail = (r.right() - x).max(0.0) as i32;
-    let body = elide_text_right(text, avail, |s| measure_text_i32(painter, s, font.clone()));
+    let body = elide_text(painter, text, avail, font);
     let split = if colored >= text.len() {
         body.len()
     } else {

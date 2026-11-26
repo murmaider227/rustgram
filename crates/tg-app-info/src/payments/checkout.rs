@@ -578,7 +578,7 @@ impl CheckoutView {
             Ok(PaymentSubmitOutcome::VerificationNeeded { url, provider }) => {
                 self.begin_verification(url, provider)
             }
-            Err(err) => Some(format!("Payment error: {err}")),
+            Err(err) => tg_app_core::user_error::send_payment_form(&err.to_string()).into_text(),
         }
     }
 
@@ -1350,7 +1350,7 @@ impl CheckoutView {
                             toast = Some("Shipping & contact information validated.".to_owned());
                         }
                         Err(err) => {
-                            toast = Some(format!("Validation rejected: {err}"));
+                            toast = tg_app_core::user_error::validate_requested_info(&err.to_string()).into_text();
                         }
                     }
                 }

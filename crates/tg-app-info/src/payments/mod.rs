@@ -15,12 +15,15 @@
 pub use tg_app_core::payments::backend;
 pub mod checkout;
 pub mod credits;
+pub mod gift_box;
+pub mod gift_card;
 pub mod giveaways_ui;
 pub use tg_app_core::payments::marketplace_backend;
 pub mod mock;
 pub mod mock_marketplace;
 pub mod passport;
 pub mod premium;
+pub mod premium_section;
 pub mod star_gifts;
 pub mod star_gifts_marketplace;
 pub mod starref_ui;
@@ -49,6 +52,17 @@ use crate::payments::star_gifts::StarGiftsView;
 use crate::payments::starref_ui::StarRefView;
 use tg_app_core::stand_in::theme::{Palette, ThemeMode};
 use tg_app_core::stand_in::types::{MsgId, PeerId};
+
+/// Environment variable that re-enables the developer Payments overlay (screen tabs and the
+/// `Ctrl+Shift+P` toggle). The normal UI never shows it: Telegram Desktop has no such panel.
+pub const DEV_OVERLAY_ENV: &str = "TGFORK_PAYMENTS_DEV_OVERLAY";
+
+/// Returns `true` when the developer Payments overlay is enabled via [`DEV_OVERLAY_ENV`]`=1`.
+#[must_use]
+pub fn dev_overlay_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var(DEV_OVERLAY_ENV).is_ok_and(|v| v.trim() == "1"))
+}
 
 /// Parsed parameters from a `tg://passport?...` deep link (`passport_form_controller.cpp`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +219,7 @@ pub struct PaymentsScreenHost {
     passport_view: Option<PassportView>,
     load_error: Option<String>,
     toast_message: Option<(String, i64)>,
+    dev_tabs: bool,
 }
 
 impl PaymentsScreenHost {
@@ -241,6 +256,7 @@ impl PaymentsScreenHost {
             passport_view: None,
             load_error: None,
             toast_message: None,
+            dev_tabs: dev_overlay_enabled(),
         };
         host.ensure_loaded(PaymentsScreen::Stars);
         host
@@ -403,6 +419,111 @@ impl PaymentsScreenHost {
         self.ensure_loaded(screen);
     }
 
+    /// Shows or hides the developer screen tabs (off unless [`dev_overlay_enabled`]).
+    ///
+    /// Without them, Premium renders as tdesktop's Premium section and Star Gifts as the
+    /// "Send a Gift" box.
+    pub fn set_dev_tabs(&mut self, enabled: bool) {
+        self.dev_tabs = enabled;
+    }
+
+    /// Returns whether the developer screen tabs are shown.
+    #[must_use]
+    pub const fn dev_tabs(&self) -> bool {
+        self.dev_tabs
+    }
+
+    /// Panel width the active screen wants when shown as a layer: `boxWideWidth` for the gift
+    /// box and `infoDesiredWidth` for the Premium section; `None` for the generic panel.
+    #[must_use]
+    pub const fn panel_width_hint(&self) -> Option<f32> {
+        if self.dev_tabs {
+            return None;
+        }
+        match self.active_screen {
+            PaymentsScreen::StarGifts => Some(crate::payments::gift_card::BOX_WIDE_WIDTH),
+            PaymentsScreen::Premium => Some(crate::payments::premium_section::PREMIUM_LAYER_WIDTH),
+            _ => None,
+        }
+    }
+
+    fn uses_parity_screen(&self) -> bool {
+        !self.dev_tabs
+            && self.load_error.is_none()
+            && match self.active_screen {
+                PaymentsScreen::StarGifts => self.gifts_view.is_some(),
+                PaymentsScreen::Premium => self.premium_view.is_some(),
+                _ => false,
+            }
+    }
+
+    /// Renders the Premium section or the "Send a Gift" box filling `ui`; returns close.
+    fn show_parity_screen(&mut self, ui: &mut Ui, palette: &Palette, now_ms: i64) -> bool {
+        let rect = ui.max_rect();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let mut closed = false;
+        let mut pending_toast = None;
+        match self.active_screen {
+            PaymentsScreen::StarGifts => {
+                if let Some(ref mut view) = self.gifts_view {
+                    let (toast, back) =
+                        view.show_gift_box(ui, self.payments_backend.as_mut(), palette, now_unix);
+                    pending_toast = toast;
+                    closed = back;
+                }
+            }
+            PaymentsScreen::Premium => {
+                if let Some(ref mut view) = self.premium_view {
+                    let outcome = view.show_section(ui, self.payments_backend.as_ref(), palette);
+                    pending_toast = outcome.toast;
+                    closed = outcome.close;
+                    // Subscribe opens the selected option's invoice (`botUrl`) in the payment
+                    // form, like `CreateSubscribeButton` -> `UrlClickHandler::Open`.
+                    if let Some(url) = outcome.open_invoice
+                        && let Err(err) = self.open_invoice_deep_link(&url)
+                    {
+                        pending_toast = Some(err);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(msg) = pending_toast {
+            self.show_toast(msg, now_ms);
+        }
+        self.paint_toast(ui, rect, now_ms);
+        closed
+    }
+
+    fn paint_toast(&mut self, ui: &Ui, rect: Rect, now_ms: i64) {
+        if let Some((ref text, expires_at)) = self.toast_message {
+            if now_ms >= expires_at {
+                self.toast_message = None;
+            } else {
+                let toast_w = (rect.width() - 40.0).min(460.0);
+                let toast_rect = Rect::from_min_size(
+                    Pos2::new(rect.center().x - toast_w / 2.0, rect.bottom() - 48.0),
+                    Vec2::new(toast_w, 34.0),
+                );
+                ui.painter().rect_filled(
+                    toast_rect,
+                    CornerRadius::same(8),
+                    Color32::from_rgba_unmultiplied(0x1E, 0x24, 0x2B, 235),
+                );
+                ui.painter().text(
+                    toast_rect.center(),
+                    Align2::CENTER_CENTER,
+                    text,
+                    FontId::proportional(11.5),
+                    Color32::WHITE,
+                );
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
     /// Returns the Stars Affiliate view, if it was opened.
     #[must_use]
     pub const fn starref_view(&self) -> Option<&StarRefView> {
@@ -471,6 +592,8 @@ impl PaymentsScreenHost {
             StarGiftsView::new(crate::payments::backend::StarGiftsBundle {
                 balance: tg_payments::credits::CreditsAmount::ZERO_STARS,
                 default_recipient: String::new(),
+                recipient_peer_id: 0,
+                recipient_is_self: true,
                 catalog: Vec::new(),
                 received: Vec::new(),
             })
@@ -666,6 +789,9 @@ impl PaymentsScreenHost {
 
     /// Displays a transient toast notification for 3 seconds.
     pub fn show_toast(&mut self, msg: String, now_ms: i64) {
+        let Some(msg) = tg_app_core::user_error::visible_toast_text(msg) else {
+            return;
+        };
         self.toast_message = Some((msg, now_ms + 3_000));
     }
 
@@ -687,6 +813,9 @@ impl PaymentsScreenHost {
         let rect = ui.max_rect();
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, palette.window_bg);
+        if self.uses_parity_screen() {
+            return self.show_parity_screen(ui, palette, now_ms);
+        }
 
         // Top navigation bar (48px)
         let top_h = 48.0;
@@ -734,93 +863,98 @@ impl PaymentsScreenHost {
             );
         });
 
-        // Section tab strip (36px, horizontally scrollable so narrow 390px windows never clip)
-        let tab_h = 36.0;
+        // Developer section tab strip (36px, only with `TGFORK_PAYMENTS_DEV_OVERLAY=1`).
+        let tab_h = if self.dev_tabs { 36.0 } else { 0.0 };
         let tab_rect = Rect::from_min_size(
             Pos2::new(rect.left(), top_rect.bottom()),
             Vec2::new(rect.width(), tab_h),
         );
-        ui.scope_builder(egui::UiBuilder::new().max_rect(tab_rect), |ui| {
-            let narrow = rect.width() < 440.0;
-            Frame::NONE
-                .inner_margin(Margin::symmetric(if narrow { 8 } else { 12 }, 0))
-                .show(ui, |ui| {
-                    ScrollArea::horizontal()
-                        .id_salt("tg_payments_tabs_scroll")
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(ui, |ui| {
-                            ui.horizontal_centered(|ui| {
-                                ui.spacing_mut().item_spacing.x = if narrow { 6.0 } else { 12.0 };
-                                let tabs = [
-                                    (PaymentsScreen::Checkout, "Checkout"),
-                                    (PaymentsScreen::Stars, "Stars"),
-                                    (PaymentsScreen::StarGifts, "Gifts"),
-                                    (PaymentsScreen::Premium, "Premium"),
-                                    (PaymentsScreen::BoostsGiveaways, "Boosts"),
-                                    (PaymentsScreen::Affiliate, "Affiliate"),
-                                    (PaymentsScreen::Passport, "Passport"),
-                                ];
-                                for (screen, label) in tabs {
-                                    let selected = self.active_screen == screen;
-                                    let col = if selected {
-                                        palette.window_active_text_fg
-                                    } else {
-                                        palette.window_sub_text_fg
-                                    };
-                                    let font_size = if narrow { 11.5 } else { 12.5 };
-                                    let galley = ui.fonts_mut(|f| {
-                                        f.layout_no_wrap(
-                                            label.to_owned(),
-                                            FontId::proportional(font_size),
-                                            col,
-                                        )
-                                    });
-                                    let (r, resp) = ui.allocate_exact_size(
-                                        Vec2::new(galley.size().x + 6.0, tab_h),
-                                        Sense::click(),
-                                    );
-                                    resp.widget_info(|| {
-                                        egui::WidgetInfo::labeled(
-                                            egui::Role::Tab,
-                                            true,
-                                            label.to_owned(),
-                                        )
-                                    });
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                    }
-                                    if resp.clicked() {
-                                        self.select_screen(screen);
-                                    }
-                                    ui.painter().galley(
-                                        Pos2::new(
-                                            r.left() + 3.0,
-                                            r.center().y - galley.size().y / 2.0,
-                                        ),
-                                        galley,
-                                        col,
-                                    );
-                                    if selected {
-                                        ui.painter().line_segment(
-                                            [
-                                                Pos2::new(r.left(), r.bottom() - 2.0),
-                                                Pos2::new(r.right(), r.bottom() - 2.0),
-                                            ],
-                                            Stroke::new(2.5, palette.window_active_text_fg),
+        if self.dev_tabs {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(tab_rect), |ui| {
+                let narrow = rect.width() < 440.0;
+                Frame::NONE
+                    .inner_margin(Margin::symmetric(if narrow { 8 } else { 12 }, 0))
+                    .show(ui, |ui| {
+                        ScrollArea::horizontal()
+                            .id_salt("tg_payments_tabs_scroll")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .show(ui, |ui| {
+                                ui.horizontal_centered(|ui| {
+                                    ui.spacing_mut().item_spacing.x =
+                                        if narrow { 6.0 } else { 12.0 };
+                                    let tabs = [
+                                        (PaymentsScreen::Checkout, "Checkout"),
+                                        (PaymentsScreen::Stars, "Stars"),
+                                        (PaymentsScreen::StarGifts, "Gifts"),
+                                        (PaymentsScreen::Premium, "Premium"),
+                                        (PaymentsScreen::BoostsGiveaways, "Boosts"),
+                                        (PaymentsScreen::Affiliate, "Affiliate"),
+                                        (PaymentsScreen::Passport, "Passport"),
+                                    ];
+                                    for (screen, label) in tabs {
+                                        let selected = self.active_screen == screen;
+                                        let col = if selected {
+                                            palette.window_active_text_fg
+                                        } else {
+                                            palette.window_sub_text_fg
+                                        };
+                                        let font_size = if narrow { 11.5 } else { 12.5 };
+                                        let galley = ui.fonts_mut(|f| {
+                                            f.layout_no_wrap(
+                                                label.to_owned(),
+                                                FontId::proportional(font_size),
+                                                col,
+                                            )
+                                        });
+                                        let (r, resp) = ui.allocate_exact_size(
+                                            Vec2::new(galley.size().x + 6.0, tab_h),
+                                            Sense::click(),
                                         );
+                                        resp.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::Role::Tab,
+                                                true,
+                                                label.to_owned(),
+                                            )
+                                        });
+                                        if resp.hovered() {
+                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        if resp.clicked() {
+                                            self.select_screen(screen);
+                                        }
+                                        ui.painter().galley(
+                                            Pos2::new(
+                                                r.left() + 3.0,
+                                                r.center().y - galley.size().y / 2.0,
+                                            ),
+                                            galley,
+                                            col,
+                                        );
+                                        if selected {
+                                            ui.painter().line_segment(
+                                                [
+                                                    Pos2::new(r.left(), r.bottom() - 2.0),
+                                                    Pos2::new(r.right(), r.bottom() - 2.0),
+                                                ],
+                                                Stroke::new(2.5, palette.window_active_text_fg),
+                                            );
+                                        }
                                     }
-                                }
+                                });
                             });
-                        });
-                });
-            ui.painter().line_segment(
-                [
-                    Pos2::new(tab_rect.left(), tab_rect.bottom()),
-                    Pos2::new(tab_rect.right(), tab_rect.bottom()),
-                ],
-                Stroke::new(1.0, palette.divider),
-            );
-        });
+                    });
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(tab_rect.left(), tab_rect.bottom()),
+                        Pos2::new(tab_rect.right(), tab_rect.bottom()),
+                    ],
+                    Stroke::new(1.0, palette.divider),
+                );
+            });
+        }
 
         // Scrollable screen body
         let body_rect = Rect::from_min_max(Pos2::new(rect.left(), tab_rect.bottom()), rect.max);
@@ -828,9 +962,10 @@ impl PaymentsScreenHost {
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
             if let Some(ref err) = self.load_error {
+                let text = tg_app_core::user_error::load_payment_screen(err).into_text().unwrap_or_default();
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("Failed to load screen: {err}"))
+                        egui::RichText::new(text)
                             .size(13.0)
                             .color(palette.attention_fg),
                     );
@@ -937,31 +1072,7 @@ impl PaymentsScreenHost {
         if let Some(msg) = pending_toast {
             self.show_toast(msg, now_ms);
         }
-
-        if let Some((ref text, expires_at)) = self.toast_message {
-            if now_ms >= expires_at {
-                self.toast_message = None;
-            } else {
-                let toast_w = (rect.width() - 40.0).min(460.0);
-                let toast_rect = Rect::from_min_size(
-                    Pos2::new(rect.center().x - toast_w / 2.0, rect.bottom() - 48.0),
-                    Vec2::new(toast_w, 34.0),
-                );
-                ui.painter().rect_filled(
-                    toast_rect,
-                    CornerRadius::same(8),
-                    Color32::from_rgba_unmultiplied(0x1E, 0x24, 0x2B, 235),
-                );
-                ui.painter().text(
-                    toast_rect.center(),
-                    Align2::CENTER_CENTER,
-                    text,
-                    FontId::proportional(11.5),
-                    Color32::WHITE,
-                );
-                ui.ctx().request_repaint();
-            }
-        }
+        self.paint_toast(ui, rect, now_ms);
 
         closed
     }
@@ -1075,11 +1186,12 @@ impl AppPaymentsHost {
 
     /// Drives keyboard toggle (`Ctrl+Shift+P`) and renders the floating panel when open.
     pub fn update_and_render(ctx: &Context, palette: &Palette, _theme_mode: ThemeMode) {
-        let toggle_pressed = ctx.input(|i| {
-            i.modifiers
-                .matches_logically(Modifiers::COMMAND | Modifiers::SHIFT)
-                && i.key_pressed(Key::P)
-        });
+        let toggle_pressed = dev_overlay_enabled()
+            && ctx.input(|i| {
+                i.modifiers
+                    .matches_logically(Modifiers::COMMAND | Modifiers::SHIFT)
+                    && i.key_pressed(Key::P)
+            });
 
         let state_arc = Self::get_or_init_state(ctx);
 
@@ -1094,7 +1206,10 @@ impl AppPaymentsHost {
         }
 
         let screen_rect = ctx.content_rect();
-        let panel_w = (screen_rect.width() * 0.62).clamp(440.0, 620.0);
+        let panel_w = guard.screen_host.panel_width_hint().map_or_else(
+            || (screen_rect.width() * 0.62).clamp(440.0, 620.0),
+            |w| w.min(screen_rect.width() - 16.0),
+        );
         let panel_h = (screen_rect.height() - 48.0).max(420.0);
         let panel_pos = Pos2::new(
             screen_rect.center().x - panel_w / 2.0,
@@ -1136,6 +1251,9 @@ impl AppPaymentsHost {
         }
     }
 }
+
+#[cfg(test)]
+mod tests_tgb2892;
 
 #[cfg(test)]
 mod tests {

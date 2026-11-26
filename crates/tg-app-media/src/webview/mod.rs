@@ -277,12 +277,11 @@ impl AppWebViewHost {
                 self.mini_app = Some(win);
             }
             Err(err) => {
-                self.process_events(
-                    vec![AppWebViewEvent::Toast {
-                        message: format!("Failed to open Mini App: {err}"),
-                    }],
-                    None,
-                );
+                if let Some(message) =
+                    tg_app_core::user_error::open_mini_app(&err.to_string()).into_text()
+                {
+                    self.process_events(vec![AppWebViewEvent::Toast { message }], None);
+                }
             }
         }
     }

@@ -335,6 +335,8 @@ pub struct DocumentData {
     pub ttl_seconds: Option<i32>,
     /// Optional video timestamp offset in seconds.
     pub video_timestamp: Option<i32>,
+    /// Custom cover of a video (`messageMediaDocument.video_cover`, `MediaFile::videoCover`).
+    pub video_cover: Option<Box<PhotoData>>,
 }
 
 /// Webpage link preview metadata (`WebPageData`).
@@ -354,12 +356,29 @@ pub struct WebPageData {
     pub title: Option<String>,
     /// Page description.
     pub description: Option<String>,
+    /// Page author; the preview block shows it as the title when the page has none.
+    pub author: Option<String>,
     /// Preview photo (if any).
     pub photo: Option<PhotoData>,
     /// Preview document (if any).
     pub document: Option<DocumentData>,
+    /// `photo` is the cover of `document` (`webPage.video_cover_photo`,
+    /// `WebPageData::photoIsVideoCover`).
+    pub photo_is_video_cover: bool,
     /// Display flags.
     pub flags: MediaWebPageFlags,
+}
+
+impl WebPageData {
+    /// [`Self::kind`] of a page the server is still preparing (`webPagePending`).
+    pub const KIND_PENDING: &'static str = "pending";
+
+    /// `WebPageData::pendingTill != 0`: the server is still preparing the page, so nothing is
+    /// drawn for it (`HistoryView::WebPage::countOptimalSize` returns an empty size).
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.kind == Self::KIND_PENDING
+    }
 }
 
 /// A single answer option in a poll.
@@ -397,8 +416,36 @@ pub struct PollResults {
     pub solution: Option<TextWithEntities>,
 }
 
+/// Media attached to a poll or to one of its answers (`PollMedia` in `data/data_poll.h`): the
+/// photo or document a reply header shows as its preview.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PollMedia {
+    /// Attached photo.
+    pub photo: Option<PhotoData>,
+    /// Attached document (used when there is no photo).
+    pub document: Option<DocumentData>,
+}
+
+impl PollMedia {
+    /// Builds the poll media of a message media; `None` when it holds no photo or document.
+    #[must_use]
+    pub fn from_media(media: &MessageMedia) -> Option<Self> {
+        match media {
+            MessageMedia::Photo(photo) => Some(Self {
+                photo: Some((**photo).clone()),
+                document: None,
+            }),
+            MessageMedia::Document(doc) => Some(Self {
+                photo: None,
+                document: Some((**doc).clone()),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Poll media payload (`PollData`).
-#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PollData {
     /// Poll ID.
     pub id: PollId,
@@ -420,6 +467,26 @@ pub struct PollData {
     pub close_date: Option<TimeId>,
     /// Current results.
     pub results: PollResults,
+    /// Media attached to the poll (`messageMediaPoll.attached_media`).
+    pub attached_media: Option<Box<PollMedia>>,
+    /// Media attached to answers (`pollAnswer.media`), by the answer's `option` bytes.
+    pub answer_media: Vec<(Vec<u8>, PollMedia)>,
+}
+
+impl PollData {
+    /// Media of the answer with `option` (`PollData::answerByOption(...)->media`).
+    #[must_use]
+    pub fn media_of_answer(&self, option: &[u8]) -> Option<&PollMedia> {
+        self.answer_media
+            .iter()
+            .find_map(|(key, media)| (key == option).then_some(media))
+    }
+
+    /// Whether the poll has an answer with `option`.
+    #[must_use]
+    pub fn has_answer(&self, option: &[u8]) -> bool {
+        self.answers.iter().any(|a| a.option == option)
+    }
 }
 
 /// Contact card media payload.
@@ -513,6 +580,24 @@ pub enum ExtendedMedia {
     Media(Box<MessageMedia>),
 }
 
+/// A file the server fetches from the web for the client (`WebDocument`), downloaded with
+/// `upload.getWebFile`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct WebDocumentData {
+    /// Source URL.
+    pub url: String,
+    /// Access hash (`None` for `webDocumentNoProxy`, which cannot be fetched through Telegram).
+    pub access_hash: Option<i64>,
+    /// File size in bytes.
+    pub size: i32,
+    /// MIME type.
+    pub mime_type: String,
+    /// Image width in pixels (`documentAttributeImageSize`), `0` when unknown.
+    pub width: i32,
+    /// Image height in pixels, `0` when unknown.
+    pub height: i32,
+}
+
 /// Payment invoice media payload.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InvoiceData {
@@ -534,6 +619,8 @@ pub struct InvoiceData {
     pub test: bool,
     /// Optional locked/unlocked extended media.
     pub extended_media: Option<Box<ExtendedMedia>>,
+    /// Product photo (`messageMediaInvoice.photo`, `Invoice::photo`).
+    pub photo: Option<WebDocumentData>,
 }
 
 /// Forwarded / mentioned story media payload.
@@ -1358,6 +1445,8 @@ pub struct ForwardInfo {
     pub saved_from_name: Option<String>,
     /// Original date when saved.
     pub saved_date: Option<TimeId>,
+    /// Whether the saved original was an outgoing message (`saved_out`, `savedFromOutgoing`).
+    pub saved_out: bool,
     /// Public Service Announcement type (if any).
     pub psa_type: Option<String>,
     /// Whether this message was imported from an external messenger.
@@ -1365,7 +1454,7 @@ pub struct ForwardInfo {
 }
 
 /// Reply target, quote, and topic threading metadata (`MessageReplyHeader` / `FullReplyTo`).
-#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReplyInfo {
     /// Target message ID (in `reply_to_peer_id` if cross-chat, else same chat).
     pub reply_to_msg_id: Option<MsgId>,
@@ -1391,7 +1480,14 @@ pub struct ReplyInfo {
     pub todo_item_id: Option<i32>,
     /// Specific poll option bytes replied to.
     pub poll_option: Option<Vec<u8>>,
+    /// Media of a replied-to message from another chat (`messageReplyHeader.reply_media`,
+    /// `ReplyFields::externalMedia`).
+    pub reply_media: Option<Box<MessageMedia>>,
 }
+
+/// `reply_media` holds floats (durations, coordinates) that are never NaN in data parsed from
+/// the server, so equality is total; drafts that embed a `ReplyInfo` rely on `Eq`.
+impl Eq for ReplyInfo {}
 
 impl ReplyInfo {
     /// Returns the resolved `FullMsgId` of the replied-to message given the
@@ -1904,6 +2000,8 @@ pub struct Message {
     pub via_business_bot_id: Option<UserId>,
     /// Post author signature (`post_author`).
     pub post_author: Option<String>,
+    /// Sender's member rank in a group at send time (`from_rank`, `HistoryItem::fromRank`).
+    pub from_rank: Option<String>,
     /// Self-destruct / auto-delete TTL in seconds.
     pub ttl_period: Option<TimeId>,
     /// Scheduled repeat period in seconds.
@@ -1952,6 +2050,7 @@ impl Message {
             via_bot_id: None,
             via_business_bot_id: None,
             post_author: None,
+            from_rank: None,
             ttl_period: None,
             schedule_repeat_period: None,
             effect_id: None,
@@ -1991,6 +2090,7 @@ impl Message {
             via_bot_id: None,
             via_business_bot_id: None,
             post_author: None,
+            from_rank: None,
             ttl_period: None,
             schedule_repeat_period: None,
             effect_id: None,

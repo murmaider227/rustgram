@@ -25,6 +25,8 @@ use tg_tl::{
 };
 use tokio::sync::broadcast;
 
+pub use crate::intro::fake_langpack::FakeLanguageSuggestion;
+
 // --- Synthetic test accounts (never real phone numbers or real people's names) ---
 
 /// Synthetic test phone for standard App -> SMS -> Call code login.
@@ -179,6 +181,8 @@ struct FakeServerInner {
     passkey_init_calls: u32,
     /// Last DC ID passed to `auth.finishPasskeyLogin`.
     last_passkey_finish_dc: Option<DcId>,
+    /// Language suggested through `help.getConfig` (none by default).
+    language_suggestion: Option<FakeLanguageSuggestion>,
 }
 
 impl FakeServerInner {
@@ -210,6 +214,7 @@ impl FakeServerInner {
             next_passkey_error: None,
             passkey_init_calls: 0,
             last_passkey_finish_dc: None,
+            language_suggestion: None,
         }
     }
 
@@ -405,6 +410,14 @@ impl FakeRpcClient {
         }
     }
 
+    /// Sets the language `help.getConfig` suggests (`suggested_lang_code`) and the
+    /// `langpack.*` answers for it; `None` (the default) suggests no language.
+    pub fn set_language_suggestion(&self, suggestion: Option<FakeLanguageSuggestion>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.language_suggestion = suggestion;
+        }
+    }
+
     /// Pushes a synthetic `tg_tl::enums::Updates` onto the live updates stream (e.g. `Update::LoginToken`).
     pub fn push_update(&self, updates: tl_enums::Updates) {
         let _ = self.updates_tx.send(updates);
@@ -553,10 +566,26 @@ impl FakeRpcClient {
                 );
                 Ok(resp.to_bytes())
             }
-            _ => Err(InvocationError::Rpc(RpcError::new(
-                501,
-                "NOT_IMPLEMENTED_IN_FAKE_INTRO",
-            ))),
+            _ => {
+                let suggestion = self
+                    .inner
+                    .lock()
+                    .map_err(|_| InvocationError::Dropped)?
+                    .language_suggestion
+                    .clone();
+                crate::intro::fake_langpack::dispatch(
+                    suggestion.as_ref(),
+                    self.main_dc_id(),
+                    constructor_id,
+                    request_bytes,
+                )
+                .unwrap_or_else(|| {
+                    Err(InvocationError::Rpc(RpcError::new(
+                        501,
+                        "NOT_IMPLEMENTED_IN_FAKE_INTRO",
+                    )))
+                })
+            }
         }
     }
 

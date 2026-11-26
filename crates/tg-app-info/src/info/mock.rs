@@ -135,6 +135,7 @@ impl MockBackend {
             is_online: false,
             verified: false,
             premium: false,
+            emoji_status_id: None,
             color_index: 5,
             phone: Some("+999 661 0000".to_owned()),
             usernames: vec![PeerUsername {
@@ -186,6 +187,7 @@ impl MockBackend {
             is_online: true,
             verified: false,
             premium: true,
+            emoji_status_id: None,
             color_index: 0,
             phone: Some("+999 661 0142".to_owned()),
             usernames: vec![
@@ -322,6 +324,7 @@ impl MockBackend {
                 is_online,
                 verified: false,
                 premium: false,
+                emoji_status_id: None,
                 color_index,
                 phone: Some(phone.to_owned()),
                 usernames: vec![PeerUsername {
@@ -374,6 +377,7 @@ impl MockBackend {
             is_online: false,
             verified: true,
             premium: false,
+            emoji_status_id: None,
             color_index: 5,
             phone: None,
             usernames: vec![PeerUsername {
@@ -543,6 +547,7 @@ impl MockBackend {
             is_online: false,
             verified: false,
             premium: false,
+            emoji_status_id: None,
             color_index: 0,
             phone: None,
             usernames: vec![PeerUsername {
@@ -633,6 +638,7 @@ impl MockBackend {
             is_online: false,
             verified: false,
             premium: false,
+            emoji_status_id: None,
             color_index: 2,
             phone: None,
             usernames: Vec::new(),
@@ -681,6 +687,7 @@ impl MockBackend {
             is_online: false,
             verified: true,
             premium: false,
+            emoji_status_id: None,
             color_index: 3,
             phone: None,
             usernames: vec![PeerUsername {
@@ -762,6 +769,7 @@ impl MockBackend {
             is_online: false,
             verified: false,
             premium: false,
+            emoji_status_id: None,
             color_index: 4,
             phone: None,
             usernames: vec![PeerUsername {
@@ -1369,6 +1377,7 @@ impl InfoBackend for MockBackend {
             is_online: false,
             verified: false,
             premium: false,
+            emoji_status_id: None,
             color_index: (bare % 7) as u8,
             phone: Some(format_phone(phone)),
             usernames: Vec::new(),
@@ -1455,6 +1464,7 @@ impl InfoBackend for MockBackend {
             is_online: false,
             verified: false,
             premium: false,
+            emoji_status_id: None,
             color_index: (bare % 7) as u8,
             phone: None,
             usernames: Vec::new(),
@@ -1542,6 +1552,7 @@ impl InfoBackend for MockBackend {
             is_online: false,
             verified: false,
             premium: false,
+            emoji_status_id: None,
             color_index: (bare % 7) as u8,
             phone: None,
             usernames,

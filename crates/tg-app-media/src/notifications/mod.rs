@@ -338,6 +338,15 @@ impl AppNotifyTrayHost {
         let now_ms = self.elapsed_ms();
         let now_unix = current_unix_secs();
 
+        // Native toasts show the photo userpics the app has loaded.
+        if !self.system.has_userpic_photo_lookup() {
+            let photos = ctx.clone();
+            self.system
+                .set_userpic_photo_lookup(Some(std::sync::Arc::new(move |peer_id| {
+                    tg_ui::userpic_images::userpic_image(&photos, peer_id)
+                })));
+        }
+
         // Update focus & minimize snapshot from egui viewport state.
         let (focused, minimized) = ctx.input(|i| {
             let vp = i.viewport();
@@ -449,6 +458,9 @@ fn current_unix_secs() -> i64 {
         .map(|d| d.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests_tgb2946;
 
 #[cfg(test)]
 mod tests {
@@ -572,7 +584,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn muted_group_skips_regular_messages_but_allows_mentions_and_replies_from_unmuted_sender() {
+    fn muted_group_skips_regular_messages_but_allows_mentions_from_unmuted_sender() {
         let now_unix = 1_700_000_000;
         let group = MockNotifyBackend::PEER_TEAM_ALPHA;
         let sender = MockNotifyBackend::PEER_BUILD_BOT;
@@ -623,7 +635,8 @@ mod tests {
             SkipDecision::Notify { silent: false }
         );
 
-        // Direct reply in muted group from unmuted sender -> notifies!
+        // A reply to my message notifies through the server's `mentioned` flag (covered by the
+        // mention case above); without it the muted group stays silent, as in tdesktop.
         let reply = IncomingMessageNotification {
             is_reply_to_me: true,
             msg_id: MsgId(22),
@@ -631,7 +644,7 @@ mod tests {
         };
         assert_eq!(
             sys.evaluate_skip(&reply, &focus, 1_000, now_unix),
-            SkipDecision::Notify { silent: false }
+            SkipDecision::Skip(SkipReason::Muted)
         );
 
         // If the mentioning sender is ALSO muted, the mention is skipped.
@@ -1232,7 +1245,16 @@ mod tests {
     fn notification_sound_player_decodes_bundled_gpl_mp3_and_mixes_into_tg_audio() {
         let mut player = NotificationSoundPlayer::headless();
         let default_track = player.default_track();
-        assert!(default_track.length_ms() > 50);
+        // tdesktop's `msg_incoming.mp3` lasts ~0.6 s; the synthesized fallback chime 180 ms.
+        assert!(
+            default_track.length_ms() > 400,
+            "the default sound must be tdesktop's msg_incoming.mp3, got {} ms",
+            default_track.length_ms()
+        );
+        assert_eq!(
+            player.lookup_sound_bytes(0),
+            crate::notifications::sound::DEFAULT_SOUND_MP3
+        );
 
         let fallback = generate_fallback_chime_track();
         assert!(fallback.length_ms() >= 150);

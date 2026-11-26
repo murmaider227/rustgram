@@ -47,6 +47,44 @@ pub struct PaletteRow {
     pub description: &'static str,
 }
 
+/// Typed slot of a [`Palette`] colour, generated from `colors.palette`
+/// (`PaletteColor::WINDOW_BG` for `windowBg`).
+///
+/// A misspelt colour is a compile error instead of a transparent paint, and [`Palette::at`]
+/// reads the slot directly instead of searching the colour names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PaletteColor(u16);
+
+impl PaletteColor {
+    /// Palette slot index (`0..Palette::COUNT`).
+    #[inline]
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// Original camelCase name (`"windowBg"`), as used by `.tdesktop-theme` files.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        Palette::name_at_index(self.index()).unwrap_or("transparent")
+    }
+
+    /// Typed colour for a slot index, or `None` outside `0..Palette::COUNT`.
+    #[must_use]
+    pub const fn from_index(index: usize) -> Option<Self> {
+        if index < PALETTE_COUNT {
+            Some(Self(index as u16))
+        } else {
+            None
+        }
+    }
+
+    /// Callers pass indices from [`Palette::index_of_name`], which are always in range.
+    const fn from_index_unchecked(index: usize) -> Self {
+        Self(index as u16)
+    }
+}
+
 include!(concat!(env!("OUT_DIR"), "/palette_generated.rs"));
 
 struct FinalizeHelper<'a> {
@@ -96,6 +134,13 @@ impl Palette {
     pub fn color_by_name(&self, name: &str) -> Option<Color> {
         let index = Self::index_of_name(name)?;
         self.raw_color_at(index)
+    }
+
+    /// Reads a typed colour slot (`palette.at(PaletteColor::WINDOW_BG)`) without a name lookup.
+    #[inline]
+    #[must_use]
+    pub fn at(&self, color: PaletteColor) -> Color {
+        self.raw_color_at(color.index()).unwrap_or(self.transparent)
     }
 
     /// Looks up a color by palette index (`0..Self::COUNT`).

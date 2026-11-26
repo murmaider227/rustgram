@@ -12,7 +12,10 @@ pub use fly::{
     MiniCopy, ReactionFlyAnimation, ReactionFlyArgs, ReactionFlyStage, TextFlightSample,
     compute_fly_parabola, cubic_bezier_ease, reveal_height, rise_progress,
 };
-pub use radial::{InfiniteRadialAnimation, RadialState, paint_arc, paint_static_loading};
+pub use radial::{
+    InfiniteRadialAnimation, RADIAL_DURATION_MS, RADIAL_PERIOD_MS, RadialAnimation, RadialState,
+    paint_arc, paint_static_loading,
+};
 pub use ripple::{RippleMask, RippleState, clamp_point_to_round_rect, update_and_paint_ripple};
 pub use spoiler::paint_spoiler_particles;
 pub use thanos::{

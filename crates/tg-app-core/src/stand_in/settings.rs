@@ -86,6 +86,57 @@ impl Default for SavedWindowColumns {
     }
 }
 
+/// A built-in theme and its accent as saved for day mode or for night mode (tdesktop keeps
+/// one saved theme per mode, `themeKeyDay` / `themeKeyNight`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedThemeChoice {
+    /// `tg-theme` embedded theme variant (`"Default"`, `"DayBlue"`, `"Night"`, `"NightGreen"`).
+    pub embedded_theme: String,
+    /// Optional custom accent color RGB override.
+    #[serde(default)]
+    pub accent_rgb: Option<[u8; 3]>,
+}
+
+impl SavedThemeChoice {
+    fn new(kind: tg_theme::EmbeddedType, accent: Option<tg_theme::Color>) -> Self {
+        Self {
+            embedded_theme: embedded_name(kind).to_owned(),
+            accent_rgb: accent.map(|c| [c.r, c.g, c.b]),
+        }
+    }
+
+    /// The saved theme, or `None` when the stored name is unknown or belongs to the other
+    /// mode (`night`).
+    fn resolve(&self, night: bool) -> Option<tg_ui::theme::SavedEmbedded> {
+        let kind = embedded_from_name(&self.embedded_theme)?;
+        (kind.is_dark() == night).then(|| tg_ui::theme::SavedEmbedded {
+            kind,
+            accent: self
+                .accent_rgb
+                .map(|[r, g, b]| tg_theme::Color::rgb(r, g, b)),
+        })
+    }
+}
+
+const fn embedded_name(kind: tg_theme::EmbeddedType) -> &'static str {
+    match kind {
+        tg_theme::EmbeddedType::DayBlue => "DayBlue",
+        tg_theme::EmbeddedType::Default => "Default",
+        tg_theme::EmbeddedType::Night => "Night",
+        tg_theme::EmbeddedType::NightGreen => "NightGreen",
+    }
+}
+
+fn embedded_from_name(name: &str) -> Option<tg_theme::EmbeddedType> {
+    match name {
+        "DayBlue" => Some(tg_theme::EmbeddedType::DayBlue),
+        "Default" => Some(tg_theme::EmbeddedType::Default),
+        "Night" => Some(tg_theme::EmbeddedType::Night),
+        "NightGreen" => Some(tg_theme::EmbeddedType::NightGreen),
+        _ => None,
+    }
+}
+
 /// Persisted shell settings stored as JSON on disk.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShellSettings {
@@ -101,6 +152,12 @@ pub struct ShellSettings {
     /// Optional custom accent color RGB override.
     #[serde(default)]
     pub accent_rgb: Option<[u8; 3]>,
+    /// Theme the night-mode toggle returns to in day mode (absent: Classic).
+    #[serde(default)]
+    pub day_theme: Option<SavedThemeChoice>,
+    /// Theme the night-mode toggle switches to in night mode (absent: Tinted).
+    #[serde(default)]
+    pub night_theme: Option<SavedThemeChoice>,
     /// Whether the vertical chat folders sidebar is enabled.
     pub folders_sidebar_enabled: bool,
     /// Optional local passcode configured in Settings (stand-in plain mock secret).
@@ -119,6 +176,8 @@ impl Default for ShellSettings {
             theme_mode: ThemeMode::Day,
             embedded_theme: None,
             accent_rgb: None,
+            day_theme: None,
+            night_theme: None,
             folders_sidebar_enabled: true,
             local_passcode: None,
             native_window_frame: false,
@@ -130,13 +189,27 @@ impl ShellSettings {
     /// Resolves the persisted `tg-theme` [`tg_theme::EmbeddedType`].
     #[must_use]
     pub fn resolved_embedded_type(&self) -> tg_theme::EmbeddedType {
-        match self.embedded_theme.as_deref() {
-            Some("DayBlue") => tg_theme::EmbeddedType::DayBlue,
-            Some("Default") => tg_theme::EmbeddedType::Default,
-            Some("Night") => tg_theme::EmbeddedType::Night,
-            Some("NightGreen") => tg_theme::EmbeddedType::NightGreen,
-            _ => self.theme_mode.to_embedded(),
+        self.embedded_theme
+            .as_deref()
+            .and_then(embedded_from_name)
+            .unwrap_or_else(|| self.theme_mode.to_embedded())
+    }
+
+    /// Builds the [`tg_ui::theme::ThemeManager`] these settings describe: the applied theme
+    /// with its accent, plus the themes saved for day mode and for night mode.
+    #[must_use]
+    pub fn restored_theme_manager(&self) -> tg_ui::theme::ThemeManager {
+        let embedded = self.resolved_embedded_type();
+        let mut manager = tg_ui::theme::ThemeManager::with_embedded(embedded);
+        for (saved, night) in [(&self.day_theme, false), (&self.night_theme, true)] {
+            if let Some(saved) = saved.as_ref().and_then(|s| s.resolve(night)) {
+                manager.remember(saved);
+            }
         }
+        if let Some(accent) = self.resolved_accent_color() {
+            manager.set_embedded(embedded, Some(accent));
+        }
+        manager
     }
 
     /// Resolves the persisted optional accent color override.
@@ -147,18 +220,18 @@ impl ShellSettings {
     }
 
     /// Updates persisted embedded theme and accent color from [`tg_ui::theme::ThemeManager`].
+    /// The applied theme is also the one saved for its own mode (day or night), as
+    /// tdesktop's `KeepApplied` writes it under `themeKeyDay` / `themeKeyNight`.
     pub fn record_theme(&mut self, kind: tg_theme::EmbeddedType, accent: Option<tg_theme::Color>) {
         self.theme_mode = ThemeMode::from_embedded(kind);
-        self.embedded_theme = Some(
-            match kind {
-                tg_theme::EmbeddedType::DayBlue => "DayBlue",
-                tg_theme::EmbeddedType::Default => "Default",
-                tg_theme::EmbeddedType::Night => "Night",
-                tg_theme::EmbeddedType::NightGreen => "NightGreen",
-            }
-            .to_owned(),
-        );
+        self.embedded_theme = Some(embedded_name(kind).to_owned());
         self.accent_rgb = accent.map(|c| [c.r, c.g, c.b]);
+        let saved = Some(SavedThemeChoice::new(kind, accent));
+        if kind.is_dark() {
+            self.night_theme = saved;
+        } else {
+            self.day_theme = saved;
+        }
     }
 
     /// Resolves the default persistence path under `%LOCALAPPDATA%\Rustgram\shell_state.json`
@@ -231,5 +304,49 @@ mod tests {
         assert_eq!(loaded.window_position.width, WINDOW_MIN_WIDTH as f32);
         assert_eq!(loaded.window_position.height, WINDOW_MIN_HEIGHT as f32);
         assert_eq!(loaded.window_position.x, Some(120.0));
+    }
+
+    /// TGB-2955: the chosen theme, its accent and the theme saved for the other mode all
+    /// survive a restart; a settings file written before the per-mode themes still loads.
+    #[test]
+    fn theme_choice_and_per_mode_themes_survive_a_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "rustgram_shell_settings_theme_test_{}.json",
+            std::process::id()
+        ));
+        let accent = tg_theme::Color::rgb(0xd0, 0x40, 0x40);
+
+        let mut s = ShellSettings::default();
+        s.record_theme(tg_theme::EmbeddedType::DayBlue, Some(accent));
+        s.record_theme(tg_theme::EmbeddedType::NightGreen, None);
+        s.save_to(&path).expect("save settings");
+
+        let loaded = ShellSettings::load_from(&path);
+        let mut manager = loaded.restored_theme_manager();
+        assert_eq!(manager.embedded_type(), tg_theme::EmbeddedType::NightGreen);
+        assert!(manager.is_dark());
+        manager.set_night_mode(false);
+        assert_eq!(manager.embedded_type(), tg_theme::EmbeddedType::DayBlue);
+        assert_eq!(manager.accent(), Some(accent));
+        manager.set_night_mode(true);
+        assert_eq!(manager.embedded_type(), tg_theme::EmbeddedType::NightGreen);
+
+        // A file written before the per-mode themes existed.
+        let mut old_json = serde_json::to_value(ShellSettings::default()).expect("to json");
+        let fields = old_json.as_object_mut().expect("object");
+        fields.remove("day_theme");
+        fields.remove("night_theme");
+        fields.insert("theme_mode".to_owned(), serde_json::json!("Night"));
+        fields.insert("embedded_theme".to_owned(), serde_json::json!("NightGreen"));
+        fs::write(&path, old_json.to_string()).expect("write old settings");
+        let old = ShellSettings::load_from(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(old.day_theme, None);
+        let manager = old.restored_theme_manager();
+        assert_eq!(manager.embedded_type(), tg_theme::EmbeddedType::NightGreen);
+        assert_eq!(
+            manager.saved_embedded(false),
+            tg_ui::theme::SavedEmbedded::default_for(false)
+        );
     }
 }

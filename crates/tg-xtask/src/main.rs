@@ -65,6 +65,9 @@ SUBCOMMANDS:
     --signing-key <FILE>     Path to 32-byte raw or 64-char hex Ed25519 signing seed
     --iscc <PATH>            Explicit path to Inno Setup ISCC.exe
     --require-iscc           Fail if ISCC.exe is not installed
+    --require-api-credentials
+                             Fail unless RUSTGRAM_API_ID/RUSTGRAM_API_HASH are set and
+                             compiled into rustgram.exe
 
   icon     Render assets/icon.svg into a multi-size Windows .ico file.
     --svg <PATH>             Input SVG path (default: <workspace>/assets/icon.svg)
@@ -86,6 +89,7 @@ fn run_dist_cli(args: &[String]) -> Result<(), XtaskError> {
     let mut signing_key_path: Option<PathBuf> = None;
     let mut iscc_path: Option<PathBuf> = None;
     let mut require_iscc = false;
+    let mut require_api_credentials = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -120,6 +124,7 @@ fn run_dist_cli(args: &[String]) -> Result<(), XtaskError> {
                 iscc_path = Some(PathBuf::from(next_value(args, i, "--iscc")?));
             }
             "--require-iscc" => require_iscc = true,
+            "--require-api-credentials" => require_api_credentials = true,
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -168,6 +173,7 @@ fn run_dist_cli(args: &[String]) -> Result<(), XtaskError> {
         signing_key_path,
         iscc_path,
         require_iscc,
+        require_api_credentials,
     })?;
 
     println!("tg-xtask: dist completed:");

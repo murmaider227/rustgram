@@ -317,8 +317,11 @@ fn peer_picker_row(ui: &mut Ui, peer: &PeerProfile, selected: bool, colors: &dyn
     if peer.kind == InfoPeerKind::SavedMessages {
         EmptyUserpic::paint_saved_messages(ui.painter(), av_rect, colors);
     } else {
-        EmptyUserpic::for_color_index(peer.color_index, &peer.title, colors)
-            .paint_circle(ui.painter(), av_rect);
+        EmptyUserpic::for_color_index(peer.color_index, &peer.title, colors).paint_circle_or_photo(
+            ui.painter(),
+            av_rect,
+            peer.id.0,
+        );
     }
 
     let resolver = ColorsResolver(colors);

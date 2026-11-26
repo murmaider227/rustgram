@@ -51,6 +51,7 @@ use crate::common::{
     AppTestState, build_harness, build_wgpu_harness, click_at, press_key, right_click_at,
     settle_layout, step_frames, wait_for_menu_item,
 };
+use crate::e2e_tgb2971_pull_next_channel as pull_gesture;
 
 const DESKTOP_SIZE: Vec2 = Vec2::new(1440.0, 900.0);
 const MOBILE_SIZE: Vec2 = Vec2::new(390.0, 844.0);
@@ -474,23 +475,21 @@ fn wp61_pull_to_next_channel_navigates_to_next_unread_channel() {
         .request_scroll_to_bottom(session_peers::CHANNEL_DEV_LOG);
     settle_layout(&mut h);
 
-    // 1. Feed overscroll past the release threshold with current egui time, then release -> jumps to CHANNEL_RELEASES.
-    let now = h.ctx.input(|i| i.time);
-    {
-        let pull = h
-            .state_mut()
+    // 1. A pull past the threshold, held and released (`e2e_tgb2971_pull_next_channel`), jumps
+    //    to CHANNEL_RELEASES.
+    let at = pull_gesture::list_point(DESKTOP_SIZE);
+    pull_gesture::pull(&mut h, at, 300.0);
+    pull_gesture::hold_for_the_dwell(&mut h);
+    assert!(
+        h.state_mut()
             .controller
             .main_widget_mut()
             .history_mut()
-            .pull_next_channel_mut();
-        pull.feed_bottom_overscroll(260.0, now, true);
-        assert!(
-            pull.is_ready(),
-            "overscroll past threshold should flip ready=true"
-        );
-    }
-    // Wait past the 220ms release threshold (~10 frames at 1/30s = 333ms).
-    step_frames(&mut h, 12);
+            .pull_next_channel_mut()
+            .is_ready(),
+        "a pull held past the threshold should flip ready=true"
+    );
+    pull_gesture::release(&mut h, at);
     settle_layout(&mut h);
 
     let active_after_pull = h.state().controller.session().map(|s| s.active_peer());
@@ -502,7 +501,7 @@ fn wp61_pull_to_next_channel_navigates_to_next_unread_channel() {
 
     // Since Step 1 read `CHANNEL_DEV_LOG` to the bottom (marking it read as in tdesktop),
     // scrolling `CHANNEL_RELEASES` to the bottom leaves no other unread channel, so no pull
-    // prompt appears even during overscroll (`FindNextUnreadChannel`).
+    // hint appears even during a pull (`FindNextUnreadChannel`).
     h.state_mut()
         .controller
         .main_widget_mut()
@@ -510,21 +509,15 @@ fn wp61_pull_to_next_channel_navigates_to_next_unread_channel() {
         .request_scroll_to_bottom(session_peers::CHANNEL_RELEASES);
     settle_layout(&mut h);
     let pull_prompt = tr::lng_pull_next_channel();
-    let now = h.ctx.input(|i| i.time);
-    h.state_mut()
-        .controller
-        .main_widget_mut()
-        .history_mut()
-        .pull_next_channel_mut()
-        .feed_bottom_overscroll(10.0, now, true);
-    step_frames(&mut h, 1);
+    pull_gesture::pull(&mut h, at, 30.0);
     assert!(
         h.query_by_label_contains(&pull_prompt).is_none(),
-        "pull-to-next-channel footer must stay hidden once all other channels are read"
+        "the pull-to-next-channel hint must stay hidden once all other channels are read"
     );
+    pull_gesture::release(&mut h, at);
 
     // 2. On a fresh workspace opened at `CHANNEL_RELEASES` (while `CHANNEL_DEV_LOG` is still
-    //    unread), the pull footer appears only while over-scrolling (WP-75); clicking it
+    //    unread), the hint appears only while the list is pulled (WP-75); a full pull
     //    navigates to unread `CHANNEL_DEV_LOG`.
     let mut h2 = build_wp61_test_harness(DESKTOP_SIZE);
     if let Some(session) = h2.state_mut().controller.session_mut() {
@@ -543,28 +536,23 @@ fn wp61_pull_to_next_channel_navigates_to_next_unread_channel() {
     settle_layout(&mut h2);
     assert!(
         h2.query_by_label_contains(&pull_prompt).is_none(),
-        "no pull footer at rest"
+        "no pull hint at rest"
     );
-    let now = h2.ctx.input(|i| i.time);
-    h2.state_mut()
-        .controller
-        .main_widget_mut()
-        .history_mut()
-        .pull_next_channel_mut()
-        .feed_bottom_overscroll(10.0, now, true);
-    step_frames(&mut h2, 1);
-    let footer_node = h2
-        .query_by_label_contains(&pull_prompt)
-        .expect("pull-to-next-channel footer should display pull prompt");
-    let footer_center = footer_node.rect().center();
-    click_at(&mut h2, footer_center);
+    pull_gesture::pull(&mut h2, at, 30.0);
+    assert!(
+        h2.query_by_label_contains(&pull_prompt).is_some(),
+        "the pull-to-next-channel hint should display the pull prompt"
+    );
+    pull_gesture::pull(&mut h2, at, 300.0);
+    pull_gesture::hold_for_the_dwell(&mut h2);
+    pull_gesture::release(&mut h2, at);
     settle_layout(&mut h2);
 
-    let active_after_click = h2.state().controller.session().map(|s| s.active_peer());
+    let active_after_release = h2.state().controller.session().map(|s| s.active_peer());
     assert_eq!(
-        active_after_click,
+        active_after_release,
         Some(session_peers::CHANNEL_DEV_LOG),
-        "clicking the pull-to-next-channel footer should navigate to the next unread channel"
+        "a full pull should navigate to the next unread channel"
     );
 }
 

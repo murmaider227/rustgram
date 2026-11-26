@@ -183,6 +183,7 @@ pub fn synthesize_community_dialog_item(
         color_index: group.color_index,
         verified: false,
         premium: false,
+        emoji_status_id: None,
         online: false,
         active_call: false,
         muted: unread_count > 0 && unread_muted,
@@ -262,7 +263,7 @@ impl CommunityChatsListWidget {
                     Vec2::splat(38.0),
                 );
                 EmptyUserpic::for_peer(peer.peer_id.bare(), &peer.title, colors)
-                    .paint_circle(ui.painter(), av_rect);
+                    .paint_circle_or_photo(ui.painter(), av_rect, peer.peer_id.0);
 
                 let tx = av_rect.right() + 10.0;
                 ui.painter().text(

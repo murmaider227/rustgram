@@ -582,6 +582,9 @@ fn live_send_sticker_and_gif_emit_send_media_input_document_with_file_reference(
             )],
         }),
     );
+    // The first call starts the background refresh; the list is there once it finishes.
+    let _ = ChatHelpersBackend::saved_gifs(&live);
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
     let gifs = ChatHelpersBackend::saved_gifs(&live);
     assert_eq!(gifs.len(), 1);
     assert_eq!(gifs[0].id, ChatDocId(gif_doc_id as u64));

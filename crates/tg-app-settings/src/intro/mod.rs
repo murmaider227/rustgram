@@ -17,6 +17,8 @@ pub mod auth_boxes;
 pub mod code;
 pub mod email;
 pub mod fake_invoker;
+mod fake_langpack;
+pub mod language_link;
 pub mod passkey_rpc;
 pub mod password;
 pub mod phone;
@@ -24,6 +26,8 @@ pub mod qr;
 pub mod signup;
 pub mod start;
 pub mod style;
+#[cfg(test)]
+mod tests_language_link;
 
 #[cfg(test)]
 mod screenshots;
@@ -532,6 +536,7 @@ pub struct IntroWidget {
     icon_cache: TgforkIconCache,
     nearest_dc_fetched: bool,
     nearest_dc_rx: Option<std::sync::mpsc::Receiver<InvokeResult<tl_types::NearestDc>>>,
+    language_link: language_link::LanguageLinkTasks,
 }
 
 impl std::fmt::Debug for IntroWidget {
@@ -646,6 +651,7 @@ impl IntroWidget {
             icon_cache: TgforkIconCache::default(),
             nearest_dc_fetched: false,
             nearest_dc_rx: None,
+            language_link: language_link::LanguageLinkTasks::default(),
         }
     }
 
@@ -1756,6 +1762,8 @@ impl IntroWidget {
     ) -> Option<IntroAction> {
         self.request_nearest_dc(ui.ctx());
         self.poll_nearest_dc();
+        self.request_language_suggestion(Some(ui.ctx()));
+        self.poll_language_link();
 
         let mut emitted = None;
         let now = tg_app_core::clock::now();
@@ -1941,7 +1949,7 @@ impl IntroWidget {
                             let _ = self.start_qr_flow(now);
                         }
                         StartStepAction::ToggleLanguage => {
-                            self.start.toggle_language();
+                            self.click_language_link(Some(ui.ctx()));
                         }
                     }
                 }

@@ -24,8 +24,6 @@ pub const TOAST_UNMUTED: &str = "Notifications unmuted";
 pub const TOAST_MARKED_READ: &str = "Marked as read";
 /// Toast shown after marking a single dialog as unread.
 pub const TOAST_MARKED_UNREAD: &str = "Marked as unread";
-/// Placeholder preview shown on a dialog whose history was cleared.
-pub const PREVIEW_HISTORY_CLEARED: &str = "History was cleared";
 /// Empty state message inside the Archived Chats view.
 pub const EMPTY_ARCHIVED_CHATS: &str = "No archived chats";
 /// Pagination button at the bottom of message search results.

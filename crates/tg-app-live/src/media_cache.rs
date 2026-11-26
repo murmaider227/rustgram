@@ -1,6 +1,10 @@
 //! Live inline media disk cache (`tg-storage`'s [`MediaCacheIndex`]) and asynchronous
 //! `upload.getFile` (with CDN redirect) background download coordinator for [`super::LiveSession`].
 //!
+//! The encrypted index (SQLite, blob files, crypto) belongs to one actor thread ([`store`]);
+//! callers keep a small in-memory layer (recently used blobs as `Arc<[u8]>`, blobs still being
+//! written, known misses, in-flight downloads) behind a mutex that is never held across I/O.
+//!
 //! Port origin:
 //! - `Telegram/lib_storage/storage/cache/storage_cache_types.h`
 //! - `Telegram/lib_storage/storage/cache/storage_cache_database.cpp`
@@ -8,14 +12,16 @@
 //! - `Telegram/SourceFiles/storage/storage_account.cpp`
 //! - `Telegram/SourceFiles/settings/sections/settings_local_storage.cpp`
 
-use std::collections::HashMap;
-use std::fs;
+mod lru;
+mod store;
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use serde::{Deserialize, Serialize};
 use tg_api::RpcClient;
 use tg_data::{
     DocumentData, DocumentKind, ExtendedMedia, Message, MessageContent, MessageMedia, PhotoData,
@@ -23,19 +29,20 @@ use tg_data::{
 use tg_storage::StorageEncryptionKey;
 use tg_storage::cache::legacy_temp::sweep_legacy_temp_dirs_once;
 pub use tg_storage::cache::media_cache::MediaCacheTag;
-use tg_storage::cache::media_cache::{
-    MediaCacheIndex, read_encrypted_blob, register_cache_key, unregister_cache_key,
-    write_encrypted_blob,
-};
+use tg_storage::cache::media_cache::{MediaCacheIndex, register_cache_key, unregister_cache_key};
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
+use self::lru::ByteLru;
+use self::store::{Priority, Store, StoreActor};
 use crate::bridge::LiveBridgeState;
 use crate::media::{
     ResolvedMediaLocation, document_thumb_location, document_to_location,
     download_file_bytes_with_progress_async, photo_thumb_location, photo_to_location,
 };
-use tg_app_core::core_types::dto::inline_media::{InlineMediaDescriptor, PhotoLoadState};
+use tg_app_core::core_types::dto::inline_media::{
+    InlineMediaDescriptor, PhotoLoadState, VoiceLoadState,
+};
 use tg_app_core::core_types::misc::InlineDocumentData;
 use tg_app_core::info::backend::SharedMediaThumb;
 use tg_app_core::settings::backend::LocalStorageStats;
@@ -70,6 +77,22 @@ const ENCRYPTED_MANIFEST_FILENAME: &str = "cache_meta.tdef";
 
 /// Legacy plaintext manifest filename deleted automatically when opening a persistent cache.
 const LEGACY_MANIFEST_FILENAME: &str = "cache_meta.json";
+
+/// Memory budget for recently read or downloaded blobs served without touching the disk.
+const HOT_BLOB_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// Blobs larger than this are not kept by blocking reads (they would push out many photos).
+const HOT_BLOB_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Memory budget for decompressed Lottie JSON of animated stickers.
+const LOTTIE_JSON_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+
+/// The set of keys known to be absent from the disk cache is reset when it grows past this.
+const KNOWN_MISSES_CAP: usize = 4096;
+
+/// Identity of the [`Store`] (the opened index) a result came from: a reopen or logout gives
+/// the cache a new store, and results of the previous one are dropped.
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Builds the canonical cache key for a downloaded photo size.
 #[must_use]
@@ -109,23 +132,25 @@ pub fn decompress_tgs_to_lottie_json(bytes: &[u8]) -> Result<String, String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedLimits {
-    size_limit_bytes: i64,
-    time_limit_days: i32,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct InFlightDownload {
     bytes_loaded: u64,
     total_bytes: u64,
+    /// Stops the download task ([`LiveMediaCache::cancel_download`]); set right after the
+    /// task is spawned.
+    abort: Option<tokio::task::AbortHandle>,
+    /// Which download task this slot belongs to: a task that was cancelled (and maybe
+    /// replaced by a new download of the same key) must not report into the slot.
+    token: u64,
 }
+
+static NEXT_FLIGHT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Result of querying or scheduling an inline media download from [`LiveMediaCache`].
 #[derive(Debug, Clone)]
 pub enum CacheFetchState {
-    /// Bytes are already available on disk / in cache.
-    Ready(Vec<u8>),
+    /// Bytes are already available (memory or disk cache).
+    Ready(Arc<[u8]>),
     /// Download is currently in flight (either previously started or just spawned).
     Loading {
         /// Bytes received so far.
@@ -133,51 +158,102 @@ pub enum CacheFetchState {
         /// Expected total bytes (`0` if unknown).
         total_bytes: u64,
     },
+    /// The disk cache is still being read (only from non-blocking lookups); the UI is notified
+    /// when the read finishes, and the next lookup returns `Ready` or `Loading`.
+    Pending,
     /// Download was skipped (e.g. exceeds inline size cap or in brief failure cooldown).
     Skipped,
 }
 
-struct LiveMediaCacheInner {
-    index: MediaCacheIndex,
+/// Whether a lookup that has to go to disk waits for the read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    /// Wait for the actor (a short read; reads are served before queued writes).
+    Blocking,
+    /// Queue the read and return [`CacheFetchState::Pending`] at once.
+    NonBlocking,
+}
+
+/// Work counters of a [`LiveMediaCache`], for tests and measurements.
+#[derive(Debug, Default)]
+pub struct MediaCacheCounters {
+    disk_reads: AtomicU64,
+    memory_hits: AtomicU64,
+    blocking_reads: AtomicU64,
+}
+
+impl MediaCacheCounters {
+    /// Blobs read and decrypted from disk (on the cache thread).
+    #[must_use]
+    pub fn disk_reads(&self) -> u64 {
+        self.disk_reads.load(Ordering::Relaxed)
+    }
+
+    /// Lookups answered from memory without the cache thread.
+    #[must_use]
+    pub fn memory_hits(&self) -> u64 {
+        self.memory_hits.load(Ordering::Relaxed)
+    }
+
+    /// Lookups whose caller waited for a disk read.
+    #[must_use]
+    pub fn blocking_reads(&self) -> u64 {
+        self.blocking_reads.load(Ordering::Relaxed)
+    }
+}
+
+/// In-memory state shared by all clones of a [`LiveMediaCache`]. Never locked across I/O.
+struct Shared {
+    store_id: u64,
     root_dir: PathBuf,
     is_persistent: bool,
     /// `true` when the index was opened with the account's storage key (derived from the `tdata`
     /// local key), `false` for a memory-only cache or one using a random per-process key.
     has_account_key: bool,
+    encryption_key: StorageEncryptionKey,
     /// Folders outside the cache root that were given the account key
     /// ([`LiveMediaCache::register_account_dir`]).
     account_dirs: Vec<PathBuf>,
-    size_limit_bytes: i64,
-    time_limit_days: i32,
     in_flight: HashMap<String, InFlightDownload>,
     failed_at: HashMap<String, Instant>,
-    lottie_json: HashMap<u64, String>,
+    lottie_json: ByteLru<u64, Arc<str>>,
+    /// Recently read or downloaded blobs.
+    hot: ByteLru<String, Arc<[u8]>>,
+    /// Downloaded blobs queued for the disk write, served from memory until it lands.
+    writing: HashMap<String, Arc<[u8]>>,
+    /// Keys the disk cache was found not to have (cleared when they are stored).
+    misses: HashSet<String>,
+    /// Keys with a queued non-blocking read.
+    reading: HashSet<String>,
+    /// Keys whose download the user cancelled (`PhotoData::cancel`, kept for the session like
+    /// tdesktop's `CancelledFileLoader`): not downloaded automatically again.
+    cancelled: HashSet<String>,
 }
 
-impl LiveMediaCacheInner {
-    fn from_index(index: MediaCacheIndex, root_dir: PathBuf, is_persistent: bool) -> Self {
-        let mut inner = Self {
-            index,
+impl Shared {
+    fn new(
+        store_id: u64,
+        root_dir: PathBuf,
+        is_persistent: bool,
+        has_account_key: bool,
+        encryption_key: StorageEncryptionKey,
+    ) -> Self {
+        Self {
+            store_id,
             root_dir,
             is_persistent,
-            has_account_key: false,
+            has_account_key,
+            encryption_key,
             account_dirs: Vec::new(),
-            size_limit_bytes: DEFAULT_CACHE_SIZE_LIMIT_BYTES,
-            time_limit_days: DEFAULT_CACHE_TIME_LIMIT_DAYS,
             in_flight: HashMap::new(),
             failed_at: HashMap::new(),
-            lottie_json: HashMap::new(),
-        };
-        if is_persistent {
-            // Purge any legacy plaintext sidecar manifest left by older builds.
-            let _ = fs::remove_file(inner.root_dir.join(LEGACY_MANIFEST_FILENAME));
-            inner.load_manifest();
+            lottie_json: ByteLru::new(LOTTIE_JSON_BUDGET_BYTES),
+            hot: ByteLru::new(HOT_BLOB_BUDGET_BYTES),
+            writing: HashMap::new(),
+            misses: HashSet::new(),
+            reading: HashSet::new(),
+            cancelled: HashSet::new(),
         }
-        inner
-    }
-
-    fn manifest_path(&self) -> PathBuf {
-        self.root_dir.join(ENCRYPTED_MANIFEST_FILENAME)
     }
 
     /// Removes the account key from every folder it was registered for (logout, or the cache is
@@ -188,61 +264,37 @@ impl LiveMediaCacheInner {
         }
     }
 
-    fn load_manifest(&mut self) {
-        let path = self.manifest_path();
-        let Ok(raw) = read_encrypted_blob(&path, self.index.encryption_key()) else {
-            return;
-        };
-        if let Ok(parsed) = serde_json::from_slice::<PersistedLimits>(&raw) {
-            self.size_limit_bytes = parsed.size_limit_bytes.max(0);
-            self.time_limit_days = parsed.time_limit_days.max(0);
-        }
+    fn memory_hit(&mut self, key: &str) -> Option<Arc<[u8]>> {
+        self.hot
+            .get(key)
+            .or_else(|| self.writing.get(key).map(Arc::clone))
     }
 
-    fn save_manifest(&self) {
-        if !self.is_persistent {
-            return;
-        }
-        let manifest = PersistedLimits {
-            size_limit_bytes: self.size_limit_bytes,
-            time_limit_days: self.time_limit_days,
-        };
-        if let Ok(json) = serde_json::to_vec(&manifest) {
-            let _ = write_encrypted_blob(&self.manifest_path(), self.index.encryption_key(), &json);
-        }
+    fn remember(&mut self, key: &str, bytes: &Arc<[u8]>) {
+        self.hot
+            .insert(key.to_owned(), Arc::clone(bytes), bytes.len());
     }
 
-    fn apply_limits_prune(&mut self) -> usize {
-        let max_bytes = (self.size_limit_bytes > 0).then_some(self.size_limit_bytes as u64);
-        let max_age = (self.time_limit_days > 0)
-            .then_some(i64::from(self.time_limit_days).saturating_mul(SECONDS_PER_DAY));
-        if max_bytes.is_none() && max_age.is_none() {
-            return 0;
+    fn note_miss(&mut self, key: &str) {
+        if self.misses.len() >= KNOWN_MISSES_CAP {
+            self.misses.clear();
         }
-        match self.index.prune(max_bytes, max_age) {
-            Ok(evicted) => {
-                if evicted > 0 {
-                    self.save_manifest();
-                }
-                evicted
-            }
-            Err(err) => {
-                warn!(error = %err, "media cache prune failed");
-                0
-            }
-        }
+        self.misses.insert(key.to_owned());
     }
 
-    fn compute_stats(&self) -> LocalStorageStats {
-        let tag_stats = self.index.stats_by_tag().unwrap_or_default();
-        LocalStorageStats {
-            photos_bytes: i64::try_from(tag_stats.photos_bytes).unwrap_or(i64::MAX),
-            videos_bytes: i64::try_from(tag_stats.videos_bytes).unwrap_or(i64::MAX),
-            files_bytes: i64::try_from(tag_stats.files_bytes).unwrap_or(i64::MAX),
-            stickers_bytes: i64::try_from(tag_stats.stickers_bytes).unwrap_or(i64::MAX),
-            size_limit_bytes: self.size_limit_bytes,
-            time_limit_days: self.time_limit_days,
-        }
+    fn note_stored(&mut self, key: &str) {
+        self.failed_at.remove(key);
+        self.misses.remove(key);
+        self.cancelled.remove(key);
+    }
+
+    fn cached_lottie(&mut self, doc_id: u64) -> Option<Arc<str>> {
+        self.lottie_json.get(&doc_id)
+    }
+
+    fn remember_lottie(&mut self, doc_id: u64, json: Arc<str>) {
+        let size = json.len();
+        self.lottie_json.insert(doc_id, json, size);
     }
 }
 
@@ -250,10 +302,50 @@ impl LiveMediaCacheInner {
 /// encrypted [`MediaCacheIndex`].
 #[derive(Clone)]
 pub struct LiveMediaCache {
-    inner: Arc<Mutex<LiveMediaCacheInner>>,
+    shared: Arc<Mutex<Shared>>,
+    actor: Arc<StoreActor>,
+    counters: Arc<MediaCacheCounters>,
+}
+
+fn new_store(index: MediaCacheIndex, root_dir: PathBuf, is_persistent: bool) -> (u64, Store) {
+    let id = NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut store = Store::from_index(index, root_dir, is_persistent);
+    store.id = id;
+    (id, store)
 }
 
 impl LiveMediaCache {
+    fn from_index(
+        index: MediaCacheIndex,
+        root_dir: PathBuf,
+        is_persistent: bool,
+        has_account_key: bool,
+    ) -> Self {
+        let key = index.encryption_key().clone();
+        let (id, store) = new_store(index, root_dir.clone(), is_persistent);
+        Self {
+            shared: Arc::new(Mutex::new(Shared::new(
+                id,
+                root_dir,
+                is_persistent,
+                has_account_key,
+                key,
+            ))),
+            actor: Arc::new(StoreActor::spawn(store)),
+            counters: Arc::new(MediaCacheCounters::default()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Work counters (disk reads, memory hits, blocking reads) of this cache.
+    #[must_use]
+    pub fn counters(&self) -> &MediaCacheCounters {
+        &self.counters
+    }
+
     /// Opens an encrypted persistent disk-backed [`MediaCacheIndex`] at `root_dir` using `key`.
     pub fn open_with_key(
         root_dir: impl Into<PathBuf>,
@@ -262,11 +354,7 @@ impl LiveMediaCache {
         let dir = root_dir.into();
         let index = MediaCacheIndex::open_with_key(&dir, key)
             .map_err(|e| anyhow!("failed to open MediaCacheIndex at {}: {e}", dir.display()))?;
-        let mut inner = LiveMediaCacheInner::from_index(index, dir, true);
-        inner.has_account_key = true;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
-        })
+        Ok(Self::from_index(index, dir, true, true))
     }
 
     /// Opens an encrypted persistent disk-backed [`MediaCacheIndex`] at `root_dir`
@@ -275,11 +363,7 @@ impl LiveMediaCache {
         let dir = root_dir.into();
         let index = MediaCacheIndex::open(&dir)
             .map_err(|e| anyhow!("failed to open MediaCacheIndex at {}: {e}", dir.display()))?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(LiveMediaCacheInner::from_index(
-                index, dir, true,
-            ))),
-        })
+        Ok(Self::from_index(index, dir, true, false))
     }
 
     /// Opens an in-memory SQLite [`MediaCacheIndex`] storing encrypted blobs under `root_dir`.
@@ -287,11 +371,7 @@ impl LiveMediaCache {
         let dir = root_dir.into();
         let index = MediaCacheIndex::open_in_memory(&dir)
             .map_err(|e| anyhow!("failed to open in-memory MediaCacheIndex: {e}"))?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(LiveMediaCacheInner::from_index(
-                index, dir, false,
-            ))),
-        })
+        Ok(Self::from_index(index, dir, false, false))
     }
 
     /// Opens a strictly memory-only cache with zero disk or `%TEMP%` writes until an account
@@ -300,13 +380,7 @@ impl LiveMediaCache {
     pub fn open_memory_only() -> Self {
         let index = MediaCacheIndex::open_memory_only()
             .unwrap_or_else(|e| panic!("unable to initialize memory-only MediaCacheIndex: {e}"));
-        Self {
-            inner: Arc::new(Mutex::new(LiveMediaCacheInner::from_index(
-                index,
-                PathBuf::new(),
-                false,
-            ))),
-        }
+        Self::from_index(index, PathBuf::new(), false, false)
     }
 
     /// Opens a default memory-only cache for `session_id` before an account directory is attached.
@@ -316,6 +390,30 @@ impl LiveMediaCache {
     #[must_use]
     pub fn open_default_for_session(_session_id: u64) -> Self {
         Self::open_memory_only()
+    }
+
+    /// Swaps the actor's store for one over `index` and resets the in-memory layer, so nothing
+    /// read from or downloaded for the previous store is served afterwards.
+    fn replace_store(
+        &self,
+        index: MediaCacheIndex,
+        root_dir: PathBuf,
+        is_persistent: bool,
+        has_account_key: bool,
+    ) -> anyhow::Result<()> {
+        let key = index.encryption_key().clone();
+        let (id, store) = new_store(index, root_dir.clone(), is_persistent);
+        // The swap runs with read priority, so reads queued after it see the new store.
+        self.actor
+            .call(Priority::Read, move |current| {
+                current.flush_touches();
+                *current = store;
+            })
+            .ok_or_else(|| anyhow!("media cache thread stopped"))?;
+        let mut guard = self.lock();
+        guard.forget_account_dirs();
+        *guard = Shared::new(id, root_dir, is_persistent, has_account_key, key);
+        Ok(())
     }
 
     /// Reopens this shared cache handle against a new persistent encrypted `root_dir` using
@@ -329,14 +427,7 @@ impl LiveMediaCache {
         let dir = root_dir.into();
         let index = MediaCacheIndex::open_with_key(&dir, key)
             .map_err(|e| anyhow!("failed to open MediaCacheIndex at {}: {e}", dir.display()))?;
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("media cache mutex poisoned"))?;
-        guard.forget_account_dirs();
-        *guard = LiveMediaCacheInner::from_index(index, dir, true);
-        guard.has_account_key = true;
-        drop(guard);
+        self.replace_store(index, dir, true, true)?;
         // An account folder is attached: media no longer goes to the system temp directory, so
         // whatever older builds left there can be removed (once per process, in the background).
         sweep_legacy_temp_dirs_once();
@@ -349,13 +440,7 @@ impl LiveMediaCache {
         let dir = root_dir.into();
         let index = MediaCacheIndex::open(&dir)
             .map_err(|e| anyhow!("failed to open MediaCacheIndex at {}: {e}", dir.display()))?;
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("media cache mutex poisoned"))?;
-        guard.forget_account_dirs();
-        *guard = LiveMediaCacheInner::from_index(index, dir, true);
-        drop(guard);
+        self.replace_store(index, dir, true, false)?;
         sweep_legacy_temp_dirs_once();
         Ok(())
     }
@@ -364,14 +449,22 @@ impl LiveMediaCache {
     /// memory-only cache (called before deleting the account cache directory on logout so
     /// Windows does not hold open SQLite/WAL file handles).
     pub fn close_to_memory(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            let old_root = guard.root_dir.clone();
-            if guard.is_persistent && !old_root.as_os_str().is_empty() {
-                unregister_cache_key(&old_root);
+        let (old_root, was_persistent) = {
+            let guard = self.lock();
+            (guard.root_dir.clone(), guard.is_persistent)
+        };
+        if was_persistent && !old_root.as_os_str().is_empty() {
+            unregister_cache_key(&old_root);
+        }
+        match MediaCacheIndex::open_memory_only() {
+            Ok(index) => {
+                if let Err(err) = self.replace_store(index, PathBuf::new(), false, false) {
+                    warn!(error = %err, "unable to close the media cache to memory");
+                }
             }
-            guard.forget_account_dirs();
-            if let Ok(index) = MediaCacheIndex::open_memory_only() {
-                *guard = LiveMediaCacheInner::from_index(index, PathBuf::new(), false);
+            Err(err) => {
+                warn!(error = %err, "unable to open a memory-only media cache");
+                self.lock().forget_account_dirs();
             }
         }
     }
@@ -379,16 +472,13 @@ impl LiveMediaCache {
     /// Returns `true` when this cache is attached to a persistent encrypted disk directory.
     #[must_use]
     pub fn is_persistent(&self) -> bool {
-        self.inner.lock().is_ok_and(|g| g.is_persistent)
+        self.lock().is_persistent
     }
 
     /// Returns the active cache root directory path (empty when in memory-only mode).
     #[must_use]
     pub fn root_dir(&self) -> PathBuf {
-        self.inner
-            .lock()
-            .map(|g| g.root_dir.clone())
-            .unwrap_or_default()
+        self.lock().root_dir.clone()
     }
 
     /// Gives `dir`, a folder outside the cache root that holds other data of this account at rest
@@ -399,13 +489,11 @@ impl LiveMediaCache {
     /// or opened with a random per-process key): data encrypted with such a key could not be
     /// read back after a restart, so those writers keep their data in memory instead.
     pub fn register_account_dir(&self, dir: &Path) -> bool {
-        let Ok(mut guard) = self.inner.lock() else {
-            return false;
-        };
+        let mut guard = self.lock();
         if !guard.has_account_key {
             return false;
         }
-        register_cache_key(dir, guard.index.encryption_key().clone());
+        register_cache_key(dir, guard.encryption_key.clone());
         if !guard.account_dirs.iter().any(|known| known == dir) {
             guard.account_dirs.push(dir.to_path_buf());
         }
@@ -417,16 +505,51 @@ impl LiveMediaCache {
     /// an account folder exists: streamed media must then use an ephemeral key instead.
     #[must_use]
     pub fn streamed_dir(&self) -> Option<PathBuf> {
-        let guard = self.inner.lock().ok()?;
+        let guard = self.lock();
         (guard.is_persistent && !guard.root_dir.as_os_str().is_empty())
             .then(|| guard.root_dir.join("streamed"))
+    }
+
+    /// Reads `key` on the cache thread and waits for it, keeping the result in memory.
+    /// `None` when the disk cache does not have it.
+    fn read_blocking(&self, key: &str) -> Option<Arc<[u8]>> {
+        if let Some(bytes) = self.lock().memory_hit(key) {
+            self.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(bytes);
+        }
+        if self.lock().misses.contains(key) {
+            return None;
+        }
+        self.counters.blocking_reads.fetch_add(1, Ordering::Relaxed);
+        let owned = key.to_owned();
+        let counters = Arc::clone(&self.counters);
+        let (store_id, data) = self.actor.call(Priority::Read, move |store| {
+            counters.disk_reads.fetch_add(1, Ordering::Relaxed);
+            (store.id, store.read(&owned))
+        })?;
+        let mut guard = self.lock();
+        if guard.store_id != store_id {
+            return None;
+        }
+        match data {
+            Some(bytes) => {
+                let bytes: Arc<[u8]> = bytes.into();
+                if bytes.len() <= HOT_BLOB_MAX_ENTRY_BYTES {
+                    guard.remember(key, &bytes);
+                }
+                Some(bytes)
+            }
+            None => {
+                guard.note_miss(key);
+                None
+            }
+        }
     }
 
     /// Reads cached bytes for `key`, updating its LRU `last_accessed` timestamp.
     #[must_use]
     pub fn get_blob(&self, key: &str) -> Option<Vec<u8>> {
-        let guard = self.inner.lock().ok()?;
-        guard.index.get_blob(key).ok().flatten()
+        self.read_blocking(key).map(|bytes| bytes.to_vec())
     }
 
     /// Stores `bytes` under `key` with category `tag`, enforcing configured cache limits.
@@ -434,18 +557,23 @@ impl LiveMediaCache {
         if bytes.is_empty() {
             return Ok(());
         }
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("media cache mutex poisoned"))?;
-        let _entry = guard
-            .index
-            .put_blob(key, tag, bytes)
-            .map_err(|e| anyhow!("MediaCacheIndex::put_blob failed: {e}"))?;
-        guard.failed_at.remove(key);
-        guard.apply_limits_prune();
-        guard.save_manifest();
-        Ok(())
+        let owned_key = key.to_owned();
+        let data: Arc<[u8]> = Arc::from(bytes);
+        let for_store = Arc::clone(&data);
+        let result = self
+            .actor
+            .call(Priority::Write, move |store| {
+                store.write(&owned_key, tag, &for_store)
+            })
+            .ok_or_else(|| anyhow!("media cache thread stopped"))?;
+        if result.is_ok() {
+            let mut guard = self.lock();
+            guard.note_stored(key);
+            if data.len() <= HOT_BLOB_MAX_ENTRY_BYTES {
+                guard.remember(key, &data);
+            }
+        }
+        result
     }
 
     /// Stores a `.tgs` animated sticker payload and caches its decompressed Lottie JSON.
@@ -458,9 +586,8 @@ impl LiveMediaCache {
         self.put_blob(key, MediaCacheTag::Sticker, raw_bytes)?;
         match decompress_tgs_to_lottie_json(raw_bytes) {
             Ok(json) => {
-                if let Ok(mut guard) = self.inner.lock() {
-                    guard.lottie_json.insert(doc_id, json.clone());
-                }
+                self.lock()
+                    .remember_lottie(doc_id, Arc::from(json.as_str()));
                 Ok(Some(json))
             }
             Err(err) => {
@@ -477,37 +604,51 @@ impl LiveMediaCache {
             return None;
         }
         let doc_id = doc.id.0;
-        {
-            let guard = self.inner.lock().ok()?;
-            if let Some(json) = guard.lottie_json.get(&doc_id) {
-                return Some(json.clone());
-            }
+        if let Some(json) = self.lock().cached_lottie(doc_id) {
+            return Some(json.as_ref().to_owned());
         }
-        // Check persistent disk cache under this document's cache key (try both doc.dc_id and 0).
         let key = document_cache_key(doc.dc_id, doc_id);
-        let bytes = self.get_blob(&key)?;
+        let bytes = self.read_blocking(&key)?;
         let json = decompress_tgs_to_lottie_json(&bytes).ok()?;
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.lottie_json.insert(doc_id, json.clone());
-        }
+        self.lock()
+            .remember_lottie(doc_id, Arc::from(json.as_str()));
         Some(json)
+    }
+
+    /// Makes sure the Lottie JSON of `doc_id` is in memory once its `.tgs` bytes are.
+    fn ensure_lottie(&self, tgs_doc_id: Option<u64>, bytes: &[u8]) {
+        let Some(doc_id) = tgs_doc_id else {
+            return;
+        };
+        if self.lock().lottie_json.contains(&doc_id) {
+            return;
+        }
+        if let Ok(json) = decompress_tgs_to_lottie_json(bytes) {
+            self.lock().remember_lottie(doc_id, Arc::from(json));
+        }
     }
 
     /// Returns whether `key` currently has an active background download in progress.
     #[must_use]
     pub fn is_in_flight(&self, key: &str) -> bool {
-        self.inner
-            .lock()
-            .map(|g| g.in_flight.contains_key(key))
-            .unwrap_or(false)
+        self.lock().in_flight.contains_key(key)
     }
 
     /// Returns real [`LocalStorageStats`] computed from [`MediaCacheIndex`].
     #[must_use]
     pub fn stats(&self) -> LocalStorageStats {
-        self.inner
-            .lock()
-            .map(|g| g.compute_stats())
+        self.actor
+            .call(Priority::Write, |store| {
+                let tag_stats = store.index.stats_by_tag().unwrap_or_default();
+                LocalStorageStats {
+                    photos_bytes: i64::try_from(tag_stats.photos_bytes).unwrap_or(i64::MAX),
+                    videos_bytes: i64::try_from(tag_stats.videos_bytes).unwrap_or(i64::MAX),
+                    files_bytes: i64::try_from(tag_stats.files_bytes).unwrap_or(i64::MAX),
+                    stickers_bytes: i64::try_from(tag_stats.stickers_bytes).unwrap_or(i64::MAX),
+                    size_limit_bytes: store.size_limit_bytes,
+                    time_limit_days: store.time_limit_days,
+                }
+            })
             .unwrap_or(LocalStorageStats {
                 photos_bytes: 0,
                 videos_bytes: 0,
@@ -520,41 +661,51 @@ impl LiveMediaCache {
 
     /// Evicts every cached blob from [`MediaCacheIndex`] and returns total bytes freed.
     pub fn clear(&self) -> i64 {
-        let Ok(mut guard) = self.inner.lock() else {
-            return 0;
-        };
-        let freed = guard.compute_stats().total_bytes();
-        if let Err(err) = guard.index.prune(Some(0), None) {
-            warn!(error = %err, "MediaCacheIndex clear prune failed");
-        }
+        let freed = self
+            .actor
+            .call(Priority::Write, |store| {
+                let tag_stats = store.index.stats_by_tag().unwrap_or_default();
+                let freed = tag_stats
+                    .photos_bytes
+                    .saturating_add(tag_stats.videos_bytes)
+                    .saturating_add(tag_stats.files_bytes)
+                    .saturating_add(tag_stats.stickers_bytes);
+                store.clear_all();
+                i64::try_from(freed).unwrap_or(i64::MAX)
+            })
+            .unwrap_or(0);
+        let mut guard = self.lock();
+        guard.hot.clear();
+        guard.writing.clear();
+        guard.misses.clear();
         guard.lottie_json.clear();
         guard.failed_at.clear();
-        guard.save_manifest();
         freed
     }
 
     /// Updates local storage size (`0` = unlimited) and retention time (`0` = forever) limits
     /// and immediately prunes [`MediaCacheIndex`] according to tdesktop's `updateSettings` behavior.
     pub fn set_limits(&self, size_limit_bytes: i64, time_limit_days: i32) {
-        let Ok(mut guard) = self.inner.lock() else {
-            return;
-        };
-        guard.size_limit_bytes = size_limit_bytes.max(0);
-        guard.time_limit_days = time_limit_days.max(0);
-        guard.apply_limits_prune();
-        guard.save_manifest();
+        let _ = self.actor.call(Priority::Write, move |store| {
+            store.size_limit_bytes = size_limit_bytes.max(0);
+            store.time_limit_days = time_limit_days.max(0);
+            store.apply_limits_prune();
+            store.save_manifest();
+        });
     }
 
     /// Triggers an immediate LRU/age prune using the active limits, returning evicted entry count.
     pub fn prune_now(&self) -> usize {
-        self.inner
-            .lock()
-            .map(|mut g| g.apply_limits_prune())
+        self.actor
+            .call(Priority::Write, Store::apply_limits_prune)
             .unwrap_or(0)
     }
 
     /// Returns cached bytes for `key`, or spawns an asynchronous `upload.getFile` (with CDN
     /// redirect support) task on `handle` if not yet cached or in-flight.
+    ///
+    /// A disk-cache hit is read on the cache thread while the caller waits (never behind queued
+    /// writes); this never returns [`CacheFetchState::Pending`].
     #[allow(clippy::too_many_arguments)]
     pub fn fetch_or_spawn<C: RpcClient + Clone + 'static>(
         &self,
@@ -566,22 +717,41 @@ impl LiveMediaCache {
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
     ) -> CacheFetchState {
+        self.fetch(
+            key,
+            tag,
+            resolved,
+            tgs_doc_id,
+            rpc,
+            handle,
+            bridge,
+            ReadMode::Blocking,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fetch<C: RpcClient + Clone + 'static>(
+        &self,
+        key: String,
+        tag: MediaCacheTag,
+        resolved: ResolvedMediaLocation,
+        tgs_doc_id: Option<u64>,
+        rpc: &C,
+        handle: &Handle,
+        bridge: &Arc<LiveBridgeState>,
+        mode: ReadMode,
+    ) -> CacheFetchState {
         if resolved.size > MAX_INLINE_AUTO_DOWNLOAD_BYTES {
             return CacheFetchState::Skipped;
         }
 
-        // Fast-path: check cache, in-flight map, and failure cooldown under a single lock.
-        {
-            let Ok(mut guard) = self.inner.lock() else {
-                return CacheFetchState::Skipped;
-            };
-            if let Ok(Some(bytes)) = guard.index.get_blob(&key) {
-                if let Some(doc_id) = tgs_doc_id
-                    && !guard.lottie_json.contains_key(&doc_id)
-                    && let Ok(json) = decompress_tgs_to_lottie_json(&bytes)
-                {
-                    guard.lottie_json.insert(doc_id, json);
-                }
+        // Fast path: memory, in-flight map, failure cooldown and known misses under one short lock.
+        let store_id = {
+            let mut guard = self.lock();
+            if let Some(bytes) = guard.memory_hit(&key) {
+                drop(guard);
+                self.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+                self.ensure_lottie(tgs_doc_id, &bytes);
                 return CacheFetchState::Ready(bytes);
             }
             if let Some(flight) = guard.in_flight.get(&key) {
@@ -595,14 +765,141 @@ impl LiveMediaCache {
             {
                 return CacheFetchState::Skipped;
             }
-            guard.in_flight.insert(
-                key.clone(),
-                InFlightDownload {
-                    bytes_loaded: 0,
-                    total_bytes: resolved.size,
-                },
-            );
+            if guard.misses.contains(&key) {
+                return self
+                    .begin_download(guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge);
+            }
+            if mode == ReadMode::NonBlocking && guard.reading.contains(&key) {
+                return CacheFetchState::Pending;
+            }
+            if mode == ReadMode::NonBlocking {
+                guard.reading.insert(key.clone());
+            }
+            guard.store_id
+        };
+
+        if mode == ReadMode::NonBlocking {
+            let cache = self.clone();
+            let rpc = rpc.clone();
+            let handle = handle.clone();
+            let bridge = Arc::clone(bridge);
+            let counters = Arc::clone(&self.counters);
+            let posted = self.actor.post(Priority::Read, move |store| {
+                if store.id != store_id {
+                    return;
+                }
+                counters.disk_reads.fetch_add(1, Ordering::Relaxed);
+                let data = store.read(&key);
+                cache.finish_read(
+                    store_id, key, data, tag, resolved, tgs_doc_id, &rpc, &handle, &bridge,
+                );
+            });
+            if !posted {
+                return CacheFetchState::Skipped;
+            }
+            return CacheFetchState::Pending;
         }
+
+        self.counters.blocking_reads.fetch_add(1, Ordering::Relaxed);
+        let read_key = key.clone();
+        let counters = Arc::clone(&self.counters);
+        let Some((read_store, data)) = self.actor.call(Priority::Read, move |store| {
+            counters.disk_reads.fetch_add(1, Ordering::Relaxed);
+            (store.id, store.read(&read_key))
+        }) else {
+            return CacheFetchState::Skipped;
+        };
+        let mut guard = self.lock();
+        if guard.store_id != store_id || read_store != store_id {
+            return CacheFetchState::Skipped;
+        }
+        match data {
+            Some(bytes) => {
+                let bytes: Arc<[u8]> = bytes.into();
+                if bytes.len() <= HOT_BLOB_MAX_ENTRY_BYTES {
+                    guard.remember(&key, &bytes);
+                }
+                drop(guard);
+                self.ensure_lottie(tgs_doc_id, &bytes);
+                CacheFetchState::Ready(bytes)
+            }
+            None => {
+                guard.note_miss(&key);
+                if let Some(flight) = guard.in_flight.get(&key) {
+                    return CacheFetchState::Loading {
+                        bytes_loaded: flight.bytes_loaded,
+                        total_bytes: flight.total_bytes,
+                    };
+                }
+                self.begin_download(guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge)
+            }
+        }
+    }
+
+    /// Completes a non-blocking read on the cache thread: a hit goes to memory, a miss starts
+    /// the download; either way the UI is told to look again.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_read<C: RpcClient + Clone + 'static>(
+        &self,
+        store_id: u64,
+        key: String,
+        data: Option<Vec<u8>>,
+        tag: MediaCacheTag,
+        resolved: ResolvedMediaLocation,
+        tgs_doc_id: Option<u64>,
+        rpc: &C,
+        handle: &Handle,
+        bridge: &Arc<LiveBridgeState>,
+    ) {
+        let mut guard = self.lock();
+        if guard.store_id != store_id {
+            return;
+        }
+        guard.reading.remove(&key);
+        match data {
+            Some(bytes) => {
+                let bytes: Arc<[u8]> = bytes.into();
+                // Kept whatever its size: the waiting lookup takes it from memory.
+                guard.remember(&key, &bytes);
+                drop(guard);
+                self.ensure_lottie(tgs_doc_id, &bytes);
+            }
+            None => {
+                guard.note_miss(&key);
+                if !guard.in_flight.contains_key(&key) {
+                    let _ = self
+                        .begin_download(guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge);
+                }
+            }
+        }
+        bridge.notify_ui();
+    }
+
+    /// Registers `key` as in flight (under the caller's lock) and spawns its download.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_download<C: RpcClient + Clone + 'static>(
+        &self,
+        mut guard: MutexGuard<'_, Shared>,
+        key: String,
+        tag: MediaCacheTag,
+        resolved: ResolvedMediaLocation,
+        tgs_doc_id: Option<u64>,
+        rpc: &C,
+        handle: &Handle,
+        bridge: &Arc<LiveBridgeState>,
+    ) -> CacheFetchState {
+        let store_id = guard.store_id;
+        let token = NEXT_FLIGHT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        guard.in_flight.insert(
+            key.clone(),
+            InFlightDownload {
+                bytes_loaded: 0,
+                total_bytes: resolved.size,
+                abort: None,
+                token,
+            },
+        );
+        drop(guard);
 
         let cache = self.clone();
         let rpc = rpc.clone();
@@ -610,8 +907,10 @@ impl LiveMediaCache {
         let key_task = key.clone();
         let expected_size = (resolved.size > 0).then_some(resolved.size);
         let total_hint = resolved.size;
+        let started = Instant::now();
+        debug!(key = %key, dc = resolved.dc_id, size = total_hint, "inline media download started");
 
-        handle.spawn(async move {
+        let task = handle.spawn(async move {
             let progress_cache = cache.clone();
             let progress_key = key_task.clone();
             let progress_bridge = Arc::clone(&bridge);
@@ -622,8 +921,11 @@ impl LiveMediaCache {
                 resolved.location,
                 expected_size,
                 move |downloaded, total| {
-                    if let Ok(mut guard) = progress_cache.inner.lock()
-                        && let Some(slot) = guard.in_flight.get_mut(&progress_key)
+                    if let Some(slot) = progress_cache
+                        .lock()
+                        .in_flight
+                        .get_mut(&progress_key)
+                        .filter(|slot| slot.token == token)
                     {
                         slot.bytes_loaded = downloaded;
                         if total > 0 {
@@ -635,24 +937,36 @@ impl LiveMediaCache {
             )
             .await;
 
+            // An aborted task stops at its next await; one that got its last answer in the
+            // same poll still arrives here and must not store what the user cancelled.
+            if !cache
+                .lock()
+                .in_flight
+                .get(&key_task)
+                .is_some_and(|slot| slot.token == token)
+            {
+                return;
+            }
             match res {
                 Ok(bytes) => {
-                    let store_res = if let Some(doc_id) = tgs_doc_id {
-                        cache.put_tgs_sticker(doc_id, &key_task, &bytes).map(|_| ())
-                    } else {
-                        cache.put_blob(&key_task, tag, &bytes)
-                    };
-                    if let Err(err) = store_res {
-                        warn!(key = %key_task, error = %err, "failed to store downloaded media blob");
-                    }
-                    if let Ok(mut guard) = cache.inner.lock() {
-                        guard.in_flight.remove(&key_task);
-                    }
+                    debug!(
+                        key = %key_task,
+                        bytes = bytes.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "inline media downloaded"
+                    );
+                    cache.finish_download(store_id, key_task, tag, tgs_doc_id, bytes);
                     bridge.notify_ui();
                 }
                 Err(err) => {
-                    debug!(key = %key_task, error = %err, "background inline media download failed");
-                    if let Ok(mut guard) = cache.inner.lock() {
+                    debug!(
+                        key = %key_task,
+                        error = %err,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "background inline media download failed"
+                    );
+                    {
+                        let mut guard = cache.lock();
                         guard.in_flight.remove(&key_task);
                         guard.failed_at.insert(key_task, Instant::now());
                     }
@@ -660,11 +974,209 @@ impl LiveMediaCache {
                 }
             }
         });
+        // A task that already finished has removed its slot; there is nothing to abort then.
+        if let Some(slot) = self
+            .lock()
+            .in_flight
+            .get_mut(&key)
+            .filter(|slot| slot.token == token)
+        {
+            slot.abort = Some(task.abort_handle());
+        }
 
         CacheFetchState::Loading {
             bytes_loaded: 0,
             total_bytes: total_hint,
         }
+    }
+
+    /// Stops the download of `key` and marks it cancelled: it is not downloaded automatically
+    /// again until [`Self::resume_download`] (`PhotoData::cancel`). Returns whether a download
+    /// was running.
+    pub fn cancel_download(&self, key: &str) -> bool {
+        let mut guard = self.lock();
+        let Some(flight) = guard.in_flight.remove(key) else {
+            return false;
+        };
+        if guard.cancelled.len() >= KNOWN_MISSES_CAP {
+            guard.cancelled.clear();
+        }
+        guard.cancelled.insert(key.to_owned());
+        drop(guard);
+        if let Some(abort) = flight.abort {
+            abort.abort();
+        }
+        debug!(key = %key, "inline media download cancelled");
+        true
+    }
+
+    /// Whether the download of `key` was cancelled and not started again.
+    #[must_use]
+    pub fn is_cancelled(&self, key: &str) -> bool {
+        self.lock().cancelled.contains(key)
+    }
+
+    /// Lets a cancelled `key` download again.
+    pub fn resume_download(&self, key: &str) {
+        self.lock().cancelled.remove(key);
+    }
+
+    /// State of a photo that is not downloaded automatically (auto-download is off for the
+    /// chat, or the user cancelled it): cached, downloading because the user asked, or not
+    /// loaded.
+    fn manual_photo_state(&self, key: &str) -> PhotoLoadState {
+        if let Some(bytes) = self.read_blocking(key) {
+            return PhotoLoadState::Ready { bytes };
+        }
+        match self.lock().in_flight.get(key) {
+            Some(flight) => PhotoLoadState::Loading {
+                progress: (flight.total_bytes > 0).then(|| {
+                    (flight.bytes_loaded as f32 / flight.total_bytes as f32).clamp(0.0, 1.0)
+                }),
+                bytes_loaded: flight.bytes_loaded,
+                total_bytes: flight.total_bytes,
+            },
+            None => PhotoLoadState::NotLoaded,
+        }
+    }
+
+    /// The file a click on `media` downloads or cancels: the photo, or a voice message's
+    /// audio (`Photo::_savel` / `_cancell`, `DocumentOpenClickHandler` for voice).
+    fn download_target(
+        media: &MessageMedia,
+    ) -> Option<(String, MediaCacheTag, ResolvedMediaLocation)> {
+        let photo = |photo: &PhotoData| {
+            let resolved = photo_to_location(photo);
+            let thumb_size = match &resolved.location {
+                tg_tl::enums::InputFileLocation::InputPhotoFileLocation(loc) => {
+                    loc.thumb_size.as_str()
+                }
+                _ => "y",
+            };
+            let key = photo_cache_key(resolved.dc_id, photo.id.0, thumb_size);
+            (key, MediaCacheTag::Photo, resolved)
+        };
+        match media {
+            MessageMedia::Photo(p) => Some(photo(p)),
+            MessageMedia::Document(doc) if doc.kind == DocumentKind::Voice => {
+                let resolved = document_to_location(doc);
+                let key = document_cache_key(resolved.dc_id, doc.id.0);
+                Some((key, MediaCacheTag::Voice, resolved))
+            }
+            MessageMedia::WebPage(wp) => wp.photo.as_ref().map(photo),
+            MessageMedia::Game(game) if game.document.is_none() => game.photo.as_ref().map(photo),
+            MessageMedia::PaidMedia(paid) => {
+                paid.extended_media.iter().find_map(|item| match item {
+                    ExtendedMedia::Media(inner) => Self::download_target(inner),
+                    ExtendedMedia::Preview { .. } => None,
+                })
+            }
+            MessageMedia::Invoice(inv) => match inv.extended_media.as_deref() {
+                Some(ExtendedMedia::Media(inner)) => Self::download_target(inner),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Cancels the running download of `msg`'s photo or voice file. Returns whether one ran.
+    pub fn cancel_media_download_for_message(&self, msg: &Message) -> bool {
+        let MessageContent::Regular { media, .. } = &msg.content else {
+            return false;
+        };
+        Self::download_target(media).is_some_and(|(key, _, _)| self.cancel_download(&key))
+    }
+
+    /// Starts (or restarts after a cancel) the download of `msg`'s photo or voice file without
+    /// blocking; a file already cached or downloading is left alone.
+    pub fn start_media_download_for_message<C: RpcClient + Clone + 'static>(
+        &self,
+        msg: &Message,
+        rpc: &C,
+        handle: &Handle,
+        bridge: &Arc<LiveBridgeState>,
+    ) {
+        let MessageContent::Regular { media, .. } = &msg.content else {
+            return;
+        };
+        if let Some((key, tag, resolved)) = Self::download_target(media) {
+            self.resume_download(&key);
+            let _ = self.fetch_nonblocking(key, tag, resolved, rpc, handle, bridge);
+        }
+    }
+
+    /// Makes a finished download available at once (memory) and queues its encrypted disk
+    /// write on the cache thread; the downloading worker never waits for the disk.
+    fn finish_download(
+        &self,
+        store_id: u64,
+        key: String,
+        tag: MediaCacheTag,
+        tgs_doc_id: Option<u64>,
+        bytes: Vec<u8>,
+    ) {
+        let bytes: Arc<[u8]> = bytes.into();
+        let lottie = tgs_doc_id.and_then(|doc_id| match decompress_tgs_to_lottie_json(&bytes) {
+            Ok(json) => Some((doc_id, Arc::<str>::from(json))),
+            Err(err) => {
+                debug!(doc_id, error = %err, "unable to decompress .tgs sticker");
+                None
+            }
+        });
+        let mut guard = self.lock();
+        guard.in_flight.remove(&key);
+        if guard.store_id != store_id {
+            // The cache was reopened for another account or closed on logout meanwhile.
+            return;
+        }
+        guard.note_stored(&key);
+        guard.remember(&key, &bytes);
+        guard.writing.insert(key.clone(), Arc::clone(&bytes));
+        if let Some((doc_id, json)) = lottie {
+            guard.remember_lottie(doc_id, json);
+        }
+        drop(guard);
+
+        let shared = Arc::clone(&self.shared);
+        self.actor.post(Priority::Write, move |store| {
+            if store.id == store_id
+                && let Err(err) = store.write(&key, tag, &bytes)
+            {
+                warn!(key = %key, error = %err, "failed to store downloaded media blob");
+            }
+            let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+            if guard
+                .writing
+                .get(&key)
+                .is_some_and(|queued| Arc::ptr_eq(queued, &bytes))
+            {
+                guard.writing.remove(&key);
+            }
+        });
+    }
+
+    /// Like [`Self::fetch_or_spawn`] for the chat-history paint path: a disk-cache hit is read
+    /// in the background and reported as [`CacheFetchState::Pending`] meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_nonblocking<C: RpcClient + Clone + 'static>(
+        &self,
+        key: String,
+        tag: MediaCacheTag,
+        resolved: ResolvedMediaLocation,
+        rpc: &C,
+        handle: &Handle,
+        bridge: &Arc<LiveBridgeState>,
+    ) -> CacheFetchState {
+        self.fetch(
+            key,
+            tag,
+            resolved,
+            None,
+            rpc,
+            handle,
+            bridge,
+            ReadMode::NonBlocking,
+        )
     }
 
     /// Builds an [`InlineMediaDescriptor`] for `msg`, serving bytes immediately from
@@ -676,27 +1188,42 @@ impl LiveMediaCache {
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
     ) -> Option<InlineMediaDescriptor> {
+        self.inline_media_descriptor_for_message_with(msg, true, rpc, handle, bridge)
+    }
+
+    /// Like [`Self::inline_media_descriptor_for_message`]; with `photo_autoload == false`
+    /// (auto-download of photos is off for this chat, `Data::AutoDownload::Should`) a photo is
+    /// only served when it is already cached, and never downloaded.
+    pub fn inline_media_descriptor_for_message_with<C: RpcClient + Clone + 'static>(
+        &self,
+        msg: &Message,
+        photo_autoload: bool,
+        rpc: &C,
+        handle: &Handle,
+        bridge: &Arc<LiveBridgeState>,
+    ) -> Option<InlineMediaDescriptor> {
         let MessageContent::Regular { media, .. } = &msg.content else {
             return None;
         };
-        self.descriptor_for_media(media, rpc, handle, bridge)
+        self.descriptor_for_media(media, photo_autoload, rpc, handle, bridge)
     }
 
     fn descriptor_for_media<C: RpcClient + Clone + 'static>(
         &self,
         media: &MessageMedia,
+        photo_autoload: bool,
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
     ) -> Option<InlineMediaDescriptor> {
         match media {
             MessageMedia::Photo(photo) => {
-                Some(self.descriptor_for_photo(photo, rpc, handle, bridge))
+                Some(self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge))
             }
             MessageMedia::Document(doc) => self.descriptor_for_document(doc, rpc, handle, bridge),
             MessageMedia::WebPage(wp) => {
                 if let Some(ref photo) = wp.photo {
-                    Some(self.descriptor_for_photo(photo, rpc, handle, bridge))
+                    Some(self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge))
                 } else if let Some(ref doc) = wp.document {
                     self.descriptor_for_document(doc, rpc, handle, bridge)
                 } else {
@@ -707,15 +1234,21 @@ impl LiveMediaCache {
                 if let Some(ref doc) = game.document {
                     self.descriptor_for_document(doc, rpc, handle, bridge)
                 } else {
-                    game.photo
-                        .as_ref()
-                        .map(|photo| self.descriptor_for_photo(photo, rpc, handle, bridge))
+                    game.photo.as_ref().map(|photo| {
+                        self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge)
+                    })
                 }
             }
             MessageMedia::PaidMedia(paid) => {
                 for item in &paid.extended_media {
                     if let ExtendedMedia::Media(inner) = item {
-                        return self.descriptor_for_media(inner, rpc, handle, bridge);
+                        return self.descriptor_for_media(
+                            inner,
+                            photo_autoload,
+                            rpc,
+                            handle,
+                            bridge,
+                        );
                     }
                 }
                 if !paid.extended_media.is_empty() {
@@ -729,7 +1262,7 @@ impl LiveMediaCache {
             }
             MessageMedia::Invoice(inv) => match inv.extended_media.as_deref() {
                 Some(ExtendedMedia::Media(inner)) => {
-                    self.descriptor_for_media(inner, rpc, handle, bridge)
+                    self.descriptor_for_media(inner, photo_autoload, rpc, handle, bridge)
                 }
                 Some(ExtendedMedia::Preview { .. }) => Some(InlineMediaDescriptor {
                     has_spoiler: true,
@@ -744,6 +1277,7 @@ impl LiveMediaCache {
     fn descriptor_for_photo<C: RpcClient + Clone + 'static>(
         &self,
         photo: &PhotoData,
+        photo_autoload: bool,
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
@@ -754,27 +1288,22 @@ impl LiveMediaCache {
             _ => "y",
         };
         let key = photo_cache_key(resolved.dc_id, photo.id.0, thumb_size);
-        let photo_load = match self.fetch_or_spawn(
+        if !photo_autoload || self.is_cancelled(&key) {
+            // `PhotoMedia::automaticLoad` loads neither; the user starts it with a click.
+            return InlineMediaDescriptor {
+                has_spoiler: photo.spoiler,
+                photo_load: Some(self.manual_photo_state(&key)),
+                ..InlineMediaDescriptor::default()
+            };
+        }
+        let photo_load = photo_load_state(self.fetch_nonblocking(
             key,
             MediaCacheTag::Photo,
             resolved,
-            None,
             rpc,
             handle,
             bridge,
-        ) {
-            CacheFetchState::Ready(bytes) => Some(PhotoLoadState::Ready { bytes }),
-            CacheFetchState::Loading {
-                bytes_loaded,
-                total_bytes,
-            } => Some(PhotoLoadState::Loading {
-                progress: (total_bytes > 0)
-                    .then(|| (bytes_loaded as f32 / total_bytes as f32).clamp(0.0, 1.0)),
-                bytes_loaded,
-                total_bytes,
-            }),
-            CacheFetchState::Skipped => None,
-        };
+        ));
         InlineMediaDescriptor {
             has_spoiler: photo.spoiler,
             photo_load,
@@ -808,9 +1337,11 @@ impl LiveMediaCache {
                     bridge,
                 ) {
                     CacheFetchState::Ready(bytes) => {
-                        desc.video_data = Some(InlineDocumentData::Bytes(bytes));
+                        desc.video_data = Some(InlineDocumentData::Bytes(bytes.to_vec()));
                     }
-                    CacheFetchState::Loading { .. } | CacheFetchState::Skipped => {
+                    CacheFetchState::Loading { .. }
+                    | CacheFetchState::Pending
+                    | CacheFetchState::Skipped => {
                         self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
                     }
                 }
@@ -843,11 +1374,13 @@ impl LiveMediaCache {
                     bridge,
                 ) {
                     CacheFetchState::Ready(bytes) => {
-                        desc.video_data = Some(InlineDocumentData::Bytes(bytes.clone()));
-                        desc.audio_bytes = Some(bytes);
+                        desc.video_data = Some(InlineDocumentData::Bytes(bytes.to_vec()));
+                        desc.audio_bytes = Some(bytes.to_vec());
                         desc.audio_ext = ext;
                     }
-                    CacheFetchState::Loading { .. } | CacheFetchState::Skipped => {
+                    CacheFetchState::Loading { .. }
+                    | CacheFetchState::Pending
+                    | CacheFetchState::Skipped => {
                         self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
                     }
                 }
@@ -857,17 +1390,20 @@ impl LiveMediaCache {
                 let resolved = document_to_location(doc);
                 let ext = resolved.ext_hint.clone().or_else(|| Some("ogg".to_owned()));
                 let key = document_cache_key(resolved.dc_id, doc.id.0);
-                if let CacheFetchState::Ready(bytes) = self.fetch_or_spawn(
-                    key,
-                    MediaCacheTag::Voice,
-                    resolved,
-                    None,
-                    rpc,
-                    handle,
-                    bridge,
-                ) {
-                    desc.audio_bytes = Some(bytes);
-                    desc.audio_ext = ext;
+                // Never downloaded automatically (`Data::AutoDownload::Should` is false for a
+                // voice message): only the cache is read here, the first play downloads it.
+                match self.read_blocking(&key) {
+                    Some(bytes) => {
+                        desc.audio_bytes = Some(bytes.to_vec());
+                        desc.audio_ext = ext;
+                    }
+                    None => {
+                        desc.voice_load = Some(if self.is_in_flight(&key) {
+                            VoiceLoadState::Loading
+                        } else {
+                            VoiceLoadState::NotLoaded
+                        });
+                    }
                 }
                 Some(desc)
             }
@@ -912,34 +1448,21 @@ impl LiveMediaCache {
                     handle,
                     bridge,
                 ) {
-                    desc.video_data = Some(InlineDocumentData::Bytes(bytes));
+                    desc.video_data = Some(InlineDocumentData::Bytes(bytes.to_vec()));
                 }
                 Some(desc)
             }
             DocumentKind::Sticker => {
                 let resolved = document_to_location(doc);
                 let key = document_cache_key(resolved.dc_id, doc.id.0);
-                desc.photo_load = match self.fetch_or_spawn(
+                desc.photo_load = photo_load_state(self.fetch_nonblocking(
                     key,
                     MediaCacheTag::Sticker,
                     resolved,
-                    None,
                     rpc,
                     handle,
                     bridge,
-                ) {
-                    CacheFetchState::Ready(bytes) => Some(PhotoLoadState::Ready { bytes }),
-                    CacheFetchState::Loading {
-                        bytes_loaded,
-                        total_bytes,
-                    } => Some(PhotoLoadState::Loading {
-                        progress: (total_bytes > 0)
-                            .then(|| (bytes_loaded as f32 / total_bytes as f32).clamp(0.0, 1.0)),
-                        bytes_loaded,
-                        total_bytes,
-                    }),
-                    CacheFetchState::Skipped => None,
-                };
+                ));
                 Some(desc)
             }
             DocumentKind::File | DocumentKind::WallPaper => {
@@ -971,27 +1494,14 @@ impl LiveMediaCache {
             _ => "m",
         };
         let key = document_thumb_cache_key(thumb_loc.dc_id, doc.id.0, thumb_size);
-        desc.photo_load = match self.fetch_or_spawn(
+        desc.photo_load = photo_load_state(self.fetch_nonblocking(
             key,
             MediaCacheTag::Photo,
             thumb_loc,
-            None,
             rpc,
             handle,
             bridge,
-        ) {
-            CacheFetchState::Ready(bytes) => Some(PhotoLoadState::Ready { bytes }),
-            CacheFetchState::Loading {
-                bytes_loaded,
-                total_bytes,
-            } => Some(PhotoLoadState::Loading {
-                progress: (total_bytes > 0)
-                    .then(|| (bytes_loaded as f32 / total_bytes as f32).clamp(0.0, 1.0)),
-                bytes_loaded,
-                total_bytes,
-            }),
-            CacheFetchState::Skipped => None,
-        };
+        ));
     }
 
     /// Loads or asynchronously fetches a grid thumbnail for a profile shared-media message
@@ -1054,7 +1564,7 @@ impl LiveMediaCache {
         }
     }
 
-    fn shared_media_thumb_for_photo<C: RpcClient + Clone + 'static>(
+    pub(crate) fn shared_media_thumb_for_photo<C: RpcClient + Clone + 'static>(
         &self,
         photo: &PhotoData,
         rpc: &C,
@@ -1074,25 +1584,19 @@ impl LiveMediaCache {
             _ => "m",
         };
         let key = photo_cache_key(resolved.dc_id, photo.id.0, thumb_size);
-        match self.fetch_or_spawn(
-            key,
-            MediaCacheTag::Photo,
-            resolved,
-            None,
-            rpc,
-            handle,
-            bridge,
-        ) {
-            CacheFetchState::Ready(bytes) => SharedMediaThumb::Ready { bytes },
-            CacheFetchState::Loading { .. } | CacheFetchState::Skipped => {
-                SharedMediaThumb::Loading {
-                    stripped_thumb: photo.stripped_thumb.clone(),
-                }
-            }
+        match self.fetch_nonblocking(key, MediaCacheTag::Photo, resolved, rpc, handle, bridge) {
+            CacheFetchState::Ready(bytes) => SharedMediaThumb::Ready {
+                bytes: bytes.to_vec(),
+            },
+            CacheFetchState::Loading { .. }
+            | CacheFetchState::Pending
+            | CacheFetchState::Skipped => SharedMediaThumb::Loading {
+                stripped_thumb: photo.stripped_thumb.clone(),
+            },
         }
     }
 
-    fn shared_media_thumb_for_document<C: RpcClient + Clone + 'static>(
+    pub(crate) fn shared_media_thumb_for_document<C: RpcClient + Clone + 'static>(
         &self,
         doc: &DocumentData,
         rpc: &C,
@@ -1114,22 +1618,35 @@ impl LiveMediaCache {
             _ => "m",
         };
         let key = document_thumb_cache_key(thumb_loc.dc_id, doc.id.0, thumb_size);
-        match self.fetch_or_spawn(
-            key,
-            MediaCacheTag::Photo,
-            thumb_loc,
-            None,
-            rpc,
-            handle,
-            bridge,
-        ) {
-            CacheFetchState::Ready(bytes) => SharedMediaThumb::Ready { bytes },
-            CacheFetchState::Loading { .. } | CacheFetchState::Skipped => {
-                SharedMediaThumb::Loading {
-                    stripped_thumb: doc.stripped_thumb.clone(),
-                }
-            }
+        match self.fetch_nonblocking(key, MediaCacheTag::Photo, thumb_loc, rpc, handle, bridge) {
+            CacheFetchState::Ready(bytes) => SharedMediaThumb::Ready {
+                bytes: bytes.to_vec(),
+            },
+            CacheFetchState::Loading { .. }
+            | CacheFetchState::Pending
+            | CacheFetchState::Skipped => SharedMediaThumb::Loading {
+                stripped_thumb: doc.stripped_thumb.clone(),
+            },
         }
+    }
+}
+
+/// Maps a cache lookup to the photo state the history paints: a pending disk read paints like
+/// no state at all (blurred thumbnail) but is re-polled like a download.
+fn photo_load_state(state: CacheFetchState) -> Option<PhotoLoadState> {
+    match state {
+        CacheFetchState::Ready(bytes) => Some(PhotoLoadState::Ready { bytes }),
+        CacheFetchState::Loading {
+            bytes_loaded,
+            total_bytes,
+        } => Some(PhotoLoadState::Loading {
+            progress: (total_bytes > 0)
+                .then(|| (bytes_loaded as f32 / total_bytes as f32).clamp(0.0, 1.0)),
+            bytes_loaded,
+            total_bytes,
+        }),
+        CacheFetchState::Pending => Some(PhotoLoadState::Pending),
+        CacheFetchState::Skipped => None,
     }
 }
 
@@ -1140,8 +1657,12 @@ pub fn has_persisted_index(dir: &Path) -> bool {
 }
 
 #[cfg(test)]
+mod tests_actor;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tg_storage::AuthKey;
     use tg_storage::cache::media_cache::derive_media_cache_key;
 

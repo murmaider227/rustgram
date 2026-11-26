@@ -167,7 +167,8 @@ impl InlineResultsPanel {
             }
             Err(err) => {
                 self.controller.on_request_failed();
-                self.last_error = Some(err);
+                let _ = tg_app_core::user_error::inline_query(&err);
+                self.last_error = Some(err); // local error: a failed-state flag, never drawn
                 false
             }
         }
@@ -431,14 +432,8 @@ impl InlineResultsPanel {
                 .max_height(body_h)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if let Some(ref err) = self.last_error {
-                        ui.add_space(16.0);
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Inline query failed: {err}"))
-                                    .color(palette.attention_fg),
-                            );
-                        });
+                    // A failed query shows nothing (`inline_results_widget.cpp:476-480`).
+                    if self.last_error.is_some() {
                         return;
                     }
 

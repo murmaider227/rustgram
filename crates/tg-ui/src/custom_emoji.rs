@@ -386,6 +386,23 @@ impl CustomEmojiRenderer {
         self.loaded.contains_key(document_id)
     }
 
+    /// Length of one animation loop of `document_id` in seconds; `None` for a still or an
+    /// unregistered emoji.
+    #[must_use]
+    pub fn loop_duration_secs(&self, document_id: &str) -> Option<f64> {
+        match self.loaded.get(document_id)? {
+            LoadedEmoji::Lottie {
+                frame_count, fps, ..
+            } => (*frame_count > 1).then(|| *frame_count as f64 / fps),
+            LoadedEmoji::Webm {
+                frames,
+                total_duration_ms,
+                ..
+            } => (frames.len() > 1).then(|| *total_duration_ms as f64 / 1000.0),
+            LoadedEmoji::Static { .. } => None,
+        }
+    }
+
     /// Removes `document_id` and its cached frames/textures.
     pub fn remove(&mut self, document_id: &str) {
         self.loaded.remove(document_id);
@@ -601,6 +618,13 @@ pub fn unregister_custom_emoji_asset(document_id: &str) {
 pub fn has_registered_custom_emoji(document_id: &str) -> bool {
     let guard = shared_registry().lock().unwrap_or_else(|e| e.into_inner());
     guard.contains(document_id)
+}
+
+/// [`CustomEmojiRenderer::loop_duration_secs`] for an emoji of the shared registry.
+#[must_use]
+pub fn registered_custom_emoji_loop_secs(document_id: &str) -> Option<f64> {
+    let guard = shared_registry().lock().unwrap_or_else(|e| e.into_inner());
+    guard.loop_duration_secs(document_id)
 }
 
 /// Paints `document_id` from the shared registry into `rect`; returns `true` if painted.

@@ -178,6 +178,8 @@ fn seed_one_to_one(state: &mut AppTestState) -> (PeerId, MsgId) {
         author_color_id: peer.bare(),
         preview_text: "Hi! Testing incoming message bubble and reply styling.".to_owned(),
         preview_thumb_rgb: None,
+        preview_thumb: None,
+        preview_colored_len: 0,
         quote_text: None,
     });
     handle.push_history_message(peer, reply);
@@ -332,6 +334,8 @@ fn seed_saved(state: &mut AppTestState) -> PeerId {
         preview_text: "Hello! Testing UI parity between the official client and Rustgram."
             .to_owned(),
         preview_thumb_rgb: None,
+        preview_thumb: None,
+        preview_colored_len: 0,
         quote_text: None,
     });
     handle.push_history_message(peer, reply);

@@ -28,7 +28,7 @@ use tokio::sync::broadcast;
 
 use crate::session::LiveSession;
 use tg_app_core::core_types::dto::moderate_messages::ModerateMessagesRequest;
-use tg_app_core::history::backend::{HistoryBackend, SendMessageExtended};
+use tg_app_core::history::backend::{HistoryBackend, HistoryLiveUpdate, SendMessageExtended};
 use tg_app_core::info::backend::{CreateChannelRequest, InfoBackend};
 use tg_app_core::stand_in::types::{MsgId, PeerId};
 
@@ -934,8 +934,36 @@ fn send_message_extended_and_create_channel_apply_updates_once_and_advance_state
             },
         )
         .expect("send_message_extended");
-    assert_eq!(sent.id, MsgId(701));
+    // The send shows at once as a pending local message (TGB-2931) and goes out in the
+    // background; wait for its reply before checking how it was applied.
+    assert!(sent.id.is_local() && sent.is_sending, "{:?}", sent.id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while live.updates_common_pts() != 301 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(live.updates_common_pts(), 301);
+    let swapped = (0..1000).find_map(|_| {
+        let found = live
+            .drain_history_updates(user_peer)
+            .into_iter()
+            .find_map(|u| match u {
+                HistoryLiveUpdate::LocalMessageSent { local_id, message }
+                    if local_id == sent.id =>
+                {
+                    Some(message.id)
+                }
+                _ => None,
+            });
+        if found.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        found
+    });
+    assert_eq!(
+        swapped,
+        Some(MsgId(701)),
+        "the reply swaps in the server message"
+    );
     let evs = drain_changes(&mut changes);
     let server_added = evs
         .iter()

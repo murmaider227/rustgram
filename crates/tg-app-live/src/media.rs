@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::bridge::LiveBridgeState;
-use crate::convert::{history_messages_ordered, known_peer_ids};
+use crate::convert::{history_messages_ordered, known_peer_ids, stored_messages_ordered};
 use anyhow::anyhow;
 use tg_api::RpcClient;
 use tg_api::convert::{
-    apply_tl_message, apply_tl_users_and_chats, input_channel_for, input_peer_for, input_user_for,
+    apply_tl_existing_message, apply_tl_users_and_chats, input_channel_for, input_peer_for,
+    input_user_for,
 };
 use tg_app_core::core_types::erased_rpc::ErasedRpcClient;
 use tg_audio::{
@@ -116,14 +117,26 @@ pub struct ResolvedMediaLocation {
     pub ext_hint: Option<String>,
 }
 
-/// Builds an [`InputFileLocation`] for a [`PhotoData`] selecting the largest downloadable size tag.
+/// Size tags of the photo shown in a message bubble and the viewer, best first
+/// (`LargeLevels`, `data/data_session.cpp:119`): `y` (1280 px) before the 2560 px `w`.
+const LARGE_PHOTO_LEVELS: &str = "ydxcwmbsa";
+
+/// Builds an [`InputFileLocation`] for a [`PhotoData`]'s large size (`PhotoSize::Large`): the
+/// first tag of `ydxcwmbsa` the photo has, else its largest downloadable size.
 #[must_use]
 pub fn photo_to_location(photo: &PhotoData) -> ResolvedMediaLocation {
-    let best_size = photo
-        .sizes
-        .iter()
-        .filter(|s| !s.kind.is_empty() && s.kind != "i" && s.kind != "j")
-        .max_by_key(|s| (i64::from(s.width) * i64::from(s.height), s.size));
+    let downloadable = || {
+        photo
+            .sizes
+            .iter()
+            .filter(|s| !s.kind.is_empty() && s.kind != "i" && s.kind != "j")
+    };
+    let best_size = LARGE_PHOTO_LEVELS
+        .chars()
+        .find_map(|level| downloadable().find(|s| s.kind.starts_with(level) && s.kind.len() == 1))
+        .or_else(|| {
+            downloadable().max_by_key(|s| (i64::from(s.width) * i64::from(s.height), s.size))
+        });
     let thumb_size = best_size
         .map(|s| s.kind.clone())
         .unwrap_or_else(|| "y".to_owned());
@@ -566,7 +579,7 @@ impl UpdatedFileReferences {
         let peers = known_peer_ids(session);
         let mut msg_keys = Vec::new();
         for pid in peers {
-            for msg in history_messages_ordered(session, pid) {
+            for msg in stored_messages_ordered(session, pid) {
                 msg_keys.push(FullMsgId::new(pid, msg.id));
             }
         }
@@ -658,7 +671,7 @@ fn infer_origin_from_session(
     let mut sticker_origin: Option<(u64, u64)> = None;
 
     for peer_id in known_peer_ids(session) {
-        for msg in history_messages_ordered(session, peer_id) {
+        for msg in stored_messages_ordered(session, peer_id) {
             match msg.media() {
                 Some(MessageMedia::Photo(p)) if Some(p.id.0) == target_photo => {
                     return (
@@ -711,7 +724,7 @@ pub async fn refresh_file_reference_async<C: RpcClient + Clone + 'static>(
                 let guard = session.read().await;
                 let mut found = None;
                 for pid in known_peer_ids(&guard) {
-                    for msg in history_messages_ordered(&guard, pid) {
+                    for msg in stored_messages_ordered(&guard, pid) {
                         if let Some(MessageMedia::Document(d)) = msg.media()
                             && let Some(ref sm) = d.sticker
                             && sm.set_id == target_set
@@ -781,19 +794,19 @@ pub async fn refresh_file_reference_async<C: RpcClient + Clone + 'static>(
                 tl_enums::messages::Messages::Messages(m) => {
                     apply_tl_users_and_chats(&mut guard, &m.users, &m.chats);
                     for msg in &m.messages {
-                        apply_tl_message(&mut guard, msg);
+                        apply_tl_existing_message(&mut guard, msg);
                     }
                 }
                 tl_enums::messages::Messages::Slice(m) => {
                     apply_tl_users_and_chats(&mut guard, &m.users, &m.chats);
                     for msg in &m.messages {
-                        apply_tl_message(&mut guard, msg);
+                        apply_tl_existing_message(&mut guard, msg);
                     }
                 }
                 tl_enums::messages::Messages::ChannelMessages(m) => {
                     apply_tl_users_and_chats(&mut guard, &m.users, &m.chats);
                     for msg in &m.messages {
-                        apply_tl_message(&mut guard, msg);
+                        apply_tl_existing_message(&mut guard, msg);
                     }
                 }
                 tl_enums::messages::Messages::NotModified(_) => {}
@@ -2463,7 +2476,7 @@ impl<C: RpcClient + Clone + 'static> LiveAudioDataSource<C> {
             }
             // Fallback scan across loaded histories for matching document_id.
             for peer_id in known_peer_ids(&guard) {
-                for msg in history_messages_ordered(&guard, peer_id) {
+                for msg in stored_messages_ordered(&guard, peer_id) {
                     if let Some(MessageMedia::Document(doc)) = msg.media()
                         && doc.id == target.document_id
                     {
@@ -2947,7 +2960,7 @@ fn resolve_listen_document(
         ));
     }
     for pid in known_peer_ids(session) {
-        for msg in history_messages_ordered(session, pid) {
+        for msg in stored_messages_ordered(session, pid) {
             if let Some(MessageMedia::Document(doc)) = msg.media()
                 && doc.id == track_id.document_id
             {

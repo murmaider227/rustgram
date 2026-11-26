@@ -753,7 +753,11 @@ impl RepliesSectionWidget {
                                                 &root_post.sender_name,
                                                 &ui_colors,
                                             )
-                                            .paint_circle(ui.painter(), av_r);
+                                            .paint_circle_or_photo(
+                                                ui.painter(),
+                                                av_r,
+                                                root_post.peer_id.0,
+                                            );
                                             ui.vertical(|ui| {
                                                 ui.label(
                                                     egui::RichText::new(&root_post.sender_name)
@@ -883,7 +887,11 @@ impl RepliesSectionWidget {
                                         &msg.sender_name,
                                         &ui_colors,
                                     )
-                                    .paint_circle(ui.painter(), av_r);
+                                    .paint_circle_or_photo(
+                                        ui.painter(),
+                                        av_r,
+                                        msg.from_id.0,
+                                    );
                                     ui.add_space(4.0);
                                 }
 
@@ -2422,7 +2430,7 @@ fn paint_admin_log_card(
                     ui.horizontal(|ui| {
                         let (av_r, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
                         EmptyUserpic::for_peer(entry.actor_id.bare(), &entry.actor_name, ui_colors)
-                            .paint_circle(ui.painter(), av_r);
+                            .paint_circle_or_photo(ui.painter(), av_r, entry.actor_id.0);
                         ui.label(
                             egui::RichText::new(&entry.actor_name)
                                 .strong()
@@ -2693,7 +2701,11 @@ fn paint_simple_message_feed(
                                 &msg.sender_name,
                                 &ui_colors,
                             )
-                            .paint_circle(ui.painter(), av_r);
+                            .paint_circle_or_photo(
+                                ui.painter(),
+                                av_r,
+                                msg.from_id.0,
+                            );
                             ui.add_space(4.0);
                         }
                         egui::Frame::NONE

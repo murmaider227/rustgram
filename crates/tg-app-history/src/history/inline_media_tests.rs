@@ -646,7 +646,7 @@ impl MediaShowcaseScreenshotApp {
             InlineMediaDescriptor {
                 has_spoiler: true,
                 photo_load: Some(PhotoLoadState::Ready {
-                    bytes: encode_sample_photo_png(),
+                    bytes: encode_sample_photo_png().into(),
                 }),
                 ..InlineMediaDescriptor::default()
             },
@@ -748,6 +748,7 @@ impl MediaShowcaseScreenshotApp {
                 media: Some(HistoryMedia::Voice(VoiceAttachment {
                     duration_secs: 18,
                     waveform_5bit: sample_voice_waveform_5bit(19),
+                    size_bytes: 72_400,
                     is_unread: false,
                     transcription: Some(
                         "Inline voice player synced with tg-audio PlayerInstance.".to_owned(),

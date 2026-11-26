@@ -264,7 +264,7 @@ impl VerifyPeersBoxState {
                         Vec2::splat(34.0),
                     );
                     EmptyUserpic::for_color_index(peer.color_index, &peer.title, colors)
-                        .paint_circle(ui.painter(), av_rect);
+                        .paint_circle_or_photo(ui.painter(), av_rect, peer.id.0);
 
                     let text_x = av_rect.right() + 10.0;
                     ui.painter().text(

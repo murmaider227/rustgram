@@ -16,8 +16,8 @@ use tg_data::{
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 
 use crate::convert::{
-    apply_tl_message, apply_tl_users_and_chats, input_peer_for, peer_id_from_tl, reaction_to_tl,
-    tl_message_meta,
+    apply_tl_existing_message, apply_tl_users_and_chats, input_peer_for, peer_id_from_tl,
+    reaction_to_tl, tl_message_meta,
 };
 use crate::error::ApiError;
 use crate::forum::apply_tl_forum_topic;
@@ -309,7 +309,7 @@ pub fn parse_search_result(
 
     let mut message_ids = Vec::with_capacity(messages.len());
     for msg in messages {
-        if let Some(full_id) = apply_tl_message(session, msg) {
+        if let Some(full_id) = apply_tl_existing_message(session, msg) {
             message_ids.push(full_id.msg);
             if full_id.msg < no_skip_range.from {
                 no_skip_range.from = full_id.msg;
@@ -601,7 +601,7 @@ impl MessagesSearch {
             if let Some((peer, _, date)) = tl_message_meta(raw)
                 && session.peer(peer).is_some()
                 && date != 0
-                && let Some(full_id) = apply_tl_message(session, raw)
+                && let Some(full_id) = apply_tl_existing_message(session, raw)
             {
                 items.push(full_id);
             }
@@ -940,7 +940,7 @@ impl GlobalSearchController {
             if let Some((peer, mid, date)) = tl_message_meta(raw) {
                 if session.peer(peer).is_some() {
                     if date != 0
-                        && let Some(full_id) = apply_tl_message(session, raw)
+                        && let Some(full_id) = apply_tl_existing_message(session, raw)
                     {
                         found_ids.push(full_id);
                     }
@@ -1435,7 +1435,7 @@ impl PostsSearchController {
             if let Some((peer, mid, date)) = tl_message_meta(raw) {
                 if session.peer(peer).is_some() {
                     if date != 0
-                        && let Some(full_id) = apply_tl_message(session, raw)
+                        && let Some(full_id) = apply_tl_existing_message(session, raw)
                     {
                         found_ids.push(full_id);
                     }

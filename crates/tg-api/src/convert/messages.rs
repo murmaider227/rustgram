@@ -437,6 +437,7 @@ pub fn forward_info_from_tl(fwd: &tl_enums::MessageFwdHeader) -> ForwardInfo {
         saved_from_id: f.saved_from_id.as_ref().map(peer_id_from_tl),
         saved_from_name: f.saved_from_name.clone(),
         saved_date: f.saved_date,
+        saved_out: f.saved_out,
         psa_type: f.psa_type.clone(),
         imported: f.imported,
     }
@@ -470,6 +471,12 @@ pub fn reply_info_from_tl(reply: &tl_enums::MessageReplyHeader) -> ReplyInfo {
                 .map(|f| Box::new(forward_info_from_tl(f))),
             todo_item_id: r.todo_item_id,
             poll_option: r.poll_option.clone(),
+            reply_media: r
+                .reply_media
+                .as_ref()
+                .map(message_media_from_tl)
+                .filter(|media| !matches!(media, tg_data::MessageMedia::Empty))
+                .map(Box::new),
         },
         tl_enums::MessageReplyHeader::MessageReplyStoryHeader(s) => ReplyInfo {
             reply_to_story: Some(FullStoryId::new(peer_id_from_tl(&s.peer), s.story_id)),
@@ -801,6 +808,7 @@ pub fn message_from_tl(tl_msg: &tl_enums::Message, self_id: UserId) -> Option<Me
                 via_bot_id: None,
                 via_business_bot_id: None,
                 post_author: None,
+                from_rank: None,
                 ttl_period: None,
                 schedule_repeat_period: None,
                 effect_id: None,
@@ -919,6 +927,7 @@ pub fn message_from_tl(tl_msg: &tl_enums::Message, self_id: UserId) -> Option<Me
                 via_bot_id: m.via_bot_id.map(UserId::from_tl),
                 via_business_bot_id: m.via_business_bot_id.map(UserId::from_tl),
                 post_author: m.post_author.clone(),
+                from_rank: m.from_rank.clone().filter(|r| !r.is_empty()),
                 ttl_period: m.ttl_period,
                 schedule_repeat_period: m.schedule_repeat_period,
                 effect_id: m.effect.map(EffectId::from_tl),
@@ -960,6 +969,19 @@ pub fn apply_tl_message(session: &mut Session, tl_msg: &tl_enums::Message) -> Op
     let msg = message_from_tl(tl_msg, session.self_user_id())?;
     let id = msg.full_id();
     session.insert_message(msg);
+    Some(id)
+}
+
+/// Converts and stores a TL `Message` that came with a page which is not the chat's own bottom
+/// (topic / comment pages, search results, unread-mention pages, reference refreshes):
+/// `NewMessageType::Existing`, see [`Session::insert_existing_message`].
+pub fn apply_tl_existing_message(
+    session: &mut Session,
+    tl_msg: &tl_enums::Message,
+) -> Option<FullMsgId> {
+    let msg = message_from_tl(tl_msg, session.self_user_id())?;
+    let id = msg.full_id();
+    session.insert_existing_message(msg);
     Some(id)
 }
 

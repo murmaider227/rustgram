@@ -114,6 +114,7 @@ pub enum WebViewHostRequest {
 pub struct WindowController {
     session_backend: Box<dyn AppSession>,
     theme_manager: ThemeManager,
+    theme_follow: theme_apply::ThemeFollow,
     strings: TgLangStrings,
     settings: ShellSettings,
     settings_path: PathBuf,
@@ -140,6 +141,8 @@ pub struct WindowController {
     pending_open_recent_calls: bool,
     pending_start_call: Option<(PeerId, bool)>,
     logout_requested: bool,
+    /// Background accounts whose forced-logout box was closed (`forced_logout.rs`).
+    background_logouts: Vec<i32>,
     menu_accounts: Vec<MainMenuAccountItem>,
     max_accounts: usize,
     pending_account_switch: Option<i32>,
@@ -150,6 +153,8 @@ pub struct WindowController {
     external_passcode_verifier:
         Option<tg_app_settings::settings::local_passcode::PasscodeVerifierFn>,
     shell_extras: WindowShellExtras,
+    /// [`Self::elapsed_ms`] of the last chat-list keep-alive read (see `show_with_stories`).
+    chats_list_keepalive_ms: Option<i64>,
     native_hwnd: isize,
     fallback_shortcuts: tg_app_settings::settings::shortcuts::ShortcutManager,
     no_warning_extensions: BTreeSet<String>,
@@ -219,12 +224,7 @@ impl WindowController {
         settings: ShellSettings,
         settings_path: PathBuf,
     ) -> Self {
-        let embedded = settings.resolved_embedded_type();
-        let accent = settings.resolved_accent_color();
-        let mut theme_manager = ThemeManager::with_embedded(embedded);
-        if let Some(c) = accent {
-            theme_manager.set_embedded(embedded, Some(c));
-        }
+        let theme_manager = settings.restored_theme_manager();
 
         let is_live = session_backend.is_live_session();
         let already_signed_in = session_backend.current_user().is_some() || is_live;
@@ -239,6 +239,7 @@ impl WindowController {
         let mut controller = Self {
             session_backend,
             theme_manager,
+            theme_follow: theme_apply::ThemeFollow::new(),
             strings: TgLangStrings::new(),
             settings,
             settings_path,
@@ -264,6 +265,7 @@ impl WindowController {
             pending_open_recent_calls: false,
             pending_start_call: None,
             logout_requested: false,
+            background_logouts: Vec::new(),
             menu_accounts: Vec::new(),
             max_accounts: tg_session::MAX_ACCOUNTS,
             pending_account_switch: None,
@@ -273,6 +275,7 @@ impl WindowController {
             pending_update_prefs: None,
             external_passcode_verifier: None,
             shell_extras: WindowShellExtras::new(),
+            chats_list_keepalive_ms: None,
             native_hwnd: 0,
             fallback_shortcuts: tg_app_settings::settings::shortcuts::ShortcutManager::new(),
             no_warning_extensions: BTreeSet::new(),
@@ -795,15 +798,11 @@ impl WindowController {
         self.mark_settings_dirty();
     }
 
-    /// Toggles between Day and Night modes via [`ThemeManager`].
+    /// Toggles between Day and Night modes via [`ThemeManager`], without asking (see
+    /// [`Self::request_night_mode_toggle`] for the menu switch).
     pub fn toggle_night_mode(&mut self) {
         let next_night = !self.theme_manager.is_dark();
-        self.theme_manager.set_night_mode(next_night);
-        self.settings.record_theme(
-            self.theme_manager.embedded_type(),
-            self.theme_manager.accent(),
-        );
-        self.mark_settings_dirty();
+        self.set_night_mode_and_keep(next_night);
     }
 
     /// Records updated window geometry and schedules a debounced save.
@@ -1325,6 +1324,7 @@ impl WindowController {
                     .history_mut()
                     .open_monoforum_section(peer_id, title, is_admin);
             }
+            DeepLinkOutcome::UserError(error) => self.show_user_error(error),
             DeepLinkOutcome::LoginCode(code) => {
                 self.pending_login_code = Some(code.clone());
                 self.layer_stack
@@ -1372,8 +1372,7 @@ impl WindowController {
             self.media_overlay
                 .open_item(&*self.session_backend, peer_id.0, item_id, now_ms)
         {
-            self.layer_stack
-                .show_toast(format!("Unable to open media: {err}"));
+            self.show_user_error(tg_app_core::user_error::open_media(&format!("{err:#}")));
         } else {
             self.attach_video_sponsored_for_current(peer_id, msg_id, now_ms);
         }
@@ -1463,8 +1462,7 @@ impl WindowController {
                     media_id,
                     now_ms,
                 ) {
-                    self.layer_stack
-                        .show_toast(format!("Unable to open media: {err}"));
+                    self.show_user_error(tg_app_core::user_error::open_media(&format!("{err:#}")));
                 } else {
                     self.attach_video_sponsored_for_current(peer_id, MsgId(item_id), now_ms);
                 }
@@ -1849,6 +1847,9 @@ impl WindowController {
         let ctx = ui.ctx().clone();
         let body_rect = ui.max_rect();
         self.session_backend.sync_cached_user();
+        self.sync_system_dark_mode();
+        self.sync_chat_background_dark_mode(&ctx);
+        self.repaint_after_theme_change(&ctx);
         let palette = self.palette();
         let now_ms = self.elapsed_ms();
 
@@ -2176,10 +2177,13 @@ impl WindowController {
 
         // Hover chat preview, Ctrl+Tab chat-switch overlay, and separate chat viewports.
         if self.root_screen == RootScreen::Main {
-            let dialogs = self.session_backend.dialogs(FilterId::ALL, "");
+            self.keep_chats_list_loading(now_ms);
+            let backend = &self.session_backend;
             if let Some(peer) =
                 self.shell_extras
-                    .show_overlays(&ctx, screen_rect, &palette, &dialogs)
+                    .show_overlays(&ctx, screen_rect, &palette, &|| {
+                        backend.dialogs(FilterId::ALL, "")
+                    })
                 && let Some(session) = self.session.as_mut()
             {
                 session.show_peer_history(peer, SectionShow::clear_stack(), MsgId::SHOW_AT_END);
@@ -2196,6 +2200,8 @@ impl WindowController {
                 self.show_toast(toast);
             }
         }
+
+        self.repaint_after_theme_change(&ctx);
 
         // Flush debounced settings writes (`kSaveWindowPositionTimeout`).
         if let Some(since) = self.settings_dirty_since
@@ -2280,6 +2286,32 @@ impl WindowController {
         {
             session.show_back_from_stack(SectionShow::forward());
         }
+    }
+
+    /// Reads an empty slice of the main chat list at most once a second on a live session.
+    ///
+    /// The overlays used to build the whole chat list every frame. On a live session that read
+    /// also kept the background chat-list loading going (a page that failed is retried from a
+    /// list read), also while the chat-list column is hidden. The empty read keeps that without
+    /// converting a single chat.
+    fn keep_chats_list_loading(&mut self, now_ms: i64) {
+        const KEEPALIVE_INTERVAL_MS: i64 = 1000;
+        if !self.session_backend.is_live_session() {
+            return;
+        }
+        if self
+            .chats_list_keepalive_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < KEEPALIVE_INTERVAL_MS)
+        {
+            return;
+        }
+        self.chats_list_keepalive_ms = Some(now_ms);
+        let _ = tg_app_core::dialogs::backend::DialogsBackend::dialog_slice(
+            &*self.session_backend,
+            tg_app_core::dialogs::backend::DialogListQuery::Filter(FilterId::ALL),
+            0,
+            0,
+        );
     }
 
     pub(crate) fn handle_chat_switch_tab(
@@ -2394,8 +2426,10 @@ impl WindowController {
                     self.layer_stack.show_toast("Reconnected (mock)");
                 }
             }
-            MainWidgetAction::ToggleTheme => self.toggle_night_mode(),
-            MainWidgetAction::ApplyTheme { kind, accent } => self.apply_theme(kind, accent),
+            MainWidgetAction::ToggleTheme => self.request_night_mode_toggle(),
+            MainWidgetAction::ApplyTheme { kind, accent } => {
+                self.choose_embedded_theme(kind, accent);
+            }
             MainWidgetAction::ApplyLanguage(code) => {
                 let _ = InfoBackend::set_language(&mut *self.session_backend, &code);
                 self.strings.refresh();
@@ -2568,6 +2602,7 @@ impl WindowController {
             MainWidgetAction::Toast(msg) => {
                 self.layer_stack.show_toast(msg);
             }
+            MainWidgetAction::UserError(error) => self.show_user_error(error),
             MainWidgetAction::OpenForwardBox { from_peer, msg_ids } => {
                 let ids = msg_ids.iter().map(|id| id.0).collect();
                 let tabs = self.forward_folder_tabs();
@@ -2804,31 +2839,19 @@ impl WindowController {
                 message_ids,
             } => {
                 if let Some(peer) = InfoBackend::peer_profile(&*self.session_backend, peer_id) {
-                    let state = if message_ids.is_empty() {
-                        let future_creator = if peer.kind.is_group() || peer.kind.is_channel() {
-                            tg_app_core::history::backend::HistoryBackend::future_chat_creator_after_leave(
-                                &*self.session_backend,
-                                peer_id,
-                            )
-                            .ok()
-                            .flatten()
-                        } else {
-                            None
-                        };
-                        DeleteMessagesBoxState::for_delete_or_leave(&peer, false)
-                            .with_revoke_full_history(
-                                tg_app_core::dialogs::backend::DialogsBackend::can_revoke_full_history(
-                                    &*self.session_backend,
-                                    peer_id,
-                                ),
-                                tg_app_core::dialogs::backend::DialogsBackend::peer_first_name(&*self.session_backend, peer_id),
-                            )
-                            .with_future_creator(future_creator)
+                    let kind = if message_ids.is_empty() {
+                        // `DeleteAndLeaveHandler` -> `DeleteChatBox`.
+                        BoxKind::DeleteChat(tg_app_info::boxes::delete_chat::delete_chat_box(
+                            &*self.session_backend,
+                            &peer,
+                        ))
                     } else {
-                        DeleteMessagesBoxState::for_messages(&peer, message_ids)
+                        BoxKind::DeleteMessages(DeleteMessagesBoxState::for_messages(
+                            &peer,
+                            message_ids,
+                        ))
                     };
-                    self.box_host
-                        .push(ctx, BoxKind::DeleteMessages(state), &self.theme_manager);
+                    self.box_host.push(ctx, kind, &self.theme_manager);
                 }
             }
             InfoWrapEvent::OpenClearHistory(peer_id) => {
@@ -3083,8 +3106,7 @@ impl WindowController {
         let sets = match self.session_backend.get_attached_stickers(media) {
             Ok(sets) => sets,
             Err(err) => {
-                self.layer_stack
-                    .show_toast(format!("Could not load attached stickers: {err}"));
+                self.show_user_error(tg_app_core::user_error::attached_stickers(&err));
                 return;
             }
         };
@@ -3095,8 +3117,9 @@ impl WindowController {
         });
         match outcome {
             AttachedStickersOutcome::NotFound => {
-                self.layer_stack
-                    .show_toast(tg_lang::tr::lng_stickers_not_found());
+                self.show_user_error(tg_app_core::user_error::attached_stickers(
+                    "no attached sticker sets",
+                ));
             }
             AttachedStickersOutcome::SingleSet(st_box) => {
                 self.box_host
@@ -3137,7 +3160,7 @@ impl WindowController {
                 comment,
             } => {
                 let mut forwarded = 0usize;
-                let mut first_err: Option<String> = None;
+                let mut first_err: Option<(PeerId, String)> = None;
                 let trimmed_comment = comment.trim().to_owned();
                 for target in targets {
                     match tg_app_media::media::backend::MediaBackend::forward_item_to(
@@ -3165,7 +3188,7 @@ impl WindowController {
                         }
                         Err(err) => {
                             if first_err.is_none() {
-                                first_err = Some(err.to_string());
+                                first_err = Some((target, err.to_string()));
                             }
                         }
                     }
@@ -3175,9 +3198,9 @@ impl WindowController {
                         tg_lang::tr::lng_share_messages_to_many_chats(forwarded as i64)
                             .replace("**", ""),
                     );
-                } else if let Some(err) = first_err {
-                    self.layer_stack
-                        .show_toast(format!("Could not forward media: {err}"));
+                } else if let Some((target, err)) = first_err {
+                    let name = self.peer_display_name(target);
+                    self.show_user_error(tg_app_core::user_error::forward_media(&err, &name));
                 }
             }
             BoxEvent::Deleted { peer_id, count, .. } => {
@@ -3195,8 +3218,16 @@ impl WindowController {
                 peer_id,
                 just_clear,
                 revoke,
+                block_bot,
+                remove_from_folders,
             } => {
                 let backend = &mut *self.session_backend;
+                tg_app_info::boxes::delete_chat::before_delete_conversation(
+                    backend,
+                    peer_id,
+                    block_bot,
+                    remove_from_folders,
+                );
                 let result = if just_clear {
                     tg_app_core::dialogs::backend::DialogsBackend::clear_history_for(backend, peer_id, revoke)
                 } else {
@@ -3272,8 +3303,7 @@ impl WindowController {
                         )
                     };
                     if let Err(err) = result {
-                        self.layer_stack
-                            .show_toast(format!("Could not connect proxy: {err}"));
+                        self.show_user_error(tg_app_core::user_error::apply_proxy(&err.to_string()));
                     }
                 }
                 ConfirmTag::JoinChatlist { slug, peers } => {
@@ -3281,15 +3311,12 @@ impl WindowController {
                         Ok(count) => self
                             .layer_stack
                             .show_toast(format!("Added folder with {count} chat(s)")),
-                        Err(err) => self
-                            .layer_stack
-                            .show_toast(format!("Failed to add folder: {err}")),
+                        Err(err) => self.show_user_error(tg_app_core::user_error::join_chatlist(&err)),
                     }
                 }
                 ConfirmTag::ApplyLanguage(code) => {
                     if let Err(err) = InfoBackend::set_language(&mut *self.session_backend, &code) {
-                        self.layer_stack
-                            .show_toast(format!("Could not switch language: {err}"));
+                        self.show_user_error(tg_app_core::user_error::switch_language(&err));
                     } else {
                         self.strings.refresh();
                         self.layer_stack
@@ -3301,9 +3328,7 @@ impl WindowController {
                         Ok(()) => self
                             .layer_stack
                             .show_toast(format!("Redeemed {days}-day Telegram Premium gift code!")),
-                        Err(err) => self
-                            .layer_stack
-                            .show_toast(format!("Could not redeem gift code: {err}")),
+                        Err(err) => self.show_user_error(tg_app_core::user_error::apply_gift_code(&err)),
                     }
                 }
                 ConfirmTag::Custom(_)
@@ -3312,7 +3337,7 @@ impl WindowController {
                 | ConfirmTag::ConvertToGigagroup(_)
                 | ConfirmTag::DeactivateAllUsernames(_) => {}
             },
-            BoxEvent::JoinInviteConfirmed { hash } => {
+            BoxEvent::JoinInviteConfirmed { hash, is_group } => {
                 match self.session_backend.import_chat_invite(&hash) {
                     Ok(peer_id) => {
                         if let Some(session) = self.session.as_mut() {
@@ -3324,9 +3349,9 @@ impl WindowController {
                         }
                         self.layer_stack.show_toast("Joined chat");
                     }
-                    Err(err) => self
-                        .layer_stack
-                        .show_toast(format!("Could not join chat: {err}")),
+                    Err(err) => self.show_user_error(
+                        tg_app_core::user_error::import_chat_invite(&err, is_group),
+                    ),
                 }
             }
             BoxEvent::TermsResolved { .. } => {}
@@ -3381,9 +3406,11 @@ impl WindowController {
                     Ok(false) => self
                         .layer_stack
                         .show_toast(format!("No change for {kind} \"{title}\"")),
-                    Err(err) => self
-                        .layer_stack
-                        .show_toast(format!("Could not update {kind} \"{title}\": {err}")),
+                    Err(err) => self.show_user_error(if install {
+                        tg_app_core::user_error::sticker_set(&err)
+                    } else {
+                        tg_app_core::user_error::uninstall_sticker_set(&err)
+                    }),
                 }
             }
             BoxEvent::StickerSetOwnerAction(act) => match act {
@@ -3408,9 +3435,7 @@ impl WindowController {
                         self.layer_stack
                             .show_toast(format!("Renamed sticker pack to \"{shown_title}\""));
                     }
-                    Err(err) => self
-                        .layer_stack
-                        .show_toast(format!("Could not rename sticker pack: {err}")),
+                    Err(err) => self.show_user_error(tg_app_core::user_error::sticker_set_owner_edit(&err)),
                 },
                 tg_app_info::boxes::sticker_set::StickerSetOwnerAction::ReorderSticker {
                     set_id,
@@ -3434,9 +3459,7 @@ impl WindowController {
                             new_position + 1
                         ));
                     }
-                    Err(err) => self
-                        .layer_stack
-                        .show_toast(format!("Could not reorder sticker: {err}")),
+                    Err(err) => self.show_user_error(tg_app_core::user_error::sticker_set_owner_edit(&err)),
                 },
                 tg_app_info::boxes::sticker_set::StickerSetOwnerAction::RemoveSticker {
                     set_id,
@@ -3455,9 +3478,7 @@ impl WindowController {
                         }
                         self.layer_stack.show_toast("Removed sticker from pack");
                     }
-                    Err(err) => self
-                        .layer_stack
-                        .show_toast(format!("Could not remove sticker: {err}")),
+                    Err(err) => self.show_user_error(tg_app_core::user_error::sticker_set_owner_edit(&err)),
                 },
                 tg_app_info::boxes::sticker_set::StickerSetOwnerAction::DeletePack {
                     set_id,
@@ -3477,9 +3498,7 @@ impl WindowController {
                         self.layer_stack
                             .show_toast(format!("Deleted sticker pack \"{short_name}\""));
                     }
-                    Err(err) => self
-                        .layer_stack
-                        .show_toast(format!("Could not delete sticker pack: {err}")),
+                    Err(err) => self.show_user_error(tg_app_core::user_error::sticker_set_owner_edit(&err)),
                 },
             },
             BoxEvent::AiToneToggleSave { tone, unsave } => {
@@ -3494,9 +3513,7 @@ impl WindowController {
                     } else {
                         format!("Added AI style \"{}\"", tone.title)
                     }),
-                    Err(err) => self
-                        .layer_stack
-                        .show_toast(format!("Could not update AI style: {err}")),
+                    Err(err) => self.show_user_error(tg_app_core::user_error::save_ai_tone(&err, unsave, false)),
                 }
             }
             BoxEvent::AiToneNextExample => {
@@ -3647,10 +3664,7 @@ impl WindowController {
                         self.layer_stack
                             .show_toast(format!("Opening {}", path.display()));
                     }
-                    Err(err) => {
-                        self.layer_stack
-                            .show_toast(format!("Failed to open file: {err}"));
-                    }
+                    Err(err) => self.show_user_error(tg_app_core::user_error::open_media(&format!("{err:#}"))),
                 }
             }
         }
@@ -3690,8 +3704,7 @@ impl WindowController {
                     .show_toast(format!("Opening {}", path.display()));
             }
             Err(err) => {
-                self.layer_stack
-                    .show_toast(format!("Failed to open file: {err}"));
+                self.show_user_error(tg_app_core::user_error::open_media(&format!("{err:#}")))
             }
         }
     }
@@ -3938,7 +3951,7 @@ impl WindowController {
                     session.show_settings(SettingsPage::Main);
                 }
             }
-            MainMenuAction::ToggleNightMode => self.toggle_night_mode(),
+            MainMenuAction::ToggleNightMode => self.request_night_mode_toggle(),
             MainMenuAction::LockApp => {
                 self.layer_stack.close_main_menu();
                 if self.has_local_passcode() {
@@ -4016,6 +4029,13 @@ impl WindowController {
             LayerAction::SetConnectionStatus(status) => {
                 self.session_backend.set_connection_status(status);
             }
+            LayerAction::DisableAutoNight => self.disable_auto_night_and_switch(),
+            LayerAction::ForcedLogout(account) => self.finish_forced_logout(account),
+            LayerAction::OpenLink(url) => self.open_link(&url),
+            LayerAction::OpenPremium(referral) => {
+                self.pending_overlay_requests
+                    .push(user_errors::premium_screen(referral));
+            }
         }
     }
 
@@ -4034,6 +4054,26 @@ impl WindowController {
         }
     }
 }
+
+#[path = "forced_logout.rs"]
+mod forced_logout;
+#[path = "theme_apply.rs"]
+mod theme_apply;
+#[path = "user_errors.rs"]
+pub mod user_errors;
+#[cfg(test)]
+#[path = "user_errors_shots.rs"]
+mod user_errors_shots;
+#[cfg(test)]
+#[path = "user_errors_tests.rs"]
+mod user_errors_tests;
+#[cfg(test)]
+#[path = "user_errors_w4_shots.rs"]
+mod user_errors_w4_shots;
+#[cfg(test)]
+#[path = "user_errors_w4_tests.rs"]
+mod user_errors_w4_tests;
+pub use theme_apply::follow_platform_dark_mode;
 
 #[cfg(test)]
 #[path = "controller_tests_sec2a.rs"]

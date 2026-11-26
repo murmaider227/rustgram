@@ -392,10 +392,14 @@ impl BankCardActionBoxState {
                 }
                 ui.add_space(4.0);
             }
-        } else if let Some(ref err) = self.lookup_error {
+        } else if let Some(text) = self
+            .lookup_error
+            .as_deref()
+            .and_then(|err| tg_app_core::user_error::bank_card_data(err).into_text())
+        {
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new(format!("Bank lookup unavailable: {err}"))
+                egui::RichText::new(text)
                     .font(FontId::new(12.0, family_regular()))
                     .color(colors.color("windowSubTextFg")),
             );
@@ -452,7 +456,18 @@ pub fn execute_url_auth_decision(
                 )),
                 UrlAuthAcceptOutcome::DoneWithoutNavigation => UrlAuthResolutionEffect::None,
             },
-            Err(err) => UrlAuthResolutionEffect::Toast(format!("Authorization failed: {err}")),
+            Err(err) => {
+                let shown = match &data.source {
+                    tg_bots::callback::UrlAuthSource::Url { .. } => {
+                        tg_app_core::user_error::accept_url_auth_link(&err, &data.display_name)
+                    }
+                    _ => tg_app_core::user_error::accept_url_auth_button(&err),
+                };
+                shown.into_text().map_or(
+                    UrlAuthResolutionEffect::None,
+                    UrlAuthResolutionEffect::Toast,
+                )
+            }
         },
     }
 }

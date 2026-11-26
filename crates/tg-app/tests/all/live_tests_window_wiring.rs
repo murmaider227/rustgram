@@ -1131,6 +1131,7 @@ fn clicking_invoice_and_paid_media_bubbles_opens_checkout_and_unlock_in_demo_and
                     shipping_address_requested: false,
                     receipt_msg_id: None,
                     extended_media: None,
+                    ..InvoiceData::default()
                 })),
             };
             s.insert_message(inv);

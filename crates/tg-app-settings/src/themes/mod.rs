@@ -11,6 +11,17 @@
 //!   `background_preview_box.cpp` ([`background_picker`])
 //! - `Telegram/SourceFiles/ui/chat/choose_theme_controller.cpp` ([`chat_theme_picker`])
 //!
+//! # The studio's theme and the app's theme
+//!
+//! [`ThemesStudio`] previews and edits its own [`ThemeManager`]; the app's theme belongs to the
+//! window. The two are kept apart (TGB-2961, TGB-2962):
+//! - The studio sets the `egui::Visuals` of its theme on its own panel `Ui` only
+//!   (`ThemesStudio::apply_panel_visuals`), never on the `egui::Context`. Nothing has to be
+//!   restored when the studio closes, because the window's colours are never replaced.
+//! - [`AppThemesHost`] copies the studio's wallpaper into the shared
+//!   [`active_chat_background`] only when the wallpaper was changed in the studio, and never
+//!   copies the studio's dark-mode flag: the window sets that flag from the app's theme.
+//!
 //! # Using [`ChatBackground`] from `history/`
 //!
 //! Other modules (such as `crates/tg-app/src/history/`) can paint the active chat background
@@ -124,7 +135,8 @@ impl ThemesTab {
 pub struct ThemesStudio {
     /// Active UI tab.
     pub active_tab: ThemesTab,
-    /// Live `tg-ui` theme manager driving the whole app when edited.
+    /// The studio's own theme: what its editor edits and its panel previews. It does not
+    /// change the app's theme (see the module doc).
     pub theme_manager: ThemeManager,
     /// Live `ChatBackground` renderer shared with `history/`.
     pub chat_background: ChatBackground,
@@ -164,8 +176,8 @@ pub struct ThemesStudio {
     /// Transient toast notification `(text, expires_at_ms)`.
     toast: Option<(String, i64)>,
     started_at: Instant,
-    /// Last applied palette generation synced to `egui::Context`.
-    applied_generation: u64,
+    /// `egui::Visuals` of the studio's palette, rebuilt when its generation changes.
+    panel_visuals: Option<(u64, egui::Visuals)>,
 }
 
 impl Default for ThemesStudio {
@@ -187,7 +199,10 @@ impl ThemesStudio {
             active_tab: ThemesTab::Editor,
             theme_manager,
             chat_background: ChatBackground::new(),
-            night_scheduler: NightModeScheduler::default(),
+            // The studio previews with its own theme manager. Whether the app follows the
+            // system dark mode is the auto-night setting, applied by the window; a studio that
+            // followed the OS on its own repainted egui behind the chosen theme (TGB-2955).
+            night_scheduler: NightModeScheduler::new(NightScheduleMode::Manual, false),
             editor,
             bg_picker,
             chat_theme_picker,
@@ -205,7 +220,7 @@ impl ThemesStudio {
             cloud_loaded: false,
             toast: None,
             started_at: Instant::now(),
-            applied_generation: 0,
+            panel_visuals: None,
         }
     }
 
@@ -535,6 +550,9 @@ impl ThemesStudio {
 
     /// Shows a transient toast notification for 3 seconds.
     pub fn show_toast(&mut self, msg: String, now_ms: i64) {
+        let Some(msg) = tg_app_core::user_error::visible_toast_text(msg) else {
+            return;
+        };
         self.toast = Some((msg, now_ms + 3_000));
     }
 
@@ -544,12 +562,19 @@ impl ThemesStudio {
         self.started_at.elapsed().as_millis().min(i64::MAX as u128) as i64
     }
 
-    /// Applies the active `ThemeManager` palette to `ctx` if its generation changed.
-    pub fn sync_egui_visuals(&mut self, ctx: &Context) {
-        if self.applied_generation != self.theme_manager.generation() {
-            self.theme_manager.apply_to_egui(ctx);
-            self.applied_generation = self.theme_manager.generation();
-        }
+    /// Gives the studio's panel `ui` the stock egui colours of the studio's theme. The
+    /// window's colours (`ui.ctx()`) stay the app's.
+    fn apply_panel_visuals(&mut self, ui: &mut Ui) {
+        tg_ui::fonts::ensure_tdesktop_fonts(ui.ctx());
+        let generation = self.theme_manager.generation();
+        let visuals = match &self.panel_visuals {
+            Some((cached, visuals)) if *cached == generation => visuals,
+            _ => {
+                let visuals = tg_ui::theme::palette_visuals(self.theme_manager.palette());
+                &self.panel_visuals.insert((generation, visuals)).1
+            }
+        };
+        ui.visuals_mut().clone_from(visuals);
     }
 
     /// Hydrates default background pattern emojis in [`Self::bg_picker`] via
@@ -589,7 +614,7 @@ impl ThemesStudio {
         if self.backend.is_some() && !self.cloud_loaded {
             let _ = self.refresh_cloud_catalogs();
         }
-        self.sync_egui_visuals(ui.ctx());
+        self.apply_panel_visuals(ui);
         let mut closed = false;
         let palette_snap = self.theme_manager.palette().clone();
         let colors: &dyn Colors = &palette_snap;
@@ -638,7 +663,7 @@ impl ThemesStudio {
                                         now_ms,
                                     ),
                                     Err(err) => {
-                                        self.show_toast(format!("Cloud sync error: {err}"), now_ms)
+                                        let _ = tg_app_core::user_error::theme_sync("account.getThemes", &err);
                                     }
                                 }
                             }
@@ -666,7 +691,7 @@ impl ThemesStudio {
                                         );
                                         self.editor.cloud_save.cloud_connected =
                                             self.backend.is_some();
-                                        self.sync_egui_visuals(ui.ctx());
+                                        ui.ctx().request_repaint();
                                     }
                                     NightScheduleEvent::NeedsConfirmDisableSystem => {
                                         self.show_toast(
@@ -820,7 +845,8 @@ impl ThemesStudio {
                                 ));
                             }
                             Err(err) => {
-                                pending_toast = Some(format!("Cloud theme save failed: {err}"));
+                                pending_toast =
+                                    tg_app_core::user_error::save_cloud_theme(&err).into_text();
                             }
                         }
                     } else if ed_out.toast.is_some() {
@@ -841,8 +867,11 @@ impl ThemesStudio {
                                 if let Some(scope) = bg_out.applied {
                                     self.preview_cache.invalidate("custom_live");
                                     if let Err(err) = self.apply_preview_background_live(scope) {
-                                        pending_toast =
-                                            Some(format!("Wallpaper sync failed: {err}"));
+                                        pending_toast = tg_app_core::user_error::theme_sync(
+                                            "account.uploadWallPaper",
+                                            &err,
+                                        )
+                                        .into_text();
                                     }
                                 }
                                 if bg_out.save_cloud_requested {
@@ -852,22 +881,32 @@ impl ThemesStudio {
                                                 Some("Saved wallpaper to cloud".to_owned());
                                         }
                                         Err(err) => {
-                                            pending_toast =
-                                                Some(format!("Save wallpaper failed: {err}"));
+                                            pending_toast = tg_app_core::user_error::theme_sync(
+                                                "account.saveWallPaper",
+                                                &err,
+                                            )
+                                            .into_text();
                                         }
                                     }
                                 }
                                 if let Some(peer_id) = bg_out.reset_peer_requested
                                     && let Err(err) = self.reset_chat_wallpaper_live(peer_id)
                                 {
-                                    pending_toast = Some(format!("Reset wallpaper failed: {err}"));
+                                    pending_toast = tg_app_core::user_error::theme_sync(
+                                        "messages.setChatWallPaper",
+                                        &err,
+                                    )
+                                    .into_text();
                                 }
                                 if let Some(removed) = bg_out.removed_cloud
                                     && let Some(backend) = self.backend.clone()
                                     && let Err(err) = backend.save_wallpaper(&removed, true)
                                 {
-                                    pending_toast =
-                                        Some(format!("Remove cloud wallpaper failed: {err}"));
+                                    pending_toast = tg_app_core::user_error::theme_sync(
+                                        "account.saveWallPaper",
+                                        &err,
+                                    )
+                                    .into_text();
                                 }
                                 if pending_toast.is_none() && bg_out.toast.is_some() {
                                     pending_toast = bg_out.toast;
@@ -893,14 +932,21 @@ impl ThemesStudio {
                                     if let Err(err) =
                                         self.apply_chat_theme_choice_live(peer_id, choice)
                                     {
-                                        pending_toast =
-                                            Some(format!("Chat theme sync failed: {err}"));
+                                        pending_toast = tg_app_core::user_error::theme_sync(
+                                            "messages.setChatTheme",
+                                            &err,
+                                        )
+                                        .into_text();
                                     }
                                 } else if let Some((peer_id, ref token)) = ct_out.applied_token
                                     && let Err(err) =
                                         self.apply_chat_theme_live(peer_id, token.as_deref())
                                 {
-                                    pending_toast = Some(format!("Chat theme sync failed: {err}"));
+                                    pending_toast = tg_app_core::user_error::theme_sync(
+                                        "messages.setChatTheme",
+                                        &err,
+                                    )
+                                    .into_text();
                                 }
                                 if let Some(peer) = ct_out.open_background_picker_for_peer {
                                     self.bg_picker.preview.target_peer = Some(peer);
@@ -957,7 +1003,7 @@ impl ThemesStudio {
         );
 
         if needs_visual_sync {
-            self.sync_egui_visuals(ui.ctx());
+            ui.ctx().request_repaint();
         }
         if let Some(msg) = pending_toast {
             self.show_toast(msg, now_ms);
@@ -1312,7 +1358,10 @@ impl ThemesStudio {
             if !self.preview_show_custom && ui.button("Apply This Theme").clicked() {
                 match self.install_embedded_theme(self.preview_embedded) {
                     Ok(()) => toast = Some(format!("Applied {:?} theme", self.preview_embedded)),
-                    Err(err) => toast = Some(format!("Theme sync failed: {err}")),
+                    Err(err) => {
+                        toast = tg_app_core::user_error::theme_sync("account.installTheme", &err)
+                            .into_text()
+                    }
                 }
             }
         });
@@ -1386,7 +1435,8 @@ impl ThemesStudio {
                         toast = Some(format!("Installed cloud theme '{}'", rec.theme.title));
                     }
                     Err(err) => {
-                        toast = Some(format!("Install cloud theme failed: {err}"));
+                        toast = tg_app_core::user_error::theme_sync("account.installTheme", &err)
+                            .into_text();
                     }
                 }
             } else if let Some((rec, unsave)) = toggle_save_candidate {
@@ -1399,7 +1449,8 @@ impl ThemesStudio {
                         });
                     }
                     Err(err) => {
-                        toast = Some(format!("Cloud theme save failed: {err}"));
+                        toast = tg_app_core::user_error::theme_sync("account.saveTheme", &err)
+                            .into_text();
                     }
                 }
             } else if let Some(rec) = edit_candidate {
@@ -1424,6 +1475,8 @@ impl ThemesStudio {
 pub struct AppThemesHost {
     open: bool,
     studio: ThemesStudio,
+    /// Generation of the studio's wallpaper last copied to [`active_chat_background`].
+    pushed_background_generation: u64,
     bound_session_key: Option<usize>,
     last_deep_link_theme_slug: Option<String>,
     last_deep_link_background: Option<String>,
@@ -1433,9 +1486,11 @@ impl AppThemesHost {
     fn get_or_init(ctx: &Context) -> Arc<Mutex<Self>> {
         ctx.data_mut(|d| {
             d.get_temp_mut_or_insert_with(Id::unique("tg_app_themes_host"), || {
+                let studio = ThemesStudio::new();
                 Arc::new(Mutex::new(Self {
                     open: false,
-                    studio: ThemesStudio::new(),
+                    pushed_background_generation: studio.chat_background.generation(),
+                    studio,
                     bound_session_key: None,
                     last_deep_link_theme_slug: None,
                     last_deep_link_background: None,
@@ -1763,7 +1818,7 @@ impl AppThemesHost {
         };
         if let NightScheduleEvent::Switched { night_mode } = polled {
             guard.studio.chat_background.set_dark_mode(night_mode);
-            guard.studio.sync_egui_visuals(ctx);
+            ctx.request_repaint();
         }
 
         if toggle_pressed {
@@ -1772,13 +1827,15 @@ impl AppThemesHost {
             guard.studio.night_scheduler.set_editing_theme(is_editing);
         }
 
-        // Keep shared `active_chat_background(ctx)` in sync for `history/` consumers
+        // A wallpaper chosen in the studio becomes the app's wallpaper. Only a change made in
+        // the studio is copied, and never its dark-mode flag, which belongs to the studio's
+        // preview theme; the window sets the shared flag from the app's theme.
         let studio_gen = guard.studio.chat_background.generation();
-        if let Ok(mut shared_bg) = active_chat_background(ctx).lock()
-            && shared_bg.generation() != studio_gen
-        {
-            shared_bg.set_global(guard.studio.chat_background.global_config().clone());
-            shared_bg.set_dark_mode(guard.studio.chat_background.is_dark_mode());
+        if guard.pushed_background_generation != studio_gen {
+            guard.pushed_background_generation = studio_gen;
+            if let Ok(mut shared_bg) = active_chat_background(ctx).lock() {
+                shared_bg.set_global(guard.studio.chat_background.global_config().clone());
+            }
         }
 
         if !guard.open {

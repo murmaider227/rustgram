@@ -406,6 +406,9 @@ impl RpcClient for FakeRpcClient {
             let mut q = self.responses.lock().expect("lock responses");
             if let Some(pos) = q.iter().position(|(c, _)| *c == ctor) {
                 q.remove(pos).map(|(_, r)| r)
+            } else if crate::common::is_background_list_request(ctor) {
+                // Never the answer a test queued for another request (TGB-2941).
+                None
             } else {
                 q.pop_front().map(|(_, r)| r)
             }

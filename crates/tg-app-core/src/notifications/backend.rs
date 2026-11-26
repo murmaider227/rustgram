@@ -3,7 +3,7 @@
 //! Decouples `tg-app::notifications` and `tg-app::tray` from `tg-api` / `tg-data`
 //! while matching tdesktop's `Data::ItemNotification` and activation callbacks.
 
-use crate::notifications::settings::UnreadBadgeState;
+use crate::notifications::settings::{NotifySettingsStore, UnreadBadgeState};
 use crate::stand_in::types::{MsgId, PeerId, PeerKind};
 
 /// Kind of incoming notification event (`Data::ItemNotificationType` in `data/data_types.h`).
@@ -290,5 +290,25 @@ pub trait NotifyBackend: Send {
     /// Returns `true` if more than one account is signed in (`addTargetAccountName`).
     fn has_multiple_accounts(&self) -> bool {
         false
+    }
+
+    /// `(session_id, version)` of each account whose notification settings this backend can
+    /// sync; the version moves whenever any of the account's mute settings may have changed.
+    ///
+    /// Accounts listed here get their own [`NotifySettingsStore`] in the notification system
+    /// (tdesktop: `thread->owner().notifySettings()`), filled by [`Self::sync_notify_settings`].
+    /// The default lists none, so the system's shared store is used.
+    fn notify_settings_versions(&self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// Copies the current notification settings of account `session_id` into `store`.
+    fn sync_notify_settings(
+        &self,
+        session_id: u64,
+        store: &mut NotifySettingsStore,
+        now_unix: i64,
+    ) {
+        let _ = (session_id, store, now_unix);
     }
 }

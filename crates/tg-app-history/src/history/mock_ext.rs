@@ -160,6 +160,8 @@ impl MockSectionsData {
             preview_text: "Awesome progress! Does the layout cache stay bounded on resize?"
                 .to_owned(),
             preview_thumb_rgb: None,
+            preview_thumb: None,
+            preview_colored_len: 0,
             quote_text: Some("layout cache stay bounded on resize".to_owned()),
         });
         c2.reactions.push(ReactionCounter {

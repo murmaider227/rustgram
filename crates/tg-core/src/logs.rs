@@ -883,6 +883,30 @@ mod tests {
     use tempfile::TempDir;
     use tracing_subscriber::layer::SubscriberExt;
 
+    /// TGB-2908: the `saved_side` diagnostics are INFO events with a custom target; they must
+    /// land in the main `log.txt` (not the debug-only logs) together with their fields.
+    #[test]
+    fn info_event_with_custom_target_reaches_main_log_with_fields() {
+        let dir = TempDir::new().unwrap();
+        let logger = Arc::new(LogManager::new());
+        logger.start(dir.path()).unwrap();
+        logger.instance_checked().unwrap();
+        let subscriber = tracing_subscriber::registry().with(TdLogLayer::new(Arc::clone(&logger)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "saved_side",
+                stage = "layout",
+                msg_id = 42,
+                side = "in",
+                "saved messages: layout side"
+            );
+        });
+        let content = logger.full_main_log();
+        assert!(content.contains("saved messages: layout side"), "{content}");
+        assert!(content.contains("stage=layout"), "{content}");
+        assert!(content.contains("side=in"), "{content}");
+    }
+
     #[test]
     fn start_log_promotion_and_cleanup() {
         let dir = TempDir::new().unwrap();

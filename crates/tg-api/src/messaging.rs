@@ -17,6 +17,7 @@ use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 use crate::convert::{input_peer_to_input_channel, peer_id_from_input_peer};
 use crate::error::{ApiError, SendMessageErrorKind, map_send_message_error};
 use crate::invoker::Invoker;
+use crate::rpc::InvocationError;
 use crate::types::{ForwardOptions, SendOptions};
 
 /// Default maximum message length in Unicode scalar values before splitting (`4096`).
@@ -214,6 +215,32 @@ impl<R: RandomIdSource> MessageSender<R> {
         }
     }
 
+    /// Starts allocating local message ids at client index `index`, so two senders that both
+    /// create local messages for one session never hand out the same id.
+    #[must_use]
+    pub fn with_first_local_index(mut self, index: i32) -> Self {
+        self.next_local_index = index.max(0);
+        self
+    }
+
+    /// Tracks chunks another sender prepared (the UI allocates them so the pending message is
+    /// shown before the send is queued): `finish_prepared_chunk` and
+    /// `resolve_update_message_id` then resolve them like chunks prepared here.
+    pub fn adopt_prepared_chunks(&mut self, chunks: &[PreparedTextChunk]) {
+        for chunk in chunks {
+            self.random_to_local.insert(chunk.random_id, chunk.local_id);
+            self.pending.insert(
+                chunk.local_id,
+                PendingMessage {
+                    local_id: chunk.local_id,
+                    random_id: chunk.random_id,
+                    text: chunk.text.clone(),
+                    state: PendingMessageState::Sending,
+                },
+            );
+        }
+    }
+
     /// Sets the maximum message length in characters before splitting into multiple messages.
     pub fn set_message_length_limit(&mut self, limit: usize) {
         self.message_length_limit = limit.max(1);
@@ -329,8 +356,22 @@ impl<R: RandomIdSource> MessageSender<R> {
         reply_to: Option<tl_enums::InputReplyTo>,
         options: &SendOptions,
     ) -> Result<(PendingMessage, tl_enums::Updates), SendMessageErrorKind> {
+        let req = Self::prepared_chunk_request(peer, chunk, reply_to, options);
+        let result = invoker.messages_send_message(req).await;
+        self.finish_prepared_chunk(chunk, result)
+    }
+
+    /// Builds the `messages.sendMessage` request for a prepared chunk, for callers that run the
+    /// request themselves and then call [`Self::finish_prepared_chunk`].
+    #[must_use]
+    pub fn prepared_chunk_request(
+        peer: tl_enums::InputPeer,
+        chunk: &PreparedTextChunk,
+        reply_to: Option<tl_enums::InputReplyTo>,
+        options: &SendOptions,
+    ) -> tl_fns::messages::SendMessage {
         let chunk_entities = (!chunk.entities.is_empty()).then(|| chunk.entities.clone());
-        let req = tl_fns::messages::SendMessage {
+        tl_fns::messages::SendMessage {
             no_webpage: options.no_webpage,
             silent: options.silent,
             background: false,
@@ -353,9 +394,17 @@ impl<R: RandomIdSource> MessageSender<R> {
             allow_paid_stars: options.allow_paid_stars,
             suggested_post: None,
             rich_message: None,
-        };
+        }
+    }
 
-        match invoker.messages_send_message(req).await {
+    /// Records the outcome of a prepared chunk's `messages.sendMessage`: resolves the server id
+    /// on success, marks the pending message failed (or destroyed on `MESSAGE_EMPTY`) on error.
+    pub fn finish_prepared_chunk(
+        &mut self,
+        chunk: &PreparedTextChunk,
+        result: Result<tl_enums::Updates, InvocationError>,
+    ) -> Result<(PendingMessage, tl_enums::Updates), SendMessageErrorKind> {
+        match result {
             Ok(batch) => {
                 self.apply_sent_updates(&batch, Some(chunk.random_id));
                 let entry = self
@@ -1153,7 +1202,23 @@ impl ReadHistoryManager {
         invoker: &I,
         now: Instant,
     ) -> Result<Vec<FlushedRead>, ApiError> {
-        let mut due: Vec<(PeerId, tl_enums::InputPeer, MsgId, MsgId)> = Vec::new();
+        let mut flushed = Vec::new();
+        for due in self.take_due(now) {
+            match due.send(invoker).await {
+                Ok(read) => flushed.push(read),
+                Err(err) => {
+                    self.restore_failed(&due);
+                    return Err(ApiError::Invocation(err));
+                }
+            }
+        }
+        Ok(flushed)
+    }
+
+    /// The bookkeeping half of [`Self::flush_due`]: marks every read due at `now` as sent and
+    /// returns the requests to send. A failed request goes back through [`Self::restore_failed`].
+    pub fn take_due(&mut self, now: Instant) -> Vec<DueRead> {
+        let mut due = Vec::new();
         for (&peer_id, state) in &mut self.states {
             if state.will_read_till > state.sent_read_till
                 && let Some(when) = state.will_read_when
@@ -1164,51 +1229,67 @@ impl ReadHistoryManager {
                 state.sent_read_till = till;
                 state.will_read_till = MsgId::ZERO;
                 state.will_read_when = None;
-                due.push((peer_id, state.peer.clone(), till, prev_sent));
+                due.push(DueRead {
+                    peer_id,
+                    peer: state.peer.clone(),
+                    max_id: till,
+                    prev_sent,
+                });
             }
         }
+        due
+    }
 
-        let mut flushed = Vec::with_capacity(due.len());
-        for (peer_id, peer, max_id, prev_sent) in due {
-            let max_id_i32 = max_id.as_i32().unwrap_or(0);
-            let rpc_res = if let Some(channel) = input_peer_to_input_channel(&peer) {
-                invoker
-                    .channels_read_history(tl_fns::channels::ReadHistory {
-                        channel,
-                        max_id: max_id_i32,
-                    })
-                    .await
-                    .map(|_| None)
-            } else {
-                invoker
-                    .messages_read_history(tl_fns::messages::ReadHistory {
-                        peer,
-                        max_id: max_id_i32,
-                    })
-                    .await
-                    .map(Some)
-            };
-            let affected = match rpc_res {
-                Ok(a) => a,
-                Err(err) => {
-                    if let Some(state) = self.states.get_mut(&peer_id)
-                        && state.sent_read_till == max_id
-                    {
-                        state.sent_read_till = prev_sent;
-                        if state.will_read_till < max_id {
-                            state.will_read_till = max_id;
-                        }
-                    }
-                    return Err(ApiError::Invocation(err));
-                }
-            };
-            flushed.push(FlushedRead {
-                peer_id,
-                max_id,
-                affected,
-            });
+    /// Restores `sent_read_till` after `due` failed so the read is retried
+    /// (`data/data_histories.cpp:763-770`, `Histories::sendReadRequests`).
+    pub fn restore_failed(&mut self, due: &DueRead) {
+        if let Some(state) = self.states.get_mut(&due.peer_id)
+            && state.sent_read_till == due.max_id
+        {
+            state.sent_read_till = due.prev_sent;
+            if state.will_read_till < due.max_id {
+                state.will_read_till = due.max_id;
+            }
         }
-        Ok(flushed)
+    }
+}
+
+/// One inbox read request taken by [`ReadHistoryManager::take_due`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DueRead {
+    /// Peer whose inbox is read.
+    pub peer_id: PeerId,
+    /// Input peer for the request.
+    pub peer: tl_enums::InputPeer,
+    /// `max_id` to send.
+    pub max_id: MsgId,
+    /// `sent_read_till` before this request, restored on failure.
+    pub prev_sent: MsgId,
+}
+
+impl DueRead {
+    /// Sends `messages.readHistory` (or `channels.readHistory` for channels).
+    pub async fn send<I: Invoker>(&self, invoker: &I) -> Result<FlushedRead, InvocationError> {
+        let max_id = self.max_id.as_i32().unwrap_or(0);
+        let affected = if let Some(channel) = input_peer_to_input_channel(&self.peer) {
+            invoker
+                .channels_read_history(tl_fns::channels::ReadHistory { channel, max_id })
+                .await
+                .map(|_| None)?
+        } else {
+            invoker
+                .messages_read_history(tl_fns::messages::ReadHistory {
+                    peer: self.peer.clone(),
+                    max_id,
+                })
+                .await
+                .map(Some)?
+        };
+        Ok(FlushedRead {
+            peer_id: self.peer_id,
+            max_id: self.max_id,
+            affected,
+        })
     }
 }
 
@@ -1377,6 +1458,24 @@ impl SendProgressManager {
         now: Instant,
         now_unix: TimeId,
     ) -> Result<bool, ApiError> {
+        let (peer_id, kind) = (update.info.peer_id, update.kind);
+        let Some(req) = self.prepare(update, now, now_unix) else {
+            return Ok(false);
+        };
+        invoker.messages_set_typing(req).await?;
+        self.finish_sent(peer_id, kind, now);
+        Ok(true)
+    }
+
+    /// The decision half of [`Self::update`]: applies the throttle and peer rules and returns
+    /// the `messages.setTyping` request to send, or `None` when nothing is sent. After a
+    /// successful request the caller reports it with [`Self::finish_sent`].
+    pub fn prepare(
+        &mut self,
+        update: SendProgressUpdate,
+        now: Instant,
+        now_unix: TimeId,
+    ) -> Option<tl_fns::messages::SetTyping> {
         let SendProgressUpdate {
             peer,
             info,
@@ -1385,37 +1484,30 @@ impl SendProgressManager {
             progress,
         } = update;
         if info.is_self || (info.is_broadcast_channel && kind != SendProgressKind::Speaking) {
-            return Ok(false);
+            return None;
         }
-
         let doing = progress >= 0;
         let key = ProgressKey {
             peer_id: info.peer_id,
             top_msg_id,
             kind,
         };
-        if !self.check_throttle(key, doing, now) {
-            return Ok(false);
+        if !self.check_throttle(key, doing, now) || !doing || Self::should_skip_peer(info, now_unix)
+        {
+            return None;
         }
-        if !doing {
-            return Ok(false);
-        }
-        if Self::should_skip_peer(info, now_unix) {
-            return Ok(false);
-        }
+        Some(tl_fns::messages::SetTyping {
+            peer,
+            top_msg_id: top_msg_id.and_then(MsgId::as_i32),
+            action: kind.to_tl_action(progress),
+        })
+    }
 
-        invoker
-            .messages_set_typing(tl_fns::messages::SetTyping {
-                peer,
-                top_msg_id: top_msg_id.and_then(MsgId::as_i32),
-                action: kind.to_tl_action(progress),
-            })
-            .await?;
-
+    /// Records a successful `messages.setTyping` prepared by [`Self::prepare`] at `now`.
+    pub fn finish_sent(&mut self, peer_id: PeerId, kind: SendProgressKind, now: Instant) {
         if kind == SendProgressKind::Typing {
-            self.stop_typing_deadline = Some((info.peer_id, now + CANCEL_TYPING_ACTION_TIMEOUT));
+            self.stop_typing_deadline = Some((peer_id, now + CANCEL_TYPING_ACTION_TIMEOUT));
         }
-        Ok(true)
     }
 
     /// Explicitly cancels active typing state for `peer_id` (`SendProgressManager::cancelTyping`).

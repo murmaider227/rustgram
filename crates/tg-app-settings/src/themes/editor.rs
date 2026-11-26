@@ -1287,9 +1287,7 @@ impl ThemeEditorState {
                                                     out.saved_cloud_theme = Some(saved);
                                                 }
                                                 Err(err) => {
-                                                    out.toast = Some(format!(
-                                                        "Cloud theme save failed: {err}"
-                                                    ));
+                                                    out.toast = tg_app_core::user_error::save_cloud_theme(&err).into_text();
                                                 }
                                             }
                                         } else {

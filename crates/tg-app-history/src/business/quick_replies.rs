@@ -250,7 +250,8 @@ impl QuickRepliesView {
                                             self.open_shortcut(id);
                                             toast = Some(format!("Created shortcut /{candidate}"));
                                         }
-                                        Err(e) => self.shortcut_name_error = Some(e),
+                                        // local error: name and count checks, no request
+                                        Err(e) => self.shortcut_name_error = Some(e), // local error: see above
                                     }
                                 }
                             }
@@ -596,7 +597,10 @@ impl QuickRepliesView {
                                     self.shortcut_name_error = None;
                                     toast = Some(format!("Renamed shortcut to /{}", updated.name));
                                 }
-                                Err(e) => self.shortcut_name_error = Some(e),
+                                Err(e) => {
+                                    self.shortcut_name_error =
+                                        tg_app_core::user_error::rename_quick_reply(&e).into_text();
+                                }
                             }
                         }
                     });
@@ -701,7 +705,10 @@ impl QuickRepliesView {
                                                         "Shortcut message updated.".to_owned(),
                                                     );
                                                 }
-                                                Err(e) => toast = Some(e),
+                                                Err(e) => {
+                                                    toast = tg_app_core::user_error::edit_quick_reply_message(&e)
+                                                        .into_text();
+                                                }
                                             }
                                         }
                                         if pill_button(
@@ -837,7 +844,7 @@ impl QuickRepliesView {
                             self.editor_attachment = QuickReplyAttachment::None;
                             toast = Some("Message added to shortcut.".to_owned());
                         }
-                        Err(e) => toast = Some(e),
+                        Err(e) => toast = tg_app_core::user_error::quick_reply_send(&e).into_text(),
                     }
                 }
             });

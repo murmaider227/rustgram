@@ -29,6 +29,41 @@ working-directory, and output paths via CLI flags or environment variables.
   way (test account): start → first window visible, start → chat list drawn and stable, open a
   chat → history stable. See "Interactive desktop" below.
 
+- `frame_bench.py` — Frame-time benchmark (smoothness). Runs scripted scenarios (scroll a 600-chat
+  list, scroll a 2500-message history, open 10 chats, open and scroll the emoji/sticker/GIF panels)
+  5 times each plus one stack-sampled run, and reports p50/p95/p99/max CPU frame time, frames over
+  16.7 ms and 33 ms, and the functions behind the slow frames. See "Frame-time benchmark" below.
+
+## Frame-time benchmark
+
+The app side is env-gated and off by default (`crates/tg-app/src/startup/frame_trace`):
+
+- `RUSTGRAM_FRAME_TRACE=1` writes one line per frame (UI time and eframe's whole-frame CPU time,
+  vsync wait excluded) to `RUSTGRAM_FRAME_TRACE_OUT`; `=sample` also samples the UI thread's stack
+  every millisecond inside script sections (Windows x64).
+- `RUSTGRAM_FRAME_SCRIPT=<file>` feeds wheel, pointer and key events straight into egui, so runs
+  repeat exactly and never move the real cursor. Commands are listed in `frame_trace/script.rs`.
+- `RUSTGRAM_BENCH_DATA=1` (demo only) adds 600 chats and a 2500-message chat ("Bench History")
+  with photos, replies and reactions to the offline demo.
+
+Build with line tables so the samples resolve to functions, then run:
+
+```
+CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -p tg-app --bin rustgram
+python -I frame_bench.py run --exe <target>/release/rustgram.exe --scratch-dir <dir outside git> \
+    --out-dir <dir> --ffmpeg-bin <ffmpeg bin dir>
+# test servers, scratch copy of a test-account workdir (deleted after each run):
+python -I frame_bench.py run ... --live-workdir <test workdir> --api-creds-doc <tdesktop>/docs/api_credentials.md \
+    --layout frame_bench_layout_testdc.json --startup-wait-ms 12000
+python -I frame_bench.py analyze --out-dir <dir>     # re-analyze saved traces
+python -I frame_bench.py probe ...                   # screenshots to recalibrate click positions
+```
+
+Click positions (`LAYOUT` in the script, overridable with `--layout <json>`) are logical points in a
+1200x800 window. Symbolization needs a dbghelp.dll that reads rust-lld PDBs; the script picks the
+Visual Studio or Windows Kits copy (the System32 one loads no symbols), or `FRAME_BENCH_DBGHELP`.
+Each run records system CPU load and running `rustc` processes, since other builds skew the numbers.
+
 ## Interactive desktop (needed for Telegram Desktop captures)
 
 `PrintWindow` returns a white rectangle for Telegram Desktop's Direct3D 11 window unless the

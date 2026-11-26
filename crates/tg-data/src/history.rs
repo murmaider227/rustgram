@@ -263,6 +263,21 @@ impl SparseIdsList {
         self.count = Some(0);
     }
 
+    /// Keeps only the newest slice and, in it, the ids `>= keep_from` (whose range then starts
+    /// at `keep_from`); the known count stays. The dropped part reads as not loaded, so it is
+    /// requested again on scroll (`History::unloadBlocks`).
+    pub fn keep_newest_from(&mut self, keep_from: MsgId) {
+        let Some(mut last) = self.slices.pop() else {
+            return;
+        };
+        last.messages = last.messages.split_off(&keep_from);
+        if keep_from > last.range.from {
+            last.range.from = keep_from;
+        }
+        self.slices.clear();
+        self.slices.push(last);
+    }
+
     /// Marks the bottom of history as no longer loaded (`SparseIdsList::invalidateBottom`).
     pub fn invalidate_bottom(&mut self) {
         if let Some(last) = self.slices.last_mut()

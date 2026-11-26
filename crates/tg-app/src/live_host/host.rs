@@ -20,8 +20,8 @@ use tg_core::domain::Environment;
 use tg_core::{CoreSettings, GlobalConfig};
 use tg_data::UserId;
 use tg_session::{
-    AccountManager, ENV_API_HASH, ENV_API_ID, SessionEvent, SessionRuntime, SessionRuntimeConfig,
-    StoredSessionSettings, WorkingDirOpenOptions, load_api_credentials_from_env,
+    AccountManager, ENV_API_HASH, ENV_API_ID, LogoutReason, SessionEvent, SessionRuntime,
+    SessionRuntimeConfig, StoredSessionSettings, WorkingDirOpenOptions, load_api_credentials,
     load_api_credentials_from_vars,
 };
 use tg_stories::StoriesStore;
@@ -489,15 +489,31 @@ impl LiveActiveWorkspace {
         let session_events = self.live_session.bridge_state().drain_session_events();
         for ev in session_events {
             match ev {
-                SessionEvent::ForceLogout { notification_type } => {
-                    self.controller.show_toast(format!(
-                        "Session signed out by server ({notification_type})."
-                    ));
-                    request_logout = true;
-                }
-                SessionEvent::SyncError(err) => {
-                    self.controller.show_toast(format!("Sync error: {err}"));
-                }
+                SessionEvent::ForceLogout { reason } => match reason {
+                    // The server's explanation in a box; logout when it closes
+                    // (`Application::forceLogOut`, `core/application.cpp:1080-1096`).
+                    LogoutReason::ServerDrop {
+                        notification_type,
+                        message,
+                        entities,
+                    } => {
+                        tracing::warn!(%notification_type, "server dropped the session");
+                        self.controller.show_forced_logout_box_rich(
+                            crate::live_host::forced_logout_text(message, entities),
+                        );
+                    }
+                    // A fatal `401` logs out silently, straight to the intro screen
+                    // (`Main::Account::logOut`, `main/main_account.cpp:469-473` and `531-542`),
+                    // unless the forced-logout box is up: then it logs out when that closes.
+                    LogoutReason::Unauthorized { .. } => {
+                        if !self.controller.is_forced_logout_shown() {
+                            request_logout = true;
+                        }
+                    }
+                },
+                // A failed sync is only logged and retried, never shown
+                // (`Api::Updates::differenceFail`, `api/api_updates.cpp:630-636`).
+                SessionEvent::SyncError(_) => {}
                 SessionEvent::Ready => {
                     self.live_session.refresh_cached_views();
                 }
@@ -733,7 +749,9 @@ impl LiveActiveWorkspace {
                     if let Some(host) = self.payments_host.as_mut()
                         && let Err(err) = host.open_deep_link_request(screen, slug.as_deref())
                     {
-                        self.controller.show_toast(err);
+                        let kind = crate::live_host::payments_link_kind(screen);
+                        self.controller
+                            .show_user_error(tg_app_core::user_error::payments_link(kind, &err));
                     }
                     self.payments_open = true;
                 }
@@ -743,8 +761,12 @@ impl LiveActiveWorkspace {
                         match BusinessScreenHost::try_new(backend) {
                             Ok(host) => self.business_host = Some(host),
                             Err(err) => {
-                                self.controller
-                                    .show_toast(format!("Could not load Telegram Business: {err}"));
+                                // tdesktop loads each Business part on its own and shows no
+                                // error (`data/business/data_business_chatbots.cpp:35`).
+                                let _ = tg_app_core::user_error::no_handler(
+                                    "business overview",
+                                    &err.to_string(),
+                                );
                                 continue;
                             }
                         }
@@ -864,8 +886,10 @@ impl LiveActiveWorkspace {
                     Ok(host) => self.business_host = Some(host),
                     Err(err) => {
                         self.business_open = false;
-                        self.controller
-                            .show_toast(format!("Could not load Telegram Business: {err}"));
+                        let _ = tg_app_core::user_error::no_handler(
+                            "business overview",
+                            &err.to_string(),
+                        );
                     }
                 }
             }
@@ -894,8 +918,8 @@ impl LiveActiveWorkspace {
             self.open_live_payments_premium();
         }
 
-        // Ctrl+Shift+P: toggle live Payments / Stars / Star Gifts / Passport overlay.
-        if payments_pressed {
+        // Ctrl+Shift+P: developer Payments overlay, only with `TGFORK_PAYMENTS_DEV_OVERLAY=1`.
+        if payments_pressed && crate::payments::dev_overlay_enabled() {
             self.payments_open = !self.payments_open;
             if self.payments_open && self.payments_host.is_none() {
                 let payments = self.live_session.create_payments_backend();
@@ -903,6 +927,11 @@ impl LiveActiveWorkspace {
                 self.payments_host = Some(PaymentsScreenHost::new(payments, passport));
             }
         }
+        let (payments_min_w, payments_max_w) = self
+            .payments_host
+            .as_ref()
+            .and_then(PaymentsScreenHost::panel_width_hint)
+            .map_or((440.0, 620.0), |w| (w, w));
         if self.payments_open
             && let Some(host) = self.payments_host.as_mut()
             && render_modal_overlay_panel(
@@ -910,8 +939,8 @@ impl LiveActiveWorkspace {
                 "tg_live_payments_overlay",
                 palette,
                 esc_pressed,
-                440.0,
-                620.0,
+                payments_min_w,
+                payments_max_w,
                 420.0,
                 |ui| host.show(ui, palette, true),
             )
@@ -922,6 +951,7 @@ impl LiveActiveWorkspace {
         if self.platform_overlays_enabled {
             crate::live::export::ensure_live_export_hooks(ctx, theme_mode, &self.live_session);
             crate::live::themes::ensure_live_themes_hooks(ctx, &self.live_session);
+            crate::live::userpic_images::ensure_live_userpics(ctx, &self.live_session);
             crate::export::AppExportHost::update_and_render(ctx, palette, theme_mode);
             crate::wallet::AppWalletHost::update_and_render(ctx, palette, theme_mode);
             crate::themes::AppThemesHost::hydrate_default_background_emojis(
@@ -1605,7 +1635,8 @@ pub struct LiveAppHost {
 }
 
 impl LiveAppHost {
-    /// Bootstraps live mode reading `RUSTGRAM_API_ID` and `RUSTGRAM_API_HASH` from the process environment.
+    /// Bootstraps live mode with `RUSTGRAM_API_ID` / `RUSTGRAM_API_HASH` from the process
+    /// environment, falling back to the credentials compiled into this build.
     #[must_use]
     pub fn bootstrap(
         egui_ctx: Option<egui::Context>,
@@ -1614,7 +1645,7 @@ impl LiveAppHost {
         working_dir: PathBuf,
         data_name: String,
     ) -> Self {
-        let creds_res = load_api_credentials_from_env();
+        let creds_res = load_api_credentials();
         Self::bootstrap_with_credentials_result(
             egui_ctx,
             settings,
@@ -1700,12 +1731,7 @@ impl LiveAppHost {
         creds_res: tg_session::Result<ApiCredentials>,
         prepared: Option<PreparedAccountManager>,
     ) -> Self {
-        let embedded = settings.resolved_embedded_type();
-        let accent = settings.resolved_accent_color();
-        let mut theme_manager = ThemeManager::with_embedded(embedded);
-        if let Some(c) = accent {
-            theme_manager.set_embedded(embedded, Some(c));
-        }
+        let theme_manager = settings.restored_theme_manager();
         if let Some(ctx) = egui_ctx.as_ref() {
             tg_ui::fonts::register_tdesktop_fonts(ctx);
             theme_manager.apply_to_egui(ctx);
@@ -2118,7 +2144,7 @@ impl LiveAppHost {
         }
 
         if retry_bootstrap {
-            let creds = load_api_credentials_from_env();
+            let creds = load_api_credentials();
             self.phase = match creds {
                 Err(err) => LivePhase::MissingCredentials {
                     message: format_missing_credentials_message(&err.to_string()),
@@ -2314,6 +2340,7 @@ impl LiveAppHost {
                 let bridged_rpc = RuntimeBridgedRpc::new(rpc, active.rt.handle().clone());
                 let mut intro = IntroWidget::with_rpc_client(credentials, bridged_rpc);
                 intro.set_passkey_window_hwnd(self.window_hwnd);
+                intro.disable_language_link();
                 let mut shim = IntroStatusShim::default();
                 if let Some(enabled) =
                     with_manager(&active.manager, |mgr| mgr.proxy_settings().is_enabled())
@@ -2336,8 +2363,15 @@ impl LiveAppHost {
             }
             Some(Err(err)) => {
                 if let Some(ws) = active.host.active_workspace_mut() {
-                    ws.controller_mut()
-                        .show_toast(format!("Cannot add account: {err}"));
+                    let shown = match &err {
+                        tg_session::SessionError::Domain(
+                            tg_core::DomainError::AccountLimitReached { limit },
+                        ) => tg_app_core::user_error::accounts_limit(*limit),
+                        other => {
+                            tg_app_core::user_error::no_handler("add account", &other.to_string())
+                        }
+                    };
+                    ws.controller_mut().show_user_error(shown);
                 }
                 self.phase = LivePhase::Active(active);
             }
@@ -2627,12 +2661,12 @@ fn format_missing_credentials_message(reason: &str) -> String {
     format!(
         "Rustgram was started in live mode (`--live` / `RUSTGRAM_LIVE=1`), but Telegram API \
          credentials could not be loaded ({reason}).\n\n\
-         Rustgram never embeds API credentials in the binary. Please obtain your own `api_id` \
+         This build has no built-in API credentials. Please obtain your own `api_id` \
          and `api_hash` from https://my.telegram.org and set both environment variables before \
          launching live mode:\n\n\
            {ENV_API_ID}=<your_numeric_api_id>\n\
            {ENV_API_HASH}=<your_api_hash>\n\n\
-         Or launch without `--live` to run in offline demo mode."
+         Or launch with `--demo` to run the offline demo mode."
     )
 }
 
@@ -2673,7 +2707,7 @@ fn prepare_account_manager(
     credentials: ApiCredentials,
 ) -> PreparedAccountManager {
     let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(tg_session::runtime::default_worker_threads())
         .enable_all()
         .build()
     {
@@ -2818,7 +2852,7 @@ impl LiveBootstrapPrefetch {
         std::thread::Builder::new()
             .name("live-bootstrap".to_owned())
             .spawn(move || {
-                let creds_res = load_api_credentials_from_env();
+                let creds_res = load_api_credentials();
                 let prepared = creds_res
                     .as_ref()
                     .ok()

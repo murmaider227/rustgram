@@ -18,8 +18,8 @@ pub use tg_app_live::{
     communities, compose_extras, convert, deep_links, emoji_pack, geo_map, history_sections,
     langpack, layer233_extras, media, media_cache, passport_upload, payments, profile_extras,
     proxy, read_metrics, rich_message, search_and_info, session, settings_extra, settings_sync,
-    star_gifts, stats, stories, suggestions, toggling_media, transcribe, upload, video_userpic,
-    web_proxy_carrier, webview, wp40_polish,
+    star_gifts, stats, stories, suggestions, toggling_media, transcribe, upload, userpic_images,
+    video_userpic, web_proxy_carrier, webview, wp40_polish,
 };
 
 pub use crate::live_host::host;

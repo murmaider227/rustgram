@@ -824,6 +824,21 @@ async fn forum_topics_and_affected_history_interleaved_with_pushed_channel_updat
                     },
                 ))
             }
+            x if x == tl_fns::messages::GetPeerDialogs::CONSTRUCTOR_ID => ServerAction::ok(
+                &tl_enums::messages::PeerDialogs::PeerDialogs(tl_types::messages::PeerDialogs {
+                    dialogs: vec![],
+                    messages: vec![],
+                    chats: vec![],
+                    users: vec![],
+                    state: tl_enums::updates::State::State(tl_types::updates::State {
+                        pts: 0,
+                        qts: 0,
+                        date: 0,
+                        seq: 0,
+                        unread_count: 0,
+                    }),
+                }),
+            ),
             other => panic!("unexpected RPC ctor: 0x{other:08x}"),
         });
 
@@ -1137,6 +1152,21 @@ async fn common_affected_history_interleaved_with_pushed_updates_and_real_gap() 
                     },
                 ))
             }
+            x if x == tl_fns::messages::GetPeerDialogs::CONSTRUCTOR_ID => ServerAction::ok(
+                &tl_enums::messages::PeerDialogs::PeerDialogs(tl_types::messages::PeerDialogs {
+                    dialogs: vec![],
+                    messages: vec![],
+                    chats: vec![],
+                    users: vec![],
+                    state: tl_enums::updates::State::State(tl_types::updates::State {
+                        pts: 0,
+                        qts: 0,
+                        date: 0,
+                        seq: 0,
+                        unread_count: 0,
+                    }),
+                }),
+            ),
             other => panic!("unexpected RPC ctor: 0x{other:08x}"),
         });
 

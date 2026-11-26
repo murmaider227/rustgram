@@ -28,12 +28,7 @@ pub use crate::info::birthday_effect::{
     current_utc_ymd, is_birthday_today,
 };
 use crate::info::values::{format_duration, format_file_size};
-use crate::payments::backend::ReceivedGiftItem;
-use crate::payments::credits::format_stars_count;
-use crate::payments::ui_helpers::{
-    PREMIUM_PURPLE, STAR_GOLD, format_unix_date, paint_gift_artwork, paint_star_emblem,
-    rgb_to_color32,
-};
+use crate::payments::ui_helpers::format_unix_date;
 use tg_app_core::stand_in::types::PeerId;
 
 // =============================================================================
@@ -382,118 +377,32 @@ impl PeerGiftsSection {
             return None;
         }
 
-        // 3. 3-column gift cards grid (`info_peer_gifts_common.cpp`)
-        let pad_x = 12.0;
-        let gap = 8.0;
-        let cols = 3usize;
-        let cell_w = ((width - pad_x * 2.0 - gap * (cols as f32 - 1.0)) / cols as f32).max(76.0);
-        let cell_h = 114.0;
+        // 3. 3-column grid of `GiftButtonMode::Minimal` cards (`info_peer_gifts_common.cpp`).
+        let skip = crate::payments::gift_card::GIFT_BOX_GIFT_SKIP;
+        let pad_x = crate::payments::gift_card::GIFT_BOX_PADDING[0];
+        let cols = crate::payments::gift_card::GIFTS_PER_ROW;
+        let cell_w = ((width - pad_x * 2.0 - skip.x * (cols as f32 - 1.0)) / cols as f32)
+            .floor()
+            .max(76.0);
+        let cell_h = crate::payments::gift_card::GIFT_BOX_GIFT_SMALL;
+        let card_bg = colors.color("windowBg");
 
         for row_items in page.gifts.chunks(cols) {
             let (row_rect, _) =
-                ui.allocate_exact_size(Vec2::new(width, cell_h + gap), Sense::hover());
+                ui.allocate_exact_size(Vec2::new(width, cell_h + skip.y), Sense::hover());
             for (c_idx, item) in row_items.iter().enumerate() {
-                let x = row_rect.left() + pad_x + c_idx as f32 * (cell_w + gap);
+                let x = row_rect.left() + pad_x + c_idx as f32 * (cell_w + skip.x);
                 let card =
                     Rect::from_min_size(Pos2::new(x, row_rect.top()), Vec2::new(cell_w, cell_h));
                 let is_selected = *selected_gift_id == Some(item.saved.info.id);
-                let resp = ui.interact(
+                let spec = crate::payments::gift_card::profile_gift_card_spec(item);
+                let resp = crate::payments::gift_card::gift_card(
+                    ui,
                     card,
                     ui.make_persistent_id(("peer_gift_card", peer_id.0, item.saved.info.id)),
-                    Sense::click(),
+                    &spec,
+                    card_bg,
                 );
-                resp.widget_info(|| {
-                    WidgetInfo::selected(Role::Button, true, is_selected, &item.title)
-                });
-                if resp.hovered() {
-                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                }
-
-                let (card_bg, accent) = gift_card_colors(item, colors);
-                ui.painter()
-                    .rect_filled(card, CornerRadius::same(10), card_bg);
-                if is_selected || resp.hovered() {
-                    ui.painter().rect_stroke(
-                        card,
-                        CornerRadius::same(10),
-                        Stroke::new(
-                            if is_selected { 2.0 } else { 1.0 },
-                            colors.color("windowActiveTextFg"),
-                        ),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-
-                // Artwork emblem (reusing `payments::ui_helpers::paint_gift_artwork`)
-                let art_rect = Rect::from_center_size(
-                    Pos2::new(card.center().x, card.top() + 40.0),
-                    Vec2::splat(48.0),
-                );
-                paint_gift_artwork(ui.painter(), art_rect, &item.artwork_kind, accent);
-
-                // Status badge (Pinned / Hidden / Unique #N)
-                if let Some(ref unique) = item.saved.info.unique {
-                    let badge_txt = format!("#{}", unique.number);
-                    ui.painter().text(
-                        Pos2::new(card.right() - 6.0, card.top() + 6.0),
-                        Align2::RIGHT_TOP,
-                        badge_txt,
-                        FontId::new(9.5, family_semibold()),
-                        Color32::WHITE,
-                    );
-                } else if item.saved.hidden {
-                    ui.painter().text(
-                        Pos2::new(card.right() - 6.0, card.top() + 6.0),
-                        Align2::RIGHT_TOP,
-                        "Hidden",
-                        FontId::new(9.5, family_semibold()),
-                        colors.color("windowSubTextFg"),
-                    );
-                }
-
-                if item.saved.pinned {
-                    ui.painter().text(
-                        Pos2::new(card.left() + 6.0, card.top() + 6.0),
-                        Align2::LEFT_TOP,
-                        "PIN",
-                        FontId::new(9.0, family_semibold()),
-                        if item.saved.info.unique.is_some() {
-                            Color32::WHITE
-                        } else {
-                            PREMIUM_PURPLE
-                        },
-                    );
-                }
-
-                // Title & Star value footer
-                let title_fg = if item.saved.info.unique.is_some() {
-                    Color32::WHITE
-                } else {
-                    colors.color("windowFg")
-                };
-                let clip = ui.painter().with_clip_rect(card.shrink(4.0));
-                clip.text(
-                    Pos2::new(card.center().x, card.bottom() - 32.0),
-                    Align2::CENTER_TOP,
-                    &item.title,
-                    FontId::new(11.0, family_semibold()),
-                    title_fg,
-                );
-                let star_y = card.bottom() - 12.0;
-                paint_star_emblem(
-                    ui.painter(),
-                    Pos2::new(card.center().x - 24.0, star_y),
-                    5.5,
-                    STAR_GOLD,
-                );
-                clip.text(
-                    Pos2::new(card.center().x - 14.0, star_y),
-                    Align2::LEFT_CENTER,
-                    format_stars_count(item.saved.info.stars),
-                    FontId::new(10.5, family_semibold()),
-                    STAR_GOLD,
-                );
-
                 if resp.clicked() {
                     *selected_gift_id = if is_selected {
                         None
@@ -573,16 +482,6 @@ impl PeerGiftsSection {
 
         action
     }
-}
-
-fn gift_card_colors(item: &ReceivedGiftItem, colors: &dyn Colors) -> (Color32, Color32) {
-    if let Some(ref unique) = item.saved.info.unique {
-        return (
-            rgb_to_color32(unique.backdrop.center_color),
-            rgb_to_color32(unique.backdrop.pattern_color),
-        );
-    }
-    (colors.color("windowBgOver"), STAR_GOLD)
 }
 
 // =============================================================================

@@ -13,14 +13,13 @@
 //! - `Telegram/SourceFiles/history/view/media/history_view_media_spoiler.cpp`
 
 use std::collections::{HashMap, HashSet};
-use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use egui::{
-    Align2, Color32, ColorImage, CornerRadius, CursorIcon, FontId, Id, Painter, Pos2, Rect, Sense,
-    Shape, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Painter, Pos2, Rect, Sense, Shape,
+    Stroke, TextureHandle, TextureOptions, Ui, Vec2,
 };
 use tg_audio::{
     AudioDataSource, AudioInput, AudioMsgId, AudioResult, AudioType, DocumentId,
@@ -29,15 +28,13 @@ use tg_audio::{
     PlaylistProvider, SPEED_MAX, SPEED_MIN, TrackState, encode_wav_pcm_s16le,
 };
 use tg_core::settings::{CoreSettings, PowerSavingFlags};
-use tg_lottie::{Composition, Size as LottieSize, render_composition};
-use tg_ui::effects::{InfiniteRadialAnimation, paint_arc, paint_spoiler_particles};
+use tg_lottie::Composition;
+use tg_ui::effects::{InfiniteRadialAnimation, RadialAnimation, paint_spoiler_particles};
 use tg_ui::style::InfiniteRadialAnimationStyle;
-use tg_video::{
-    FrameData, Size as VideoSize, ThumbnailOptions, extract_thumbnail, extract_thumbnail_from_bytes,
-};
 
 use crate::history::backend::{DocumentAttachment, HistoryMedia, HistoryMessage};
 use crate::history::media::{format_duration, format_file_size};
+use crate::history::photo_frame::{PhotoFit, photo_frame};
 use crate::history::theme::HistoryColors;
 use tg_app_core::stand_in::theme::Palette;
 use tg_app_core::stand_in::types::{MsgId, PeerId};
@@ -47,8 +44,100 @@ use tg_app_media::media::inline::{
 };
 use tg_app_media::media::player_bar::{AudioPlayerBar, AudioPlayerBarEvent};
 
+mod asset_lru;
+mod decode_pool;
+mod downloads;
+mod round_video;
+
+pub use downloads::{MSG_FILE_OVER_DURATION_SECS, MediaDownloadAction, PhotoLink};
+
+#[cfg(test)]
+mod tests_decode;
+#[cfg(test)]
+mod tests_photo_radial;
+
+use asset_lru::{AssetLru, TexturePool, texture_bytes};
+use decode_pool::{DecodeJob, DecodeOutput, DecodeQueue, LottieFrameKey};
+pub use round_video::{RoundVideoPhase, paint_round_video_inline, round_remaining_secs};
+
+/// GPU memory budget of decoded inline photos (display-size textures).
+const FULL_PHOTO_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+/// GPU memory budget of generated video thumbnails.
+const VIDEO_THUMB_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// GPU memory budget of rasterised in-chat Lottie frames (all sizes and steps).
+const LOTTIE_FRAME_BUDGET_BYTES: usize = 96 * 1024 * 1024;
+/// Parsed Lottie compositions kept (counted per sticker).
+const LOTTIE_COMP_BUDGET: usize = 256;
+/// Evicted Lottie frame textures kept for reuse.
+const LOTTIE_TEXTURE_POOL_CAP: usize = 48;
+/// Decoded pixels uploaded per frame before the rest waits for the next frame.
+const UPLOAD_BUDGET_BYTES_PER_FRAME: usize = 16 * 1024 * 1024;
+/// Photos are decoded at their display size rounded up to this many physical pixels.
+const PHOTO_DECODE_BUCKET_PX: u32 = 128;
+/// Largest side a photo is decoded at.
+const PHOTO_DECODE_MAX_SIDE_PX: u32 = 4096;
+
+/// Turns on background decoding of chat media and emoji sprite sheets for the whole process.
+/// The desktop binary calls this at startup; tests and screenshot harnesses keep decoding
+/// synchronously so their first frame is complete.
+pub fn enable_background_decode() {
+    tg_emoji::background::set_background_decode(true);
+}
+
+/// What [`HistoryMediaRuntime::lottie_frame_per_size`] has for a sticker on this frame.
+#[derive(Clone)]
+pub enum LottieFrameState {
+    /// A frame to paint (the current step, or the last painted one while it is rendered).
+    Ready {
+        /// Frame texture.
+        texture: TextureHandle,
+        /// `true` while the animation is still running (keep repainting).
+        animated: bool,
+    },
+    /// The sticker is still being parsed or its first frame rendered in the background; paint
+    /// nothing for it on this frame (a repaint follows when it is ready).
+    Pending,
+    /// The Lottie JSON does not parse.
+    Unavailable,
+}
+
+/// Square side in physical pixels a photo shown in `rect` is decoded at.
+fn photo_decode_side(rect: Rect, pixels_per_point: f32) -> u32 {
+    let side = (rect.width().max(rect.height()) * pixels_per_point.max(0.5)).ceil();
+    let side = if side.is_finite() { side as u32 } else { 0 };
+    side.div_ceil(PHOTO_DECODE_BUCKET_PX)
+        .saturating_mul(PHOTO_DECODE_BUCKET_PX)
+        .clamp(PHOTO_DECODE_BUCKET_PX, PHOTO_DECODE_MAX_SIDE_PX)
+}
+
+/// `true` when two video payloads are the same file or the same bytes.
+fn same_video_data(a: &InlineDocumentData, b: &InlineDocumentData) -> bool {
+    match (a, b) {
+        (InlineDocumentData::File(x), InlineDocumentData::File(y)) => x == y,
+        (InlineDocumentData::Bytes(x), InlineDocumentData::Bytes(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn photo_ready_bytes(desc: &InlineMediaDescriptor) -> Option<&Arc<[u8]>> {
+    match desc.photo_load.as_ref()? {
+        PhotoLoadState::Ready { bytes } => Some(bytes),
+        PhotoLoadState::Loading { .. } | PhotoLoadState::Pending | PhotoLoadState::NotLoaded => {
+            None
+        }
+    }
+}
+
 /// Duration of the blur-up crossfade from stripped thumbnail to full photo (`240ms`).
 pub const PHOTO_BLUR_UP_DURATION_SECS: f64 = 0.24;
+/// Frame interval of the photo loading arc (tdesktop animations run at 60 fps).
+pub const RADIAL_FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
+/// `st::msgFileLayout.thumbSize`: the circle the loading arc is drawn in.
+const PHOTO_RADIAL_SIZE: f32 = 44.0;
+/// `st::msgFileRadialLine`.
+const PHOTO_RADIAL_LINE: f32 = 3.0;
+/// `msgDateImgBg` (`#00000054`).
+const MSG_DATE_IMG_BG: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 0x54);
 /// Duration of the spoiler reveal fade-out transition (`220ms`).
 pub const SPOILER_REVEAL_FADE_SECS: f64 = 0.22;
 /// Standard voice/music speed presets cycled by the inline speed button.
@@ -522,7 +611,13 @@ impl MediaBackend for SharedAudioBackend {
 
 struct BlurUpEntry {
     texture: TextureHandle,
-    started_at_secs: f64,
+    /// First paint with this texture; `None` until then (and after a descriptor reload, which
+    /// replays the blur-up exactly like before).
+    started_at_secs: Option<f64>,
+    /// Square side the photo was decoded to fit.
+    max_side: u32,
+    /// `true` when the source is larger than `max_side` (a larger display needs a new decode).
+    downscaled: bool,
 }
 
 /// Complete inline media playback coordinator owned by [`crate::history::HistoryWidget`] /
@@ -548,13 +643,42 @@ pub struct HistoryMediaRuntime {
     round_seeks: HashMap<MsgId, crate::history::video_message_seek::VideoMessageSeek>,
     /// Last explicitly sought normalized position (`0.0..=1.0`) per round video message.
     round_seek_positions: HashMap<MsgId, f64>,
+    /// Circle-masked document thumbnails shown until a round video's first frame decodes.
+    round_thumbs: HashMap<MsgId, Option<TextureHandle>>,
+    /// Round thumbnails being prepared in the background (`msg_id -> media revision`).
+    round_thumbs_pending: HashMap<MsgId, u64>,
+    /// Whether the sound-on round's audio track has reported active since it was started, so a
+    /// track that has not started yet is not mistaken for one that has finished.
+    round_sound_seen_active: bool,
     /// Generated `tg-video` thumbnail textures for videos lacking `stripped_thumb`.
-    video_thumbs: HashMap<MsgId, Option<TextureHandle>>,
-    /// Decoded full-resolution photo textures with blur-up start timestamps.
-    full_photos: HashMap<MsgId, BlurUpEntry>,
+    video_thumbs: AssetLru<MsgId, Option<TextureHandle>>,
+    /// Video thumbnails being generated in the background (`msg_id -> media revision`).
+    video_thumbs_pending: HashMap<MsgId, u64>,
+    /// Decoded inline photo textures (display size) with blur-up start timestamps.
+    full_photos: AssetLru<MsgId, BlurUpEntry>,
+    /// Photos being decoded in the background (`msg_id -> (media revision, max side)`).
+    photos_pending: HashMap<MsgId, (u64, u32)>,
+    /// Photos whose bytes failed to decode (`msg_id -> media revision`), not retried.
+    photos_failed: HashMap<MsgId, u64>,
+    /// Bumped whenever a message's media payload changes, so stale decodes are dropped.
+    media_revisions: HashMap<MsgId, u64>,
+    next_media_revision: u64,
     /// Size-keyed Lottie compositions and rendered frames `(sticker_id, size_px, step_idx)`.
-    lottie_comps: HashMap<u64, Option<Composition>>,
-    lottie_size_frames: HashMap<(u64, u32, u32), TextureHandle>,
+    lottie_comps: AssetLru<u64, Option<Arc<Composition>>>,
+    lottie_parsing: HashSet<u64>,
+    lottie_size_frames: AssetLru<LottieFrameKey, TextureHandle>,
+    lottie_rendering: HashSet<LottieFrameKey>,
+    /// `(sticker_id, size_px)` whose remaining steps were queued for background rendering.
+    lottie_prefetched: HashSet<(u64, u32)>,
+    /// Last frame painted per `(sticker_id, size_px)`, shown while the current step renders.
+    lottie_last_shown: HashMap<(u64, u32), TextureHandle>,
+    /// Evicted Lottie frame textures, refilled for new frames of the same size.
+    lottie_texture_pool: TexturePool,
+    /// Background decode workers (photos, video thumbnails, Lottie).
+    decode: DecodeQueue,
+    /// Frame (egui pass) the upload budget below belongs to.
+    upload_pass: u64,
+    upload_budget_left: usize,
     /// Lottie first-seen timestamp per message (for single-play when `loop_animated_stickers == false`).
     lottie_started_at: HashMap<MsgId, f64>,
     /// Underlying shared audio backend & single unified [`AudioPlayerBar`] (`tg-audio::PlayerInstance`).
@@ -566,8 +690,12 @@ pub struct HistoryMediaRuntime {
     registered_audio: HashMap<MsgId, AudioMsgId>,
     /// Active peer id for audio playlists.
     active_peer: PeerId,
-    /// Infinite radial spinner state for indeterminate photo loads.
+    /// Infinite radial spinner state (round video loads).
     spinner: InfiniteRadialAnimation,
+    /// Loading arcs of photos (`Photo::_animation->radial`), only while one animates.
+    photo_radials: HashMap<MsgId, RadialAnimation>,
+    /// Download requests for the backend and the voice message waiting for its file.
+    downloads: downloads::MediaDownloads,
     /// Last frame timestamp in ms.
     last_now_ms: i64,
 }
@@ -621,10 +749,26 @@ impl HistoryMediaRuntime {
             unmuted_round_msg: None,
             round_seeks: HashMap::new(),
             round_seek_positions: HashMap::new(),
-            video_thumbs: HashMap::new(),
-            full_photos: HashMap::new(),
-            lottie_comps: HashMap::new(),
-            lottie_size_frames: HashMap::new(),
+            round_thumbs: HashMap::new(),
+            round_thumbs_pending: HashMap::new(),
+            round_sound_seen_active: false,
+            video_thumbs: AssetLru::new(VIDEO_THUMB_BUDGET_BYTES),
+            video_thumbs_pending: HashMap::new(),
+            full_photos: AssetLru::new(FULL_PHOTO_BUDGET_BYTES),
+            photos_pending: HashMap::new(),
+            photos_failed: HashMap::new(),
+            media_revisions: HashMap::new(),
+            next_media_revision: 0,
+            lottie_comps: AssetLru::new(LOTTIE_COMP_BUDGET),
+            lottie_parsing: HashSet::new(),
+            lottie_size_frames: AssetLru::new(LOTTIE_FRAME_BUDGET_BYTES),
+            lottie_rendering: HashSet::new(),
+            lottie_prefetched: HashSet::new(),
+            lottie_last_shown: HashMap::new(),
+            lottie_texture_pool: TexturePool::new(LOTTIE_TEXTURE_POOL_CAP),
+            decode: DecodeQueue::default(),
+            upload_pass: u64::MAX,
+            upload_budget_left: UPLOAD_BUDGET_BYTES_PER_FRAME,
             lottie_started_at: HashMap::new(),
             audio_backend,
             audio_player_bar,
@@ -632,6 +776,8 @@ impl HistoryMediaRuntime {
             registered_audio: HashMap::new(),
             active_peer: PeerId::ZERO,
             spinner,
+            photo_radials: HashMap::new(),
+            downloads: downloads::MediaDownloads::default(),
             last_now_ms: 0,
         }
     }
@@ -697,10 +843,51 @@ impl HistoryMediaRuntime {
 
     /// Registers an [`InlineMediaDescriptor`] for `msg_id`.
     pub fn register_descriptor(&mut self, msg_id: MsgId, descriptor: InlineMediaDescriptor) {
-        // Invalidate cached generated thumb / full photo if replaced.
-        self.video_thumbs.remove(&msg_id);
-        self.full_photos.remove(&msg_id);
+        // A reload with the same bytes keeps the decoded pixels (nothing to decode again) but
+        // replays the blur-up exactly like a fresh decode did; changed media is decoded anew.
+        let old = self.descriptors.get(&msg_id);
+        let same_photo = match (
+            old.and_then(photo_ready_bytes),
+            photo_ready_bytes(&descriptor),
+        ) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a[..] == b[..],
+            (None, None) => true,
+            _ => false,
+        };
+        let same_video = match (
+            old.and_then(|d| d.video_data.as_ref()),
+            descriptor.video_data.as_ref(),
+        ) {
+            (Some(a), Some(b)) => same_video_data(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !(same_photo && same_video) {
+            self.bump_media_revision(msg_id);
+        }
+        if same_photo {
+            if let Some(entry) = self.full_photos.get_mut(&msg_id) {
+                entry.started_at_secs = None;
+            }
+        } else {
+            self.full_photos.remove(&msg_id);
+            self.round_thumbs.remove(&msg_id);
+        }
+        if !same_video {
+            self.video_thumbs.remove(&msg_id);
+        }
+        // A voice / round track registered before its bytes arrived plays the synthesized
+        // stand-in: drop it so the next sync registers the downloaded audio.
+        let had_audio = self
+            .descriptors
+            .get(&msg_id)
+            .is_some_and(|d| d.audio_bytes.is_some());
+        if !had_audio && descriptor.audio_bytes.is_some() && self.unmuted_round_msg != Some(msg_id)
+        {
+            self.registered_audio.remove(&msg_id);
+        }
         self.descriptors.insert(msg_id, descriptor);
+        self.play_pending_voice_if_loaded(msg_id);
     }
 
     /// Returns the registered [`InlineMediaDescriptor`] for `msg_id`, if any.
@@ -715,6 +902,205 @@ impl HistoryMediaRuntime {
         entry.photo_load = Some(state);
         if matches!(entry.photo_load, Some(PhotoLoadState::Ready { .. })) {
             self.full_photos.remove(&msg_id);
+            self.bump_media_revision(msg_id);
+        }
+    }
+
+    fn bump_media_revision(&mut self, msg_id: MsgId) {
+        self.next_media_revision += 1;
+        self.media_revisions
+            .insert(msg_id, self.next_media_revision);
+        self.photos_pending.remove(&msg_id);
+        self.photos_failed.remove(&msg_id);
+        self.video_thumbs_pending.remove(&msg_id);
+        self.round_thumbs_pending.remove(&msg_id);
+    }
+
+    fn media_revision(&self, msg_id: MsgId) -> u64 {
+        self.media_revisions.get(&msg_id).copied().unwrap_or(0)
+    }
+
+    /// Uses background decode workers (`Some(true)`), decodes inline (`Some(false)`), or follows
+    /// the process-wide switch [`tg_emoji::background::set_background_decode`] (`None`).
+    pub fn set_background_decode(&mut self, background: Option<bool>) {
+        self.decode.set_background(background);
+    }
+
+    /// Number of decode jobs handed to background workers so far.
+    #[must_use]
+    pub const fn background_decode_jobs(&self) -> u64 {
+        self.decode.submitted()
+    }
+
+    /// GPU bytes held by decoded photos, video thumbnails and Lottie frames, and the number of
+    /// entries evicted by their memory budgets so far.
+    #[must_use]
+    pub fn decoded_asset_stats(&self) -> (usize, u64) {
+        (
+            self.full_photos.bytes() + self.video_thumbs.bytes() + self.lottie_size_frames.bytes(),
+            self.full_photos.evicted()
+                + self.video_thumbs.evicted()
+                + self.lottie_size_frames.evicted(),
+        )
+    }
+
+    /// Number of Lottie frame textures refilled instead of created.
+    #[must_use]
+    pub const fn reused_textures(&self) -> u64 {
+        self.lottie_texture_pool.reused()
+    }
+
+    /// Side of the decoded texture of `msg_id`'s photo, if decoded.
+    #[must_use]
+    pub fn decoded_photo_size(&self, msg_id: MsgId) -> Option<[usize; 2]> {
+        self.full_photos.peek(&msg_id).map(|e| e.texture.size())
+    }
+
+    /// Uploads finished background decodes, within this frame's upload budget.
+    fn pump_decoded(&mut self, ctx: &egui::Context) {
+        let pass = ctx.cumulative_pass_nr();
+        self.lottie_texture_pool.begin_pass(pass);
+        if pass != self.upload_pass {
+            self.upload_pass = pass;
+            self.upload_budget_left = UPLOAD_BUDGET_BYTES_PER_FRAME;
+        }
+        while let Some(output) = self.decode.next_output() {
+            let cost = decode_output_bytes(&output);
+            if cost > self.upload_budget_left
+                && self.upload_budget_left < UPLOAD_BUDGET_BYTES_PER_FRAME
+            {
+                self.decode.defer(output);
+                ctx.request_repaint();
+                break;
+            }
+            self.upload_budget_left = self.upload_budget_left.saturating_sub(cost);
+            self.apply_decoded(ctx, output);
+        }
+    }
+
+    /// Runs `job` inline or on the workers; an inline result is applied at once.
+    fn run_decode(&mut self, ctx: &egui::Context, job: DecodeJob) {
+        if let Some(output) = self.decode.submit(ctx, job) {
+            self.apply_decoded(ctx, output);
+        }
+    }
+
+    fn apply_decoded(&mut self, ctx: &egui::Context, output: DecodeOutput) {
+        match output {
+            DecodeOutput::Photo {
+                msg_id,
+                revision,
+                max_side,
+                image,
+            } => {
+                if self.photos_pending.get(&msg_id) == Some(&(revision, max_side)) {
+                    self.photos_pending.remove(&msg_id);
+                }
+                if revision != self.media_revision(msg_id) {
+                    return;
+                }
+                if self
+                    .descriptors
+                    .get(&msg_id)
+                    .and_then(photo_ready_bytes)
+                    .is_none()
+                {
+                    return;
+                }
+                let Some((image, downscaled)) = image else {
+                    if !self.full_photos.contains(&msg_id) {
+                        self.photos_failed.insert(msg_id, revision);
+                    }
+                    return;
+                };
+                // A sharper re-decode for a larger display keeps the running blur-up.
+                let started_at_secs = self
+                    .full_photos
+                    .peek(&msg_id)
+                    .and_then(|e| e.started_at_secs);
+                let size = texture_bytes(image.size);
+                let texture = ctx.load_texture(
+                    format!("tg_full_photo_{}", msg_id.0),
+                    image,
+                    TextureOptions::LINEAR,
+                );
+                self.full_photos.insert(
+                    msg_id,
+                    BlurUpEntry {
+                        texture,
+                        started_at_secs,
+                        max_side,
+                        downscaled,
+                    },
+                    size,
+                );
+            }
+            DecodeOutput::VideoThumb {
+                msg_id,
+                revision,
+                image,
+            } => {
+                if self.video_thumbs_pending.get(&msg_id) == Some(&revision) {
+                    self.video_thumbs_pending.remove(&msg_id);
+                }
+                if revision != self.media_revision(msg_id) {
+                    return;
+                }
+                let size = image.as_ref().map_or(0, |img| texture_bytes(img.size));
+                let texture = image.map(|img| {
+                    ctx.load_texture(
+                        format!("tg_gen_video_thumb_{}", msg_id.0),
+                        img,
+                        TextureOptions::LINEAR,
+                    )
+                });
+                self.video_thumbs.insert(msg_id, texture, size);
+            }
+            DecodeOutput::RoundThumb {
+                msg_id,
+                revision,
+                image,
+            } => {
+                if self.round_thumbs_pending.get(&msg_id) == Some(&revision) {
+                    self.round_thumbs_pending.remove(&msg_id);
+                }
+                if revision != self.media_revision(msg_id) {
+                    return;
+                }
+                let texture = image.map(|img| {
+                    ctx.load_texture(
+                        format!("tg_round_thumb_{}", msg_id.0),
+                        img,
+                        TextureOptions::LINEAR,
+                    )
+                });
+                self.round_thumbs.insert(msg_id, texture);
+            }
+            DecodeOutput::LottieParsed { sticker_id, comp } => {
+                self.lottie_parsing.remove(&sticker_id);
+                self.lottie_comps.insert(sticker_id, comp, 1);
+            }
+            DecodeOutput::LottieFrame { key, image } => {
+                self.lottie_rendering.remove(&key);
+                let (sticker_id, size_bucket, step_idx) = key;
+                let size = texture_bytes(image.size);
+                let texture = match self.lottie_texture_pool.take(image.size) {
+                    Some(mut reused) => {
+                        reused.set(image, TextureOptions::LINEAR);
+                        reused
+                    }
+                    None => ctx.load_texture(
+                        format!("tg_lottie_{sticker_id}_{size_bucket}_{step_idx}"),
+                        image,
+                        TextureOptions::LINEAR,
+                    ),
+                };
+                for evicted in self.lottie_size_frames.insert(key, texture, size) {
+                    let id = evicted.id();
+                    self.lottie_last_shown.retain(|_, shown| shown.id() != id);
+                    self.lottie_texture_pool.release(evicted);
+                }
+            }
         }
     }
 
@@ -787,6 +1173,10 @@ impl HistoryMediaRuntime {
         }
         // Evict long-idle decoders (> 30s offscreen) to keep memory bounded.
         self.inline.evict_stale(now_ms, 30_000);
+        // Stand-in frames for stickers being rendered: only what was on screen lately matters.
+        if self.lottie_last_shown.len() > 512 {
+            self.lottie_last_shown.clear();
+        }
         std::mem::swap(&mut self.visible_last_frame, &mut self.visible_this_frame);
         self.visible_this_frame.clear();
     }
@@ -922,6 +1312,9 @@ impl HistoryMediaRuntime {
         if let Some(&existing) = self.registered_audio.get(&msg_id) {
             return existing;
         }
+        if !is_round {
+            self.remember_voice_meta(msg_id, sender_name, duration_secs);
+        }
         let dur_ms = i64::from(duration_secs.max(1)) * 1000;
         let doc_id = DocumentId(0x5000_0000 + msg_id.0.unsigned_abs() as u64);
         let full = AudioFullMsgId::new(AudioPeerId(peer_id.0), AudioMsgIdNum(i64::from(msg_id.0)));
@@ -1024,6 +1417,12 @@ impl HistoryMediaRuntime {
         duration_secs: u32,
         seek_frac: Option<f64>,
     ) {
+        if self.voice_loaded(msg_id) == Some(false) {
+            // Not in the media cache: the play starts the download (TGB-2958).
+            self.remember_voice_meta(msg_id, sender_name, duration_secs);
+            self.request_voice_play(peer_id, msg_id, seek_frac);
+            return;
+        }
         let audio_id =
             self.ensure_voice_registered(peer_id, msg_id, sender_name, duration_secs, false);
         let ctx = PlaylistContext {
@@ -1101,21 +1500,8 @@ impl HistoryMediaRuntime {
         sender_name: &str,
         duration_secs: u32,
     ) {
-        let audio_id =
-            self.ensure_voice_registered(peer_id, msg_id, sender_name, duration_secs, true);
-        let ctx = PlaylistContext {
-            peer_id: AudioPeerId(peer_id.0),
-            ..PlaylistContext::default()
-        };
-        if self.unmuted_round_msg == Some(msg_id) {
-            let _ = self
-                .audio_player_bar
-                .player_mut()
-                .play_pause(AudioType::Voice);
-        } else {
-            self.unmuted_round_msg = Some(msg_id);
-            let _ = self.audio_player_bar.play_item(audio_id, Some(ctx));
-        }
+        let now_ms = self.last_now_ms;
+        self.click_round_video(peer_id, msg_id, sender_name, duration_secs, now_ms);
     }
 
     /// Seeks a round video message to normalized `progress` in `0.0..=1.0` via the circular seek
@@ -1142,12 +1528,16 @@ impl HistoryMediaRuntime {
         };
         if self.unmuted_round_msg != Some(msg_id) {
             self.unmuted_round_msg = Some(msg_id);
+            self.round_sound_seen_active = false;
             let _ = self.audio_player_bar.play_item(audio_id, Some(ctx));
         }
         let _ = self
             .audio_player_bar
             .player_mut()
             .finish_seeking(AudioType::Voice, clamped);
+        let position_ms = (clamped * f64::from(duration_secs) * 1000.0) as i64;
+        self.inline
+            .seek_item(media_item_id_for_msg(msg_id), position_ms, self.last_now_ms);
     }
 
     /// Returns the last seek progress (`0.0..=1.0`) recorded for round video `msg_id`, if any.
@@ -1217,7 +1607,15 @@ impl HistoryMediaRuntime {
         now_ms: i64,
     ) -> Option<InlineFrameState> {
         self.mark_visible(msg_id);
-        let data = self.descriptors.get(&msg_id)?.video_data.clone()?;
+        let item_id = media_item_id_for_msg(msg_id);
+        let video_data = self.descriptors.get(&msg_id)?.video_data.as_ref()?;
+        // An open decoder only needs the payload to be created: don't copy the whole video or
+        // GIF on every paint once it exists.
+        let data = if self.inline.item_position_ms(item_id).is_some() {
+            InlineDocumentData::Bytes(Vec::new())
+        } else {
+            video_data.clone()
+        };
         // Respect per-kind autoplay settings from CoreSettings.
         let allowed = self.policy.allows_inline(kind);
         match kind {
@@ -1229,7 +1627,7 @@ impl HistoryMediaRuntime {
             }
         }
         let source = InlineMediaSource {
-            id: media_item_id_for_msg(msg_id),
+            id: item_id,
             kind,
             data,
             target_size,
@@ -1245,41 +1643,35 @@ impl HistoryMediaRuntime {
         max_side: u32,
         round_circle: bool,
     ) -> Option<TextureHandle> {
+        self.pump_decoded(ctx);
         if let Some(cached) = self.video_thumbs.get(&msg_id) {
             return cached.clone();
         }
+        let revision = self.media_revision(msg_id);
+        if self.video_thumbs_pending.get(&msg_id) == Some(&revision) {
+            // Being generated: the caller paints the placeholder surface meanwhile.
+            return None;
+        }
         let data = self.descriptors.get(&msg_id)?.video_data.clone()?;
-        let opts = ThumbnailOptions {
-            position_ms: 0,
-            max_size: Some(VideoSize::new(max_side.max(64), max_side.max(64))),
-            keep_alpha: round_circle,
-            round_circle,
-        };
-        let frame_res = match data {
-            InlineDocumentData::File(path) => extract_thumbnail(&path, opts),
-            InlineDocumentData::Bytes(bytes) => extract_thumbnail_from_bytes(bytes, opts),
-        };
-        let tex = frame_res.ok().and_then(|frame| {
-            let FrameData::Rgba(rgba) = frame.data else {
-                return None;
-            };
-            let img = ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &rgba,
-            );
-            Some(ctx.load_texture(
-                format!("tg_gen_video_thumb_{}", msg_id.0),
-                img,
-                TextureOptions::LINEAR,
-            ))
-        });
-        self.video_thumbs.insert(msg_id, tex.clone());
-        tex
+        self.video_thumbs_pending.insert(msg_id, revision);
+        self.run_decode(
+            ctx,
+            DecodeJob::VideoThumb {
+                msg_id,
+                revision,
+                data,
+                max_side,
+                round_circle,
+            },
+        );
+        self.video_thumbs.peek(&msg_id).cloned().flatten()
     }
 
     /// Renders and caches an animated Lottie sticker frame keyed by `(sticker_id, size_px, step_idx)`.
     ///
-    /// Respects [`AutoplayPolicy::allows_lottie_loop`] and pauses offscreen.
+    /// Respects [`AutoplayPolicy::allows_lottie_loop`] and pauses offscreen. `None` while the
+    /// sticker is parsed or rendered in the background, or when it does not parse; see
+    /// [`Self::lottie_frame_per_size`] to tell those apart.
     pub fn get_lottie_frame_per_size(
         &mut self,
         ctx: &egui::Context,
@@ -1289,11 +1681,55 @@ impl HistoryMediaRuntime {
         time_secs: f64,
         render_px: u32,
     ) -> Option<(TextureHandle, bool)> {
+        match self.lottie_frame_per_size(ctx, msg_id, sticker_id, lottie_json, time_secs, render_px)
+        {
+            LottieFrameState::Ready { texture, animated } => Some((texture, animated)),
+            LottieFrameState::Pending | LottieFrameState::Unavailable => None,
+        }
+    }
+
+    /// Frame of an animated Lottie sticker for this paint, keyed by
+    /// `(sticker_id, size_px, step_idx)`: parsing and rasterising run on the decode workers, the
+    /// step timing (24-step quantisation, loop policy) is unchanged.
+    pub fn lottie_frame_per_size(
+        &mut self,
+        ctx: &egui::Context,
+        msg_id: MsgId,
+        sticker_id: u64,
+        lottie_json: &str,
+        time_secs: f64,
+        render_px: u32,
+    ) -> LottieFrameState {
         self.mark_visible(msg_id);
-        self.lottie_comps
-            .entry(sticker_id)
-            .or_insert_with(|| Composition::from_json(lottie_json).ok());
-        let comp = self.lottie_comps.get(&sticker_id)?.as_ref()?;
+        self.pump_decoded(ctx);
+        // Quantize render size to 16px buckets so each size has its own crisp cached frames.
+        let size_bucket = render_px.clamp(32, 256).div_ceil(16) * 16;
+        let last_shown = |rt: &Self| {
+            rt.lottie_last_shown
+                .get(&(sticker_id, size_bucket))
+                .cloned()
+                .map_or(LottieFrameState::Pending, |texture| {
+                    LottieFrameState::Ready {
+                        texture,
+                        animated: true,
+                    }
+                })
+        };
+
+        if !self.lottie_comps.contains(&sticker_id) && self.lottie_parsing.insert(sticker_id) {
+            self.run_decode(
+                ctx,
+                DecodeJob::LottieParse {
+                    sticker_id,
+                    json: Arc::from(lottie_json),
+                },
+            );
+        }
+        let comp = match self.lottie_comps.get(&sticker_id) {
+            Some(Some(comp)) => Arc::clone(comp),
+            Some(None) => return LottieFrameState::Unavailable,
+            None => return last_shown(self),
+        };
         let frame_span = (comp.out_point - comp.in_point).max(1.0);
         let fps = comp.frame_rate.clamp(1.0, 60.0);
         let total_steps = (frame_span as u32).clamp(1, 24);
@@ -1326,29 +1762,64 @@ impl HistoryMediaRuntime {
             (0, false)
         };
 
-        // Quantize render size to 16px buckets so each size has its own crisp cached frames.
-        let size_bucket = render_px.clamp(32, 256).div_ceil(16) * 16;
         let key = (sticker_id, size_bucket, step_idx);
-        if let Some(tex) = self.lottie_size_frames.get(&key) {
-            return Some((tex.clone(), still_animating));
+        if let Some(tex) = self.lottie_size_frames.get(&key).cloned() {
+            self.lottie_last_shown
+                .insert((sticker_id, size_bucket), tex.clone());
+            return LottieFrameState::Ready {
+                texture: tex,
+                animated: still_animating,
+            };
         }
 
-        let sample_frame =
-            comp.in_point + (f64::from(step_idx) / f64::from(total_steps)) * frame_span;
-        let fb = render_composition(
-            comp,
-            sample_frame,
-            LottieSize::new(size_bucket, size_bucket),
-        );
-        let img =
-            ColorImage::from_rgba_premultiplied([fb.width as usize, fb.height as usize], &fb.data);
-        let tex = ctx.load_texture(
-            format!("tg_lottie_{sticker_id}_{size_bucket}_{step_idx}"),
-            img,
-            TextureOptions::LINEAR,
-        );
-        self.lottie_size_frames.insert(key, tex.clone());
-        Some((tex, still_animating))
+        let sample_frame_for =
+            |step: u32| comp.in_point + (f64::from(step) / f64::from(total_steps)) * frame_span;
+        // In the background the other steps of an animated sticker are queued first, so the
+        // newest job (the step needed now) is picked up before them.
+        if self.decode.is_background()
+            && still_animating
+            && self.lottie_prefetched.insert((sticker_id, size_bucket))
+        {
+            for step in (0..total_steps).rev().filter(|&step| step != step_idx) {
+                let other = (sticker_id, size_bucket, step);
+                if !self.lottie_size_frames.contains(&other) && self.lottie_rendering.insert(other)
+                {
+                    self.run_decode(
+                        ctx,
+                        DecodeJob::LottieFrame {
+                            key: other,
+                            comp: Arc::clone(&comp),
+                            sample_frame: sample_frame_for(step),
+                        },
+                    );
+                }
+            }
+        }
+        if self.lottie_rendering.insert(key) {
+            self.run_decode(
+                ctx,
+                DecodeJob::LottieFrame {
+                    key,
+                    comp: Arc::clone(&comp),
+                    sample_frame: sample_frame_for(step_idx),
+                },
+            );
+        }
+        if let Some(tex) = self.lottie_size_frames.get(&key).cloned() {
+            self.lottie_last_shown
+                .insert((sticker_id, size_bucket), tex.clone());
+            return LottieFrameState::Ready {
+                texture: tex,
+                animated: still_animating,
+            };
+        }
+        match last_shown(self) {
+            LottieFrameState::Ready { texture, .. } => LottieFrameState::Ready {
+                texture,
+                animated: still_animating,
+            },
+            other => other,
+        }
     }
 
     /// Replays a non-looping animated sticker from frame 0 (e.g. on click).
@@ -1356,89 +1827,220 @@ impl HistoryMediaRuntime {
         self.lottie_started_at.insert(msg_id, now_secs);
     }
 
-    /// Paints a photo's blur-up full texture (if [`PhotoLoadState::Ready`]) or loading progress
-    /// ring (if [`PhotoLoadState::Loading`]) over the stripped thumbnail surface.
+    /// Paints a photo's full picture over its blurred thumbnail once it is
+    /// [`PhotoLoadState::Ready`] (fading in, placed by [`photo_frame`] for `fit` so it keeps its
+    /// aspect ratio), and the loading arc while it downloads (`Photo::draw`).
+    ///
+    /// The arc turns and eases toward the progress every frame, so while it is painted this
+    /// asks for the next frame at [`RADIAL_FRAME`]; a photo that is not painted asks for none.
+    #[allow(clippy::too_many_arguments)]
     pub fn paint_photo_load_and_blur_up(
         &mut self,
         ctx: &egui::Context,
         painter: &Painter,
         msg_id: MsgId,
         rect: Rect,
+        rounding: CornerRadius,
+        fit: PhotoFit,
         now_secs: f64,
+        over: f32,
     ) {
-        let Some(state) = self
+        self.pump_decoded(ctx);
+        // Borrow the state: the encoded bytes are never copied by a paint.
+        let progress = match self
             .descriptors
             .get(&msg_id)
-            .and_then(|d| d.photo_load.clone())
-        else {
+            .and_then(|d| d.photo_load.as_ref())
+        {
+            // Not loaded, or still being read from the disk cache: the blurred thumbnail
+            // painted by the caller is all there is.
+            None | Some(PhotoLoadState::Pending) => {
+                self.photo_radials.remove(&msg_id);
+                return;
+            }
+            Some(PhotoLoadState::NotLoaded) => {
+                self.photo_radials.remove(&msg_id);
+                Self::paint_photo_download(painter, rect, over);
+                return;
+            }
+            Some(PhotoLoadState::Loading { progress, .. }) => Some(progress.unwrap_or(0.0)),
+            Some(PhotoLoadState::Ready { .. }) => None,
+        };
+        let loading = progress.is_some();
+        if loading {
+            self.paint_full_photo_cached(ctx, painter, msg_id, rect, rounding, fit, now_secs);
+        } else {
+            self.paint_full_photo(ctx, painter, msg_id, rect, rounding, fit, now_secs);
+        }
+        self.paint_photo_radial(
+            painter,
+            msg_id,
+            rect,
+            progress.map(f64::from),
+            now_secs,
+            over,
+        );
+    }
+
+    /// A photo still downloading shows its full picture only when one is already decoded (a
+    /// re-download); usually there is none and the blurred thumbnail stays.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_full_photo_cached(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &Painter,
+        msg_id: MsgId,
+        rect: Rect,
+        rounding: CornerRadius,
+        fit: PhotoFit,
+        now_secs: f64,
+    ) {
+        if self.full_photos.peek(&msg_id).is_some() {
+            self.draw_full_photo(ctx, painter, msg_id, rect, rounding, fit, now_secs);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_full_photo(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &Painter,
+        msg_id: MsgId,
+        rect: Rect,
+        rounding: CornerRadius,
+        fit: PhotoFit,
+        now_secs: f64,
+    ) {
+        let want_side = photo_decode_side(rect, ctx.pixels_per_point());
+        let needs_decode = self
+            .full_photos
+            .peek(&msg_id)
+            .is_none_or(|e| e.downscaled && e.max_side < want_side);
+        let revision = self.media_revision(msg_id);
+        let in_flight = self
+            .photos_pending
+            .get(&msg_id)
+            .is_some_and(|&(rev, side)| rev == revision && side >= want_side);
+        let failed = self.photos_failed.get(&msg_id) == Some(&revision);
+        if needs_decode
+            && !in_flight
+            && !failed
+            && let Some(bytes) = self
+                .descriptors
+                .get(&msg_id)
+                .and_then(photo_ready_bytes)
+                .map(Arc::clone)
+        {
+            self.photos_pending.insert(msg_id, (revision, want_side));
+            self.run_decode(
+                ctx,
+                DecodeJob::Photo {
+                    msg_id,
+                    revision,
+                    bytes,
+                    max_side: want_side,
+                },
+            );
+        }
+        self.draw_full_photo(ctx, painter, msg_id, rect, rounding, fit, now_secs);
+    }
+
+    /// Draws the decoded picture into `rect` keeping its aspect ratio
+    /// (`PrepareWithBlurredBackground`): cropped to cover the box, or centered whole with the
+    /// blurred thumbnail around it.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_full_photo(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &Painter,
+        msg_id: MsgId,
+        rect: Rect,
+        rounding: CornerRadius,
+        fit: PhotoFit,
+        now_secs: f64,
+    ) {
+        let Some(entry) = self.full_photos.get_mut(&msg_id) else {
             return;
         };
+        let started_at = *entry.started_at_secs.get_or_insert(now_secs);
+        let t = ((now_secs - started_at) / PHOTO_BLUR_UP_DURATION_SECS).clamp(0.0, 1.0) as f32;
+        let alpha = (t * 255.0).round() as u8;
+        let tint = Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+        let frame = photo_frame(rect, entry.texture.size_vec2(), fit);
+        let corners = if frame.letterboxed {
+            CornerRadius::ZERO
+        } else {
+            rounding
+        };
+        painter.add(
+            egui::epaint::RectShape::filled(frame.rect, corners, tint)
+                .with_texture(entry.texture.id(), frame.uv),
+        );
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+    }
 
-        match state {
-            PhotoLoadState::Loading { progress, .. } => {
-                // Soft dark scrim + circular progress ring centered on the blurred stripped thumb.
-                let center = rect.center();
-                let bg_r = 24.0;
-                painter.circle_filled(center, bg_r, Color32::from_rgba_unmultiplied(0, 0, 0, 148));
-                let ring_rect = Rect::from_center_size(center, Vec2::splat(38.0));
-                if let Some(p) = progress {
-                    let frac = p.clamp(0.02, 1.0);
-                    paint_arc(
-                        painter,
-                        ring_rect,
-                        -FRAC_PI_2,
-                        f64::from(frac) * TAU,
-                        2.8,
-                        Color32::WHITE,
-                    );
-                    let pct = (frac * 100.0).round() as u32;
-                    painter.text(
-                        center,
-                        Align2::CENTER_CENTER,
-                        format!("{pct}%"),
-                        FontId::proportional(10.5),
-                        Color32::WHITE,
-                    );
-                } else {
-                    self.spinner.start(now_secs);
-                    self.spinner.paint(ctx, painter, ring_rect);
-                }
-            }
-            PhotoLoadState::Ready { bytes } => {
-                if !self.full_photos.contains_key(&msg_id)
-                    && let Some((w, h, raw)) = decode_inline_photo_rgba(&bytes)
-                {
-                    let color_img =
-                        ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
-                    let tex = ctx.load_texture(
-                        format!("tg_full_photo_{}", msg_id.0),
-                        color_img,
-                        TextureOptions::LINEAR,
-                    );
-                    self.full_photos.insert(
-                        msg_id,
-                        BlurUpEntry {
-                            texture: tex,
-                            started_at_secs: now_secs,
-                        },
-                    );
-                }
-                if let Some(entry) = self.full_photos.get(&msg_id) {
-                    let t = ((now_secs - entry.started_at_secs) / PHOTO_BLUR_UP_DURATION_SECS)
-                        .clamp(0.0, 1.0) as f32;
-                    let alpha = (t * 255.0).round() as u8;
-                    painter.image(
-                        entry.texture.id(),
-                        rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
-                    );
-                    if t < 1.0 {
-                        ctx.request_repaint();
-                    }
-                }
+    /// The loading arc (`Photo::draw`, `paintInCenter`): a `msgDateImgBg` circle of
+    /// `msgFileLayout.thumbSize` with the cancel cross, and the `Ui::RadialAnimation` arc inside
+    /// it. After the load finishes the arc completes and fades out, then the entry is dropped.
+    fn paint_photo_radial(
+        &mut self,
+        painter: &Painter,
+        msg_id: MsgId,
+        rect: Rect,
+        progress: Option<f64>,
+        now_secs: f64,
+        over: f32,
+    ) {
+        let now_ms = now_secs * 1000.0;
+        if let Some(progress) = progress {
+            let radial = self.photo_radials.entry(msg_id).or_default();
+            if !radial.animating() {
+                radial.start(progress, now_ms);
             }
         }
+        let Some(radial) = self.photo_radials.get_mut(&msg_id) else {
+            return;
+        };
+        radial.update(progress.unwrap_or(1.0), progress.is_none(), now_ms);
+        if !radial.animating() {
+            self.photo_radials.remove(&msg_id);
+            return;
+        }
+        let circle_opacity = if progress.is_some() {
+            1.0
+        } else {
+            radial.opacity() as f32
+        };
+        let inner = Rect::from_center_size(rect.center(), Vec2::splat(PHOTO_RADIAL_SIZE));
+        painter.circle_filled(
+            inner.center(),
+            PHOTO_RADIAL_SIZE / 2.0,
+            downloads::circle_bg(if progress.is_some() { over } else { 0.0 })
+                .gamma_multiply(circle_opacity),
+        );
+        paint_cancel_cross(
+            painter,
+            inner.center(),
+            Color32::WHITE.gamma_multiply(circle_opacity),
+        );
+        radial.draw(
+            painter,
+            inner.shrink(PHOTO_RADIAL_LINE),
+            PHOTO_RADIAL_LINE,
+            Color32::WHITE,
+        );
+        painter.ctx().request_repaint_after(RADIAL_FRAME);
+    }
+
+    /// The loading arc state of `msg_id` while it animates (tests).
+    #[cfg(test)]
+    pub(crate) fn photo_radial_state(&self, msg_id: MsgId) -> Option<tg_ui::effects::RadialState> {
+        self.photo_radials
+            .get(&msg_id)
+            .filter(|r| r.animating())
+            .map(RadialAnimation::compute_state)
     }
 
     /// Paints the shimmering spoiler particle veil over `rect` if `msg_id` has an active spoiler.
@@ -1757,321 +2359,18 @@ pub fn paint_music_document_bubble(
     }
 }
 
-/// Paints a circular round video message with `tg-video` inline playback, circular progress ring,
-/// muted/unmuted speaker indicator, click-to-sound switching, and optional spoiler veil.
-#[allow(clippy::too_many_arguments)]
-pub fn paint_round_video_inline(
-    ui: &mut Ui,
-    peer_id: PeerId,
-    msg_id: MsgId,
-    sender_name: &str,
-    rv: &crate::history::sections_model::RoundVideoAttachment,
-    rect: Rect,
-    colors: &HistoryColors,
-    runtime: &mut HistoryMediaRuntime,
-) {
-    let now_secs = ui.ctx().input(|i| i.time);
-    let now_ms = (now_secs * 1000.0).max(0.0) as i64;
-    let diameter = rect.width().min(rect.height()).max(80.0);
-    let radius = diameter * 0.48;
-    let circle_rect = Rect::from_center_size(rect.center(), Vec2::splat(radius * 2.0));
-
-    let sound_on = runtime.is_round_video_unmuted(msg_id);
-    let (audio_active, audio_playing, audio_progress, audio_speed, _) =
-        runtime.audio_item_state(msg_id, AudioType::Voice);
-
-    // Decode live circular frame via `InlinePlayback` (`tg-video::ClipReader`).
-    let target_px = (radius * 2.0).round().clamp(96.0, 320.0) as u32;
-    let clip_state = runtime.inline_clip_frame(
-        ui.ctx(),
-        msg_id,
-        InlinePlaybackKind::RoundVideo,
-        Some((target_px, target_px)),
-        now_ms,
-    );
-
-    let progress = if let Some(sought) = runtime.round_video_seek_progress(msg_id)
-        && (!sound_on
-            || !audio_playing
-            || runtime
-                .round_seeks
-                .get(&msg_id)
-                .is_some_and(|s| s.is_grabbed()))
-    {
-        sought as f32
-    } else if sound_on && audio_active {
-        audio_progress
-    } else if let Some(ref cs) = clip_state {
-        cs.progress
-    } else if runtime.policy.allows_inline(InlinePlaybackKind::RoundVideo) {
-        let dur = rv.duration_secs.max(1) as f64;
-        ((now_secs % dur) / dur) as f32
-    } else {
-        0.0
-    };
-
-    // 1. Circular video frame or generated thumbnail / gradient fallback.
-    let mut painted_tex = false;
-    if let Some(ref cs) = clip_state
-        && let Some(ref tex) = cs.texture
-    {
-        ui.painter().image(
-            tex.id(),
-            circle_rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        painted_tex = true;
-    } else if let Some(thumb) =
-        runtime.get_or_generate_video_thumb(ui.ctx(), msg_id, target_px, true)
-    {
-        ui.painter().image(
-            thumb.id(),
-            circle_rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        painted_tex = true;
-    }
-
-    if !painted_tex {
-        let [r0, g0, b0] = rv.accent_rgb.0;
-        let [r1, g1, b1] = rv.accent_rgb.1;
-        let base = Color32::from_rgb(r0, g0, b0);
-        let alt = Color32::from_rgb(r1, g1, b1);
-        ui.painter().circle_filled(rect.center(), radius, base);
-        ui.painter().circle_filled(
-            rect.center() + Vec2::new(radius * 0.12, -radius * 0.14),
-            radius * 0.56,
-            Color32::from_rgba_unmultiplied(alt.r(), alt.g(), alt.b(), 140),
-        );
-    }
-
-    // 2. Interactive circular seek ring (`HistoryView::VideoMessageSeek`).
-    let resp = ui.interact(
-        circle_rect,
-        Id::unique(("tg_round_vid", msg_id.0)),
-        Sense::click_and_drag(),
-    );
-    resp.widget_info(|| {
-        egui::WidgetInfo::slider(
-            true,
-            f64::from(progress),
-            format!(
-                "Round video message ({})",
-                format_duration(rv.duration_secs)
-            ),
-        )
-    });
-    let pointer_pos = ui.ctx().pointer_interact_pos();
-    let pointer_in_band = pointer_pos.is_some_and(|pt| {
-        crate::history::video_message_seek::VideoMessageSeek::grab_point(circle_rect, pt)
-    });
-
-    let mut pending_seek: Option<f64> = None;
-    let mut was_grabbed_this_frame = runtime
-        .round_seeks
-        .get(&msg_id)
-        .is_some_and(|s| s.is_grabbed());
-
-    if resp.drag_started()
-        && let Some(pt) = pointer_pos
-        && crate::history::video_message_seek::VideoMessageSeek::grab_point(circle_rect, pt)
-    {
-        let p = crate::history::video_message_seek::VideoMessageSeek::progress_from_point(
-            circle_rect,
-            pt,
-        );
-        let seek = runtime.round_seek_mut(msg_id);
-        seek.set_grabbed(true, now_secs);
-        seek.set_dragged_progress(p, now_secs);
-        was_grabbed_this_frame = true;
-        pending_seek = Some(p);
-    } else if resp.dragged()
-        && was_grabbed_this_frame
-        && let Some(pt) = pointer_pos
-    {
-        let p = crate::history::video_message_seek::VideoMessageSeek::progress_from_point(
-            circle_rect,
-            pt,
-        );
-        runtime
-            .round_seek_mut(msg_id)
-            .set_dragged_progress(p, now_secs);
-        pending_seek = Some(p);
-    } else if resp.drag_stopped() && was_grabbed_this_frame {
-        let p = pointer_pos.map_or_else(
-            || runtime.round_seek_mut(msg_id).progress(),
-            |pt| {
-                crate::history::video_message_seek::VideoMessageSeek::progress_from_point(
-                    circle_rect,
-                    pt,
-                )
-            },
-        );
-        let seek = runtime.round_seek_mut(msg_id);
-        seek.set_dragged_progress(p, now_secs);
-        seek.set_grabbed(false, now_secs);
-        was_grabbed_this_frame = false;
-        pending_seek = Some(p);
-    }
-
-    // Keyboard seek support (`ArrowLeft` / `ArrowRight` by 5%) when focused.
-    if resp.has_focus() {
-        let delta = ui.ctx().input(|i| {
-            if i.key_pressed(egui::Key::ArrowRight) {
-                Some(0.05)
-            } else if i.key_pressed(egui::Key::ArrowLeft) {
-                Some(-0.05)
-            } else {
-                None
-            }
-        });
-        if let Some(d) = delta {
-            let next = (f64::from(progress) + d).clamp(0.0, 1.0);
-            runtime
-                .round_seek_mut(msg_id)
-                .set_dragged_progress(next, now_secs);
-            pending_seek = Some(next);
+/// Pixel bytes a finished decode uploads (counted against the per-frame upload budget).
+fn decode_output_bytes(output: &DecodeOutput) -> usize {
+    match output {
+        DecodeOutput::Photo { image, .. } => {
+            image.as_ref().map_or(0, |(img, _)| texture_bytes(img.size))
         }
-    }
-
-    if let Some(seek_pos) = pending_seek {
-        runtime.seek_round_video(peer_id, msg_id, sender_name, rv.duration_secs, seek_pos);
-    }
-
-    let seek_shown = was_grabbed_this_frame
-        || (sound_on && !audio_playing)
-        || (resp.hovered() && pointer_in_band);
-    let display_progress = pending_seek.unwrap_or_else(|| f64::from(progress));
-    let reduced_motion = runtime.policy.power_saving_enabled();
-    let needs_repaint = runtime.round_seek_mut(msg_id).paint(
-        ui.painter(),
-        circle_rect,
-        seek_shown,
-        was_grabbed_this_frame,
-        display_progress,
-        false,
-        now_secs,
-        reduced_motion,
-    );
-    if needs_repaint {
-        ui.ctx().request_repaint();
-    }
-
-    // 3. Muted indicator at bottom-center when autoplaying muted (`historyVideoMessageMute`),
-    //    or Play icon when paused with sound on.
-    if !sound_on {
-        let mute_center = Pos2::new(rect.center().x, circle_rect.bottom() - 22.0);
-        ui.painter().circle_filled(
-            mute_center,
-            13.0,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 130),
-        );
-        tg_app_core::ui_icons::paint_style_tinted(
-            ui.painter(),
-            Rect::from_center_size(mute_center, Vec2::splat(15.0)),
-            tg_ui::tg_style::st::menu_icon_mute,
-            Color32::WHITE,
-        );
-    } else if !audio_playing {
-        ui.painter().circle_filled(
-            rect.center(),
-            22.0,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 132),
-        );
-        let c = rect.center();
-        let pts = vec![
-            Pos2::new(c.x - 5.0, c.y - 9.0),
-            Pos2::new(c.x + 9.0, c.y),
-            Pos2::new(c.x - 5.0, c.y + 9.0),
-        ];
-        ui.painter()
-            .add(Shape::convex_polygon(pts, Color32::WHITE, Stroke::NONE));
-    }
-
-    // 4. Bottom-left duration + sound pill (matches `history_view_gif.cpp:934-962`).
-    let elapsed_secs = if sound_on && audio_active {
-        (progress * rv.duration_secs as f32).round() as u32
-    } else {
-        rv.duration_secs
-    };
-    let dur_label = if sound_on {
-        format!(
-            "{} · {}",
-            format_duration(elapsed_secs),
-            format!("{:.1}x", audio_speed).replace(".0x", "x")
-        )
-    } else {
-        format_duration(elapsed_secs)
-    };
-    let dur_galley =
-        ui.painter()
-            .layout_no_wrap(dur_label, FontId::proportional(11.0), Color32::WHITE);
-    let sound_icon_w = if sound_on { 14.0 } else { 0.0 };
-    let pill_size = Vec2::new(
-        dur_galley.size().x + 12.0 + sound_icon_w,
-        dur_galley.size().y + 4.0,
-    );
-    let pill_rect = Rect::from_min_size(
-        Pos2::new(
-            circle_rect.left() + 4.0,
-            circle_rect.bottom() - pill_size.y - 2.0,
-        ),
-        pill_size,
-    );
-    ui.painter().rect_filled(
-        pill_rect,
-        CornerRadius::same(8),
-        Color32::from_rgba_unmultiplied(0, 0, 0, 135),
-    );
-    if sound_on {
-        tg_app_core::ui_icons::paint_style_tinted(
-            ui.painter(),
-            Rect::from_center_size(
-                Pos2::new(pill_rect.left() + 11.0, pill_rect.center().y),
-                Vec2::splat(11.0),
-            ),
-            tg_ui::tg_style::st::menu_icon_sound_on,
-            Color32::WHITE,
-        );
-    }
-    ui.painter().galley(
-        Pos2::new(pill_rect.left() + 6.0 + sound_icon_w, pill_rect.top() + 2.0),
-        dur_galley,
-        Color32::WHITE,
-    );
-
-    // 5. Optional spoiler particles overlay with click-to-reveal.
-    let spoiler_hidden = runtime.paint_spoiler_overlay(
-        ui.ctx(),
-        ui.painter(),
-        msg_id,
-        circle_rect,
-        CornerRadius::same((radius.round().min(255.0)) as u8),
-        now_secs,
-    );
-
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    if resp.clicked() && !was_grabbed_this_frame {
-        if spoiler_hidden {
-            runtime.reveal_spoiler(msg_id, now_secs);
-        } else if pointer_in_band
-            && sound_on
-            && let Some(pt) = pointer_pos
-        {
-            let p = crate::history::video_message_seek::VideoMessageSeek::progress_from_point(
-                circle_rect,
-                pt,
-            );
-            runtime.seek_round_video(peer_id, msg_id, sender_name, rv.duration_secs, p);
-        } else {
-            runtime.click_round_video_sound(peer_id, msg_id, sender_name, rv.duration_secs);
+        DecodeOutput::VideoThumb { image, .. } | DecodeOutput::RoundThumb { image, .. } => {
+            image.as_ref().map_or(0, |img| texture_bytes(img.size))
         }
+        DecodeOutput::LottieParsed { .. } => 0,
+        DecodeOutput::LottieFrame { image, .. } => texture_bytes(image.size),
     }
-    let _ = colors;
 }
 
 /// Decodes inline photo bytes into `(width, height, rgba)` via [`tg_media::image::read_image`],
@@ -2108,6 +2407,26 @@ pub fn synthesize_tone_wav(base_hz: f32, duration_secs: f32) -> Vec<u8> {
         pcm.push(sample);
     }
     encode_wav_pcm_s16le(&pcm, sample_rate, 1)
+}
+
+/// `historyFileThumbCancel` (`history_file_cancel.png`): a 10 px cross with 2 px strokes.
+fn paint_cancel_cross(painter: &Painter, center: Pos2, color: Color32) {
+    let half = 5.0;
+    let stroke = Stroke::new(2.0, color);
+    painter.line_segment(
+        [
+            center + Vec2::new(-half, -half),
+            center + Vec2::new(half, half),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(half, -half),
+            center + Vec2::new(-half, half),
+        ],
+        stroke,
+    );
 }
 
 #[cfg(test)]

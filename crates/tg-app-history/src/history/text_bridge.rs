@@ -29,6 +29,14 @@ pub fn entities_to_rich_text(source: &TextWithEntities) -> RichText {
             continue;
         }
         let slice = &source.text[start..end];
+        // Hashtags, cashtags, bot commands and name mentions share their click target with the
+        // block renderer (`tg_ui::entity_link`); the history widget handles them.
+        if let Some(target) =
+            tg_ui::entity_link::entity_link_target(entity.entity_type(), entity.data(), slice)
+        {
+            rich.add_span(start, end, TextEntityKind::Link(target));
+            continue;
+        }
         let kind = match entity.entity_type() {
             EntityType::Bold | EntityType::Semibold => TextEntityKind::Bold,
             EntityType::Italic => TextEntityKind::Italic,
@@ -49,8 +57,10 @@ pub fn entities_to_rich_text(source: &TextWithEntities) -> RichText {
                 let handle = slice.trim_start_matches('@');
                 TextEntityKind::Link(format!("tg://resolve?domain={handle}"))
             }
-            EntityType::Hashtag => TextEntityKind::Link(format!("tg://search?hashtag={slice}")),
-            EntityType::BotCommand => TextEntityKind::Link(format!("tg://bot_command?cmd={slice}")),
+            EntityType::MentionName => TextEntityKind::Link(entity.data().to_owned()),
+            EntityType::TonAddress | EntityType::MediaTimestamp => {
+                TextEntityKind::Link(slice.to_owned())
+            }
             EntityType::Email => TextEntityKind::Link(format!("mailto:{slice}")),
             EntityType::Phone => TextEntityKind::Link(format!("tel:{slice}")),
             EntityType::BankCard => TextEntityKind::Link(format!("bankcard:{slice}")),
@@ -82,12 +92,14 @@ pub fn parse_compose_markdown(raw: &str) -> TextWithEntities {
     with_links
 }
 
-/// Standard message body [`TextStyle`] matching tdesktop's `13.5px` / `19px` line height.
+/// Message body [`TextStyle`]: tdesktop's `historyTextStyle` (`defaultTextStyle`, `msgFont` =
+/// `normalFont` = Open Sans 13px, `lineHeight: 0` so lines are `normalFont->height` = 18px,
+/// the same metric `tg_history::FontMetrics::normal` lays the bubble out with).
 #[must_use]
 pub fn message_text_style() -> TextStyle {
     TextStyle {
-        font: FontSpec::regular(13.5),
-        line_height: 19.0,
+        font: FontSpec::regular(13.0),
+        line_height: 18.0,
         link_underline: LinkUnderline::Active,
     }
 }

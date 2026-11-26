@@ -114,7 +114,7 @@ pub struct DialogVideoUserpic {
     video_photo_id: Option<i64>,
     /// Current state (`Idle` / `Loading` / `Ready` / `Bad`).
     state: VideoUserpicState,
-    /// Circularly masked RGBA frames ready for texture upload.
+    /// Decoded square RGBA frames; the circle is cut when a frame is painted.
     frames: Vec<VideoUserpicFrame>,
     /// Total loop duration in milliseconds.
     total_duration_ms: u64,
@@ -242,7 +242,8 @@ impl DialogVideoUserpic {
         self.cached_texture = None;
     }
 
-    /// Installs decoded frames, applying the circular ellipse mask (`ImageRoundRadius::Ellipse`).
+    /// Installs decoded frames. They stay square: the circle (`ImageRoundRadius::Ellipse`) is
+    /// cut when a frame is painted, at the pixel size it is drawn (TGB-2971).
     pub fn set_decoded_frames(&mut self, raw_frames: Vec<VideoUserpicFrame>) {
         if raw_frames.is_empty() {
             self.state = VideoUserpicState::Bad;
@@ -250,22 +251,21 @@ impl DialogVideoUserpic {
             self.total_duration_ms = 0;
             return;
         }
-        let mut masked = Vec::with_capacity(raw_frames.len());
+        let mut frames = Vec::with_capacity(raw_frames.len());
         let mut total = 0u64;
         for frame in raw_frames {
-            let rgba = apply_ellipse_mask(frame.width, frame.height, &frame.rgba);
-            if let Some(m) =
-                VideoUserpicFrame::new(frame.width, frame.height, rgba, frame.duration_ms)
+            if let Some(valid) =
+                VideoUserpicFrame::new(frame.width, frame.height, frame.rgba, frame.duration_ms)
             {
-                total = total.saturating_add(m.duration_ms);
-                masked.push(m);
+                total = total.saturating_add(valid.duration_ms);
+                frames.push(valid);
             }
         }
-        if masked.is_empty() {
+        if frames.is_empty() {
             self.state = VideoUserpicState::Bad;
             return;
         }
-        self.frames = masked;
+        self.frames = frames;
         self.total_duration_ms = total.max(1);
         self.state = VideoUserpicState::Ready;
         self.cached_texture = None;
@@ -317,16 +317,24 @@ impl DialogVideoUserpic {
             return false;
         };
 
+        // The frame is scaled to the pixels it covers and masked there, like a photo userpic
+        // (`tg_ui::userpic_images::paint_userpic_image`), so the circle's edge is smooth.
+        let pixels_per_point = painter.pixels_per_point();
+        let side = rect.width().min(rect.height());
+        let side_px = (side * pixels_per_point).round().clamp(1.0, 1024.0) as usize;
         let needs_upload = self
             .cached_texture
             .as_ref()
-            .is_none_or(|(cached_idx, _)| *cached_idx != frame_idx);
+            .is_none_or(|(cached_idx, tex)| *cached_idx != frame_idx || tex.size()[0] != side_px);
         if needs_upload {
             let frame = &self.frames[frame_idx];
-            let img = ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
+            let circle = tg_ui::userpic_images::prepare_circle(
+                frame.width as usize,
+                frame.height as usize,
                 &frame.rgba,
+                side_px,
             );
+            let img = ColorImage::from_rgba_premultiplied([side_px, side_px], &circle);
             let tex = ui.ctx().load_texture(
                 format!("dialog_video_userpic_{}_{frame_idx}", self.peer_id.bare()),
                 img,
@@ -336,9 +344,15 @@ impl DialogVideoUserpic {
         }
 
         if let Some((_, ref tex)) = self.cached_texture {
+            let snap = |v: f32| (v * pixels_per_point).round() / pixels_per_point;
+            let center = rect.center();
+            let square = Rect::from_min_size(
+                Pos2::new(snap(center.x - side * 0.5), snap(center.y - side * 0.5)),
+                egui::Vec2::splat(side_px as f32 / pixels_per_point),
+            );
             painter.image(
                 tex.id(),
-                rect,
+                square,
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 egui::Color32::WHITE,
             );

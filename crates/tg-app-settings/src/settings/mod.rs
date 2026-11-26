@@ -560,6 +560,9 @@ impl SettingsController {
     }
 
     fn show_toast(&mut self, ctx: &egui::Context, text: impl Into<String>) {
+        let Some(text) = tg_app_core::user_error::visible_toast_text(text.into()) else {
+            return;
+        };
         self.toasts.show_toast(
             ctx,
             ToastConfig::simple(text)
@@ -797,9 +800,11 @@ impl SettingsController {
                                         self.backend.as_mut(),
                                         &colors,
                                     );
-                                    if out.toggled_dark_mode.is_some() {
-                                        action = Some(SettingsAction::ToggleTheme);
-                                    } else if out.toggled_folders_sidebar {
+                                    // A theme card changes `live_theme`, and the window applies
+                                    // that change. It must not also be reported as a night-mode
+                                    // toggle: the toggle ran after the apply and flipped the
+                                    // chosen dark theme straight back (TGB-2955).
+                                    if out.toggled_folders_sidebar {
                                         action = Some(SettingsAction::ToggleFoldersSidebar);
                                     }
                                     if out.open_shortcuts {

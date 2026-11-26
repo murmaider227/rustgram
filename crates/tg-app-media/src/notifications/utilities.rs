@@ -73,6 +73,13 @@ impl UserpicKey {
         second: 0,
     };
 
+    /// Builds the cache key of a peer's loaded photo `photo_id` (`peer->userpicUniqueKey`): a
+    /// new photo gets a new file, and it never collides with an empty userpic's colour key.
+    #[must_use]
+    pub const fn for_peer_photo(peer_id: i64, photo_id: i64) -> Self {
+        Self::for_peer(peer_id, (photo_id as u64) | (1 << 63))
+    }
+
     /// Builds a cache key for a peer's avatar.
     #[must_use]
     pub const fn for_peer(peer_id: i64, revision: u64) -> Self {
@@ -128,6 +135,26 @@ pub fn generate_userpic(peer: Option<&NotifyPeerInfo>, size: u32) -> RgbaImage {
         draw_initials(&mut img, &letters, fg);
     }
     img
+}
+
+/// The toast image of a peer whose photo is loaded (`PeerData::generateUserpicImage` with a
+/// loaded `userpicCloudImage`): the photo scaled to `size` and masked to a circle, straight
+/// (not premultiplied) RGBA for the PNG.
+#[must_use]
+pub fn userpic_from_photo(photo: &tg_ui::userpic_images::UserpicImage, size: u32) -> RgbaImage {
+    let dim = size.max(16);
+    let side = dim as usize;
+    let mut pixels =
+        tg_ui::userpic_images::prepare_circle(photo.width, photo.height, &photo.rgba, side);
+    for px in pixels.as_chunks_mut::<4>().0 {
+        let alpha = u32::from(px[3]);
+        if alpha > 0 && alpha < 255 {
+            for channel in &mut px[..3] {
+                *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+    RgbaImage::from_rgba(dim, dim, pixels).unwrap_or_else(|_| RgbaImage::transparent(dim, dim))
 }
 
 /// Extracts up to two uppercase ASCII initials from a chat or sender title.
@@ -224,6 +251,18 @@ impl CachedUserpics {
         peer: Option<&NotifyPeerInfo>,
         now_ms: i64,
     ) -> std::io::Result<PathBuf> {
+        self.get_with_photo(key, peer, None, now_ms)
+    }
+
+    /// Like [`Self::get`], drawing the peer's loaded `photo` instead of its empty userpic when
+    /// there is one (key it with [`UserpicKey::for_peer_photo`]).
+    pub fn get_with_photo(
+        &mut self,
+        key: UserpicKey,
+        peer: Option<&NotifyPeerInfo>,
+        photo: Option<&tg_ui::userpic_images::UserpicImage>,
+        now_ms: i64,
+    ) -> std::io::Result<PathBuf> {
         self.sync_default_dir();
         if let Some(existing) = self.images.get_mut(&key) {
             if existing.until_ms != 0 {
@@ -239,7 +278,9 @@ impl CachedUserpics {
         let filename = format!("notify_{}_{:x}.png", std::process::id(), seq);
         let path = self.cache_dir.join(filename);
 
-        let image = if key.first != 0 || key.second != 0 {
+        let image = if let Some(photo) = photo {
+            userpic_from_photo(photo, NOTIFY_USERPIC_SIZE)
+        } else if key.first != 0 || key.second != 0 {
             generate_userpic(peer, NOTIFY_USERPIC_SIZE)
         } else {
             default_app_icon(NOTIFY_USERPIC_SIZE, false, false)

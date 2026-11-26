@@ -616,7 +616,10 @@ impl AppStoriesHost {
     }
 
     fn show_toast(&mut self, msg: impl Into<String>, now_ms: i64) {
-        self.toast_text = Some((msg.into(), now_ms + 3_200));
+        let Some(msg) = tg_app_core::user_error::visible_toast_text(msg.into()) else {
+            return;
+        };
+        self.toast_text = Some((msg, now_ms + 3_200));
     }
 
     /// Dispatches actions emitted by [`StoriesStrip::show`].

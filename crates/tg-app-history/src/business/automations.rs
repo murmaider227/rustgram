@@ -273,7 +273,7 @@ impl GreetingView {
             } else {
                 "Greeting message disabled.".to_owned()
             }),
-            Err(e) => Some(e),
+            Err(e) => tg_app_core::user_error::business_auto_message(&e).into_text(),
         }
     }
 }
@@ -583,7 +583,7 @@ impl AwayMessageView {
             } else {
                 "Away message disabled.".to_owned()
             }),
-            Err(e) => Some(e),
+            Err(e) => tg_app_core::user_error::business_auto_message(&e).into_text(),
         }
     }
 }
@@ -904,7 +904,7 @@ impl ChatbotsView {
                 {
                     match backend.save_chatbots(self.settings.clone()) {
                         Ok(()) => toast = Some("Chatbot permissions and access saved.".to_owned()),
-                        Err(e) => toast = Some(e),
+                        Err(e) => toast = tg_app_core::user_error::business_chatbot(&e).into_text(),
                     }
                 }
             });
@@ -1079,7 +1079,13 @@ impl ChatLinksView {
                                             keep_open = false;
                                             toast = Some("Chat link saved.".to_owned());
                                         }
-                                        Err(e) => toast = Some(e),
+                                        Err(e) => {
+                                            toast = tg_app_core::user_error::business_silent(
+                                                "account.editBusinessChatLink",
+                                                &e,
+                                            )
+                                            .into_text();
+                                        }
                                     }
                                 }
                                 if pill_button(

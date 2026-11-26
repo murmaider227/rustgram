@@ -637,6 +637,8 @@ fn live_available_effects_catalog_send_and_lottie_playback() {
         )
         .expect("send message with live effect");
     assert_eq!(sent.extra.effect_id, Some(99001122334455));
+    let sent = crate::send_wait::wait_sent(&mut h.live, h.peer_id, sent.id);
+    assert_eq!(sent.extra.effect_id, Some(99001122334455));
     let send_raw = &h
         .rpc
         .captured_for(tl_fns::messages::SendMessage::CONSTRUCTOR_ID)[0];

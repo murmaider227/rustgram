@@ -69,6 +69,7 @@ pub fn handle_wallet_deep_link(
     controller: &mut WindowController,
 ) {
     if let Err(err) = AppWalletHost::handle_deep_link_action(ctx, action) {
-        controller.show_toast(err);
+        // local error: the wallet is off or the TonConnect link is malformed (no Telegram request)
+        controller.show_toast(err); // local error: see above
     }
 }

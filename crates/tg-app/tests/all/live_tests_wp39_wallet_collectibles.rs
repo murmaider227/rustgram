@@ -324,6 +324,9 @@ impl RpcClient for FakeRpcClient {
             let mut q = self.responses.lock().expect("responses");
             if let Some(pos) = q.iter().position(|(c, _)| *c == ctor) {
                 q.remove(pos).map(|(_, r)| r)
+            } else if crate::common::is_background_list_request(ctor) {
+                // Never the answer a test queued for another request (TGB-2941).
+                None
             } else {
                 q.pop_front().map(|(_, r)| r)
             }
@@ -837,6 +840,7 @@ fn wp39_fragment_get_collectible_info_fake_rpc_and_modal() {
         is_online: true,
         verified: false,
         premium: true,
+        emoji_status_id: None,
         color_index: 2,
         phone: Some("+888 0123 4567".to_owned()),
         usernames: vec![

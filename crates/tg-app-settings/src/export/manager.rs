@@ -140,15 +140,11 @@ impl SettingsStore for QtFileSettingsStore {
 #[must_use]
 pub fn default_export_download_path() -> String {
     if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
-        let p = PathBuf::from(profile)
-            .join("Downloads")
-            .join("Telegram Desktop");
+        let p = PathBuf::from(profile).join("Downloads").join("Rustgram");
         return p.to_string_lossy().into_owned();
     }
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        let p = PathBuf::from(home)
-            .join("Downloads")
-            .join("Telegram Desktop");
+        let p = PathBuf::from(home).join("Downloads").join("Rustgram");
         return p.to_string_lossy().into_owned();
     }
     std::env::temp_dir()

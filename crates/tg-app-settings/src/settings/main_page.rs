@@ -505,7 +505,8 @@ pub fn render_main_settings_page_with_extras(
         let av_resp = ui.interact(av_rect, ui.scope_id().with("cover_photo"), Sense::click());
         let userpic =
             EmptyUserpic::for_color_index(profile.photo_color_index, &profile.full_name(), colors);
-        userpic.paint_circle(ui.painter(), av_rect);
+        // A user's full peer id is its bare id (`peerFromUser`).
+        userpic.paint_circle_or_photo(ui.painter(), av_rect, profile.user_id as i64);
         if av_resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }

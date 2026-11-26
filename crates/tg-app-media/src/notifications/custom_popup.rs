@@ -620,32 +620,42 @@ impl CustomPopupManager {
                                     Vec2::splat(NOTIFY_PHOTO_SIZE),
                                     Sense::hover(),
                                 );
-                                let avatar_color = if card.content.hide_name_and_photo {
-                                    active_bg
-                                } else {
-                                    Color32::from_rgb(
-                                        card.content.avatar_rgb[0],
-                                        card.content.avatar_rgb[1],
-                                        card.content.avatar_rgb[2],
-                                    )
-                                };
-                                ui.painter().circle_filled(
-                                    avatar_rect.center(),
-                                    NOTIFY_PHOTO_SIZE * 0.5,
-                                    avatar_color,
-                                );
-                                let avatar_text = if card.content.hide_name_and_photo {
-                                    strings::APP_MONOGRAM
-                                } else {
-                                    card.content.initials.as_str()
-                                };
-                                ui.painter().text(
-                                    avatar_rect.center(),
-                                    Align2::CENTER_CENTER,
-                                    avatar_text,
-                                    egui::FontId::proportional(20.0),
-                                    Color32::WHITE,
-                                );
+                                // `Notification::updateNotifyDisplay`: the peer's photo
+                                // userpic once loaded, unless names and photos are hidden.
+                                let photo_painted = !card.content.hide_name_and_photo
+                                    && tg_ui::userpic_images::paint_userpic_image(
+                                        ui.painter(),
+                                        avatar_rect,
+                                        card_id.context.peer_id,
+                                    );
+                                if !photo_painted {
+                                    let avatar_color = if card.content.hide_name_and_photo {
+                                        active_bg
+                                    } else {
+                                        Color32::from_rgb(
+                                            card.content.avatar_rgb[0],
+                                            card.content.avatar_rgb[1],
+                                            card.content.avatar_rgb[2],
+                                        )
+                                    };
+                                    ui.painter().circle_filled(
+                                        avatar_rect.center(),
+                                        NOTIFY_PHOTO_SIZE * 0.5,
+                                        avatar_color,
+                                    );
+                                    let avatar_text = if card.content.hide_name_and_photo {
+                                        strings::APP_MONOGRAM
+                                    } else {
+                                        card.content.initials.as_str()
+                                    };
+                                    ui.painter().text(
+                                        avatar_rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        avatar_text,
+                                        egui::FontId::proportional(20.0),
+                                        Color32::WHITE,
+                                    );
+                                }
 
                                 ui.add_space(6.0);
 

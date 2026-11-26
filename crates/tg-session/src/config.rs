@@ -3,9 +3,11 @@
 //! Port origin: `main/main_account.cpp` (`Account::startMtp`), `mtproto/session_private.cpp`
 //! (`prepareInitParams`), and `core/application.cpp` (app metadata).
 //!
-//! Credentials (`api_id` and `api_hash`) are never embedded in code; they are always
-//! read from `RUSTGRAM_API_ID` and `RUSTGRAM_API_HASH` (with legacy `TGFORK_API_ID` /
-//! `TGFORK_API_HASH` fallback) at runtime or injected by the caller.
+//! Credentials (`api_id` and `api_hash`) are never committed to the repository. They are read
+//! from `RUSTGRAM_API_ID` and `RUSTGRAM_API_HASH` (with legacy `TGFORK_API_ID` /
+//! `TGFORK_API_HASH` fallback) at runtime; a release build may also compile them in from the
+//! same `RUSTGRAM_*` variables set at build time (like tdesktop's official builds), and the
+//! runtime variables override those.
 
 use tg_api::ApiCredentials;
 use tg_core::domain::Environment as CoreEnvironment;
@@ -31,8 +33,69 @@ pub const LEGACY_ENV_API_HASH: &str = "TGFORK_API_HASH";
 /// Default initial Telegram DC ID (`DC 2`) when none is stored yet.
 pub const DEFAULT_MAIN_DC_ID: DcId = 2;
 
+/// `api_id` compiled in from `RUSTGRAM_API_ID` at build time (release builds with secrets).
+const EMBEDDED_API_ID: Option<&str> = option_env!("RUSTGRAM_API_ID");
+
+/// `api_hash` compiled in from `RUSTGRAM_API_HASH` at build time (release builds with secrets).
+const EMBEDDED_API_HASH: Option<&str> = option_env!("RUSTGRAM_API_HASH");
+
+/// Where [`load_api_credentials`] found the credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiCredentialsSource {
+    /// `RUSTGRAM_API_ID` / `RUSTGRAM_API_HASH` (or the legacy names) at runtime.
+    Environment,
+    /// Values compiled into this build.
+    Embedded,
+}
+
+/// Returns `true` when this build carries compiled-in credentials (values are not exposed).
+#[must_use]
+pub fn has_embedded_api_credentials() -> bool {
+    load_api_credentials_from_vars(EMBEDDED_API_ID, EMBEDDED_API_HASH).is_ok()
+}
+
+/// Reads the credentials the app should use: the runtime environment first, then the values
+/// compiled into this build. Fails with [`SessionError::MissingEnvVar`] when neither has them.
+pub fn load_api_credentials() -> Result<ApiCredentials> {
+    let id_raw = env_var_with_fallback(ENV_API_ID, LEGACY_ENV_API_ID);
+    let hash_raw = env_var_with_fallback(ENV_API_HASH, LEGACY_ENV_API_HASH);
+    resolve_api_credentials(
+        id_raw.as_deref(),
+        hash_raw.as_deref(),
+        EMBEDDED_API_ID,
+        EMBEDDED_API_HASH,
+    )
+    .map(|(creds, _)| creds)
+}
+
+/// Returns `true` when [`load_api_credentials`] would succeed.
+#[must_use]
+pub fn api_credentials_available() -> bool {
+    load_api_credentials().is_ok()
+}
+
+/// Resolution order behind [`load_api_credentials`]: runtime values win when either of them is
+/// set (an invalid runtime pair is an error, not a silent fallback), then the embedded pair.
+pub fn resolve_api_credentials(
+    env_id: Option<&str>,
+    env_hash: Option<&str>,
+    embedded_id: Option<&str>,
+    embedded_hash: Option<&str>,
+) -> Result<(ApiCredentials, ApiCredentialsSource)> {
+    let present = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
+    if present(env_id) || present(env_hash) {
+        return load_api_credentials_from_vars(env_id, env_hash)
+            .map(|c| (c, ApiCredentialsSource::Environment));
+    }
+    if present(embedded_id) || present(embedded_hash) {
+        return load_api_credentials_from_vars(embedded_id, embedded_hash)
+            .map(|c| (c, ApiCredentialsSource::Embedded));
+    }
+    load_api_credentials_from_vars(None, None).map(|c| (c, ApiCredentialsSource::Environment))
+}
+
 /// Reads Telegram `ApiCredentials` from `RUSTGRAM_API_ID` and `RUSTGRAM_API_HASH`
-/// (falling back to `TGFORK_API_ID` and `TGFORK_API_HASH`).
+/// (falling back to `TGFORK_API_ID` and `TGFORK_API_HASH`) only, ignoring compiled-in values.
 pub fn load_api_credentials_from_env() -> Result<ApiCredentials> {
     let id_raw = env_var_with_fallback(ENV_API_ID, LEGACY_ENV_API_ID);
     let hash_raw = env_var_with_fallback(ENV_API_HASH, LEGACY_ENV_API_HASH);
@@ -141,6 +204,35 @@ fn non_empty_or(value: String, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_resolution_prefers_env_then_embedded() {
+        let (c, src) =
+            resolve_api_credentials(Some("111"), Some("envhash"), Some("222"), Some("embhash"))
+                .expect("env pair");
+        assert_eq!(
+            (c.api_id, c.api_hash.as_str(), src),
+            (111, "envhash", ApiCredentialsSource::Environment)
+        );
+
+        let (c, src) = resolve_api_credentials(None, Some("  "), Some("222"), Some("embhash"))
+            .expect("embedded pair");
+        assert_eq!(
+            (c.api_id, c.api_hash.as_str(), src),
+            (222, "embhash", ApiCredentialsSource::Embedded)
+        );
+
+        assert!(matches!(
+            resolve_api_credentials(None, None, None, None),
+            Err(SessionError::MissingEnvVar(ENV_API_ID))
+        ));
+        // A half-set runtime pair is an error rather than a silent switch to the embedded pair.
+        assert!(matches!(
+            resolve_api_credentials(Some("111"), None, Some("222"), Some("embhash")),
+            Err(SessionError::MissingEnvVar(ENV_API_HASH))
+        ));
+        assert!(resolve_api_credentials(None, None, Some("0"), Some("embhash")).is_err());
+    }
 
     #[test]
     fn api_credentials_validation() {

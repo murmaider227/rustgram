@@ -1370,8 +1370,13 @@ mod win_tray {
             .map_err(|e| PlatformError::from_win("PostMessageW(tray)", e))
         }
 
+        // The app sets the unread state and tooltip every frame; the tray thread rebuilds the
+        // icon only when one of them changed.
         pub(crate) fn set_unread(&self, count: u32, muted: bool) -> Result<()> {
             if let Ok(mut g) = self.shared.lock() {
+                if g.config.unread_count == count && g.config.muted == muted {
+                    return Ok(());
+                }
                 g.config.unread_count = count;
                 g.config.muted = muted;
             }
@@ -1380,6 +1385,9 @@ mod win_tray {
 
         pub(crate) fn set_monochrome(&self, monochrome: bool) -> Result<()> {
             if let Ok(mut g) = self.shared.lock() {
+                if g.config.monochrome == monochrome {
+                    return Ok(());
+                }
                 g.config.monochrome = monochrome;
             }
             self.notify_update(WM_TRAY_UPDATE)
@@ -1387,6 +1395,9 @@ mod win_tray {
 
         pub(crate) fn set_tooltip(&self, tooltip: String) -> Result<()> {
             if let Ok(mut g) = self.shared.lock() {
+                if g.config.tooltip.as_deref() == Some(tooltip.as_str()) {
+                    return Ok(());
+                }
                 g.config.tooltip = Some(tooltip);
             }
             self.notify_update(WM_TRAY_UPDATE)

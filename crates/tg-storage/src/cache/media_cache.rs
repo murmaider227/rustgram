@@ -470,6 +470,34 @@ impl MediaCacheIndex {
 
     /// Read and decrypt a cached blob by `key`, updating its `last_accessed` timestamp.
     pub fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.read_blob(key, true)
+    }
+
+    /// Like [`Self::get_blob`] without the `last_accessed` write: the caller records the access
+    /// later with [`Self::touch_keys`], which batches many reads into one transaction.
+    pub fn get_blob_deferred_touch(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.read_blob(key, false)
+    }
+
+    /// Sets `last_accessed` to now for every key in `keys` (cache keys as given to
+    /// [`Self::put_blob`]) in one transaction; returns the number of rows updated.
+    pub fn touch_keys<'a>(&self, keys: impl IntoIterator<Item = &'a str>) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = now_unix_secs();
+        let mut updated = 0usize;
+        {
+            let mut stmt =
+                tx.prepare_cached("UPDATE media_cache SET last_accessed = ?1 WHERE key = ?2")?;
+            for key in keys {
+                let db_key = encode_hex(&keyed_entry_id(&self.key, key));
+                updated += stmt.execute(params![now, db_key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    fn read_blob(&self, key: &str, touch: bool) -> Result<Option<Vec<u8>>> {
         let entry_id = keyed_entry_id(&self.key, key);
         let db_key = encode_hex(&entry_id);
         let enc_rel_path: Option<String> = self
@@ -494,10 +522,12 @@ impl MediaCacheIndex {
                 let full_path = root_dir.join(&rel);
                 match read_encrypted_blob_bound(&full_path, &self.key, &entry_id) {
                     Ok(bytes) => {
-                        let _ = self.conn.execute(
-                            "UPDATE media_cache SET last_accessed = ?1 WHERE key = ?2",
-                            params![now_unix_secs(), db_key],
-                        );
+                        if touch {
+                            let _ = self.conn.execute(
+                                "UPDATE media_cache SET last_accessed = ?1 WHERE key = ?2",
+                                params![now_unix_secs(), db_key],
+                            );
+                        }
                         Ok(Some(bytes))
                     }
                     Err(StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -524,7 +554,7 @@ impl MediaCacheIndex {
             }
             CacheBackend::MemoryOnly { blobs } => {
                 let maybe = blobs.lock().ok().and_then(|g| g.get(&rel).cloned());
-                if maybe.is_some() {
+                if touch && maybe.is_some() {
                     let _ = self.conn.execute(
                         "UPDATE media_cache SET last_accessed = ?1 WHERE key = ?2",
                         params![now_unix_secs(), db_key],
@@ -1743,5 +1773,73 @@ mod tests {
         assert!(!old_part.exists());
         assert!(!old_meta.exists());
         assert!(current.exists(), "current-format names are kept");
+    }
+}
+
+#[cfg(test)]
+mod tests_deferred_touch {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn last_accessed(cache: &MediaCacheIndex, key: &str) -> i64 {
+        let db_key = encode_hex(&keyed_entry_id(cache.encryption_key(), key));
+        cache
+            .conn
+            .query_row(
+                "SELECT last_accessed FROM media_cache WHERE key = ?1",
+                params![db_key],
+                |row| row.get(0),
+            )
+            .expect("row")
+    }
+
+    #[test]
+    fn deferred_reads_keep_lru_order_until_the_batched_touch() {
+        let dir = TempDir::new().expect("tempdir");
+        let cache = MediaCacheIndex::open(dir.path()).expect("open");
+        cache
+            .put_blob("photo:2:1:x", MediaCacheTag::Photo, &[1u8; 400])
+            .expect("put a");
+        cache
+            .put_blob("photo:2:2:x", MediaCacheTag::Photo, &[2u8; 400])
+            .expect("put b");
+        cache
+            .conn
+            .execute("UPDATE media_cache SET last_accessed = 1000", [])
+            .expect("age rows");
+
+        // The read itself writes nothing.
+        assert_eq!(
+            cache
+                .get_blob_deferred_touch("photo:2:1:x")
+                .expect("read")
+                .as_deref(),
+            Some(&[1u8; 400][..])
+        );
+        assert_eq!(last_accessed(&cache, "photo:2:1:x"), 1000);
+
+        // One batched touch records it; an unknown key updates nothing.
+        assert_eq!(
+            cache
+                .touch_keys(["photo:2:1:x", "photo:2:404:x"])
+                .expect("touch"),
+            1
+        );
+        assert!(last_accessed(&cache, "photo:2:1:x") > 1000);
+
+        // LRU pruning now evicts the untouched entry, exactly like after a touching get_blob.
+        assert_eq!(cache.prune(Some(400), None).expect("prune"), 1);
+        assert!(
+            cache
+                .get_blob_deferred_touch("photo:2:1:x")
+                .expect("a")
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_blob_deferred_touch("photo:2:2:x")
+                .expect("b")
+                .is_none()
+        );
     }
 }

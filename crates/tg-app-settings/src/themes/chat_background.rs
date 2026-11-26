@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use egui::{
     Color32, ColorImage, Context, CornerRadius, Id, Pos2, Rect, TextureHandle, TextureOptions, Ui,
@@ -53,6 +53,10 @@ const PATTERN_MASK_SIZE: u32 = 256;
 const PATTERN_ASPECT: f32 = 1440.0 / 2960.0;
 /// Largest side a full-size pattern wallpaper texture is rendered at.
 const MAX_PATTERN_RENDER_SIDE: f32 = 2048.0;
+/// Most GPU textures [`ChatBackground`] keeps (least recently used are dropped first).
+const MAX_CACHED_TEXTURES: usize = 24;
+/// Most area-sized pattern textures kept among [`MAX_CACHED_TEXTURES`] (each can be 2048 px).
+const MAX_CACHED_SIZED_TEXTURES: usize = 6;
 /// Night-mode default chat background (`night.tdesktop-theme` ships a 1x1 `#0e1621`).
 const NIGHT_DEFAULT_BACKGROUND: Color32 = Color32::from_rgb(0x0e, 0x16, 0x21);
 
@@ -347,8 +351,8 @@ impl BackgroundConfig {
             .map_or(0usize, |img| Arc::as_ptr(img) as usize);
         let pattern_bytes_hash = self
             .pattern_bytes
-            .as_deref()
-            .map_or(0u64, |bytes| hash_pattern_bytes(bytes));
+            .as_ref()
+            .map_or(0u64, pattern_bytes_hash_cached);
         BackgroundCacheKey {
             colors: self.wallpaper.background_colors.clone(),
             rotation: self.wallpaper.rotation,
@@ -384,11 +388,64 @@ struct BackgroundCacheKey {
     dark_mode: bool,
 }
 
+impl BackgroundCacheKey {
+    /// Same wallpaper, colours and mode, rendered at any size.
+    fn same_look(&self, other: &Self) -> bool {
+        Self {
+            width: other.width,
+            height: other.height,
+            ..self.clone()
+        } == *other
+    }
+}
+
+/// A cached GPU texture and when it was last drawn.
+struct CachedTexture {
+    handle: TextureHandle,
+    /// Rendered at the chat area's size (pattern wallpapers), not the square motion size.
+    sized: bool,
+    last_used: u64,
+}
+
+/// A pattern wallpaper being rendered at a new area size on a worker thread.
+struct PendingRender {
+    key: BackgroundCacheKey,
+    result: mpsc::Receiver<ColorImage>,
+}
+
 fn hash_pattern_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.len().hash(&mut hasher);
     bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+/// [`hash_pattern_bytes`] of `bytes`, computed once per buffer.
+///
+/// The cache key is built on every painted frame and the Classic pattern is 184 KB, so hashing
+/// it each time cost more than painting the messages of the chat (TGB-2930). A pattern buffer
+/// is a shared `Arc` whose bytes do not change, so its hash is kept. The cache holds the `Arc`
+/// itself: the address it is compared by cannot be reused by another buffer, and a buffer
+/// modified through `Arc::make_mut` becomes a new allocation with its own entry.
+fn pattern_bytes_hash_cached(bytes: &Arc<Vec<u8>>) -> u64 {
+    /// Most buffers remembered (the global wallpaper plus per-chat and preview ones).
+    const KEPT: usize = 8;
+    thread_local! {
+        static KNOWN: std::cell::RefCell<Vec<(Arc<Vec<u8>>, u64)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    KNOWN.with(|known| {
+        let mut known = known.borrow_mut();
+        if let Some((_, hash)) = known.iter().find(|(kept, _)| Arc::ptr_eq(kept, bytes)) {
+            return *hash;
+        }
+        let hash = hash_pattern_bytes(bytes);
+        if known.len() >= KEPT {
+            known.remove(0);
+        }
+        known.push((Arc::clone(bytes), hash));
+        hash
+    })
 }
 
 /// Live chat background manager exposing a clean rendering API for `history/` and previews.
@@ -404,7 +461,13 @@ pub struct ChatBackground {
     per_peer: HashMap<i64, BackgroundConfig>,
     pattern_masks: HashMap<PatternKind, Arc<RgbaImage>>,
     svg_pattern_masks: HashMap<(u64, u32), Arc<RgbaImage>>,
-    texture_cache: HashMap<BackgroundCacheKey, TextureHandle>,
+    texture_cache: HashMap<BackgroundCacheKey, CachedTexture>,
+    use_tick: u64,
+    pending_render: Option<PendingRender>,
+    queued_render: Option<(BackgroundConfig, BackgroundCacheKey)>,
+    /// Area-sized renders done on the UI thread (tests check resizes add none).
+    #[cfg(test)]
+    sync_renders: u64,
     motion_rotation_add: i32,
     motion_anim_progress: f32,
     motion_animating: bool,
@@ -428,6 +491,11 @@ impl ChatBackground {
             pattern_masks: HashMap::new(),
             svg_pattern_masks: HashMap::new(),
             texture_cache: HashMap::new(),
+            use_tick: 0,
+            pending_render: None,
+            queued_render: None,
+            #[cfg(test)]
+            sync_renders: 0,
             motion_rotation_add: 0,
             motion_anim_progress: 1.0,
             motion_animating: false,
@@ -769,8 +837,8 @@ impl ChatBackground {
             0
         };
         let key = config.cache_key(rot_add, render_size, render_size, self.dark_mode);
-        if let Some(existing) = self.texture_cache.get(&key) {
-            return existing.clone();
+        if let Some(existing) = self.cached_texture(&key) {
+            return existing;
         }
         let rgba = self.render_image(config, render_size, render_size, rot_add);
         let color_image = rgba_to_color_image(&rgba);
@@ -788,34 +856,145 @@ impl ChatBackground {
             self.texture_cache.len()
         );
         let handle = ctx.load_texture(name, color_image, options);
-        self.texture_cache.insert(key, handle.clone());
-        self.trim_cache();
+        self.insert_texture(key, handle.clone(), false);
         handle
     }
 
-    /// Obtains (or renders and uploads) a `width`x`height` texture for `config`; used for
-    /// pattern wallpapers, which tdesktop renders at the real area size.
+    /// Obtains a `width`x`height` texture for `config`; used for pattern wallpapers, which
+    /// tdesktop renders at the real area size. Returns the texture and whether it has exactly
+    /// that size.
+    ///
+    /// The first size of a wallpaper renders here. A later size (the area was resized, or a chat
+    /// with other bars opened) renders on a worker thread while the closest cached size of the
+    /// same wallpaper stands in, so the frame does not wait 35-50 ms for the rasterizer.
     fn texture_for_config_sized(
         &mut self,
         ctx: &Context,
         config: &BackgroundConfig,
         width: u32,
         height: u32,
-    ) -> TextureHandle {
+    ) -> (TextureHandle, bool) {
+        self.poll_background_render(ctx);
         let key = config.cache_key(0, width, height, self.dark_mode);
-        if let Some(existing) = self.texture_cache.get(&key) {
-            return existing.clone();
+        if let Some(existing) = self.cached_texture(&key) {
+            return (existing, true);
+        }
+        if let Some(stand_in) = self.closest_same_look(&key) {
+            self.request_background_render(ctx, config, key);
+            return (stand_in, false);
+        }
+        #[cfg(test)]
+        {
+            self.sync_renders += 1;
         }
         let rgba = self.render_image(config, width, height, 0);
+        let handle = self.upload_sized(ctx, rgba_to_color_image(&rgba));
+        self.insert_texture(key, handle.clone(), true);
+        (handle, true)
+    }
+
+    fn upload_sized(&self, ctx: &Context, image: ColorImage) -> TextureHandle {
         let name = format!(
             "tg_chat_bg_{}_{}",
             self.generation,
             self.texture_cache.len()
         );
-        let handle = ctx.load_texture(name, rgba_to_color_image(&rgba), TextureOptions::LINEAR);
-        self.texture_cache.insert(key, handle.clone());
+        ctx.load_texture(name, image, TextureOptions::LINEAR)
+    }
+
+    fn cached_texture(&mut self, key: &BackgroundCacheKey) -> Option<TextureHandle> {
+        self.use_tick += 1;
+        let tick = self.use_tick;
+        self.texture_cache.get_mut(key).map(|entry| {
+            entry.last_used = tick;
+            entry.handle.clone()
+        })
+    }
+
+    /// The cached size of the same wallpaper closest to `key`'s size.
+    fn closest_same_look(&mut self, key: &BackgroundCacheKey) -> Option<TextureHandle> {
+        let distance =
+            |k: &BackgroundCacheKey| k.width.abs_diff(key.width) + k.height.abs_diff(key.height);
+        let found = self
+            .texture_cache
+            .keys()
+            .filter(|k| k.same_look(key))
+            .min_by_key(|k| distance(k))?
+            .clone();
+        self.cached_texture(&found)
+    }
+
+    fn insert_texture(&mut self, key: BackgroundCacheKey, handle: TextureHandle, sized: bool) {
+        self.use_tick += 1;
+        self.texture_cache.insert(
+            key,
+            CachedTexture {
+                handle,
+                sized,
+                last_used: self.use_tick,
+            },
+        );
         self.trim_cache();
-        handle
+    }
+
+    /// Renders `key`'s size of `config` on a worker thread; while one render runs, only the
+    /// latest further request is kept.
+    fn request_background_render(
+        &mut self,
+        ctx: &Context,
+        config: &BackgroundConfig,
+        key: BackgroundCacheKey,
+    ) {
+        if let Some(pending) = &self.pending_render {
+            if pending.key != key {
+                self.queued_render = Some((config.clone(), key));
+            }
+            return;
+        }
+        self.start_background_render(ctx, config.clone(), key);
+    }
+
+    fn start_background_render(
+        &mut self,
+        ctx: &Context,
+        config: BackgroundConfig,
+        key: BackgroundCacheKey,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let (width, height) = (key.width, key.height);
+        let spawned = std::thread::Builder::new()
+            .name("tg-chat-bg-render".to_owned())
+            .spawn(move || {
+                let rgba = ChatBackground::new().render_image(&config, width, height, 0);
+                if tx.send(rgba_to_color_image(&rgba)).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+        if spawned.is_ok() {
+            self.pending_render = Some(PendingRender { key, result: rx });
+        }
+    }
+
+    /// Uploads a finished worker render and starts the queued one, if any.
+    fn poll_background_render(&mut self, ctx: &Context) {
+        if let Some(pending) = &self.pending_render {
+            match pending.result.try_recv() {
+                Ok(image) => {
+                    let handle = self.upload_sized(ctx, image);
+                    if let Some(done) = self.pending_render.take() {
+                        self.insert_texture(done.key, handle, true);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => self.pending_render = None,
+            }
+        }
+        if let Some((config, key)) = self.queued_render.take()
+            && !self.texture_cache.contains_key(&key)
+        {
+            self.start_background_render(ctx, config, key);
+        }
     }
 
     /// Whether `config` is the stock default wallpaper (no user choice was made).
@@ -837,13 +1016,9 @@ impl ChatBackground {
         }
         if cfg.custom_image.is_none() && cfg.wallpaper.is_pattern() && cfg.has_svg_pattern() {
             let side = (area_side.clamp(64.0, MAX_PATTERN_RENDER_SIDE) / 16.0).ceil() as u32 * 16;
-            let tex = self.texture_for_config_sized(ui.ctx(), &cfg, side, side);
-            ui.painter().image(
-                tex.id(),
-                rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            let (tex, exact) = self.texture_for_config_sized(ui.ctx(), &cfg, side, side);
+            ui.painter()
+                .image(tex.id(), rect, sized_uv(rect, &tex, exact), Color32::WHITE);
         } else {
             self.paint_config(ui, rect, &cfg, self.dark_mode);
         }
@@ -907,13 +1082,10 @@ impl ChatBackground {
             }
             // Quantize so small resizes reuse the cached texture.
             let quant = |v: f32| (((v.max(16.0) / 16.0).ceil()) * 16.0) as u32;
-            let tex = self.texture_for_config_sized(ui.ctx(), config, quant(px_w), quant(px_h));
-            ui.painter().image(
-                tex.id(),
-                rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            let (tex, exact) =
+                self.texture_for_config_sized(ui.ctx(), config, quant(px_w), quant(px_h));
+            ui.painter()
+                .image(tex.id(), rect, sized_uv(rect, &tex, exact), Color32::WHITE);
             return;
         }
 
@@ -986,11 +1158,37 @@ impl ChatBackground {
         }
     }
 
+    /// Drops least recently used textures above [`MAX_CACHED_TEXTURES`], and area-sized ones
+    /// above [`MAX_CACHED_SIZED_TEXTURES`].
     fn trim_cache(&mut self) {
-        if self.texture_cache.len() > 24 {
-            self.texture_cache.clear();
+        loop {
+            let sized = self.texture_cache.values().filter(|t| t.sized).count();
+            let only_sized = sized > MAX_CACHED_SIZED_TEXTURES;
+            if !only_sized && self.texture_cache.len() <= MAX_CACHED_TEXTURES {
+                return;
+            }
+            let Some(oldest) = self
+                .texture_cache
+                .iter()
+                .filter(|(_, t)| t.sized || !only_sized)
+                .min_by_key(|(_, t)| t.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                return;
+            };
+            self.texture_cache.remove(&oldest);
         }
     }
+}
+
+/// UV rect for an area-sized texture: all of it when it has the requested size, else the
+/// centred part that covers `rect` at the texture's own aspect (scaled evenly, never stretched).
+fn sized_uv(rect: Rect, tex: &TextureHandle, exact: bool) -> Rect {
+    if exact {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let [tw, th] = tex.size();
+    aspect_fill_uv(rect.width(), rect.height(), tw as f32, th as f32)
 }
 
 /// Converts an `image::RgbaImage` into an `egui::ColorImage`.
@@ -1425,5 +1623,41 @@ fn render_constellation_pattern(img: &mut RgbaImage) {
     for &(x, y, r) in nodes {
         draw_disc_aa(img, x * s, y * s, r * s, 220.0);
         draw_ring_aa(img, x * s, y * s, (r + 3.5) * s, 1.2 * s, 130.0);
+    }
+}
+
+#[cfg(test)]
+#[path = "chat_background_tests.rs"]
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod pattern_hash_tests {
+    use super::*;
+
+    #[test]
+    fn the_kept_hash_is_the_hash_of_the_bytes() {
+        let classic = classic_pattern_bytes();
+        let expected = hash_pattern_bytes(&classic);
+        assert_eq!(pattern_bytes_hash_cached(&classic), expected);
+        assert_eq!(pattern_bytes_hash_cached(&classic), expected);
+
+        // Another buffer has its own hash, and more buffers than the cache keeps still do.
+        for seed in 0u8..20 {
+            let other = Arc::new(vec![seed; 64]);
+            assert_eq!(
+                pattern_bytes_hash_cached(&other),
+                hash_pattern_bytes(&other)
+            );
+        }
+        assert_eq!(pattern_bytes_hash_cached(&classic), expected);
+
+        // Changing a buffer the cache knows makes a new allocation, so the old hash is not reused.
+        let mut edited = Arc::new(vec![7u8; 64]);
+        let before = pattern_bytes_hash_cached(&edited);
+        Arc::make_mut(&mut edited)[0] = 8;
+        let after = pattern_bytes_hash_cached(&edited);
+        assert_eq!(after, hash_pattern_bytes(&edited));
+        assert_ne!(before, after);
     }
 }

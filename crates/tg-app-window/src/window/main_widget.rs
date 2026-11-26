@@ -200,6 +200,8 @@ pub enum MainWidgetAction {
     },
     /// Show an informational toast.
     Toast(String),
+    /// Show a failed request as tdesktop does there (a box or the Premium screen).
+    UserError(tg_app_core::user_error::UserFacingError),
     /// Column widths changed and should be persisted.
     PersistSettings,
 }
@@ -249,6 +251,9 @@ pub struct MainWidget {
     history: HistoryWidget,
     /// The chat last passed to `AppSession::prepare_open_chat`.
     prepared_chat: PeerId,
+    /// Open chat and `DialogsBackend::dialogs_version` the next-unread-channel hint was found
+    /// for: the chat list is searched again only when one of them changes (TGB-2949).
+    next_unread_channel_key: Option<(PeerId, u64)>,
     main_info: InfoWrapWidget,
     third_info: InfoWrapWidget,
     settings: Option<SettingsController>,
@@ -274,6 +279,8 @@ pub struct MainWidget {
     /// Wallpaper painter for the empty chat pane (`HistoryWidget::paintEvent` without a peer).
     empty_background: ChatBackground,
     empty_background_dark: Option<bool>,
+    /// The system dark-mode value the window read this frame, handed to Chat settings.
+    pub(super) system_dark_mode: Option<bool>,
     /// Whether this frame renders Settings as a centered layer instead of a main section.
     settings_as_layer: bool,
     /// Whether the Settings layer's top-bar menu (`Settings::Main::fillTopBarMenu`) is open.
@@ -311,6 +318,7 @@ impl MainWidget {
             dialogs: DialogsPanel::new(),
             history,
             prepared_chat: PeerId::ZERO,
+            next_unread_channel_key: None,
             main_info: InfoWrapWidget::for_peer(PeerId::ZERO),
             third_info: InfoWrapWidget::for_peer(PeerId::ZERO),
             settings: None,
@@ -331,6 +339,7 @@ impl MainWidget {
             dragging_third_splitter: false,
             empty_background: ChatBackground::new(),
             empty_background_dark: None,
+            system_dark_mode: None,
             settings_as_layer: false,
             settings_layer_menu_open: false,
             tabbed_docked: false,
@@ -1133,6 +1142,14 @@ impl MainWidget {
                 strings,
             ) {
                 self.handle_dialogs_action(act, session, session_backend, now_ms, actions);
+                // The list above was painted with the chat open before this click; the history
+                // below paints the chat it opened. Run the pass again (without the input) so the
+                // shown frame highlights the same chat the history shows, as tdesktop repaints
+                // both together.
+                if session.active_peer() != active_peer {
+                    ui.ctx()
+                        .request_discard("the chat list painted the chat open before the click");
+                }
             }
         });
     }
@@ -1148,7 +1165,9 @@ impl MainWidget {
         match act {
             DialogsPanelAction::OpenMainMenu => actions.push(MainWidgetAction::OpenMainMenu),
             DialogsPanelAction::SelectPeer(peer_id) => {
-                Backend::mark_read(session_backend, peer_id);
+                // Not `mark_read`: like `HistoryInner::readTill`, only the messages shown on
+                // screen are read, so the unread bar and counter survive until they are seen.
+                let reselected = self.history.active_peer() == peer_id;
                 session.show_peer_history(
                     peer_id,
                     SectionShow::clear_stack(),
@@ -1161,13 +1180,16 @@ impl MainWidget {
                     self.history.close_section();
                 }
                 self.history.close_monoforum_section();
-                self.history.request_scroll_to_bottom(peer_id);
+                // A click on the open chat jumps to its end; a newly opened chat is positioned
+                // by `ShowAtUnreadMsgId` (first unread message or the bottom).
+                if reselected {
+                    self.history.request_scroll_to_bottom(peer_id);
+                }
                 self.tabbed_panel.hide_fast();
                 self.autocomplete.dismiss();
                 self.last_jumped_msg = None;
             }
             DialogsPanelAction::SelectMessage { peer_id, msg_id } => {
-                Backend::mark_read(session_backend, peer_id);
                 session.show_peer_history(peer_id, SectionShow::clear_stack(), msg_id);
                 self.tabbed_panel.hide_fast();
                 self.autocomplete.dismiss();
@@ -1450,6 +1472,7 @@ impl MainWidget {
         ctrl.host_top_bar = self.settings_as_layer;
         ctrl.core_settings.chat_filters_horizontal = !session.filters_enabled();
         ctrl.live_theme.update(embedded_theme, accent_color);
+        ctrl.chat.system_dark_mode = self.system_dark_mode;
         ctrl.privacy.top_peers_enabled =
             tg_app_info::dialogs::backend::DialogsBackend::top_peers_enabled(session_backend);
 
@@ -1597,27 +1620,34 @@ impl MainWidget {
             session_backend.prepare_open_chat(peer_id);
         }
 
-        // Populate next unread broadcast channel hint for `PullToNextChannel`.
-        let next_unread_channel = Backend::dialogs(
-            session_backend,
-            tg_app_core::stand_in::types::FilterId::ALL,
-            "",
-        )
-        .into_iter()
-        .find(|d| {
-            d.peer.id != peer_id
-                && d.peer.kind == tg_app_core::stand_in::types::PeerKind::Channel
-                && d.unread_count > 0
-        })
-        .map(
-            |d| tg_app_history::history::pull_to_next_channel::NextUnreadChannelHint {
-                peer_id: d.peer.id,
-                title: d.peer.title,
-                unread_count: d.unread_count,
-                color_index: (d.peer.id.bare() % 8) as u8,
-            },
-        );
-        self.history.set_next_unread_channel(next_unread_channel);
+        // Populate next unread broadcast channel hint for `PullToNextChannel`. Searching it
+        // converts the whole chat list, so it runs when the open chat or the list's data changed,
+        // not on every frame.
+        let list_version =
+            tg_app_info::dialogs::backend::DialogsBackend::dialogs_version(&*session_backend);
+        if self.next_unread_channel_key != Some((peer_id, list_version)) {
+            self.next_unread_channel_key = Some((peer_id, list_version));
+            let next_unread_channel = Backend::dialogs(
+                session_backend,
+                tg_app_core::stand_in::types::FilterId::ALL,
+                "",
+            )
+            .into_iter()
+            .find(|d| {
+                d.peer.id != peer_id
+                    && d.peer.kind == tg_app_core::stand_in::types::PeerKind::Channel
+                    && d.unread_count > 0
+            })
+            .map(|d| {
+                tg_app_history::history::pull_to_next_channel::NextUnreadChannelHint {
+                    peer_id: d.peer.id,
+                    title: d.peer.title,
+                    unread_count: d.unread_count,
+                    color_index: (d.peer.id.bare() % 8) as u8,
+                }
+            });
+            self.history.set_next_unread_channel(next_unread_channel);
+        }
 
         let mode_before = self.history.compose_mut().mode.clone();
         let emitted = self.history.show_with_backend(
@@ -1807,6 +1837,9 @@ impl MainWidget {
                 HistoryAction::Toast(msg) => actions.push(MainWidgetAction::Toast(msg)),
             }
         }
+        for error in self.history.take_user_errors() {
+            actions.push(MainWidgetAction::UserError(error));
+        }
 
         // Wire chat_helpers FieldAutocompleteView & TabbedPanel directly to the compose bar.
         let compose_rect = self.history.last_compose_rect();
@@ -1904,9 +1937,12 @@ impl MainWidget {
                             self.history.reload_active_peer(session_backend);
                         }
                         Err(err) => {
-                            actions.push(MainWidgetAction::Toast(format!(
-                                "Could not send sticker: {err}"
-                            )));
+                            if let Some(text) =
+                                tg_app_core::user_error::send_message(&err, send_target(peer_id))
+                                    .into_text()
+                            {
+                                actions.push(MainWidgetAction::Toast(text));
+                            }
                         }
                     }
                 }
@@ -1980,9 +2016,14 @@ impl MainWidget {
                                 }
                             }
                             Err(err) => {
-                                actions.push(MainWidgetAction::Toast(format!(
-                                    "Could not send sticker: {err}"
-                                )));
+                                if let Some(text) = tg_app_core::user_error::send_message(
+                                    &err,
+                                    send_target(peer_id),
+                                )
+                                .into_text()
+                                {
+                                    actions.push(MainWidgetAction::Toast(text));
+                                }
                             }
                         }
                     }
@@ -2010,9 +2051,14 @@ impl MainWidget {
                                 }
                             }
                             Err(err) => {
-                                actions.push(MainWidgetAction::Toast(format!(
-                                    "Could not send GIF: {err}"
-                                )));
+                                if let Some(text) = tg_app_core::user_error::send_message(
+                                    &err,
+                                    send_target(peer_id),
+                                )
+                                .into_text()
+                                {
+                                    actions.push(MainWidgetAction::Toast(text));
+                                }
                             }
                         }
                     }
@@ -2636,6 +2682,17 @@ pub fn bot_earn_affiliate_action(
     MainWidgetAction::OpenPayments {
         screen: tg_app_info::payments::PaymentsScreen::Affiliate,
         slug,
+    }
+}
+
+/// The chat kind for the send-failure texts (`ApiWrap::sendMessageFail`).
+fn send_target(peer_id: PeerId) -> tg_app_core::user_error::SendTarget {
+    use tg_app_core::stand_in::types::PeerKind;
+    use tg_app_core::user_error::SendTarget;
+    match peer_id.kind() {
+        PeerKind::User => SendTarget::User,
+        PeerKind::Group => SendTarget::Group,
+        PeerKind::Channel => SendTarget::Channel,
     }
 }
 

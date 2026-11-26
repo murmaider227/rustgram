@@ -583,7 +583,7 @@ impl LiveSession {
         self.bridge_state().notify_ui();
     }
 
-    fn apply_slowmode_wait_from_error(&self, peer_id: PeerId, err: &str) {
+    pub(crate) fn apply_slowmode_wait_from_error(&self, peer_id: PeerId, err: &str) {
         if let Some(wait_secs) = parse_slowmode_wait_error(err) {
             let now = now_unix_i64();
             let next = now.saturating_add(i64::from(wait_secs));
@@ -893,6 +893,30 @@ impl LiveSession {
             effect_id: request.effect_id.map(|id| id as i64),
             ..SendOptions::default()
         };
+        if request.schedule_date.is_none() {
+            // Shown at once, sent in the background (TGB-2931); a scheduled message never
+            // appears in the chat, so it still waits for the server below.
+            let extras = crate::optimistic_send::QueuedSendExtras {
+                reply_to_msg_id: request.reply_to.map(crate::convert::to_data_msg),
+                reply_quote: request
+                    .reply_quote
+                    .as_ref()
+                    .map(|q| (q.text.clone(), q.offset_utf16)),
+                effect_id: request.effect_id,
+            };
+            let sent = self.send_text_optimistic(
+                data_peer,
+                &request.text.text,
+                &entities,
+                reply_to,
+                options,
+                &extras,
+            )?;
+            // The slow-mode wait starts with the send (`HistoryWidget::showSlowmodeError` also
+            // refuses while a message is still sending).
+            self.record_slow_mode_send_live(peer_id, now);
+            return Ok(sent);
+        }
         let rt = Arc::clone(self.runtime());
         let text_owned = request.text.text.clone();
         let outcome = match block_on_runtime(self.runtime().tokio_handle(), async move {

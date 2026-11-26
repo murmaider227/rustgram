@@ -4,8 +4,10 @@
 //! (`System::lookupSoundBytes`, `System::lookupSound`, `System::ensureSoundCreated`,
 //! `System::playSound`).
 //!
-//! The default chime is an original synthesized two-tone sound: Telegram's own notification
-//! sound is part of its brand and is not shipped with Rustgram.
+//! The default sound is tdesktop's own `msg_incoming.mp3` (`Telegram/Resources/sounds`, GPLv3
+//! with the OpenSSL exception, like Rustgram; see `THIRD_PARTY_NOTICES.txt`), embedded the way
+//! tdesktop embeds it in `sounds.qrc`. A short synthesized chime remains only as the fallback
+//! if that file cannot be decoded (tdesktop: `Unexpected("Embedded sound not found!")`).
 
 use std::collections::BTreeMap;
 use std::f32::consts::TAU;
@@ -15,6 +17,10 @@ use tg_audio::{
     AudioOutputEngine, DEFAULT_FREQUENCY, DeviceManager, DocumentId, LocalCache, LocalSound,
     MixerCore, SoundTrack, decode_sound_track,
 };
+
+/// tdesktop's default notification sound (`:/sounds/msg_incoming.mp3`), the "Default" entry of
+/// the notification sound list (`RingtonesBox`).
+pub const DEFAULT_SOUND_MP3: &[u8] = include_bytes!("../../assets/sounds/msg_incoming.mp3");
 
 /// Record of a sound playback request (useful for diagnostics and unit tests).
 #[derive(Debug, Clone, PartialEq)]
@@ -98,7 +104,8 @@ impl NotificationSoundPlayer {
         self.custom_tracks.remove(&document_id);
     }
 
-    /// Returns raw encoded bytes for `sound_id`, falling back to [`default_chime_wav`].
+    /// Returns raw encoded bytes for `sound_id`, falling back to the default sound
+    /// (`System::lookupSoundBytes`).
     #[must_use]
     pub fn lookup_sound_bytes(&self, sound_id: u64) -> Vec<u8> {
         if sound_id != 0
@@ -106,7 +113,7 @@ impl NotificationSoundPlayer {
         {
             return bytes.clone();
         }
-        default_chime_wav()
+        DEFAULT_SOUND_MP3.to_vec()
     }
 
     /// Prepares a cached local WAV [`LocalSound`] via `tg-audio::LocalCache` for OS notification APIs.
@@ -118,7 +125,7 @@ impl NotificationSoundPlayer {
         };
         let resolved = self.local_cache.sound(
             DocumentId(sound_id),
-            || custom.unwrap_or_default(),
+            || custom.unwrap_or_else(|| DEFAULT_SOUND_MP3.to_vec()),
             Some(default_chime_wav),
         );
         if resolved.is_valid() {
@@ -220,7 +227,20 @@ impl NotificationSoundPlayer {
         if self.default_track.is_some() {
             return;
         }
-        self.default_track = Some(generate_fallback_chime_track());
+        self.default_track = Some(default_sound_track());
+    }
+}
+
+/// Decodes [`DEFAULT_SOUND_MP3`] (`System::ensureSoundCreated`), or the synthesized chime if it
+/// cannot be decoded.
+#[must_use]
+pub fn default_sound_track() -> SoundTrack {
+    match decode_sound_track(DEFAULT_SOUND_MP3.to_vec(), Some("mp3".to_owned()), 0) {
+        Ok(track) => track,
+        Err(err) => {
+            tracing::warn!(%err, "default notification sound failed to decode; using the chime");
+            generate_fallback_chime_track()
+        }
     }
 }
 

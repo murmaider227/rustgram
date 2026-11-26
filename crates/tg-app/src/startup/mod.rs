@@ -10,6 +10,7 @@
 //! `Telegram/SourceFiles/platform/win/specific_win.cpp`.
 
 pub mod crash_window;
+pub mod frame_trace;
 pub mod icon;
 pub mod ipc;
 pub mod plan;
@@ -40,7 +41,7 @@ pub use ipc::{
 };
 pub use plan::{
     ENV_LIVE_MODE, StartupAction, StartupPlan, StartupPrefs, help_text, is_live_mode_env_enabled,
-    parse_live_mode_env,
+    parse_live_mode_env, select_live_mode,
 };
 pub use platform::{CleanupReport, PlatformHooks, RealWindowsPlatform, StartupPlatformReport};
 pub use profile_paths::{
@@ -125,6 +126,7 @@ pub fn run_from_cli() -> anyhow::Result<()> {
 
     match plan.action {
         StartupAction::ShowHelp => {
+            attach_parent_console();
             println!("{}", help_text());
             return Ok(());
         }
@@ -251,7 +253,12 @@ pub fn run_from_cli() -> anyhow::Result<()> {
     );
     profiler::mark("update_controller_start");
 
-    let live_mode = plan.live_mode || is_live_mode_env_enabled();
+    let live_mode = select_live_mode(
+        plan.live_mode,
+        plan.demo_mode,
+        is_live_mode_env_enabled(),
+        tg_session::api_credentials_available(),
+    );
     let native_window_frame = std::env::var("RUSTGRAM_NATIVE_FRAME")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -296,6 +303,18 @@ fn spawn_startup_integration(plan: StartupPlan, exe_path: PathBuf, mut prefs: St
         });
     if let Err(err) = spawned {
         tracing::warn!(%err, "Could not start the startup integration thread");
+    }
+}
+
+/// Release builds are GUI-subsystem binaries without a console of their own, so `--help`
+/// attaches to the console of the shell that started it (if any) before printing.
+fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        // SAFETY: `AttachConsole` takes no pointers; failure (no parent console, or a console
+        // is already attached as in debug builds) only means the help text is not shown.
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
 }
 
@@ -415,9 +434,27 @@ mod tests {
 
         let cases = vec![
             Case {
-                name: "default_first_run",
+                name: "default_first_run_keeps_the_users_tg_handler",
                 argv: vec!["rustgram.exe"],
                 prefs: StartupPrefs::default(),
+                expected_action: StartupAction::RunApp,
+                expected_single_instance: true,
+                expected_tray: false,
+                expected_updates: true,
+                expected_register_schemes: false,
+                expected_debug: false,
+                expected_to_settings: false,
+                expected_start_signed_in: false,
+                expected_urls: vec![],
+                expected_send_paths: vec![],
+            },
+            Case {
+                name: "opted_in_first_run_takes_the_tg_handler",
+                argv: vec!["rustgram.exe"],
+                prefs: StartupPrefs {
+                    take_url_schemes: true,
+                    ..StartupPrefs::default()
+                },
                 expected_action: StartupAction::RunApp,
                 expected_single_instance: true,
                 expected_tray: false,
@@ -578,6 +615,36 @@ mod tests {
                     "tonsite://foundation.ton",
                 ],
                 expected_send_paths: vec![r"C:\tmp\photo.png"],
+            },
+            Case {
+                name: "demo_first_run_never_takes_the_tg_handler",
+                argv: vec!["rustgram.exe", "--demo"],
+                prefs: StartupPrefs::default(),
+                expected_action: StartupAction::RunApp,
+                expected_single_instance: true,
+                expected_tray: false,
+                expected_updates: true,
+                expected_register_schemes: false,
+                expected_debug: false,
+                expected_to_settings: false,
+                expected_start_signed_in: false,
+                expected_urls: vec![],
+                expected_send_paths: vec![],
+            },
+            Case {
+                name: "custom_workdir_first_run_never_takes_the_tg_handler",
+                argv: vec!["rustgram.exe", "-workdir", &custom_wd_str],
+                prefs: StartupPrefs::default(),
+                expected_action: StartupAction::RunApp,
+                expected_single_instance: true,
+                expected_tray: false,
+                expected_updates: true,
+                expected_register_schemes: false,
+                expected_debug: false,
+                expected_to_settings: false,
+                expected_start_signed_in: false,
+                expected_urls: vec![],
+                expected_send_paths: vec![],
             },
             Case {
                 name: "auto_update_off_disables_checks",
@@ -1190,7 +1257,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = test_env(dir.path());
         let exe = env.exe_dir.join("rustgram.exe");
-        let mut prefs = StartupPrefs::default();
+        // Registration is opt-in; this test exercises the registration hooks themselves.
+        let mut prefs = StartupPrefs {
+            take_url_schemes: true,
+            ..StartupPrefs::default()
+        };
         let plan = StartupPlan::build(["rustgram.exe"], &env, Some(&exe), &prefs);
         let mut hooks = MockPlatformHooks::default();
 

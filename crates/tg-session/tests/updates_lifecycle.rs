@@ -856,3 +856,134 @@ async fn on_reconnect_get_difference_increments_unread_for_incoming_messages() {
 
     rt.shutdown_async().await;
 }
+
+/// Collects the flags of every queued `MessageUpdated` event, merged per message.
+fn drained_flags(
+    changes_rx: &mut broadcast::Receiver<ChangeEvent>,
+) -> HashMap<FullMsgId, tg_data::MessageUpdateFlags> {
+    let mut out: HashMap<FullMsgId, tg_data::MessageUpdateFlags> = HashMap::new();
+    while let Ok(ev) = changes_rx.try_recv() {
+        if let ChangeEvent::MessageUpdated { id, flags } = ev {
+            *out.entry(id).or_default() |= flags;
+        }
+    }
+    out
+}
+
+/// Live bug (alpha.2): messages the startup catch-up `getDifference` brings (sent while the
+/// app was closed) raised a desktop notification each. tdesktop never notifies for them (it
+/// calls `updates.getState` on start), so they must be added without `NEW_UNREAD`, while a
+/// live update after startup still carries it.
+#[tokio::test]
+async fn startup_catch_up_difference_messages_are_not_new_unread() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp.path().join("updates_state.bin");
+    FileUpdatesStateStore::new(&state_path)
+        .save(&PersistedUpdatesState {
+            pts: 300,
+            qts: 1,
+            date: 1_760_000_000,
+            seq: 3,
+            channel_pts: Default::default(),
+        })
+        .expect("save state");
+    let self_uid = 610_001i64;
+    let peer_uid = 610_002i64;
+    let peer = tl_enums::Peer::User(tl_types::PeerUser { user_id: peer_uid });
+    let peer_id = PeerId::from_user(UserId::from_tl(peer_uid));
+
+    let rpc = ScriptedRpc::new(2);
+    rpc.enqueue_ok::<tl_fns::updates::GetDifference>(&tl_enums::updates::Difference::Difference(
+        tl_types::updates::Difference {
+            new_messages: vec![synthetic_msg(
+                peer.clone(),
+                701,
+                1_760_000_050,
+                "sent while closed",
+            )],
+            new_encrypted_messages: Vec::new(),
+            other_updates: vec![tl_enums::Update::NewMessage(tl_types::UpdateNewMessage {
+                message: synthetic_msg(peer.clone(), 702, 1_760_000_060, "also while closed"),
+                pts: 302,
+                pts_count: 1,
+            })],
+            chats: Vec::new(),
+            users: vec![tl_enums::User::User(synthetic_user(
+                peer_uid, "PeerTwo", false,
+            ))],
+            state: tl_state(302, 1, 1_760_000_060, 4),
+        },
+    ));
+    let cfg = SessionRuntimeConfig {
+        init_updates_state: true,
+        run_get_difference_on_start: false,
+        load_initial_dialogs: false,
+        fetch_self_user_on_start: false,
+        ..SessionRuntimeConfig::default()
+    }
+    .with_updates_state_path(&state_path);
+    let rt = SessionRuntime::start_on(
+        UserId::from_tl(self_uid),
+        rpc.clone(),
+        tokio::runtime::Handle::current(),
+        cfg,
+    )
+    .expect("start runtime");
+    let mut changes = rt.subscribe_changes();
+    rt.wait_ready().await.expect("ready");
+    assert_eq!(rpc.calls_of::<tl_fns::updates::GetDifference>().len(), 1);
+
+    let seen = drained_flags(&mut changes);
+    for id in [701, 702] {
+        let flags = seen
+            .get(&FullMsgId::new(peer_id, MsgId(id)))
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            flags.contains(tg_data::MessageUpdateFlags::NEW_ADDED),
+            "catch-up message {id} is added: {flags:?}"
+        );
+        assert!(
+            !flags.contains(tg_data::MessageUpdateFlags::NEW_UNREAD),
+            "catch-up message {id} must not be NEW_UNREAD: {flags:?}"
+        );
+    }
+
+    rpc.push_update(tl_enums::Updates::UpdateShortMessage(
+        tl_types::UpdateShortMessage {
+            out: false,
+            mentioned: false,
+            media_unread: false,
+            silent: false,
+            id: 703,
+            user_id: peer_uid,
+            message: "live after startup".into(),
+            pts: 303,
+            pts_count: 1,
+            date: 1_760_000_070,
+            fwd_from: None,
+            via_bot_id: None,
+            reply_to: None,
+            entities: None,
+            ttl_period: None,
+        },
+    ));
+    let target = FullMsgId::new(peer_id, MsgId(703));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut live_flags = tg_data::MessageUpdateFlags::empty();
+    while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, changes.recv()).await {
+        if let ChangeEvent::MessageUpdated { id, flags } = ev
+            && id == target
+        {
+            live_flags |= flags;
+            break;
+        }
+    }
+    assert!(
+        live_flags.contains(
+            tg_data::MessageUpdateFlags::NEW_ADDED | tg_data::MessageUpdateFlags::NEW_UNREAD
+        ),
+        "a live update after startup notifies: {live_flags:?}"
+    );
+    rt.shutdown_async().await;
+}

@@ -1675,7 +1675,7 @@ impl LiveSession {
                                 if let Some(dm) = message_from_tl(raw, self_uid) {
                                     let mut hm = message_to_history_message(session, &dm);
                                     hm.extra.thread_id = Some(topic_root_id);
-                                    session.insert_message(dm);
+                                    session.insert_existing_message(dm);
                                     out.push(hm);
                                 }
                             }
@@ -2031,7 +2031,10 @@ impl LiveSession {
         let guard = state.lock().ok()?;
         let meta = guard.discussion_threads.get(&key)?;
         let root = meta.root_post.clone()?;
-        Some((root, meta.comments.clone()))
+        let mut comments = meta.comments.clone();
+        drop(guard);
+        crate::reply_targets::attach_reply_targets(self, &mut comments);
+        Some((root, comments))
     }
 
     /// Returns the cached read-state metadata for a channel comments / discussion thread.
@@ -2134,7 +2137,7 @@ impl LiveSession {
                     disc_peer = from_data_peer(dm.peer_id);
                     disc_root = from_data_msg(dm.id);
                     let hm = message_to_history_message(session, &dm);
-                    session.insert_message(dm);
+                    session.insert_existing_message(dm);
                     fallback_root = Some(hm);
                 }
 
@@ -2182,7 +2185,7 @@ impl LiveSession {
                                 {
                                     hm.is_read = hm.id.0 <= outbox_max;
                                 }
-                                session.insert_message(dm);
+                                session.insert_existing_message(dm);
                                 out.push(hm);
                             }
                         }
@@ -3098,9 +3101,11 @@ impl LiveSession {
                 suggested_post: None,
                 rich_message: None,
             };
-            if let Err(err) = invoke_rpc(self, req) {
+            // Sent from the session's ordered queue (`ApiWrap::saveDraftToCloudDelayed`): the
+            // chat switch that saves the draft does not wait for it, and drafts keep their order.
+            self.queue_background_rpc(req, move |err| {
                 debug!(peer = target_peer.0, error = %err, "messages.saveDraft (rich) failed");
-            }
+            });
         }
 
         let data_peer = to_data_peer(target_peer);

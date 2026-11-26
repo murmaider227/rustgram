@@ -29,8 +29,10 @@ pub use account::{
     WorkingDirOpenOptions,
 };
 pub use config::{
-    ENV_API_HASH, ENV_API_ID, build_mtproto_client_config, core_env_to_mtproto,
-    load_api_credentials_from_env, load_api_credentials_from_vars, mtproto_env_to_core,
+    ApiCredentialsSource, ENV_API_HASH, ENV_API_ID, api_credentials_available,
+    build_mtproto_client_config, core_env_to_mtproto, has_embedded_api_credentials,
+    load_api_credentials, load_api_credentials_from_env, load_api_credentials_from_vars,
+    mtproto_env_to_core, resolve_api_credentials,
 };
 pub use error::{Result, SessionError};
 pub use proxy::{
@@ -46,7 +48,8 @@ pub use rpc::{
     DecodedMtpPush, MtprotoRpc, decode_updates_msg, map_invocation_error, map_rpc_error,
 };
 pub use runtime::{
-    DialogSummary, SessionEvent, SessionRuntime, SessionRuntimeConfig, SessionSnapshot,
+    DialogSummary, LogoutReason, SessionEvent, SessionRuntime, SessionRuntimeConfig,
+    SessionSnapshot,
 };
 pub use tg_data::PersistedUpdatesState;
 pub use tg_mtproto::{

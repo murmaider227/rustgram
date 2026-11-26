@@ -17,6 +17,7 @@ Telegram Desktop's Apple-style emoji artwork is **not** used or redistributed he
 - **8 WebP sprite sheets** (`assets/sheet_0.webp` .. `assets/sheet_7.webp`), total ~5.3 MB
 - **Cell size**: `64 × 64 px`, **32 columns × 16 rows** (`512` emojis per sheet, `2048 × 1024 px` per sheet)
 - **Indexing**: direct O(1) mapping from `tg_text::emoji::EmojiRef` (`sprite = index >> 9`, `row = (index >> 5) & 0x0F`, `col = index & 0x1F`)
+- **Tiles**: `build.rs` decodes the sheets once and embeds each sheet row as a lossless PNG tile (`2048 × 64 px`, 32 emojis, `tile = index >> 5`), so the first use of an emoji decodes one row (~1 ms) instead of a whole sheet. Colour channels hidden by premultiplied alpha are normalised; the textures egui uploads are byte-identical to the sheet path (`tests_tile_pixels`).
 - **Coverage**: 3,499 / 3,900 entries directly present (3,484 exact Noto `v2.042` matches + 15 fallbacks), with automatic fallback to `EmojiRef::original()` for rare multi-skin-tone sequences not present in `v2.042`.
 
 ## Usage

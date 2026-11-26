@@ -32,6 +32,9 @@ use crate::chat_helpers::stickers_list_widget::{StickerMediaCache, paint_premium
 use crate::chat_helpers::strings;
 use tg_app_core::stand_in::theme::Palette;
 
+#[cfg(test)]
+mod tests_tgb2946;
+
 /// Row height for `@mention`, `#hashtag`, and `/command` suggestions (`st::mentionHeight`).
 pub const AUTOCOMPLETE_ROW_HEIGHT: f32 = st::mention_height.0 as f32;
 /// Maximum popup height (`4.5 * st::mentionHeight = 180px`).
@@ -750,18 +753,12 @@ impl FieldAutocompleteView {
                 .rect_filled(rect, CornerRadius::ZERO, palette.window_bg_over);
         }
 
-        // Peer avatar circle
+        // Peer userpic (`PeerData::paintUserpicLeft`): the photo once loaded, else the empty
+        // userpic in the peer's colour. A user's full peer id is its bare id.
         let avatar_c = Pos2::new(rect.left() + 24.0, rect.center().y);
-        ui.painter()
-            .circle_filled(avatar_c, 15.0, peer_avatar_color(row.user_id.0));
-        let initials = extract_initials(&row.display_name);
-        ui.painter().text(
-            avatar_c,
-            Align2::CENTER_CENTER,
-            &initials,
-            FontId::proportional(11.5),
-            Color32::WHITE,
-        );
+        let avatar_rect = Rect::from_center_size(avatar_c, Vec2::splat(30.0));
+        tg_ui::userpic::EmptyUserpic::for_peer(row.user_id.0, &row.display_name, userpic_palette())
+            .paint_circle_or_photo(ui.painter(), avatar_rect, row.user_id.0 as i64);
 
         // Display name + `@username`
         let text_x = rect.left() + 48.0;
@@ -917,16 +914,12 @@ impl FieldAutocompleteView {
                 .rect_filled(rect, CornerRadius::ZERO, palette.window_bg_over);
         }
 
+        // The bot's userpic (`row.user->paintUserpicLeft`): its photo once loaded, else its
+        // empty userpic. A user's full peer id is its bare id.
         let avatar_c = Pos2::new(rect.left() + 24.0, rect.center().y);
-        ui.painter()
-            .circle_filled(avatar_c, 14.0, peer_avatar_color(row.user_id.0));
-        ui.painter().text(
-            avatar_c,
-            Align2::CENTER_CENTER,
-            "/",
-            FontId::proportional(14.0),
-            Color32::WHITE,
-        );
+        let avatar_rect = Rect::from_center_size(avatar_c, Vec2::splat(28.0));
+        tg_ui::userpic::EmptyUserpic::for_peer(row.user_id.0, &row.bot_name, userpic_palette())
+            .paint_circle_or_photo(ui.painter(), avatar_rect, row.user_id.0 as i64);
 
         let cmd_text = row.formatted_command();
         let cmd_galley = ui.painter().layout_no_wrap(
@@ -1109,32 +1102,9 @@ pub(crate) fn format_emoji_suggestion_label(item: &EmojiKeywordResult) -> String
     format!(":{}:", item.label)
 }
 
-fn peer_avatar_color(id: u64) -> Color32 {
-    const COLORS: [Color32; 7] = [
-        Color32::from_rgb(0xE1, 0x70, 0x76),
-        Color32::from_rgb(0xFA, 0xA7, 0x74),
-        Color32::from_rgb(0xA6, 0x95, 0xE7),
-        Color32::from_rgb(0x7B, 0xC8, 0x62),
-        Color32::from_rgb(0x6E, 0xC9, 0xCB),
-        Color32::from_rgb(0x65, 0xAA, 0xDD),
-        Color32::from_rgb(0xEE, 0x7A, 0xAE),
-    ];
-    COLORS[(id as usize) % COLORS.len()]
-}
-
-fn extract_initials(name: &str) -> String {
-    let mut words = name.split_whitespace();
-    let Some(first) = words.next() else {
-        return "?".into();
-    };
-    let mut out = String::new();
-    if let Some(ch) = first.chars().next() {
-        out.extend(ch.to_uppercase());
-    }
-    if let Some(last) = words.last()
-        && let Some(ch) = last.chars().next()
-    {
-        out.extend(ch.to_uppercase());
-    }
-    out
+/// Userpic gradients (`historyPeerNUserpicBg`): the night themes keep the day values and accent
+/// colorizing skips them (`kColorizeIgnoredKeys`), so the day palette serves every theme.
+fn userpic_palette() -> &'static tg_ui::theme::DayPalette {
+    static PALETTE: std::sync::OnceLock<tg_ui::theme::DayPalette> = std::sync::OnceLock::new();
+    PALETTE.get_or_init(tg_ui::theme::DayPalette::new)
 }

@@ -58,10 +58,10 @@ pub use message::{
     InvoiceData, KeyboardButton, KeyboardButtonKind, LiveLocationData, MediaWebPageFlags, Message,
     MessageContent, MessageFlags, MessageMedia, MessageReactionCount, MessageReactionsSummary,
     PaidMediaData, PhoneCallDiscardReason, PhotoData, PhotoSize, PollAnswer, PollAnswerVoters,
-    PollData, PollRequestRestriction, PollResults, RecentReactor, ReplyInfo, ReplyMarkup,
-    RequestPeerQuery, RequestPeerRestriction, RequestPeerType, ServiceAction, StarsAmount,
-    StickerMeta, StoryMediaData, TodoCompletionData, TodoItemData, TodoListData, VenueData,
-    VideoStreamData, WebPageData, WidgetData,
+    PollData, PollMedia, PollRequestRestriction, PollResults, RecentReactor, ReplyInfo,
+    ReplyMarkup, RequestPeerQuery, RequestPeerRestriction, RequestPeerType, ServiceAction,
+    StarsAmount, StickerMeta, StoryMediaData, TodoCompletionData, TodoItemData, TodoListData,
+    VenueData, VideoStreamData, WebDocumentData, WebPageData, WidgetData,
 };
 pub use peer::{
     AllowedReactions, AllowedReactionsType, Birthday, BlockStatus, BotCommand, BotInfo, BotStatus,
@@ -87,7 +87,7 @@ pub use scheduled::{
     hash_update_u32, hash_update_u64, scheduled_local_to_remote_id, scheduled_remote_to_local_id,
     shortcut_local_to_remote_id, shortcut_remote_to_local_id,
 };
-pub use session::Session;
+pub use session::{DefaultNotifyScope, Session};
 pub use text::{EntityKind, FormattedDateFlags, TextEntity, TextWithEntities};
 pub use updates::{
     CHANNEL_GET_DIFF_LIMIT, ChannelUpdateEnvelope, CommonUpdateEnvelope,

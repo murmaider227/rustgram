@@ -4,7 +4,9 @@
 //! `Telegram/SourceFiles/history/view/history_view_element.cpp` and
 //! `Telegram/SourceFiles/ui/text/format_values.cpp`.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
 use chrono::{Local, Offset, TimeZone};
 
@@ -25,18 +27,78 @@ pub fn set_utc_offset_override(offset_secs: Option<i32>) {
     );
 }
 
+/// Width of the UTC ranges [`local_utc_offset_secs`] caches one offset for. Time-zone and
+/// daylight-saving transitions since Telegram exists fall on whole quarter hours of UTC (every
+/// zone's offset is a multiple of 15 minutes and clocks change on the local minute 0, 15, 30
+/// or 45), so the offset is the same for every second of a range.
+const OFFSET_RANGE_SECS: i64 = 900;
+/// Ranges cached per thread (a chat list or a history page spans a handful).
+const OFFSET_CACHE_SLOTS: usize = 64;
+/// How long cached offsets are trusted before the system zone is asked again, so a changed
+/// time zone shows within a minute.
+const OFFSET_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Per-thread direct-mapped cache of `(range index, offset)`; `i64::MIN` marks an empty slot.
+struct OffsetCache {
+    filled_at: Option<Instant>,
+    slots: [(i64, i32); OFFSET_CACHE_SLOTS],
+}
+
+thread_local! {
+    static OFFSET_CACHE: RefCell<OffsetCache> = const {
+        RefCell::new(OffsetCache {
+            filled_at: None,
+            slots: [(i64::MIN, 0); OFFSET_CACHE_SLOTS],
+        })
+    };
+}
+
+/// Asks the system time zone (a Windows time-zone query per call, which is why the result is
+/// cached).
+fn system_utc_offset_secs(unix_secs: i64) -> i32 {
+    Local
+        .timestamp_opt(unix_secs, 0)
+        .single()
+        .map_or(0, |dt| dt.offset().fix().local_minus_utc())
+}
+
 /// UTC offset (seconds east of UTC) of the system local time zone at `unix_secs`, including
 /// daylight saving time, or the value set by [`set_utc_offset_override`].
+///
+/// Every message and chat-list time calls this, so offsets are cached per 15-minute UTC range
+/// and re-read from the system after [`OFFSET_CACHE_TTL`].
 #[must_use]
 pub fn local_utc_offset_secs(unix_secs: i64) -> i32 {
     let forced = UTC_OFFSET_OVERRIDE.load(Ordering::Relaxed);
     if forced != NO_OVERRIDE {
         return i32::try_from(forced).unwrap_or(0);
     }
-    Local
-        .timestamp_opt(unix_secs, 0)
-        .single()
-        .map_or(0, |dt| dt.offset().fix().local_minus_utc())
+    cached_system_utc_offset_secs(unix_secs)
+}
+
+/// [`system_utc_offset_secs`] through the per-thread range cache.
+fn cached_system_utc_offset_secs(unix_secs: i64) -> i32 {
+    let range = unix_secs.div_euclid(OFFSET_RANGE_SECS);
+    OFFSET_CACHE.with(|cell| {
+        let Ok(mut cache) = cell.try_borrow_mut() else {
+            return system_utc_offset_secs(unix_secs);
+        };
+        let now = Instant::now();
+        if cache
+            .filled_at
+            .is_none_or(|at| now.duration_since(at) >= OFFSET_CACHE_TTL)
+        {
+            cache.slots = [(i64::MIN, 0); OFFSET_CACHE_SLOTS];
+            cache.filled_at = Some(now);
+        }
+        let slot = range.rem_euclid(OFFSET_CACHE_SLOTS as i64) as usize;
+        if cache.slots[slot].0 == range {
+            return cache.slots[slot].1;
+        }
+        let offset = system_utc_offset_secs(unix_secs);
+        cache.slots[slot] = (range, offset);
+        offset
+    })
 }
 
 /// Formats a message time like tdesktop's `QLocale::toString(time, QLocale::ShortFormat)` with a
@@ -242,5 +304,54 @@ mod tests {
             format_time_short(LocalDateTime::new(2026, 11, 24, 23, 47, 0)),
             "23:47"
         );
+    }
+
+    #[test]
+    fn cached_offset_matches_the_system_zone_across_dst_changes() {
+        // Every 7 minutes over 2025-2026 (both DST changes of each year in zones that have
+        // them), twice, so the second pass reads the cache.
+        let start = 1_735_689_600_i64; // 2025-01-01 00:00 UTC
+        let end = start + 2 * 366 * 86_400;
+        for _ in 0..2 {
+            let mut t = start;
+            while t < end {
+                assert_eq!(
+                    cached_system_utc_offset_secs(t),
+                    system_utc_offset_secs(t),
+                    "offset at {t}"
+                );
+                t += 7 * 60;
+            }
+        }
+        // Range edges and pre-1970 seconds.
+        for t in [-1, 0, 899, 900, 901, -899, -900, -901] {
+            assert_eq!(cached_system_utc_offset_secs(t), system_utc_offset_secs(t));
+        }
+    }
+
+    #[test]
+    fn cached_offset_is_cheaper_than_the_system_query() {
+        const CALLS: i64 = 20_000;
+        // A history page: timestamps a few minutes apart.
+        let base = 1_795_557_720_i64;
+        let started = std::time::Instant::now();
+        let mut direct = 0_i64;
+        for i in 0..CALLS {
+            direct += i64::from(system_utc_offset_secs(base + i * 37));
+        }
+        let direct_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let mut cached = 0_i64;
+        for i in 0..CALLS {
+            cached += i64::from(cached_system_utc_offset_secs(base + i * 37));
+        }
+        let cached_time = started.elapsed();
+        assert_eq!(direct, cached);
+        println!(
+            "measured: {CALLS} timestamps, system query {:.3} us each, cached {:.3} us each",
+            direct_time.as_secs_f64() * 1e6 / CALLS as f64,
+            cached_time.as_secs_f64() * 1e6 / CALLS as f64
+        );
+        assert!(cached_time < direct_time);
     }
 }

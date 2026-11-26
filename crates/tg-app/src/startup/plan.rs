@@ -58,12 +58,29 @@ pub fn is_live_mode_env_enabled() -> bool {
     parse_live_mode_env(val.as_deref())
 }
 
+/// Chooses live MTProto mode or the offline demo (`MockSession`).
+///
+/// Live mode is the default whenever API credentials are available (runtime environment or
+/// compiled into the build, like tdesktop's official builds). `--demo` always selects the
+/// offline demo; `--live` / `RUSTGRAM_LIVE=1` force live mode even without credentials (the
+/// app then shows how to provide them).
+#[must_use]
+pub const fn select_live_mode(
+    explicit_live: bool,
+    explicit_demo: bool,
+    live_env: bool,
+    credentials_available: bool,
+) -> bool {
+    !explicit_demo && (explicit_live || live_env || credentials_available)
+}
+
 /// Extra `tg-app` developer switches extracted before handing argv to `tg-core`'s parser.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DevSwitches {
     show_help: bool,
     start_signed_in: bool,
     live_mode: bool,
+    demo_mode: bool,
     settings_path: Option<PathBuf>,
 }
 
@@ -104,9 +121,11 @@ pub struct StartupPlan {
     pub debug_logging: bool,
     /// Skip intro and open straight into the signed-in mock workspace (`--start-main`).
     pub start_signed_in: bool,
-    /// Enable live `tg-session` MTProto mode (`--live` or `RUSTGRAM_LIVE=1`).
-    /// Defaults to `false` (offline `MockSession` demo mode).
+    /// `--live` was passed. Live mode is also the default when API credentials are available;
+    /// see [`select_live_mode`].
     pub live_mode: bool,
+    /// `--demo` was passed: run the offline `MockSession` demo even when credentials exist.
+    pub demo_mode: bool,
     /// Resolved path for `ShellSettings` JSON.
     pub settings_path: PathBuf,
     /// Resolved path to the companion `rustgram-widget-helper.exe` binary next to the main executable.
@@ -187,7 +206,13 @@ impl StartupPlan {
         let register_url_schemes_now = is_run
             && !parsed_args.quit
             && !parsed_args.many
-            && prefs.register_url_schemes
+            // Test-server runs (agents, live checks) must never take over the system's tg:// handler.
+            && !parsed_args.test_mode
+            // Demo runs and custom `-workdir` runs (agents, benchmarks, scratch copies) never take it
+            // either: the handler must keep pointing at the user's own Telegram.
+            && !dev.demo_mode
+            && !resolved_working_dir.is_custom
+            && prefs.take_url_schemes
             && !prefs.url_schemes_registered;
 
         let settings_path = dev
@@ -211,6 +236,7 @@ impl StartupPlan {
             debug_logging: parsed_args.debug,
             start_signed_in: dev.start_signed_in,
             live_mode: dev.live_mode,
+            demo_mode: dev.demo_mode,
             settings_path,
             widget_helper_path,
             pipe_activation,
@@ -261,6 +287,9 @@ fn extract_dev_switches(raw: &[String]) -> (DevSwitches, Vec<String>) {
             "--live" => {
                 dev.live_mode = true;
             }
+            "--demo" => {
+                dev.demo_mode = true;
+            }
             "--settings" => {
                 if let Some(next) = raw.get(i + 1) {
                     dev.settings_path = Some(PathBuf::from(next));
@@ -306,7 +335,8 @@ pub fn help_text() -> &'static str {
        -scale <50..300>     Override UI scale percentage\n  \
        --                   Treat all remaining arguments as URLs or file paths\n\n\
      Developer Options:\n  \
-       --live               Run live tg-session mode (also enabled by RUSTGRAM_LIVE=1)\n  \
+       --demo               Run the offline demo (no Telegram connection)\n  \
+       --live               Force live mode (default when API credentials are available)\n  \
        --start-main         Skip Intro and open straight into the signed-in workspace\n  \
        --settings <PATH>    Use a custom shell settings JSON file\n  \
        -h, --help           Show this help message"

@@ -694,6 +694,8 @@ impl PaymentsBackend for MockPaymentsBackend {
         Ok(StarGiftsBundle {
             balance: self.credits.available_balance(),
             default_recipient: "Sam Taylor".to_owned(),
+            recipient_peer_id: 1_000_007,
+            recipient_is_self: false,
             catalog: build_sample_catalog_gifts(),
             received: self.received_gifts.clone(),
         })

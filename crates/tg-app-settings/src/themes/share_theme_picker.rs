@@ -775,9 +775,11 @@ impl ShareThemePickerState {
                         out.toast = Some(format!("Share theme updated for {}", self.peer_name));
                     }
                     Err(err) => {
-                        out.toast = Some(format!(
-                            "Could not update share theme ({err}). Check your connection and try again."
-                        ));
+                        out.toast = tg_app_core::user_error::share_theme_or_qr(
+                            "messages.setShareTheme",
+                            &err,
+                        )
+                        .into_text();
                     }
                 }
             }
@@ -797,9 +799,11 @@ impl ShareThemePickerState {
                         out.toast = Some(format!("Share theme reset for {}", self.peer_name));
                     }
                     Err(err) => {
-                        out.toast = Some(format!(
-                            "Could not reset share theme ({err}). Try again."
-                        ));
+                        out.toast = tg_app_core::user_error::share_theme_or_qr(
+                            "messages.setShareTheme",
+                            &err,
+                        )
+                        .into_text();
                     }
                 }
             }

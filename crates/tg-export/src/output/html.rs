@@ -4247,7 +4247,7 @@ impl HtmlWrap {
                 message.id,
                 dialog,
                 base_path,
-                "This message is not supported by this version of Telegram Desktop. Please update the application.",
+                "This message is not supported by this version of Rustgram. Please update the application.",
                 None,
             );
             return (info, html);

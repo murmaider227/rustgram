@@ -6,7 +6,7 @@
 /// About box Rustgram-specific description and attribution copy.
 pub const ABOUT_TITLE: &str = "Rustgram";
 pub const ABOUT_VERSION_SUFFIX: &str = "(Rust · egui)";
-pub const ABOUT_INTRO_PREFIX: &str = "Rustgram is an open-source Rust port of ";
+pub const ABOUT_INTRO_PREFIX: &str = "Rustgram is an unofficial open-source Rust port of ";
 pub const ABOUT_TDESKTOP_NAME: &str = "Telegram Desktop";
 pub const ABOUT_INTRO_MID: &str = ", built on the official ";
 pub const ABOUT_INTRO_SUFFIX: &str = " for speed and memory safety.";

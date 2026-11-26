@@ -12,13 +12,14 @@ use tg_ui::tg_style::st;
 use tg_ui::widgets::menu::MenuItem;
 
 use crate::dialogs::backend::{
-    ArchiveSummary, DialogItem, DialogListQuery, DialogPeerKind, DialogsBackend, SpecialRowKind,
+    DialogItem, DialogListQuery, DialogPeerKind, DialogsBackend, SpecialRowKind,
 };
 use crate::dialogs::entry_menu::{EntryMenu, EntryMenuRow};
 use crate::dialogs::layout::{
-    COLLAPSED_ARCHIVE_HEIGHT, DialogColors, RowPaintState, paint_archive_row, paint_dialog_row,
-    row_style_for,
+    COLLAPSED_ARCHIVE_HEIGHT, DialogColors, RowPaintState, paint_archive_row,
+    paint_prepared_dialog_row,
 };
+use crate::dialogs::list_cache::{DialogsFrameStats, ListCache, ListRequest, RowTextCache};
 use crate::dialogs::quick_action::{
     DialogHoverQuickAction, DialogSwipeState, QuickDialogActionLabel, paint_quick_action_strip,
     perform_quick_dialog_action, resolve_quick_dialog_label, show_hover_quick_action_pill,
@@ -323,6 +324,10 @@ pub struct DialogsInnerWidget {
     hover_quick_action: DialogHoverQuickAction,
     /// Reduced-motion flag (`PowerSavingFlags::ANIMATIONS`).
     reduced_motion: bool,
+    /// Rows of the shown list, read from the backend only when they can have changed.
+    list_cache: ListCache,
+    /// Prepared text and geometry of the painted rows.
+    row_text: RowTextCache,
 }
 
 impl Default for DialogsInnerWidget {
@@ -350,6 +355,18 @@ impl DialogsInnerWidget {
             swipe_drag_origin: None,
             hover_quick_action: DialogHoverQuickAction::default(),
             reduced_motion: false,
+            list_cache: ListCache::default(),
+            row_text: RowTextCache::default(),
+        }
+    }
+
+    /// How often the list was read from the backend and how many rows were prepared so far.
+    /// A frame that moves neither counter converted no chat and measured no row.
+    #[must_use]
+    pub const fn frame_stats(&self) -> DialogsFrameStats {
+        DialogsFrameStats {
+            list_reads: self.list_cache.reads(),
+            rows_prepared: self.row_text.prepared(),
         }
     }
 
@@ -483,48 +500,35 @@ impl DialogsInnerWidget {
         let now = backend.current_time();
         let anim_time = ui.ctx().input(|i| i.time);
 
-        let show_archive_row = matches!(list, DialogListQuery::Filter(FilterId::ALL));
-        let archive_summary: Option<ArchiveSummary> = if show_archive_row {
-            backend.archive_summary()
-        } else {
-            None
-        };
-        let archive_h = archive_summary.as_ref().map_or(0.0, |a| {
+        // The archive row, the loaded rows and their heights: read from the backend only when
+        // its version moved, the request changed or the last read got old.
+        let snapshot = self.list_cache.snapshot(
+            &*backend,
+            ListRequest {
+                list,
+                loaded_limit: self.loaded_limit,
+                show_folder_tags,
+                narrow,
+            },
+            anim_time,
+        );
+        self.row_text.begin_frame(ui.painter());
+        let slice = &snapshot.slice;
+        let archive_summary = snapshot.archive_summary.as_ref();
+        let chats_loading = snapshot.chats_loading;
+        let row_heights = snapshot.row_heights.as_slice();
+        let archive_h = archive_summary.map_or(0.0, |a| {
             if a.collapsed {
                 COLLAPSED_ARCHIVE_HEIGHT
             } else {
                 tg_history::consts::DIALOGS_ROW_HEIGHT as f32
             }
         });
+        let total_content_h = archive_h + snapshot.rows_height();
+        // Set when this frame changes the list through the backend.
+        let mut list_changed = false;
 
-        let mut slice = backend.dialog_slice(list, 0, self.loaded_limit);
-        let chats_loading = matches!(list, DialogListQuery::Filter(FilterId::ALL))
-            && slice.entries.is_empty()
-            && !backend.chats_list_loaded();
-        if matches!(list, DialogListQuery::Filter(FilterId::ALL)) {
-            let groups = backend.community_groups();
-            if groups.iter().any(|g| g.collapsed_in_dialogs) {
-                let grouped = crate::dialogs::community::group_dialogs_with_communities(
-                    &slice.entries,
-                    &groups,
-                );
-                slice.entries = grouped
-                    .into_iter()
-                    .map(|row| row.as_dialog_item().clone())
-                    .collect();
-                slice.pinned_count = slice.entries.iter().take_while(|d| d.pinned).count();
-            }
-        }
-        let row_heights: Vec<f32> = slice
-            .entries
-            .iter()
-            .map(|item| row_style_for(item, show_folder_tags, narrow).height as f32)
-            .collect();
-        let total_dialogs_h: f32 = row_heights.iter().sum();
-        let total_content_h = archive_h + total_dialogs_h;
-
-        let any_typing = slice.entries.iter().any(|d| d.typing.is_some());
-        if any_typing {
+        if snapshot.any_typing {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(60));
         }
@@ -588,7 +592,7 @@ impl DialogsInnerWidget {
             let origin = content_rect.min;
 
             // 1. Archive row at top of All Chats if visible in viewport.
-            if let Some(summary) = &archive_summary
+            if let Some(summary) = archive_summary
                 && viewport.min.y < archive_h
                 && viewport.max.y > 0.0
             {
@@ -639,8 +643,7 @@ impl DialogsInnerWidget {
             // 2. Virtualized visible dialog rows.
             let dialogs_vp_top = (viewport.min.y - archive_h).max(0.0);
             let dialogs_vp_bottom = (viewport.max.y - archive_h).max(0.0);
-            let (vis_range, vis_start_y) =
-                variable_visible_row_range(dialogs_vp_top, dialogs_vp_bottom, &row_heights);
+            let (vis_range, vis_start_y) = snapshot.visible_rows(dialogs_vp_top, dialogs_vp_bottom);
 
             let mut deferred_drag_paint: Option<(Rect, usize)> = None;
             let mut cursor_y = archive_h + vis_start_y;
@@ -785,13 +788,20 @@ impl DialogsInnerWidget {
                         anim_time_secs: anim_time,
                         use_24h: true,
                     };
-                    let bot_btn_rect = paint_dialog_row(
-                        &ui.painter().with_clip_rect(row_rect),
-                        paint_row_rect,
+                    let row_painter = ui.painter().with_clip_rect(row_rect);
+                    let prepared = self.row_text.row(
+                        &row_painter,
                         item,
                         now,
+                        paint_row_rect.width(),
                         paint_state,
-                        palette,
+                    );
+                    let bot_btn_rect = paint_prepared_dialog_row(
+                        &row_painter,
+                        paint_row_rect,
+                        item,
+                        prepared,
+                        paint_state,
                         &colors,
                     );
                     crate::dialogs::video_userpic::paint_row_video_userpic(
@@ -886,13 +896,15 @@ impl DialogsInnerWidget {
                     anim_time_secs: anim_time,
                     use_24h: true,
                 };
-                paint_dialog_row(
+                let prepared =
+                    self.row_text
+                        .row(ui.painter(), item, now, drag_rect.width(), paint_state);
+                paint_prepared_dialog_row(
                     ui.painter(),
                     drag_rect,
                     item,
-                    now,
+                    prepared,
                     paint_state,
-                    palette,
                     &colors,
                 );
                 crate::dialogs::video_userpic::paint_row_video_userpic(
@@ -914,6 +926,7 @@ impl DialogsInnerWidget {
         // Commit any pinned swaps produced during drag.
         for (from, to) in pending_swaps {
             backend.reorder_pinned(list, from, to);
+            list_changed = true;
         }
 
         // Execute any swipe / hover-pill / middle-click dialog quick action. "Delete" opens the
@@ -924,10 +937,13 @@ impl DialogsInnerWidget {
                     peer_id,
                     just_clear: false,
                 });
-            } else if let Some(toast) =
-                perform_quick_dialog_action(backend, peer_id, self.quick_dialog_action, list)
-            {
-                action = Some(InnerAction::Toast(toast));
+            } else {
+                list_changed = true;
+                if let Some(toast) =
+                    perform_quick_dialog_action(backend, peer_id, self.quick_dialog_action, list)
+                {
+                    action = Some(InnerAction::Toast(toast));
+                }
             }
         }
 
@@ -977,15 +993,20 @@ impl DialogsInnerWidget {
                         peer_id,
                         just_clear: triggered == CLEAR_HISTORY_ACTION,
                     });
-                } else if let Some(toast) =
-                    execute_context_action(&triggered, target, backend, list)
-                {
-                    action = Some(InnerAction::Toast(toast));
+                } else {
+                    list_changed = true;
+                    if let Some(toast) = execute_context_action(&triggered, target, backend, list) {
+                        action = Some(InnerAction::Toast(toast));
+                    }
                 }
             }
             if !self.context_menu.is_open() {
                 self.context_target = None;
             }
+        }
+
+        if list_changed {
+            self.list_cache.invalidate();
         }
 
         action
@@ -1162,7 +1183,10 @@ fn build_context_menu_rows(
                 if item.muted {
                     rows.push(EntryMenuRow::action(
                         "unmute",
-                        tg_lang::tr::lng_context_unmute(),
+                        crate::dialogs::mute_label::unmute_menu_label(
+                            backend.dialog_mute_until(peer_id),
+                            crate::dialogs::mute_label::unix_now(),
+                        ),
                         Some(st::menu_icon_unmute),
                     ));
                 } else {

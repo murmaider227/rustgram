@@ -36,6 +36,16 @@ impl RpcError {
         Self { code, name, value }
     }
 
+    /// Whether this error means the main DC no longer accepts the account's key: any `401`
+    /// except `AUTH_KEY_PERM_EMPTY` (`AUTH_KEY_UNREGISTERED`, `AUTH_KEY_INVALID`,
+    /// `SESSION_REVOKED`, `SESSION_EXPIRED`, `USER_DEACTIVATED`, ...).
+    /// `AUTH_KEY_PERM_EMPTY` only asks MTProto to bind a temporary key again
+    /// (`Instance::Private::onErrorDefault`, `mtproto/mtp_instance.cpp:1666-1679`).
+    #[must_use]
+    pub fn is_unauthorized(&self) -> bool {
+        self.code == 401 && self.name != "AUTH_KEY_PERM_EMPTY"
+    }
+
     /// Returns `true` if this is a flood wait error (`MTP::IsFloodError`).
     #[must_use]
     pub fn is_flood_error(&self) -> bool {
@@ -128,8 +138,9 @@ impl RpcError {
 /// MTProto RPC invocation error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum InvocationError {
-    /// Server returned an RPC error.
-    #[error("RPC error {0:?}")]
+    /// Server returned an RPC error. Displays as `RPC error <code>: <NAME>`, the form
+    /// [`RpcError::find_in_text`] reads back from an error that was turned into a string.
+    #[error("RPC error {0}")]
     Rpc(RpcError),
     /// Request was dropped before receiving a response.
     #[error("request dropped")]
@@ -143,6 +154,67 @@ pub enum InvocationError {
     /// Request was cancelled locally.
     #[error("request cancelled")]
     Cancelled,
+}
+
+/// `<code>: <NAME>`, e.g. `400: CHANNELS_TOO_MUCH` (same shape as `tg_mtproto::RpcError`).
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.name)
+    }
+}
+
+impl RpcError {
+    /// Finds the RPC error inside an error that was turned into a string on its way to the UI
+    /// (backend traits return `Result<_, String>`): the `RPC error <code>: <NAME>` form written by
+    /// [`InvocationError`] and `tg_mtproto::RpcError`, anywhere in `text`, or the old
+    /// `RpcError { code: <code>, name: "<NAME>"` debug form.
+    #[must_use]
+    pub fn find_in_text(text: &str) -> Option<Self> {
+        Self::find_display_form(text).or_else(|| Self::find_debug_form(text))
+    }
+
+    fn find_display_form(text: &str) -> Option<Self> {
+        const MARKER: &str = "RPC error ";
+        let mut rest = text;
+        while let Some(at) = rest.find(MARKER) {
+            rest = &rest[at + MARKER.len()..];
+            if let Some((code, after)) = split_code(rest)
+                && let Some(after) = after.strip_prefix(": ")
+                && let Some(name) = take_name(after)
+            {
+                return Some(Self::new(code, name));
+            }
+        }
+        None
+    }
+
+    fn find_debug_form(text: &str) -> Option<Self> {
+        let rest = &text[text.find("RpcError { code: ")? + "RpcError { code: ".len()..];
+        let (code, after) = split_code(rest)?;
+        let after = after.strip_prefix(", name: \"")?;
+        Some(Self::new(code, take_name(after)?))
+    }
+}
+
+fn split_code(text: &str) -> Option<(i32, &str)> {
+    let digits_start = usize::from(text.starts_with('-'));
+    let len = digits_start
+        + text[digits_start..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+    if len == digits_start {
+        return None;
+    }
+    Some((text[..len].parse().ok()?, &text[len..]))
+}
+
+fn take_name(text: &str) -> Option<&str> {
+    let len = text
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    (len > 0).then(|| &text[..len])
 }
 
 impl From<RpcError> for InvocationError {

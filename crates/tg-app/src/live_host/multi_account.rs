@@ -221,6 +221,34 @@ impl NotifyBackend for MultiAccountNotifyBackend {
         }
     }
 
+    fn notify_settings_versions(&self) -> Vec<(u64, u64)> {
+        let Ok(guard) = self.state.lock() else {
+            return Vec::new();
+        };
+        guard
+            .slots
+            .values()
+            .flat_map(|slot| slot.session.notify_settings_versions())
+            .collect()
+    }
+
+    fn sync_notify_settings(
+        &self,
+        session_id: u64,
+        store: &mut NotifySettingsStore,
+        now_unix: i64,
+    ) {
+        let target = self.state.lock().ok().and_then(|g| {
+            g.slots
+                .values()
+                .find(|s| s.session_id == session_id)
+                .map(|s| s.session.clone())
+        });
+        if let Some(session) = target {
+            session.sync_notify_settings(session_id, store, now_unix);
+        }
+    }
+
     fn unread_state(&self) -> UnreadBadgeState {
         let Ok(guard) = self.state.lock() else {
             return UnreadBadgeState::default();
@@ -801,6 +829,7 @@ impl MultiAccountWorkspaceHost {
                 next.workspace
                     .controller_mut()
                     .set_native_hwnd(self.native_hwnd);
+                next.workspace.controller_mut().adopt_theme(&self.settings);
             }
             if let Ok(mut guard) = self.notify_state.lock() {
                 guard.active_slot = slot_index;
@@ -1065,6 +1094,7 @@ impl MultiAccountWorkspaceHost {
         // 1. Poll background accounts' SessionEvents so cached views stay fresh and
         //    background ForceLogout is detected promptly.
         let mut background_force_logout: Option<i32> = None;
+        let mut background_drop_boxes: Vec<(i32, tg_ui::text::RichText)> = Vec::new();
         for (&slot, entry) in &mut self.accounts {
             entry.workspace.live_session().set_egui_ctx(ctx.clone());
             // Keep Premium status synchronized live from tg_data::Session when it changes
@@ -1093,6 +1123,20 @@ impl MultiAccountWorkspaceHost {
                     SessionEvent::Ready => {
                         entry.workspace.live_session_mut().refresh_cached_views();
                     }
+                    // `AUTH_KEY_DROP_*`: the box in this window, logout when it closes
+                    // (`Application::forceLogOut`, `core/application.cpp:1080-1096`).
+                    SessionEvent::ForceLogout {
+                        reason:
+                            tg_session::LogoutReason::ServerDrop {
+                                message, entities, ..
+                            },
+                    } => {
+                        background_drop_boxes.push((
+                            slot,
+                            crate::live_host::forced_logout_text(message, entities),
+                        ));
+                    }
+                    // A fatal `401` logs out silently (`main/main_account.cpp:469-473`).
                     SessionEvent::ForceLogout { .. } => {
                         background_force_logout = Some(slot);
                     }
@@ -1113,7 +1157,21 @@ impl MultiAccountWorkspaceHost {
 
         let mut updated_badge_prefs: Option<(bool, bool)> = None;
         if let Some(entry) = self.accounts.get_mut(&self.active_slot) {
+            for (slot, text) in background_drop_boxes {
+                entry
+                    .workspace
+                    .controller_mut()
+                    .show_background_forced_logout_box(slot, text);
+            }
             let logout_requested = entry.workspace.show(ctx, ui);
+            if background_force_logout.is_none() {
+                background_force_logout = entry
+                    .workspace
+                    .controller_mut()
+                    .take_background_logouts()
+                    .into_iter()
+                    .next();
+            }
             active_palette = entry.workspace.controller().palette();
             active_passcode_locked =
                 entry.workspace.controller().root_screen() == RootScreen::PasscodeLock;

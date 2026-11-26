@@ -663,14 +663,20 @@ impl DialogsLoader {
         if let Some(st) = self.folders.get_mut(&folder_id) {
             st.total_count = Some(total_count);
             st.request_in_flight = false;
-            if last_date != 0 {
+            let offset_peer = self
+                .peer_inputs
+                .get(&last_peer)
+                .cloned()
+                .unwrap_or(tl_enums::InputPeer::Empty);
+            // A page that does not move the offset would be requested again forever: treat it
+            // as the end of the list.
+            let no_progress = st.offset_date == last_date
+                && st.offset_id == last_msg_id
+                && st.offset_peer == offset_peer;
+            if last_date != 0 && !no_progress {
                 st.offset_date = last_date;
                 st.offset_id = last_msg_id;
-                st.offset_peer = self
-                    .peer_inputs
-                    .get(&last_peer)
-                    .cloned()
-                    .unwrap_or(tl_enums::InputPeer::Empty);
+                st.offset_peer = offset_peer;
             } else {
                 st.list_received = true;
             }

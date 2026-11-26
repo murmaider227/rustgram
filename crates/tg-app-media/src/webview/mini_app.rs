@@ -777,10 +777,7 @@ impl MiniAppWindow {
                                 err.code.clone()
                             };
                             self.post_host_event(&HostEvent::PreparedMessageFailed { error: code });
-                            self.show_toast(format!(
-                                "Prepared message unavailable: {}",
-                                err.message
-                            ));
+                            let _ = tg_app_core::user_error::prepared_message(&err.message);
                         }
                     }
                 }
@@ -1048,10 +1045,14 @@ impl MiniAppWindow {
                             self.post_host_event(&HostEvent::PreparedMessageFailed {
                                 error: "MESSAGE_SEND_FAILED".to_owned(),
                             });
-                            self.show_toast(format!(
-                                "Failed to share prepared message: {}",
-                                err.message
-                            ));
+                            if let Some(text) = tg_app_core::user_error::send_message(
+                                &err.message,
+                                tg_app_core::user_error::SendTarget::User,
+                            )
+                            .into_text()
+                            {
+                                self.show_toast(text);
+                            }
                         }
                     }
                 } else {
@@ -1237,6 +1238,9 @@ impl MiniAppWindow {
     }
 
     fn show_toast(&mut self, message: String) {
+        let Some(message) = tg_app_core::user_error::visible_toast_text(message) else {
+            return;
+        };
         self.toast = Some((message, Instant::now()));
     }
 

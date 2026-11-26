@@ -1160,8 +1160,11 @@ fn paint_reaction_peer_row(
         Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
         Vec2::splat(34.0),
     );
-    EmptyUserpic::for_color_index(entry.color_index, &entry.name, ui_colors)
-        .paint_circle(ui.painter(), av_rect);
+    EmptyUserpic::for_color_index(entry.color_index, &entry.name, ui_colors).paint_circle_or_photo(
+        ui.painter(),
+        av_rect,
+        entry.peer_id.0,
+    );
 
     // Optional overflow actions button (`...`) on non-self rows for reaction moderation/reporting.
     let mut right_edge = rect.right() - 8.0;
@@ -1286,8 +1289,11 @@ fn paint_voter_row(
         Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
         Vec2::splat(34.0),
     );
-    EmptyUserpic::for_color_index(voter.color_index, &voter.name, ui_colors)
-        .paint_circle(ui.painter(), av_rect);
+    EmptyUserpic::for_color_index(voter.color_index, &voter.name, ui_colors).paint_circle_or_photo(
+        ui.painter(),
+        av_rect,
+        voter.peer_id.0,
+    );
 
     let text_x = av_rect.right() + 10.0;
     let max_text_w = (rect.right() - text_x - 10.0).max(60.0);

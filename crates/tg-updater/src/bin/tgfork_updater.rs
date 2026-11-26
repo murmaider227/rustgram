@@ -6,6 +6,10 @@
 //! cleans up `tupdates`, updates the Windows uninstall registry version, and relaunches
 //! `rustgram.exe` with `-noupdate` plus forwarded flags (`-workdir`, `-key`, `-debug`,
 //! `-autostart`, `-startintray`).
+//! Release builds use the GUI subsystem (like tdesktop's `Updater.exe`), so applying an update
+//! never flashes a console window; `-debug` writes its log to a file instead.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
 use std::fs::{self, File};

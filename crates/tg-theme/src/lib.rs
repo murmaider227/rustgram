@@ -46,7 +46,7 @@ pub use gradient::{
 pub use night_mode::{NightModeState, NightModeSwitch, ToggleDecision, default_theme_path};
 pub use palette::{
     BubblesReadabilityArgs, PALETTE_CHECKSUM, PALETTE_COUNT, PALETTE_ENTRY_COUNT, PALETTE_ROWS,
-    Palette, PaletteRow, SetResult, darken_under_white_text, ensure_bubbles_readable,
+    Palette, PaletteColor, PaletteRow, SetResult, darken_under_white_text, ensure_bubbles_readable,
     ensure_peer_name_readable,
 };
 pub use svg_pattern::{

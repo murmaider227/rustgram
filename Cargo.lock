@@ -5750,6 +5750,7 @@ dependencies = [
  "tg-core",
  "tg-crypto",
  "tg-data",
+ "tg-emoji",
  "tg-export",
  "tg-history",
  "tg-iv",
@@ -5842,9 +5843,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tg-api",
  "tg-app-core",
  "tg-app-info",
+ "tg-app-live",
  "tg-app-media",
+ "tg-app-settings",
  "tg-audio",
  "tg-bots",
  "tg-chat",
@@ -5858,12 +5862,14 @@ dependencies = [
  "tg-lottie",
  "tg-media",
  "tg-platform",
+ "tg-session",
  "tg-text",
  "tg-tgw",
  "tg-theme",
  "tg-tl",
  "tg-ui",
  "tg-video",
+ "tokio",
  "tracing",
  "winit",
 ]
@@ -5879,6 +5885,7 @@ dependencies = [
  "image",
  "png 0.18.1",
  "qrcode",
+ "resvg",
  "rfd",
  "serde",
  "serde_json",
@@ -5892,8 +5899,10 @@ dependencies = [
  "tg-emoji",
  "tg-history",
  "tg-lang",
+ "tg-media",
  "tg-passport",
  "tg-payments",
+ "tg-platform",
  "tg-stats",
  "tg-text",
  "tg-theme",
@@ -5950,6 +5959,7 @@ dependencies = [
  "tg-theme",
  "tg-tl",
  "tg-transport",
+ "tg-ui",
  "tg-video",
  "tg-voip",
  "tg-wallet",
@@ -5985,6 +5995,7 @@ dependencies = [
  "tg-lang",
  "tg-media",
  "tg-platform",
+ "tg-storage",
  "tg-stories",
  "tg-text",
  "tg-tgw",
@@ -6185,6 +6196,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
  "crc32fast",
+ "rustc-hash 2.1.3",
  "tokio",
 ]
 
@@ -6205,6 +6217,7 @@ dependencies = [
 name = "tg-emoji"
 version = "0.1.0"
 dependencies = [
+ "ecolor",
  "egui",
  "image",
  "tg-text",
@@ -6235,6 +6248,7 @@ dependencies = [
 name = "tg-history"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "tg-data",
  "tg-style",
 ]
@@ -6509,6 +6523,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "egui_kittest",
  "image",
  "tg-lottie",
  "tg-style",

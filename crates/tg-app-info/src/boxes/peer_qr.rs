@@ -263,8 +263,11 @@ impl PeerQrBoxState {
             match backend.export_contact_token() {
                 Ok(info) => state.apply_contact_token(&info),
                 Err(err) => {
-                    state.status_message =
-                        Some(format!("{} ({err})", tr::lng_peer_qr_link_unavailable()));
+                    state.status_message = tg_app_core::user_error::share_theme_or_qr(
+                        "contacts.exportContactToken",
+                        &err,
+                    )
+                    .into_text();
                 }
             }
         }

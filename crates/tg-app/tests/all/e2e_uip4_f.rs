@@ -242,6 +242,7 @@ fn parity_search(rows: &[DialogItem]) -> SearchResults {
             time,
             send_state: TICKS[usize::from(peer.special != SpecialRowKind::SavedMessages)], // after-only
             archived: false,
+            media_preview: None,
         }
     };
     SearchResults {

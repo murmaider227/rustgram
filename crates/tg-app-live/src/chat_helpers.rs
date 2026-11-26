@@ -11,7 +11,7 @@
 //! - `Telegram/SourceFiles/chat_helpers/field_autocomplete.cpp`
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tg_api::RpcClient;
@@ -37,9 +37,7 @@ use crate::convert::{
     avatar_rgb_for_color_index, history_messages_ordered, known_peer_ids, now_unix_i32,
     to_data_peer,
 };
-use crate::media::{
-    block_on_runtime, download_file_bytes, download_file_bytes_async, with_rpc_timeout,
-};
+use crate::media::{block_on_runtime, download_file_bytes_async, with_rpc_timeout};
 use crate::session::LiveSession;
 use tg_app_core::chat_helpers::backend::{
     AttachedStickerSetSummary, AttachedStickersMedia, ChatHelpersBackend, DefaultEmojiCatalog,
@@ -404,6 +402,11 @@ struct LiveChatHelpersInner {
     sticker_media_cache: HashMap<ChatDocId, Option<StickerMedia>>,
     sticker_media_in_flight: HashSet<ChatDocId>,
     gif_frames_cache: HashMap<ChatDocId, Option<Vec<GifFrameRgba>>>,
+    gif_frames_in_flight: HashSet<ChatDocId>,
+    panel_refreshes_in_flight: HashSet<PanelRefresh>,
+    // Bumped by `invalidate_all`; a panel refresh that started before the bump re-marks its
+    // timestamps stale when it finishes, so the invalidation is not lost.
+    invalidation_epoch: u64,
     emoji_statuses_sync: tg_api::cached_lists::EmojiStatusesSync,
     stickers_by_emoji: HashMap<String, StickersByEmojiCacheEntry>,
     search_sets_cache: HashMap<(String, bool), SearchStickerSetsCacheEntry>,
@@ -443,6 +446,9 @@ impl LiveChatHelpersInner {
             sticker_media_cache: HashMap::new(),
             sticker_media_in_flight: HashSet::new(),
             gif_frames_cache: HashMap::new(),
+            gif_frames_in_flight: HashSet::new(),
+            panel_refreshes_in_flight: HashSet::new(),
+            invalidation_epoch: 0,
             emoji_statuses_sync: tg_api::cached_lists::EmojiStatusesSync::default(),
             stickers_by_emoji: HashMap::new(),
             search_sets_cache: HashMap::new(),
@@ -480,6 +486,8 @@ impl LiveChatHelpersInner {
 pub(super) struct LiveChatHelpersState {
     inner: Mutex<LiveChatHelpersInner>,
     doc_pool: StickerDocPool,
+    /// Signalled whenever a panel refresh or a GIF frame download finishes.
+    background_idle: Condvar,
 }
 
 impl LiveChatHelpersState {
@@ -488,6 +496,7 @@ impl LiveChatHelpersState {
         Self {
             inner: Mutex::new(LiveChatHelpersInner::new()),
             doc_pool: StickerDocPool::new(),
+            background_idle: Condvar::new(),
         }
     }
 
@@ -501,6 +510,7 @@ impl LiveChatHelpersState {
     /// Marks all cached sticker/GIF/participant timestamps stale so subsequent reads re-fetch with hashes.
     pub(super) fn invalidate_all(&self) {
         if let Ok(mut g) = self.inner.lock() {
+            g.invalidation_epoch = g.invalidation_epoch.wrapping_add(1);
             g.last_stickers_update_ms = 0;
             g.last_masks_update_ms = 0;
             g.last_custom_emoji_update_ms = 0;
@@ -518,6 +528,86 @@ impl LiveChatHelpersState {
             g.participants_cache.clear();
             g.full_chat_fetched.clear();
         }
+    }
+}
+
+/// A server refresh the sticker, GIF and emoji panels start from their per-frame getters.
+///
+/// It runs on its own thread, so a cold or expired cache never stalls a frame; until it lands
+/// the getters return what is cached, the same content the panels show before the first load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PanelRefresh {
+    /// `messages.getFavedStickers`, `messages.getRecentStickers`, `messages.getAllStickers`
+    /// and `messages.getStickerSet` for new or changed sets.
+    MyStickers,
+    /// `messages.getFeaturedStickers`.
+    Featured,
+    /// `messages.getSavedGifs`.
+    SavedGifs,
+    /// `messages.getEmojiGroups`.
+    EmojiGroups,
+}
+
+impl PanelRefresh {
+    /// Whether the refresh functions would contact the server now (same checks they make).
+    fn is_due(self, g: &LiveChatHelpersInner, now_ms: i64) -> bool {
+        let needed = |last_ms| StickersStore::update_needed(last_ms, now_ms);
+        match self {
+            Self::MyStickers => {
+                needed(g.last_faved_update_ms)
+                    || needed(g.last_recent_update_ms)
+                    || needed(g.last_stickers_update_ms)
+            }
+            Self::Featured => needed(g.last_featured_update_ms),
+            Self::SavedGifs => needed(g.last_saved_gifs_update_ms),
+            Self::EmojiGroups => {
+                g.last_emoji_groups_update_ms == 0
+                    || now_ms.saturating_sub(g.last_emoji_groups_update_ms)
+                        >= STICKERS_UPDATE_TIMEOUT_MS
+            }
+        }
+    }
+
+    /// Marks the timestamps this refresh wrote stale again after a racing `invalidate_all`.
+    fn mark_stale(self, g: &mut LiveChatHelpersInner) {
+        match self {
+            Self::MyStickers => {
+                g.last_faved_update_ms = 0;
+                g.last_recent_update_ms = 0;
+                g.last_stickers_update_ms = 0;
+            }
+            Self::Featured => g.last_featured_update_ms = 0,
+            Self::SavedGifs => g.last_saved_gifs_update_ms = 0,
+            Self::EmojiGroups => {}
+        }
+    }
+}
+
+/// Clears a panel refresh's in-flight mark when its thread ends, even by a panic.
+struct PanelRefreshDone {
+    state: Arc<LiveChatHelpersState>,
+    job: PanelRefresh,
+    epoch: u64,
+}
+
+impl Drop for PanelRefreshDone {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.state.inner.lock() {
+            g.panel_refreshes_in_flight.remove(&self.job);
+            if g.invalidation_epoch != self.epoch {
+                self.job.mark_stale(&mut g);
+            }
+        }
+        self.state.background_idle.notify_all();
+    }
+}
+
+fn pick_gif_frame(frames: Option<&Vec<GifFrameRgba>>, frame_index: usize) -> Option<GifFrameRgba> {
+    let frames = frames?;
+    if frames.is_empty() {
+        None
+    } else {
+        Some(frames[frame_index % frames.len()].clone())
     }
 }
 
@@ -808,6 +898,54 @@ fn ingest_document(
     Some(id)
 }
 
+/// Registers Star Gift sticker documents (`starGift.sticker`) with the sticker media cache.
+pub(crate) fn ingest_gift_sticker_documents(
+    state: &LiveChatHelpersState,
+    docs: &[tl_enums::Document],
+) {
+    let Ok(mut inner) = state.inner.lock() else {
+        return;
+    };
+    for doc in docs {
+        let _ = ingest_document(&mut inner, &state.doc_pool, doc, None);
+    }
+}
+
+/// Returns cached media for a registered gift sticker, or starts its download on `handle`.
+pub(crate) fn gift_sticker_media<C: RpcClient + Clone + 'static>(
+    state: &Arc<LiveChatHelpersState>,
+    rpc: &C,
+    handle: &tokio::runtime::Handle,
+    bridge: std::sync::Weak<crate::bridge::LiveBridgeState>,
+    id: ChatDocId,
+) -> Option<StickerMedia> {
+    let meta = {
+        let mut g = state.inner.lock().ok()?;
+        if let Some(cached) = g.sticker_media_cache.get(&id) {
+            return cached.clone();
+        }
+        if g.sticker_media_in_flight.contains(&id) {
+            return None;
+        }
+        let meta = g.doc_meta.get(&id)?.clone();
+        g.sticker_media_in_flight.insert(id);
+        meta
+    };
+    let state = Arc::clone(state);
+    let rpc = rpc.clone();
+    handle.spawn(async move {
+        let resolved = fetch_sticker_media_async(&rpc, &meta).await;
+        if let Ok(mut g) = state.inner.lock() {
+            g.sticker_media_in_flight.remove(&id);
+            g.sticker_media_cache.insert(id, resolved);
+        }
+        if let Some(b) = bridge.upgrade() {
+            b.notify_ui();
+        }
+    });
+    None
+}
+
 fn ingest_sticker_set_full(
     inner: &mut LiveChatHelpersInner,
     pool: &StickerDocPool,
@@ -1003,6 +1141,69 @@ impl LiveSession {
 
     fn ch_state(&self) -> &Arc<LiveChatHelpersState> {
         &self.chat_helpers.state
+    }
+
+    /// Starts `job` on a background thread when its cache is due and it is not already running.
+    /// The panels' getters call this every frame; when nothing is due it only checks the state.
+    fn start_panel_refresh(&self, job: PanelRefresh) {
+        let state = Arc::clone(self.ch_state());
+        let epoch = {
+            let Ok(mut g) = state.inner.lock() else {
+                return;
+            };
+            let now_ms = g.now_ms();
+            if g.panel_refreshes_in_flight.contains(&job) || !job.is_due(&g, now_ms) {
+                return;
+            }
+            g.panel_refreshes_in_flight.insert(job);
+            g.invalidation_epoch
+        };
+        let live = self.clone();
+        let done = PanelRefreshDone { state, job, epoch };
+        let spawned = std::thread::Builder::new()
+            .name("tg-panel-refresh".to_owned())
+            .spawn(move || {
+                {
+                    let _done = done;
+                    live.run_panel_refresh(job);
+                }
+                live.bridge_state().notify_ui();
+            });
+        if let Err(err) = spawned {
+            debug!(error = %err, ?job, "panel refresh thread failed to start");
+        }
+    }
+
+    fn run_panel_refresh(&self, job: PanelRefresh) {
+        let result = match job {
+            PanelRefresh::MyStickers => {
+                let faved = self.refresh_faved_stickers(false);
+                let recent = self.refresh_recent_stickers(false, false);
+                let all = self.refresh_all_stickers(false);
+                faved.and(recent).and(all)
+            }
+            PanelRefresh::Featured => self.refresh_featured_stickers(false),
+            PanelRefresh::SavedGifs => self.refresh_saved_gifs(false),
+            PanelRefresh::EmojiGroups => self.refresh_emoji_groups(false).map(|_| ()),
+        };
+        if let Err(err) = result {
+            debug!(error = %err, ?job, "panel refresh failed");
+        }
+    }
+
+    /// Blocks until no panel refresh or GIF frame download started by the panel getters is
+    /// running, or `timeout` passes. Returns `true` when idle (tests and headless captures).
+    pub fn wait_panel_background_idle(&self, timeout: Duration) -> bool {
+        let state = self.ch_state();
+        let Ok(g) = state.inner.lock() else {
+            return false;
+        };
+        state
+            .background_idle
+            .wait_timeout_while(g, timeout, |g| {
+                !g.panel_refreshes_in_flight.is_empty() || !g.gif_frames_in_flight.is_empty()
+            })
+            .is_ok_and(|(_, res)| !res.timed_out())
     }
 
     /// Sets the `@gif` inline bot username used for GIF search (default `"gif"`).
@@ -2643,94 +2844,75 @@ impl LiveSession {
         None
     }
 
-    fn load_gif_frame_inner(
-        &self,
-        id: ChatDocId,
-        frame_index: usize,
-    ) -> Option<(u32, u32, Vec<u8>)> {
-        if let Ok(g) = self.ch_state().inner.lock()
-            && let Some(cached) = g.gif_frames_cache.get(&id)
-        {
-            return cached.as_ref().and_then(|frames| {
-                if frames.is_empty() {
-                    None
-                } else {
-                    Some(frames[frame_index % frames.len()].clone())
-                }
-            });
-        }
-
-        let meta = self
-            .ch_state()
-            .inner
-            .lock()
-            .ok()
-            .and_then(|g| g.doc_meta.get(&id).cloned())?;
-
-        let frames = if let Some(cached_bytes) = &meta.cached_thumb_bytes {
-            decode_rgba_image_bytes(cached_bytes).map(|f| vec![f])
-        } else if let Some(thumb_type) = &meta.thumb_size_type {
-            let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
-                tl_types::InputDocumentFileLocation {
-                    id: meta.id.0 as i64,
-                    access_hash: meta.access_hash,
-                    file_reference: meta.file_reference.clone(),
-                    thumb_size: thumb_type.clone(),
-                },
-            );
-            download_file_bytes(
-                self.runtime().rpc(),
-                self.runtime().tokio_handle(),
-                meta.dc_id,
-                loc,
-                None,
-            )
-            .ok()
-            .and_then(|bytes| decode_rgba_image_bytes(&bytes))
-            .map(|f| vec![f])
-            .or_else(|| {
-                meta.stripped_thumb
-                    .as_deref()
-                    .and_then(decode_stripped_thumb)
-                    .map(|f| vec![f])
-            })
-        } else if meta.mime_type == "image/gif" {
-            let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
-                tl_types::InputDocumentFileLocation {
-                    id: meta.id.0 as i64,
-                    access_hash: meta.access_hash,
-                    file_reference: meta.file_reference.clone(),
-                    thumb_size: String::new(),
-                },
-            );
-            download_file_bytes(
-                self.runtime().rpc(),
-                self.runtime().tokio_handle(),
-                meta.dc_id,
-                loc,
-                (meta.size > 0).then_some(meta.size),
-            )
-            .ok()
-            .and_then(|bytes| decode_rgba_image_bytes(&bytes))
-            .map(|f| vec![f])
-        } else {
-            meta.stripped_thumb
-                .as_deref()
-                .and_then(decode_stripped_thumb)
-                .map(|f| vec![f])
+    /// Returns frame `frame_index` of GIF `id`. Frames that need a download are fetched and
+    /// decoded in the background (`None` until then, as for a GIF that failed to load); local
+    /// thumbnails decode inline.
+    fn load_gif_frame_inner(&self, id: ChatDocId, frame_index: usize) -> Option<GifFrameRgba> {
+        let meta = {
+            let Ok(mut g) = self.ch_state().inner.lock() else {
+                return None;
+            };
+            if let Some(cached) = g.gif_frames_cache.get(&id) {
+                return pick_gif_frame(cached.as_ref(), frame_index);
+            }
+            if g.gif_frames_in_flight.contains(&id) {
+                return None;
+            }
+            let meta = g.doc_meta.get(&id)?.clone();
+            if gif_frame_download(&meta).is_some() {
+                g.gif_frames_in_flight.insert(id);
+            }
+            meta
         };
 
-        let result = frames.as_ref().and_then(|fs| {
-            if fs.is_empty() {
-                None
-            } else {
-                Some(fs[frame_index % fs.len()].clone())
+        let Some((loc, expected_size)) = gif_frame_download(&meta) else {
+            let frames = match meta.cached_thumb_bytes.as_deref() {
+                Some(cached) => decode_rgba_image_bytes(cached),
+                None => meta
+                    .stripped_thumb
+                    .as_deref()
+                    .and_then(decode_stripped_thumb),
+            }
+            .map(|f| vec![f]);
+            let result = pick_gif_frame(frames.as_ref(), frame_index);
+            if let Ok(mut g) = self.ch_state().inner.lock() {
+                g.gif_frames_cache.insert(id, frames);
+            }
+            return result;
+        };
+
+        let state = Arc::clone(&self.chat_helpers.state);
+        let bridge = Arc::downgrade(self.bridge_state());
+        let rpc = self.runtime().rpc().clone();
+        self.runtime().tokio_handle().spawn(async move {
+            let bytes = download_file_bytes_async(&rpc, meta.dc_id, loc, expected_size)
+                .await
+                .ok();
+            let frames = tokio::task::spawn_blocking(move || {
+                bytes
+                    .as_deref()
+                    .and_then(decode_rgba_image_bytes)
+                    .or_else(|| {
+                        meta.thumb_size_type.as_ref()?;
+                        meta.stripped_thumb
+                            .as_deref()
+                            .and_then(decode_stripped_thumb)
+                    })
+                    .map(|f| vec![f])
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Ok(mut g) = state.inner.lock() {
+                g.gif_frames_in_flight.remove(&id);
+                g.gif_frames_cache.insert(id, frames);
+            }
+            state.background_idle.notify_all();
+            if let Some(b) = bridge.upgrade() {
+                b.notify_ui();
             }
         });
-        if let Ok(mut g) = self.ch_state().inner.lock() {
-            g.gif_frames_cache.insert(id, frames);
-        }
-        result
+        None
     }
 
     /// Searches `@mention` candidates for `peer_id` using `channels.getParticipants`
@@ -2841,6 +3023,32 @@ impl LiveSession {
         self.chat_helpers.is_premium = is_premium;
         self.ch_state().set_is_premium(is_premium);
     }
+}
+
+/// The file a GIF frame is decoded from when it is not cached locally: the thumbnail, or the
+/// whole file for a plain `image/gif`. `None` when only local bytes are available.
+fn gif_frame_download(
+    meta: &LiveDocumentMeta,
+) -> Option<(tl_enums::InputFileLocation, Option<u64>)> {
+    if meta.cached_thumb_bytes.is_some() {
+        return None;
+    }
+    let (thumb_size, expected_size) = if let Some(thumb_type) = &meta.thumb_size_type {
+        (thumb_type.clone(), None)
+    } else if meta.mime_type == "image/gif" {
+        (String::new(), (meta.size > 0).then_some(meta.size))
+    } else {
+        return None;
+    };
+    let loc = tl_enums::InputFileLocation::InputDocumentFileLocation(
+        tl_types::InputDocumentFileLocation {
+            id: meta.id.0 as i64,
+            access_hash: meta.access_hash,
+            file_reference: meta.file_reference.clone(),
+            thumb_size,
+        },
+    );
+    Some((loc, expected_size))
 }
 
 fn extract_web_document_dims(doc: Option<&tl_enums::WebDocument>) -> Option<(u32, u32)> {
@@ -3078,7 +3286,12 @@ impl ChatHelpersBackend for LiveSession {
     }
 
     fn emoji_groups(&self) -> Result<Vec<EmojiGroupInfo>, String> {
-        self.refresh_emoji_groups(false)
+        self.start_panel_refresh(PanelRefresh::EmojiGroups);
+        self.ch_state()
+            .inner
+            .lock()
+            .map(|g| emoji_groups_to_dto(&g.emoji_statuses_sync.emoji_groups.groups))
+            .map_err(|_| "chat helpers state lock poisoned".to_owned())
     }
 
     fn is_premium(&self) -> bool {
@@ -3091,9 +3304,7 @@ impl ChatHelpersBackend for LiveSession {
     }
 
     fn sticker_sections(&self) -> Vec<StickerPanelSection> {
-        let _ = self.refresh_faved_stickers(false);
-        let _ = self.refresh_recent_stickers(false, false);
-        let _ = self.refresh_all_stickers(false);
+        self.start_panel_refresh(PanelRefresh::MyStickers);
         self.ch_state()
             .inner
             .lock()
@@ -3110,7 +3321,7 @@ impl ChatHelpersBackend for LiveSession {
     }
 
     fn featured_sticker_sections(&self) -> Vec<StickerPanelSection> {
-        let _ = self.refresh_featured_stickers(false);
+        self.start_panel_refresh(PanelRefresh::Featured);
         self.ch_state()
             .inner
             .lock()
@@ -3420,7 +3631,7 @@ impl ChatHelpersBackend for LiveSession {
     }
 
     fn saved_gifs(&self) -> Vec<GifItem> {
-        let _ = self.refresh_saved_gifs(false);
+        self.start_panel_refresh(PanelRefresh::SavedGifs);
         self.ch_state()
             .inner
             .lock()

@@ -104,7 +104,7 @@ pub fn preview_sender(session: &Session, msg: &Message) -> Option<String> {
 }
 
 /// `Dialogs::Ui::DialogsPreviewText`: one line, no line breaks.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.trim()
         .split(['\r', '\n'])
         .filter(|s| !s.trim().is_empty())
@@ -148,7 +148,7 @@ fn song_name(doc: &DocumentData) -> String {
     }
 }
 
-const fn is_sticker(kind: DocumentKind) -> bool {
+pub(crate) const fn is_sticker(kind: DocumentKind) -> bool {
     matches!(
         kind,
         DocumentKind::Sticker | DocumentKind::AnimatedSticker | DocumentKind::VideoSticker
@@ -218,7 +218,7 @@ pub fn message_preview_text(session: &Session, msg: &Message) -> String {
         MessageContent::Service(action) => service_action_text(session, msg, action),
         MessageContent::Regular { text, media } => {
             let caption = one_line(&text.text);
-            regular_preview(media, &caption)
+            regular_preview(media, &caption, true)
         }
     }
 }
@@ -230,6 +230,7 @@ pub fn message_preview_text(session: &Session, msg: &Message) -> String {
 pub fn message_media_preview(msg: &Message) -> Option<DialogMediaPreview> {
     match &msg.content {
         MessageContent::Empty => None,
+        MessageContent::Service(action) if matches!(**action, ServiceAction::HistoryClear) => None,
         MessageContent::Service(_) => Some(DialogMediaPreview {
             kind: DialogMediaPreviewKind::Service,
             stripped_thumb: None,
@@ -346,7 +347,10 @@ pub fn message_media_preview(msg: &Message) -> Option<DialogMediaPreview> {
     }
 }
 
-fn regular_preview(media: &MessageMedia, caption: &str) -> String {
+/// `Media*::toPreview(...).text`. `mini_images` is `ToPreviewOptions::generateImages`: the
+/// chat list draws mini thumbnails and then shows a caption alone; a reply header does not
+/// (`HistoryItem::inReplyText`) and shows "{media}, {caption}".
+pub(crate) fn regular_preview(media: &MessageMedia, caption: &str, mini_images: bool) -> String {
     match media {
         MessageMedia::Empty | MessageMedia::WebPage(_) | MessageMedia::Unsupported => {
             caption.to_owned()
@@ -359,7 +363,7 @@ fn regular_preview(media: &MessageMedia, caption: &str) -> String {
                 tr::lng_in_dlg_photo()
             };
             let caption = if ttl { "" } else { caption };
-            with_caption(&kind, caption, true)
+            with_caption(&kind, caption, mini_images)
         }
         MessageMedia::Document(doc) => {
             if is_sticker(doc.kind) {
@@ -370,7 +374,7 @@ fn regular_preview(media: &MessageMedia, caption: &str) -> String {
             with_caption(
                 &document_type_text(doc),
                 caption,
-                document_has_mini_image(doc),
+                mini_images && document_has_mini_image(doc),
             )
         }
         MessageMedia::Contact(_) => tr::lng_in_dlg_contact(),
@@ -574,6 +578,8 @@ pub fn known_service_text(
             duration,
             ..
         } => call_text(msg, *video, reason.as_ref(), *duration),
+        // `PrepareEmptyText<MTPDmessageActionHistoryClear>` (`history_item.cpp`).
+        ServiceAction::HistoryClear => String::new(),
         _ => return None,
     };
     Some(text)
@@ -655,7 +661,7 @@ pub fn has_saved_messages_out_layout(session: &Session, msg: &Message) -> bool {
         return true;
     };
     if forward_of_forward(fwd) {
-        fwd.saved_from_id == Some(self_id)
+        fwd.saved_from_id == Some(self_id) || fwd.saved_out
     } else {
         fwd.from_id == Some(self_id)
     }

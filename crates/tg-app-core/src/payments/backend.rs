@@ -179,6 +179,10 @@ pub struct StarGiftsBundle {
     pub balance: CreditsAmount,
     /// Default recipient display name for the Send Gift flow.
     pub default_recipient: String,
+    /// Default recipient peer id (userpic color in the gift box).
+    pub recipient_peer_id: i64,
+    /// Whether the default recipient is the current user ("Buy a Gift" box texts).
+    pub recipient_is_self: bool,
     /// Catalog gifts available in the picker grid.
     pub catalog: Vec<CatalogGiftItem>,
     /// Received gifts owned by the current user.

@@ -41,6 +41,13 @@ use crate::fonts::font_id_for_flags;
 use crate::icons::paint_style_icon;
 use crate::style::{LinkUnderline, QuoteStyle, TextPalette, TextStyle, px};
 
+mod prepared;
+
+pub use prepared::{
+    PreparedEntityText, PreparedRichText, fonts_epoch, note_text_preparation,
+    render_prepared_rich_text, render_prepared_text_with_entities, text_preparation_count,
+};
+
 // ---------------------------------------------------------------------------
 // Legacy RichText API (kept 100% source-compatible)
 // ---------------------------------------------------------------------------
@@ -100,6 +107,16 @@ impl RichText {
                 continue;
             };
             let slice = &src.text[range.clone()];
+            if let Some(target) =
+                crate::entity_link::entity_link_target(entity.entity_type(), entity.data(), slice)
+            {
+                out.spans.push(TextSpan {
+                    start: range.start,
+                    end: range.end,
+                    kind: TextEntityKind::Link(target),
+                });
+                continue;
+            }
             let kind = match entity.entity_type() {
                 EntityType::Bold | EntityType::Semibold => TextEntityKind::Bold,
                 EntityType::Italic => TextEntityKind::Italic,
@@ -337,15 +354,41 @@ pub fn build_layout_job(
     hovered_link: Option<&str>,
     spoilers_revealed: bool,
 ) -> LayoutJob {
+    let segments = split_legacy_segments(rich);
+    layout_job_for_segments(
+        &rich.text,
+        &segments,
+        style,
+        palette,
+        base_color,
+        wrap_width,
+        hovered_link,
+        spoilers_revealed,
+    )
+}
+
+/// [`build_layout_job`] for `segments` split from `text` earlier
+/// ([`split_legacy_segments`]): a prepared text splits once and builds a job per hover state.
+#[allow(clippy::too_many_arguments)]
+fn layout_job_for_segments(
+    text: &str,
+    segments: &[LegacySegment],
+    style: &TextStyle,
+    palette: &TextPalette,
+    base_color: Color32,
+    wrap_width: f32,
+    hovered_link: Option<&str>,
+    spoilers_revealed: bool,
+) -> LayoutJob {
+    prepared::note_text_preparation();
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width.max(1.0);
 
-    let segments = split_legacy_segments(rich);
     let base_size = style.font.size;
     let base_line_height = (style.line_height > 0.0).then_some(style.line_height);
 
     for seg in segments {
-        let slice = &rich.text[seg.start..seg.end];
+        let slice = &text[seg.start..seg.end];
         let mut flags = style.font.to_tg_flags();
         if seg.mono {
             flags = FontFlags::MONOSPACE;
@@ -430,121 +473,17 @@ pub fn render_rich_text(
     base_color: Color32,
     max_width: f32,
 ) -> RichTextResponse {
-    let reveal_id = id.with("_tg_spoiler_revealed");
-    let hover_link_id = id.with("_tg_hover_link");
-    let mut revealed = ui
-        .ctx()
-        .data_mut(|d| d.get_temp::<bool>(reveal_id))
-        .unwrap_or(false);
-    let prev_hovered = ui
-        .ctx()
-        .data_mut(|d| d.get_temp::<Option<String>>(hover_link_id))
-        .unwrap_or(None);
-
-    let wrap_w = max_width.max(1.0);
-    let job = build_layout_job(
+    // The widget itself lives in `prepared`; called like this it keeps nothing between frames.
+    prepared::render_rich_text_cached(
+        ui,
+        id,
         rich,
+        &mut prepared::RichTextCache::default(),
         style,
         palette,
         base_color,
-        wrap_w,
-        prev_hovered.as_deref(),
-        revealed,
-    );
-    let galley = ui.painter().layout_job(job);
-    let desired = galley.size();
-    let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
-
-    let segments = split_legacy_segments(rich);
-    let mut link_hits: Vec<(Rect, String)> = Vec::new();
-    let mut spoiler_rects: Vec<Rect> = Vec::new();
-
-    for seg in &segments {
-        if seg.link.is_none() && !seg.spoiler {
-            continue;
-        }
-        let rects = byte_range_rects(&galley, rich.text.as_str(), seg.start, seg.end, rect.min);
-        if let Some(url) = &seg.link {
-            for r in &rects {
-                link_hits.push((*r, url.clone()));
-            }
-        }
-        if seg.spoiler {
-            spoiler_rects.extend(rects.iter().copied());
-        }
-    }
-
-    let pointer = ui.ctx().pointer_hover_pos();
-    let mut new_hovered_link: Option<String> = None;
-    let mut hovering_spoiler = false;
-    if let Some(pos) = pointer
-        && rect.contains(pos)
-    {
-        if !revealed && spoiler_rects.iter().any(|r| r.contains(pos)) {
-            hovering_spoiler = true;
-        } else {
-            for (r, url) in &link_hits {
-                if r.contains(pos) {
-                    new_hovered_link = Some(url.clone());
-                    break;
-                }
-            }
-        }
-    }
-
-    if hovering_spoiler || new_hovered_link.is_some() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-
-    if new_hovered_link != prev_hovered {
-        ui.ctx()
-            .data_mut(|d| d.insert_temp(hover_link_id, new_hovered_link.clone()));
-        ui.ctx().request_repaint();
-    }
-
-    let mut out = RichTextResponse {
-        clicked_link: None,
-        spoiler_toggled: false,
-        rect,
-    };
-
-    if response.clicked()
-        && let Some(pos) = response.interact_pointer_pos()
-    {
-        if !revealed && spoiler_rects.iter().any(|r| r.contains(pos)) {
-            revealed = true;
-            out.spoiler_toggled = true;
-            ui.ctx().data_mut(|d| d.insert_temp(reveal_id, revealed));
-            ui.ctx().request_repaint();
-        } else {
-            for (r, url) in &link_hits {
-                if r.contains(pos) {
-                    out.clicked_link = Some(url.clone());
-                    break;
-                }
-            }
-        }
-    }
-
-    if ui.is_rect_visible(rect) {
-        ui.painter().galley(rect.min, galley, base_color);
-
-        if !revealed {
-            let bg = with_alpha(palette.spoiler_fg, 0.16);
-            for (i, srect) in spoiler_rects.iter().enumerate() {
-                paint_spoiler_particles(
-                    ui.ctx(),
-                    ui.painter(),
-                    srect.expand2(Vec2::new(1.0, 0.0)),
-                    palette.spoiler_fg,
-                    bg,
-                    (i as u64).wrapping_add(1),
-                );
-            }
-        }
-    }
-
-    out
+        max_width,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,6 +1037,11 @@ fn is_link_entity(kind: EntityType) -> bool {
 }
 
 fn link_target_for_entity(entity: &EntityInText, slice: &str) -> String {
+    if let Some(target) =
+        crate::entity_link::entity_link_target(entity.entity_type(), entity.data(), slice)
+    {
+        return target;
+    }
     match entity.entity_type() {
         EntityType::CustomUrl | EntityType::MentionName => entity.data().to_owned(),
         EntityType::Email => format!("mailto:{slice}"),
@@ -1377,6 +1321,7 @@ pub fn layout_text_with_entities_expanded(
     options: &RichTextOptions,
     expanded_blockquotes: &[usize],
 ) -> LaidOutRichText {
+    prepared::note_text_preparation();
     let mapper = OffsetMapper::new(&source.text);
     let (links, link_ranges) = extract_links(source, &mapper);
     let source_blocks = partition_blocks(source, &mapper);
@@ -1713,6 +1658,31 @@ pub fn render_text_with_entities_and_emoji(
     style: &TextStyle,
     palette: &TextPalette,
     options: &RichTextOptions,
+    emoji_renderer: Option<&mut CustomEmojiRenderer>,
+) -> EntityTextResponse {
+    render_entity_text_cached(
+        ui,
+        id,
+        source,
+        &mut prepared::EntityLayoutCache::default(),
+        style,
+        palette,
+        options,
+        emoji_renderer,
+    )
+}
+
+/// [`render_text_with_entities_and_emoji`] with the block layout taken from `layout_cache`,
+/// which lays the text out again only when an input of the layout changed.
+#[allow(clippy::too_many_arguments)]
+fn render_entity_text_cached(
+    ui: &mut Ui,
+    id: Id,
+    source: &TextWithEntities,
+    layout_cache: &mut prepared::EntityLayoutCache,
+    style: &TextStyle,
+    palette: &TextPalette,
+    options: &RichTextOptions,
     mut emoji_renderer: Option<&mut CustomEmojiRenderer>,
 ) -> EntityTextResponse {
     let state_key = id.with("_tg_entity_text_state");
@@ -1729,7 +1699,7 @@ pub fn render_text_with_entities_and_emoji(
     layout_opts.spoilers_revealed = effective_revealed;
     layout_opts.hovered_link_index = state.hovered_link_index;
 
-    let laid = layout_text_with_entities_expanded(
+    let laid = layout_cache.layout(
         ui.ctx(),
         source,
         style,

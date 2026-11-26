@@ -609,6 +609,9 @@ pub struct PeerProfile {
     pub verified: bool,
     /// Premium star badge.
     pub premium: bool,
+    /// Custom emoji status document painted in the premium star's place
+    /// (`Info::Profile::BadgeContentForPeer`).
+    pub emoji_status_id: Option<u64>,
     /// Deterministic color index (`0..7`) for `EmptyUserpic`.
     pub color_index: u8,
     /// Optional phone number (users).

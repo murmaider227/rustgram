@@ -170,7 +170,7 @@ impl PersonalChannelSection {
                 Vec2::splat(34.0),
             );
             EmptyUserpic::for_color_index((ch.peer_id.bare() % 7) as u8, &ch.title, colors)
-                .paint_circle(ui.painter(), av_rect);
+                .paint_circle_or_photo(ui.painter(), av_rect, ch.peer_id.0);
 
             let text_x = rect.left() + 56.0;
             let right_reserve = if is_self_editable { 116.0 } else { 26.0 };

@@ -210,7 +210,9 @@ pub fn apply_startup_integration(
         }
     }
 
-    if plan.register_url_schemes_now {
+    // Debug builds (agents' dev runs) never touch the system tg:// handler; unit tests still
+    // exercise the registration path through their fake hooks.
+    if plan.register_url_schemes_now && (cfg!(test) || !cfg!(debug_assertions)) {
         let custom_wd = plan
             .resolved_working_dir
             .is_custom

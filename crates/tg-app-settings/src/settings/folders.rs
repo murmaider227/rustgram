@@ -414,7 +414,7 @@ pub fn render_folders_section(
                     out.toast = Some(format!("Folder invite link copied: {url}"));
                 }
                 Err(err) => {
-                    out.toast = Some(format!("Could not export invite link: {err}"));
+                    out.toast = tg_app_core::user_error::export_chatlist_invite(&err).into_text();
                 }
             }
         }
@@ -524,7 +524,7 @@ pub fn render_folders_section(
                 });
             }
             Err(err) => {
-                out.toast = Some(format!("Could not toggle folder tags: {err}"));
+                out.toast = tg_app_core::user_error::toggle_folder_tags(&err).into_text();
             }
         }
     }

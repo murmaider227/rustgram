@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use tg_api::convert::{apply_tl_users_and_chats, input_peer_for, input_user_for};
-use tg_api::{Invoker, LoadDirection, PendingMessageState, RpcClient, SendOptions};
+use tg_api::{Invoker, LoadDirection, RpcClient, SendOptions};
 use tg_audio::{AudioDataSource, AudioMsgId, PlaylistProvider};
 use tg_chat::autocomplete::RecentHashtags;
 use tg_chat::emoji::{EmojiKeywords, EmojiVariants, LegacyEmojiCompleter, RecentEmojiStore};
@@ -21,8 +21,7 @@ use tg_data::rights::{ChatAdminRights, ChatBannedRights};
 use tg_data::{
     ARCHIVE_FOLDER_ID, BlockStatus, ChatFilter, ChatFilterFlags, DialogKey, Draft, DraftKey,
     FolderId, FullMsgId as DataFullMsgId, MessageContent, MessageMedia, MsgId as DataMsgId, Peer,
-    PeerId as DataPeerId, PeerNotifySettings, ReplyInfo, Session, TextWithEntities as DataText,
-    WebPageDraft,
+    PeerId as DataPeerId, ReplyInfo, Session, TextWithEntities as DataText, WebPageDraft,
 };
 use tg_history::LocalDateTime;
 use tg_lang::LangPackLanguageInfo;
@@ -62,9 +61,9 @@ use tg_app_core::dialogs::backend::{
 };
 use tg_app_core::history::backend::{
     AvailableMessageEffect, AvailableReactionItem, DraftMessage, HistoryBackend, HistoryLiveUpdate,
-    HistoryMessage, HistoryPeerInfo, HistorySlice, MediaUploadStatus, MessageReactionsPage,
-    PinnedMessageSummary, PollVotesPage, ReactionCounter, SavedReactionTagItem,
-    SendMessageExtended, SendMessageRequest, ThreadDraft, TypingAction,
+    HistoryMessage, HistoryPeerInfo, HistorySlice, Loadable, MediaUploadStatus,
+    MessageReactionsPage, PinnedMessageSummary, PollVotesPage, ReactionCounter,
+    SavedReactionTagItem, SendMessageExtended, SendMessageRequest, ThreadDraft, TypingAction,
 };
 use tg_app_core::history::sections_model::{
     AdminLogAdmin, AdminLogEntry, AdminLogFilter, CreatePollRequest, ForumTopic, ForwardOptions,
@@ -116,10 +115,18 @@ pub(super) struct LiveSessionCache {
     dialogs_loaded_folders: HashSet<FolderId>,
     /// `true` while [`LiveSession::start_chats_list_request`]'s first main-list page is in flight.
     main_dialogs_pending: bool,
+    /// Background loading of the remaining chat-list pages ([`crate::dialogs_loading`]).
+    pub(crate) dialogs_preload: crate::dialogs_loading::DialogsPreload,
     /// Requests started together for opened chats ([`crate::open_chat_prefetch`]).
     pub(super) open_chat: crate::open_chat_prefetch::OpenChatRequests,
     history_loaded_peers: HashSet<DataPeerId>,
+    /// Background history requests started by `try_load_slice_*`, by peer, direction and anchor.
+    history_requests: HashMap<HistoryRequestKey, HistoryRequestState>,
+    /// Chats with a background `messages.getMessagesReactions` poll running.
+    reaction_polls: HashSet<DataPeerId>,
     filters_loaded: bool,
+    /// Set while the background `messages.getDialogFilters` runs; settings screens wait on it.
+    filters_loading: Option<Arc<FiltersLoad>>,
     privacy_loaded: HashSet<PrivacyKey>,
     privacy_rules: BTreeMap<PrivacyKey, PrivacyRule>,
     pub(super) global_privacy_loaded: bool,
@@ -139,6 +146,8 @@ pub(super) struct LiveSessionCache {
     pub(super) notify_exception_peers: HashSet<DataPeerId>,
     pub(super) scope_notify: BTreeMap<NotifyScope, ScopeNotifySettings>,
     pub(super) notify_settings_version: u64,
+    /// Per-type notification defaults load ([`crate::notify_sync`]).
+    pub(crate) notify_defaults_load: crate::notify_sync::NotifyDefaultsLoad,
     pub(super) notify_events_loaded: bool,
     pub(super) notify_events: NotificationEventsSettings,
     pub(super) auto_download_loaded: bool,
@@ -169,9 +178,13 @@ impl LiveSessionCache {
             active_language: tg_lang::default_language_id().to_owned(),
             dialogs_loaded_folders: HashSet::new(),
             main_dialogs_pending: false,
+            dialogs_preload: crate::dialogs_loading::DialogsPreload::default(),
             open_chat: crate::open_chat_prefetch::OpenChatRequests::default(),
             history_loaded_peers: HashSet::new(),
+            history_requests: HashMap::new(),
+            reaction_polls: HashSet::new(),
             filters_loaded: false,
+            filters_loading: None,
             privacy_loaded: HashSet::new(),
             privacy_rules: BTreeMap::new(),
             global_privacy_loaded: false,
@@ -191,6 +204,7 @@ impl LiveSessionCache {
             notify_exception_peers: HashSet::new(),
             scope_notify: BTreeMap::new(),
             notify_settings_version: 0,
+            notify_defaults_load: crate::notify_sync::NotifyDefaultsLoad::default(),
             notify_events_loaded: false,
             notify_events: NotificationEventsSettings::default(),
             auto_download_loaded: false,
@@ -214,6 +228,51 @@ impl LiveSessionCache {
         let now = now_unix_i32() as u64;
         self.next_random_id = self.next_random_id.wrapping_add(1);
         ((now << 24) ^ self.next_random_id ^ 0x5A5A_1234_ABCD) as i64
+    }
+}
+
+/// Completion signal of the background folder load ([`LiveSession::ensure_filters_loaded`]).
+#[derive(Default)]
+struct FiltersLoad {
+    done: Mutex<bool>,
+    signal: std::sync::Condvar,
+}
+
+impl FiltersLoad {
+    fn finish(&self) {
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
+        }
+        self.signal.notify_all();
+    }
+
+    fn wait(&self) {
+        if let Ok(guard) = self.done.lock() {
+            let _ = self
+                .signal
+                .wait_timeout_while(guard, LIVE_RPC_TIMEOUT, |done| !*done);
+        }
+    }
+}
+
+/// A history page request: peer, direction (0 around, 1 before, 2 after) and the anchor the UI
+/// asked with.
+type HistoryRequestKey = (DataPeerId, u8, MsgId);
+
+/// State of a background history page request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryRequestState {
+    /// `open_history` is running.
+    InFlight,
+    /// It finished (or failed); the next read builds the slice from what is loaded.
+    Done,
+}
+
+const fn direction_code(direction: LoadDirection) -> u8 {
+    match direction {
+        LoadDirection::Around => 0,
+        LoadDirection::Before => 1,
+        LoadDirection::After => 2,
     }
 }
 
@@ -290,6 +349,14 @@ pub struct LiveSession {
     proxy: crate::proxy::LiveProxyController,
     pub(super) transcribes: Arc<Mutex<crate::transcribe::TranscribeState>>,
     pub(super) promo_state: Arc<Mutex<crate::suggestions::LivePromoState>>,
+    /// Requests the UI starts without waiting for them (typing, read receipts, drafts).
+    pub(crate) ui_rpc: crate::ui_rpc_queue::UiRpcQueue,
+    /// Text sends shown before the server answers (TGB-2931).
+    pub(crate) sends: crate::optimistic_send::OptimisticSends,
+    /// Last answers of per-frame UI reads, served while the session is being written (TGB-2932).
+    pub(crate) ui_reads: crate::ui_reads::UiReadCache,
+    /// Account id stamped on this session's notifications (`session->uniqueId()`).
+    session_id: u64,
 }
 
 /// Cheaply cloneable shared handle to a [`LiveSession`].
@@ -311,6 +378,10 @@ impl Clone for LiveSession {
             proxy: self.proxy.clone(),
             transcribes: Arc::clone(&self.transcribes),
             promo_state: Arc::clone(&self.promo_state),
+            ui_rpc: self.ui_rpc.clone(),
+            sends: self.sends.clone(),
+            ui_reads: self.ui_reads.clone(),
+            session_id: self.session_id,
         }
     }
 }
@@ -331,6 +402,7 @@ impl LiveSession {
         let promo_state = Arc::new(Mutex::new(crate::suggestions::LivePromoState::new()));
         let _ =
             crate::transcribe::spawn_transcribe_update_listener(&runtime, &bridge, &transcribes);
+        let ui_rpc = crate::ui_rpc_queue::UiRpcQueue::start(runtime.tokio_handle());
         let mut live = Self {
             runtime,
             bridge,
@@ -345,6 +417,10 @@ impl LiveSession {
             proxy,
             transcribes,
             promo_state,
+            ui_rpc,
+            sends: crate::optimistic_send::OptimisticSends::default(),
+            ui_reads: crate::ui_reads::UiReadCache::default(),
+            session_id,
         };
         live.refresh_cached_views();
         crate::history_sections::attach_history_sections_listener(&live);
@@ -500,6 +576,33 @@ impl LiveSession {
     /// Attaches an `egui::Context` so background updates wake the UI immediately.
     pub fn set_egui_ctx(&self, ctx: egui::Context) {
         self.bridge.state().set_egui_ctx(ctx);
+    }
+
+    /// Sends `req` from the ordered background queue ([`crate::ui_rpc_queue`]) instead of waiting
+    /// for it; `on_error` runs on the runtime if it fails.
+    pub(crate) fn queue_background_rpc<R>(
+        &self,
+        req: R,
+        on_error: impl FnOnce(String) + Send + 'static,
+    ) where
+        R: tg_tl::RemoteCall + Send + Sync + 'static,
+        R::Return: Send + 'static,
+    {
+        let rpc = self.runtime.rpc().clone();
+        self.ui_rpc.push(async move {
+            if let Err(err) =
+                with_rpc_timeout(LIVE_RPC_TIMEOUT, async move { rpc.invoke(&req).await }).await
+            {
+                on_error(err);
+            }
+        });
+    }
+
+    /// Waits until the requests the UI queued without waiting (typing, read receipts, drafts)
+    /// have run. Returns `false` after `limit`. For tests and shutdown only.
+    #[doc(hidden)]
+    pub fn flush_background_rpcs(&self, limit: Duration) -> bool {
+        self.ui_rpc.wait_idle(limit)
     }
 
     /// Returns a [`TelegramMediaInvoker`] backed by this session's RPC client and `Session`.
@@ -689,6 +792,51 @@ impl LiveSession {
     // Internal Session & RPC helpers
     // -------------------------------------------------------------------------
 
+    /// Shows a text send at once and sends it in the background (TGB-2931, see
+    /// [`crate::optimistic_send`]): stores the local message, queues the send in the runtime's
+    /// ordered send lane and returns the first chunk as a pending message.
+    pub(crate) fn send_text_optimistic(
+        &self,
+        data_peer: DataPeerId,
+        text: &str,
+        entities: &[tl_enums::MessageEntity],
+        reply_to: Option<tl_enums::InputReplyTo>,
+        options: SendOptions,
+        extras: &crate::optimistic_send::QueuedSendExtras,
+    ) -> Result<HistoryMessage, String> {
+        let chunks = self.sends.prepare(data_peer, text, entities);
+        if chunks.is_empty() {
+            return Err("Cannot send an empty message.".to_owned());
+        }
+        let first = self.write_session(|s| {
+            crate::optimistic_send::store_local_messages(s, data_peer, &chunks, &options, extras)
+        });
+        self.sends
+            .queue(self, data_peer, chunks, reply_to, options, extras);
+        self.bridge.state().notify_ui();
+        first.ok_or_else(|| "sent message was not stored in session".to_owned())
+    }
+
+    /// Runs `f` under the session read lock when it is free. While the session actor holds the
+    /// write lock, returns `last()` (the previous answer for the same read) instead of waiting
+    /// and moves the view versions so the next frame reads again; waits only when there is no
+    /// earlier answer (TGB-2932). The flag is `true` for a fresh read.
+    pub(crate) fn read_session_or_last<R: Send>(
+        &self,
+        last: impl FnOnce() -> Option<R>,
+        f: impl FnOnce(&Session) -> R + Send,
+    ) -> (R, bool) {
+        if let Ok(guard) = self.runtime.session().try_read() {
+            return (f(&guard), true);
+        }
+        if let Some(last) = last() {
+            self.bridge.state().mark_views_changed();
+            self.bridge.state().notify_ui();
+            return (last, false);
+        }
+        (self.read_session(f), true)
+    }
+
     pub(super) fn read_session<R: Send>(&self, f: impl FnOnce(&Session) -> R + Send) -> R {
         let session_lock = self.runtime.session();
         if let Ok(guard) = session_lock.try_read() {
@@ -704,14 +852,19 @@ impl LiveSession {
     #[doc(hidden)]
     pub fn write_session<R: Send>(&self, f: impl FnOnce(&mut Session) -> R + Send) -> R {
         let session_lock = self.runtime.session();
-        if let Ok(mut guard) = session_lock.try_write() {
-            return f(&mut guard);
-        }
-        let session_arc = Arc::clone(session_lock);
-        block_on_runtime(self.runtime.tokio_handle(), async move {
-            let mut guard = session_arc.write().await;
+        let out = if let Ok(mut guard) = session_lock.try_write() {
             f(&mut guard)
-        })
+        } else {
+            let session_arc = Arc::clone(session_lock);
+            block_on_runtime(self.runtime.tokio_handle(), async move {
+                let mut guard = session_arc.write().await;
+                f(&mut guard)
+            })
+        };
+        // Not every session mutation emits a change event (flags set through `message_mut`), so
+        // a write from here always moves the view versions.
+        self.bridge.state().mark_views_changed();
+        out
     }
 
     pub(super) fn invoke_rpc<R>(&self, req: R) -> Result<R::Return, String>
@@ -765,6 +918,7 @@ impl LiveSession {
         drop(c);
         let rt = Arc::clone(&self.runtime);
         let cache = Arc::clone(&self.cache);
+        let live = self.clone();
         self.runtime.tokio_handle().spawn(async move {
             // The runtime's startup sync usually brings the first page itself
             // (`SessionRuntimeConfig::load_initial_dialogs`); request one only if it did not.
@@ -783,7 +937,9 @@ impl LiveSession {
             if let Ok(mut c) = cache.lock() {
                 c.main_dialogs_pending = false;
             }
+            live.bridge.state().mark_views_changed();
             on_loaded();
+            live.request_more_dialogs(false);
         });
     }
 
@@ -796,40 +952,74 @@ impl LiveSession {
         if already_tried {
             return;
         }
+        if folder_id == MAIN_FOLDER_ID {
+            // The main list shows its "Loading..." state meanwhile (`chats_list_loaded`).
+            let bridge = Arc::clone(self.bridge.state());
+            self.start_chats_list_request(move || bridge.notify_ui());
+            return;
+        }
         if let Ok(mut c) = self.cache.lock() {
             c.dialogs_loaded_folders.insert(folder_id);
         }
+        // `ApiWrap::requestDialogs` for the archive: the list shows what is loaded until the page
+        // lands (its chats arrive through change events, the version moves, the UI repaints).
         let rt = Arc::clone(&self.runtime);
-        let res = block_on_runtime(self.runtime.tokio_handle(), async move {
-            with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.load_dialogs_page(folder_id)).await
+        let bridge = Arc::clone(self.bridge.state());
+        self.runtime.tokio_handle().spawn(async move {
+            let res = with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.load_dialogs_page(folder_id)).await;
+            if let Err(err) = res {
+                debug!(folder = folder_id, error = %err, "load_dialogs_page returned error");
+            }
+            bridge.notify_ui();
         });
-        if let Err(err) = res {
-            debug!(folder = folder_id, error = %err, "load_dialogs_page returned error");
-        }
     }
 
-    fn ensure_history_loaded(&self, peer_id: PeerId, around_id: MsgId, direction: LoadDirection) {
+    /// The `open_history` request a slice read at `around_id` in `direction` needs, or `None` when
+    /// the loaded history already answers it. Marks a first open of the chat as tried (it is
+    /// requested once, like before).
+    fn history_request(
+        &self,
+        peer_id: PeerId,
+        around_id: MsgId,
+        direction: LoadDirection,
+    ) -> Option<(DataPeerId, DataMsgId, LoadDirection)> {
         let data_peer = to_data_peer(peer_id);
-        let needs_load = self.read_session(|s| {
-            let Some(h) = s.history(data_peer) else {
-                return true;
-            };
-            match direction {
-                LoadDirection::Around => h.loaded_ranges.is_empty(),
-                LoadDirection::Before => !h.loaded_ranges.loaded_at_top(),
-                LoadDirection::After => !h.loaded_ranges.loaded_at_bottom(),
-            }
-        });
-        if !needs_load {
-            return;
-        }
         let already_loaded_initial = self
             .cache
             .lock()
             .map(|c| c.history_loaded_peers.contains(&data_peer))
             .unwrap_or(false);
-        if matches!(direction, LoadDirection::Around) && already_loaded_initial {
-            return;
+        // `ShowAtUnreadMsgId`: around `History::loadAroundId` when the chat has unread messages.
+        let unread_around = if around_id == MsgId::SHOW_AT_UNREAD {
+            self.read_session(|s| {
+                s.history(data_peer)
+                    .and_then(crate::open_at_unread::load_around_id)
+            })
+        } else {
+            None
+        };
+        let (needs_load, unread_missing) = self.read_session(|s| {
+            let Some(h) = s.history(data_peer) else {
+                return (true, false);
+            };
+            let unread_missing =
+                unread_around.is_some_and(|id| !h.loaded_ranges.contains_range_for(id));
+            let needs = match direction {
+                LoadDirection::Around => crate::open_at_unread::first_open_needs_load(
+                    &h.loaded_ranges,
+                    already_loaded_initial,
+                    unread_missing,
+                ),
+                LoadDirection::Before => !h.loaded_ranges.loaded_at_top(),
+                LoadDirection::After => !h.loaded_ranges.loaded_at_bottom(),
+            };
+            (needs, unread_missing)
+        });
+        if !needs_load {
+            return None;
+        }
+        if matches!(direction, LoadDirection::Around) && already_loaded_initial && !unread_missing {
+            return None;
         }
         if matches!(direction, LoadDirection::Around)
             && let Ok(mut c) = self.cache.lock()
@@ -837,8 +1027,9 @@ impl LiveSession {
             c.history_loaded_peers.insert(data_peer);
         }
 
-        let rt = Arc::clone(&self.runtime);
-        let (data_around, effective_direction) = if around_id == MsgId::SHOW_AT_END {
+        let (data_around, effective_direction) = if let Some(around) = unread_around {
+            (around, direction)
+        } else if around_id == MsgId::SHOW_AT_END || around_id == MsgId::SHOW_AT_UNREAD {
             // Opening at the bottom of history uses `LoadDirection::Before` with `offset_id = 0`
             // so `parse_history_result` anchors `no_skip_range.till = SERVER_MAX_MSG_ID`
             // (`loaded_at_bottom() == true`) even on a partial `messagesSlice`.
@@ -848,11 +1039,19 @@ impl LiveSession {
                 direction
             };
             (DataMsgId(0), dir)
-        } else if around_id == MsgId::SHOW_AT_UNREAD {
-            (DataMsgId(0), direction)
         } else {
             (to_data_msg(around_id), direction)
         };
+        Some((data_peer, data_around, effective_direction))
+    }
+
+    fn ensure_history_loaded(&self, peer_id: PeerId, around_id: MsgId, direction: LoadDirection) {
+        let Some((data_peer, data_around, effective_direction)) =
+            self.history_request(peer_id, around_id, direction)
+        else {
+            return;
+        };
+        let rt = Arc::clone(&self.runtime);
         let res = block_on_runtime(self.runtime.tokio_handle(), async move {
             with_rpc_timeout(
                 LIVE_RPC_TIMEOUT,
@@ -865,27 +1064,116 @@ impl LiveSession {
         }
     }
 
+    /// Non-blocking counterpart of [`Self::ensure_history_loaded`]: `true` when the slice can be
+    /// built now, `false` while its page is requested in the background. The finished request
+    /// moves the chat's version and wakes the UI; the next call then answers from what loaded
+    /// (also after a failure, like the blocking read did).
+    fn history_ready_or_request(
+        &self,
+        peer_id: PeerId,
+        around_id: MsgId,
+        direction: LoadDirection,
+    ) -> bool {
+        let data_peer = to_data_peer(peer_id);
+        let key = (data_peer, direction_code(direction), around_id);
+        let state = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|c| c.history_requests.get(&key).copied());
+        match state {
+            Some(HistoryRequestState::InFlight) => return false,
+            Some(HistoryRequestState::Done) => {
+                if let Ok(mut c) = self.cache.lock() {
+                    c.history_requests.remove(&key);
+                }
+                return true;
+            }
+            None => {}
+        }
+        let Some((data_peer, data_around, effective_direction)) =
+            self.history_request(peer_id, around_id, direction)
+        else {
+            return true;
+        };
+        if let Ok(mut c) = self.cache.lock() {
+            c.history_requests
+                .insert(key, HistoryRequestState::InFlight);
+        }
+        let rt = Arc::clone(&self.runtime);
+        let cache = Arc::clone(&self.cache);
+        let bridge = Arc::clone(self.bridge.state());
+        self.runtime.tokio_handle().spawn(async move {
+            let res = with_rpc_timeout(
+                LIVE_RPC_TIMEOUT,
+                rt.open_history(data_peer, data_around, effective_direction),
+            )
+            .await;
+            if let Err(err) = res {
+                debug!(peer = data_peer.0, error = %err, "open_history returned error");
+            }
+            if let Ok(mut c) = cache.lock() {
+                c.history_requests.insert(key, HistoryRequestState::Done);
+            }
+            bridge.notify_chat_changed(data_peer);
+        });
+        false
+    }
+
     fn ensure_filters_loaded(&self) {
         let loaded = self.cache.lock().map(|c| c.filters_loaded).unwrap_or(true);
         if loaded {
             return;
         }
+        let load = Arc::new(FiltersLoad::default());
         if let Ok(mut c) = self.cache.lock() {
             c.filters_loaded = true;
+            c.filters_loading = Some(Arc::clone(&load));
         }
+        // `Data::ChatFilters::load`: the folders arrive in the background; until then the tabs
+        // show the folders the session already knows.
         let rpc = self.runtime.rpc().clone();
-        let res = block_on_runtime(self.runtime.tokio_handle(), async move {
-            with_rpc_timeout(LIVE_RPC_TIMEOUT, rpc.messages_get_dialog_filters()).await
-        });
-        if let Ok(tl_filters) = res {
-            self.write_session(|session| {
-                session.set_filters_tags_enabled(tl_filters.tags_enabled);
-                for filter in tl_filters.filters {
-                    if let Some(parsed) = tl_dialog_filter_to_data(&filter) {
-                        session.set_filter(parsed);
-                    }
+        let live = self.clone();
+        self.runtime.tokio_handle().spawn(async move {
+            let res = with_rpc_timeout(LIVE_RPC_TIMEOUT, rpc.messages_get_dialog_filters()).await;
+            let finish = |live: &LiveSession| {
+                if let Ok(mut c) = live.cache.lock() {
+                    c.filters_loading = None;
                 }
-            });
+                load.finish();
+            };
+            let Ok(tl_filters) = res else {
+                finish(&live);
+                return;
+            };
+            {
+                let mut session = live.runtime.session().write().await;
+                let self_id = Some(session.self_user_id());
+                let parsed: Vec<ChatFilter> = tl_filters
+                    .filters
+                    .iter()
+                    .filter_map(|f| tg_api::convert::dialog_filter_from_tl(f, self_id))
+                    .collect();
+                session.sync_filters_from_list(parsed, tl_filters.tags_enabled);
+            }
+            finish(&live);
+            live.bridge.state().notify_ui();
+            live.dialog_filters_loaded(tl_filters);
+        });
+    }
+
+    /// [`Self::ensure_filters_loaded`] for screens that edit folders (settings): they wait until
+    /// the folders arrived, so a change made there is never overwritten by the late answer of a
+    /// load that started before it.
+    fn ensure_filters_loaded_now(&self) {
+        self.ensure_filters_loaded();
+        let pending = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|c| c.filters_loading.clone());
+        if let Some(load) = pending {
+            load.wait();
         }
     }
 
@@ -893,23 +1181,24 @@ impl LiveSession {
         &self,
         id: MediaItemId,
     ) -> Option<(DataPeerId, DataMsgId, ResolvedMediaLocation)> {
+        // The media index (TGB-2938) instead of a walk over every chat's messages.
         self.read_session(|session| {
-            for peer_id in known_peer_ids(session) {
-                for msg in history_messages_ordered(session, peer_id) {
-                    let Some(media) = msg.media() else {
-                        continue;
-                    };
+            session
+                .messages_with_media(id.0)
+                .into_iter()
+                .find_map(|full_id| {
+                    let msg = session.message(full_id)?;
+                    let media = msg.media()?;
                     let matches = match media {
                         MessageMedia::Photo(p) => p.id.0 == id.0,
                         MessageMedia::Document(d) => d.id.0 == id.0,
                         _ => false,
                     };
-                    if matches && let Some(loc) = message_media_to_location(media) {
-                        return Some((peer_id, msg.id, loc));
+                    if !matches {
+                        return None;
                     }
-                }
-            }
-            None
+                    message_media_to_location(media).map(|loc| (full_id.peer, msg.id, loc))
+                })
         })
     }
 
@@ -1254,108 +1543,7 @@ fn updates_contain_pin_for(updates: &tl_enums::Updates, msg_id: i32) -> bool {
     }
 }
 
-fn tl_dialog_filter_to_data(filter: &tl_enums::DialogFilter) -> Option<ChatFilter> {
-    match filter {
-        tl_enums::DialogFilter::DialogFilter(f) => {
-            let mut flags = ChatFilterFlags::empty();
-            if f.contacts {
-                flags |= ChatFilterFlags::CONTACTS;
-            }
-            if f.non_contacts {
-                flags |= ChatFilterFlags::NON_CONTACTS;
-            }
-            if f.groups {
-                flags |= ChatFilterFlags::GROUPS;
-            }
-            if f.broadcasts {
-                flags |= ChatFilterFlags::CHANNELS;
-            }
-            if f.bots {
-                flags |= ChatFilterFlags::BOTS;
-            }
-            if f.exclude_muted {
-                flags |= ChatFilterFlags::NO_MUTED;
-            }
-            if f.exclude_read {
-                flags |= ChatFilterFlags::NO_READ;
-            }
-            if f.exclude_archived {
-                flags |= ChatFilterFlags::NO_ARCHIVED;
-            }
-            let always: BTreeSet<DataPeerId> = f
-                .include_peers
-                .iter()
-                .filter_map(tl_input_peer_to_data_peer)
-                .collect();
-            let pinned: Vec<DataPeerId> = f
-                .pinned_peers
-                .iter()
-                .filter_map(tl_input_peer_to_data_peer)
-                .collect();
-            let never: BTreeSet<DataPeerId> = f
-                .exclude_peers
-                .iter()
-                .filter_map(tl_input_peer_to_data_peer)
-                .collect();
-            let tl_enums::TextWithEntities::TextWithEntities(title_tl) = &f.title;
-            Some(ChatFilter::new(
-                f.id,
-                DataText::plain(title_tl.text.clone()),
-                f.emoticon.clone().unwrap_or_default(),
-                f.color.and_then(|c| u8::try_from(c).ok()),
-                flags,
-                always,
-                pinned,
-                never,
-            ))
-        }
-        tl_enums::DialogFilter::Chatlist(f) => {
-            let mut flags = ChatFilterFlags::CHATLIST;
-            if f.has_my_invites {
-                flags |= ChatFilterFlags::HAS_MY_LINKS;
-            }
-            let always: BTreeSet<DataPeerId> = f
-                .include_peers
-                .iter()
-                .filter_map(tl_input_peer_to_data_peer)
-                .collect();
-            let pinned: Vec<DataPeerId> = f
-                .pinned_peers
-                .iter()
-                .filter_map(tl_input_peer_to_data_peer)
-                .collect();
-            let tl_enums::TextWithEntities::TextWithEntities(title_tl) = &f.title;
-            Some(ChatFilter::new(
-                f.id,
-                DataText::plain(title_tl.text.clone()),
-                f.emoticon.clone().unwrap_or_default(),
-                f.color.and_then(|c| u8::try_from(c).ok()),
-                flags,
-                always,
-                pinned,
-                BTreeSet::new(),
-            ))
-        }
-        tl_enums::DialogFilter::Default => None,
-    }
-}
-
-fn tl_input_peer_to_data_peer(peer: &tl_enums::InputPeer) -> Option<DataPeerId> {
-    match peer {
-        tl_enums::InputPeer::User(u) => {
-            Some(DataPeerId::from_user(tg_data::UserId(u.user_id as u64)))
-        }
-        tl_enums::InputPeer::Chat(c) => {
-            Some(DataPeerId::from_chat(tg_data::ChatId(c.chat_id as u64)))
-        }
-        tl_enums::InputPeer::Channel(c) => Some(DataPeerId::from_channel(tg_data::ChannelId(
-            c.channel_id as u64,
-        ))),
-        _ => None,
-    }
-}
-
-fn data_filter_to_tl(filter: &ChatFilter, session: &Session) -> tl_enums::DialogFilter {
+pub(crate) fn data_filter_to_tl(filter: &ChatFilter, session: &Session) -> tl_enums::DialogFilter {
     let to_peers = |ids: &[DataPeerId]| -> Vec<tl_enums::InputPeer> {
         ids.iter()
             .map(|&pid| input_peer_for(session, pid))
@@ -1519,6 +1707,7 @@ impl Backend for LiveSession {
 
     fn dialogs(&self, folder: FilterId, query: &str) -> Vec<DialogEntry> {
         self.ensure_dialogs_loaded(MAIN_FOLDER_ID);
+        self.request_more_dialogs(false);
         let q = query.trim().to_ascii_lowercase();
         let now = now_unix_i32();
         self.read_session(|session| {
@@ -1666,57 +1855,74 @@ impl DialogsBackend for LiveSession {
         self.cache.lock().map_or(true, |c| !c.main_dialogs_pending)
     }
 
+    fn dialogs_version(&self) -> u64 {
+        self.bridge.state().dialogs_version()
+    }
+
     fn dialog_slice(&self, list: DialogListQuery, offset: usize, limit: usize) -> DialogSlice {
         match list {
             DialogListQuery::Filter(_) => self.ensure_dialogs_loaded(MAIN_FOLDER_ID),
             DialogListQuery::Archive => self.ensure_dialogs_loaded(ARCHIVE_FOLDER_ID),
         }
         let now = now_unix_i32();
-        self.read_session(|session| {
-            let (ordered, pinned_count, complete): (&[DialogKey], usize, bool) = match list {
-                DialogListQuery::Filter(fid) if fid == FilterId::ALL => (
-                    session.main_dialogs(),
-                    session.main_list().pinned().order().len(),
-                    session.main_list().loaded(),
-                ),
-                DialogListQuery::Filter(fid) => {
-                    let keys = session.filter_dialogs(fid.0).unwrap_or(&[]);
-                    let pinned = session
-                        .filters()
-                        .chats_list(fid.0)
-                        .map_or(0, |l| l.pinned().order().len());
-                    (keys, pinned, session.main_list().loaded())
+        let key = (list, offset, limit);
+        let (slice, fresh) = self.read_session_or_last(
+            || self.ui_reads.last_dialog_slice(key),
+            |session| {
+                let (ordered, pinned_count, complete): (&[DialogKey], usize, bool) = match list {
+                    DialogListQuery::Filter(fid) if fid == FilterId::ALL => (
+                        session.main_dialogs(),
+                        session.main_list().pinned().order().len(),
+                        session.main_list().loaded(),
+                    ),
+                    DialogListQuery::Filter(fid) => {
+                        let keys = session.filter_dialogs(fid.0).unwrap_or(&[]);
+                        let pinned = session
+                            .filters()
+                            .chats_list(fid.0)
+                            .map_or(0, |l| l.pinned().order().len());
+                        (keys, pinned, session.main_list().loaded())
+                    }
+                    DialogListQuery::Archive => (
+                        session.archive_dialogs(),
+                        session.archive().chats_list.pinned().order().len(),
+                        session.archive().chats_list.loaded(),
+                    ),
+                };
+                let history_peers: Vec<DataPeerId> = ordered
+                    .iter()
+                    .filter_map(|&k| match k {
+                        DialogKey::History(pid) => Some(pid),
+                        DialogKey::Folder(_)
+                        | DialogKey::ForumTopic { .. }
+                        | DialogKey::SavedSublist { .. } => None,
+                    })
+                    .collect();
+                let total = history_peers.len();
+                let entries: Vec<DialogItem> = history_peers
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .filter_map(|&pid| dialog_item_from_session(session, pid, list, now))
+                    .collect();
+                let has_more = offset.saturating_add(entries.len()) < total || !complete;
+                DialogSlice {
+                    entries,
+                    total,
+                    pinned_count,
+                    has_more,
                 }
-                DialogListQuery::Archive => (
-                    session.archive_dialogs(),
-                    session.archive().chats_list.pinned().order().len(),
-                    session.archive().chats_list.loaded(),
-                ),
-            };
-            let history_peers: Vec<DataPeerId> = ordered
-                .iter()
-                .filter_map(|&k| match k {
-                    DialogKey::History(pid) => Some(pid),
-                    DialogKey::Folder(_)
-                    | DialogKey::ForumTopic { .. }
-                    | DialogKey::SavedSublist { .. } => None,
-                })
-                .collect();
-            let total = history_peers.len();
-            let entries: Vec<DialogItem> = history_peers
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .filter_map(|&pid| dialog_item_from_session(session, pid, list, now))
-                .collect();
-            let has_more = offset.saturating_add(entries.len()) < total || !complete;
-            DialogSlice {
-                entries,
-                total,
-                pinned_count,
-                has_more,
-            }
-        })
+            },
+        );
+        if fresh {
+            self.ui_reads.store_dialog_slice(key, &slice);
+            crate::peer_emoji_status::request_for_rows(self, &slice.entries);
+        }
+        // Scrolled past the loaded chats: like `Widget::setLoadMoreCallback`
+        // (`dialogs_widget.cpp:548-561`) ask for the next page of the shown list.
+        let past_loaded = offset.saturating_add(limit) >= slice.total;
+        self.request_more_dialogs(matches!(list, DialogListQuery::Archive) && past_loaded);
+        slice
     }
 
     fn is_peer_blocked(&self, peer_id: PeerId) -> bool {
@@ -1901,6 +2107,7 @@ impl DialogsBackend for LiveSession {
             c.archive_collapsed = collapsed;
             c.session_settings_dirty = true;
         }
+        self.bridge.state().mark_views_changed();
     }
 
     fn toggle_archive(&mut self, peer_id: PeerId) -> bool {
@@ -2454,6 +2661,18 @@ impl DialogsBackend for LiveSession {
         crate::dialogs_delete::peer_first_name(self, peer_id)
     }
 
+    fn can_delete_chat_for_everyone(&self, peer_id: PeerId) -> bool {
+        crate::dialogs_delete::can_delete_chat_for_everyone(self, peer_id)
+    }
+
+    fn folders_including_peer(&self, peer_id: PeerId) -> Vec<FilterId> {
+        crate::dialogs_delete::folders_including_peer(self, peer_id)
+    }
+
+    fn remove_peer_from_all_folders(&mut self, peer_id: PeerId) {
+        crate::dialogs_delete::remove_peer_from_all_folders(self, peer_id);
+    }
+
     fn unblock_and_restart_bot(&mut self, peer_id: PeerId) -> Result<(), String> {
         crate::dialogs_actions::unblock_and_restart_bot(self, peer_id)
     }
@@ -2464,6 +2683,190 @@ impl DialogsBackend for LiveSession {
 // ============================================================================
 
 impl LiveSession {
+    fn slice_around_now(
+        &self,
+        peer_id: PeerId,
+        around_id: MsgId,
+        limit_before: usize,
+        limit_after: usize,
+    ) -> HistorySlice {
+        let data_peer = to_data_peer(peer_id);
+        // Clear pending deltas right before snapshotting `Session` so events already reflected
+        // in the returned slice are not replayed, while events arriving afterward stay queued.
+        self.bridge.state().clear_history_delta(data_peer);
+        let media_cache = self.media_cache.clone();
+        let mut slice = self.read_session(|s| {
+            let mut slice = build_history_slice(
+                s,
+                data_peer,
+                around_id,
+                limit_before,
+                limit_after,
+                &media_cache,
+            );
+            // A window that stops short of either end of what is loaded is not at that end:
+            // the view pages the rest in from the session.
+            let ends = |first: bool| {
+                let edge = if first {
+                    s.loaded_messages(data_peer).next()
+                } else {
+                    s.loaded_messages(data_peer).next_back()
+                };
+                let shown = if first {
+                    slice.messages.first()
+                } else {
+                    slice.messages.last()
+                };
+                edge.is_none_or(|edge| shown.is_some_and(|m| m.id == from_data_msg(edge.id)))
+            };
+            let (at_oldest, at_newest) = (ends(true), ends(false));
+            slice.loaded_at_top &= at_oldest;
+            slice.loaded_at_bottom &= at_newest;
+            if at_newest {
+                append_local_messages(s, data_peer, &mut slice);
+            }
+            slice
+        });
+        self.decorate_cached_translations(peer_id, &mut slice.messages);
+        crate::rich_message::attach_cached_rich_messages(
+            self.runtime.session(),
+            &mut slice.messages,
+        );
+        crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
+        crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        crate::reply_targets::attach_reply_targets(self, &mut slice.messages);
+        crate::custom_emoji_loader::request_for_messages(self, &slice.messages);
+        if slice.loaded_at_bottom {
+            crate::chat_l233::append_streamed_drafts_to_slice(self, peer_id, &mut slice.messages);
+        }
+        slice
+    }
+
+    fn slice_before_now(&self, peer_id: PeerId, before_id: MsgId, limit: usize) -> HistorySlice {
+        let data_peer = to_data_peer(peer_id);
+        let media_cache = self.media_cache.clone();
+        let mut slice = self.read_session(|s| {
+            let Some(history) = s.history(data_peer) else {
+                return HistorySlice::default();
+            };
+            let target = to_data_msg(before_id);
+            let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
+            // A range query from `target` down, only as far as the page needs (TGB-2938).
+            let mut msgs: Vec<HistoryMessage> = s
+                .loaded_messages_before(data_peer, target)
+                .take(limit)
+                .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
+                .collect();
+            msgs.reverse();
+            HistorySlice {
+                messages: msgs,
+                loaded_at_top: history.loaded_ranges.loaded_at_top(),
+                loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
+                total_count: loaded_id_count(history),
+                first_unread_id: first_unread_in_history(s, data_peer),
+                unread_count: history.unread_count.unwrap_or(0).max(0) as u32,
+            }
+        });
+        self.decorate_cached_translations(peer_id, &mut slice.messages);
+        crate::rich_message::attach_cached_rich_messages(
+            self.runtime.session(),
+            &mut slice.messages,
+        );
+        crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
+        crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        crate::reply_targets::attach_reply_targets(self, &mut slice.messages);
+        crate::custom_emoji_loader::request_for_messages(self, &slice.messages);
+        slice
+    }
+
+    fn slice_after_now(&self, peer_id: PeerId, after_id: MsgId, limit: usize) -> HistorySlice {
+        let data_peer = to_data_peer(peer_id);
+        let media_cache = self.media_cache.clone();
+        let mut slice = self.read_session(|s| {
+            let Some(history) = s.history(data_peer) else {
+                return HistorySlice::default();
+            };
+            let target = to_data_msg(after_id);
+            let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
+            let msgs: Vec<HistoryMessage> = s
+                .loaded_messages_after(data_peer, target)
+                .take(limit)
+                .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
+                .collect();
+            let reaches_bottom = msgs.len() < limit;
+            let mut slice = HistorySlice {
+                messages: msgs,
+                loaded_at_top: history.loaded_ranges.loaded_at_top(),
+                loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
+                total_count: loaded_id_count(history),
+                first_unread_id: first_unread_in_history(s, data_peer),
+                unread_count: history.unread_count.unwrap_or(0).max(0) as u32,
+            };
+            if reaches_bottom && slice.loaded_at_bottom {
+                append_local_messages(s, data_peer, &mut slice);
+            }
+            slice
+        });
+        self.decorate_cached_translations(peer_id, &mut slice.messages);
+        crate::rich_message::attach_cached_rich_messages(
+            self.runtime.session(),
+            &mut slice.messages,
+        );
+        crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
+        crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        crate::reply_targets::attach_reply_targets(self, &mut slice.messages);
+        crate::custom_emoji_loader::request_for_messages(self, &slice.messages);
+        slice
+    }
+
+    /// [`Self::poll_visible_slice_reactions`] without waiting: `messages.getMessagesReactions`
+    /// runs on a worker thread (one per chat at a time) and the refreshed messages reach the
+    /// open history as edits, like tdesktop's periodic `Data::Reactions` poll. The slice shows the
+    /// reactions it was loaded with until then.
+    fn poll_slice_reactions_in_background(&self, peer_id: PeerId, messages: &[HistoryMessage]) {
+        let data_peer = to_data_peer(peer_id);
+        if data_peer.is_user() {
+            return;
+        }
+        let reacted_ids: Vec<MsgId> = messages
+            .iter()
+            .filter(|m| m.id.0 > 0 && !m.reactions.is_empty())
+            .map(|m| m.id)
+            .collect();
+        if reacted_ids.is_empty() {
+            return;
+        }
+        let first = self
+            .cache
+            .lock()
+            .is_ok_and(|mut c| c.reaction_polls.insert(data_peer));
+        if !first {
+            return;
+        }
+        let live = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("reactions-poll".to_owned())
+            .spawn(move || {
+                if let Ok(polled) = live.poll_visible_messages_reactions_live(peer_id, &reacted_ids)
+                    && !polled.is_empty()
+                {
+                    let bridge = live.bridge.state();
+                    for id in polled {
+                        bridge.record_message_edited(data_peer, to_data_msg(id));
+                    }
+                    bridge.notify_chat_changed(data_peer);
+                }
+                if let Ok(mut c) = live.cache.lock() {
+                    c.reaction_polls.remove(&data_peer);
+                }
+            });
+        if spawned.is_err()
+            && let Ok(mut c) = self.cache.lock()
+        {
+            c.reaction_polls.remove(&data_peer);
+        }
+    }
+
     fn poll_visible_slice_reactions(&self, peer_id: PeerId, messages: &mut [HistoryMessage]) {
         if to_data_peer(peer_id).is_user() {
             return;
@@ -2501,6 +2904,21 @@ impl LiveSession {
 }
 
 impl HistoryBackend for LiveSession {
+    fn chat_version(&self, peer: PeerId) -> u64 {
+        self.bridge.state().chat_version(to_data_peer(peer))
+    }
+
+    fn search_chat_messages(
+        &self,
+        peer_id: PeerId,
+        query: &str,
+        from: Option<PeerId>,
+        offset_id: MsgId,
+        limit: i32,
+    ) -> Result<tg_app_core::history::backend::ChatSearchPage, String> {
+        crate::chat_search::chat_search_page(self, peer_id, query, from, offset_id, limit)
+    }
+
     fn self_peer(&self) -> (PeerId, String) {
         self.read_session(|s| {
             let pid = s.self_peer_id();
@@ -2516,13 +2934,20 @@ impl HistoryBackend for LiveSession {
             .map(|c| c.dismissed_contact_banners.contains(&peer_id))
             .unwrap_or(false);
         let now = now_unix_i32();
-        self.read_session(|s| {
-            let mut info = peer_to_history_peer_info(s, data_peer, now)?;
-            if dismissed {
-                info.contact_status = None;
-            }
-            Some(info)
-        })
+        let (info, fresh) = self.read_session_or_last(
+            || self.ui_reads.last_peer_info(peer_id),
+            |s| {
+                let mut info = peer_to_history_peer_info(s, data_peer, now)?;
+                if dismissed {
+                    info.contact_status = None;
+                }
+                Some(info)
+            },
+        );
+        if fresh {
+            self.ui_reads.store_peer_info(peer_id, &info);
+        }
+        info
     }
 
     fn load_slice_around(
@@ -2533,187 +2958,85 @@ impl HistoryBackend for LiveSession {
         limit_after: usize,
     ) -> HistorySlice {
         self.ensure_history_loaded(peer_id, around_id, LoadDirection::Around);
-        let data_peer = to_data_peer(peer_id);
-        // Clear pending deltas right before snapshotting `Session` so events already reflected
-        // in the returned slice are not replayed, while events arriving afterward stay queued.
-        self.bridge.state().clear_history_delta(data_peer);
-        let media_cache = self.media_cache.clone();
-        let mut slice = self.read_session(|s| {
-            build_history_slice(
-                s,
-                data_peer,
-                around_id,
-                limit_before,
-                limit_after,
-                &media_cache,
-            )
-        });
-        self.decorate_cached_translations(peer_id, &mut slice.messages);
-        crate::rich_message::attach_cached_rich_messages(
-            self.runtime.session(),
-            &mut slice.messages,
-        );
-        crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
-        crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        let mut slice = self.slice_around_now(peer_id, around_id, limit_before, limit_after);
         self.poll_visible_slice_reactions(peer_id, &mut slice.messages);
-        if slice.loaded_at_bottom {
-            crate::chat_l233::append_streamed_drafts_to_slice(self, peer_id, &mut slice.messages);
-        }
         slice
+    }
+
+    fn try_load_slice_around(
+        &self,
+        peer_id: PeerId,
+        around_id: MsgId,
+        limit_before: usize,
+        limit_after: usize,
+    ) -> Loadable<HistorySlice> {
+        if self.history_ready_or_request(peer_id, around_id, LoadDirection::Around) {
+            let slice = self.slice_around_now(peer_id, around_id, limit_before, limit_after);
+            self.poll_slice_reactions_in_background(peer_id, &slice.messages);
+            Loadable::Ready(slice)
+        } else {
+            Loadable::Loading
+        }
     }
 
     fn load_slice_before(&self, peer_id: PeerId, before_id: MsgId, limit: usize) -> HistorySlice {
         self.ensure_history_loaded(peer_id, before_id, LoadDirection::Before);
-        let data_peer = to_data_peer(peer_id);
-        let media_cache = self.media_cache.clone();
-        let mut slice = self.read_session(|s| {
-            let Some(history) = s.history(data_peer) else {
-                return HistorySlice::default();
-            };
-            let target = to_data_msg(before_id);
-            let all = history_messages_ordered(s, data_peer);
-            let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
-            let mut msgs: Vec<HistoryMessage> = all
-                .iter()
-                .rev()
-                .filter(|m| m.id < target)
-                .take(limit)
-                .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
-                .collect();
-            msgs.reverse();
-            HistorySlice {
-                messages: msgs,
-                loaded_at_top: history.loaded_ranges.loaded_at_top(),
-                loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
-                total_count: all.len(),
-                first_unread_id: first_unread_in_history(s, data_peer, history),
-                unread_count: history.unread_count.unwrap_or(0).max(0) as u32,
-            }
-        });
-        self.decorate_cached_translations(peer_id, &mut slice.messages);
-        crate::rich_message::attach_cached_rich_messages(
-            self.runtime.session(),
-            &mut slice.messages,
-        );
-        crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
-        crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        let mut slice = self.slice_before_now(peer_id, before_id, limit);
         self.poll_visible_slice_reactions(peer_id, &mut slice.messages);
         slice
+    }
+
+    fn try_load_slice_before(
+        &self,
+        peer_id: PeerId,
+        before_id: MsgId,
+        limit: usize,
+    ) -> Loadable<HistorySlice> {
+        if self.history_ready_or_request(peer_id, before_id, LoadDirection::Before) {
+            let slice = self.slice_before_now(peer_id, before_id, limit);
+            self.poll_slice_reactions_in_background(peer_id, &slice.messages);
+            Loadable::Ready(slice)
+        } else {
+            Loadable::Loading
+        }
     }
 
     fn load_slice_after(&self, peer_id: PeerId, after_id: MsgId, limit: usize) -> HistorySlice {
         self.ensure_history_loaded(peer_id, after_id, LoadDirection::After);
-        let data_peer = to_data_peer(peer_id);
-        let media_cache = self.media_cache.clone();
-        let mut slice = self.read_session(|s| {
-            let Some(history) = s.history(data_peer) else {
-                return HistorySlice::default();
-            };
-            let target = to_data_msg(after_id);
-            let all = history_messages_ordered(s, data_peer);
-            let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
-            let msgs: Vec<HistoryMessage> = all
-                .iter()
-                .filter(|m| m.id > target)
-                .take(limit)
-                .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
-                .collect();
-            HistorySlice {
-                messages: msgs,
-                loaded_at_top: history.loaded_ranges.loaded_at_top(),
-                loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
-                total_count: all.len(),
-                first_unread_id: first_unread_in_history(s, data_peer, history),
-                unread_count: history.unread_count.unwrap_or(0).max(0) as u32,
-            }
-        });
-        self.decorate_cached_translations(peer_id, &mut slice.messages);
-        crate::rich_message::attach_cached_rich_messages(
-            self.runtime.session(),
-            &mut slice.messages,
-        );
-        crate::widgets::attach_cached_widget_states(self.runtime.session(), &mut slice.messages);
-        crate::dice_pack::attach_and_prefetch_dice_lottie(self, &mut slice.messages);
+        let mut slice = self.slice_after_now(peer_id, after_id, limit);
         self.poll_visible_slice_reactions(peer_id, &mut slice.messages);
         slice
     }
 
-    fn drain_history_updates(&mut self, peer_id: PeerId) -> Vec<HistoryLiveUpdate> {
+    fn try_load_slice_after(
+        &self,
+        peer_id: PeerId,
+        after_id: MsgId,
+        limit: usize,
+    ) -> Loadable<HistorySlice> {
+        if self.history_ready_or_request(peer_id, after_id, LoadDirection::After) {
+            let slice = self.slice_after_now(peer_id, after_id, limit);
+            self.poll_slice_reactions_in_background(peer_id, &slice.messages);
+            Loadable::Ready(slice)
+        } else {
+            Loadable::Loading
+        }
+    }
+
+    fn set_history_open(&self, peer_id: PeerId, open: bool) {
+        // Off the UI thread: the write lock may be held by the session actor (TGB-2938).
+        let session = Arc::clone(self.runtime.session());
         let data_peer = to_data_peer(peer_id);
-        let Some(delta) = self.bridge.state().take_history_delta(data_peer) else {
-            return Vec::new();
-        };
-        if delta.reload_required {
-            return vec![HistoryLiveUpdate::ReloadRequired];
-        }
-
-        let media_cache = self.media_cache.clone();
-        let (mut added_msgs, mut edited_msgs, outbox_max, unread_state) = self.read_session(|s| {
-            let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
-            let added: Vec<HistoryMessage> = delta
-                .added
-                .iter()
-                .filter_map(|&mid| {
-                    s.message(DataFullMsgId::new(data_peer, mid))
-                        .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
-                })
-                .collect();
-            let edited: Vec<HistoryMessage> = delta
-                .edited
-                .iter()
-                .filter_map(|&mid| {
-                    s.message(DataFullMsgId::new(data_peer, mid))
-                        .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
-                })
-                .collect();
-            let outbox = if delta.outbox_read_changed {
-                s.history(data_peer)
-                    .map(|h| from_data_msg(h.outbox_read_till_id()))
-                    .filter(|id| id.0 > 0)
-            } else {
-                None
-            };
-            let unread = if delta.unread_changed {
-                s.history(data_peer).map(|h| {
-                    (
-                        h.unread_count.unwrap_or(0).max(0) as u32,
-                        from_data_msg(h.inbox_read_till_id()),
-                    )
-                })
-            } else {
-                None
-            };
-            (added, edited, outbox, unread)
+        self.runtime.tokio_handle().spawn(async move {
+            session.write().await.set_history_open(data_peer, open);
         });
+    }
 
-        for batch in [&mut added_msgs, &mut edited_msgs] {
-            if !batch.is_empty() {
-                self.decorate_cached_translations(peer_id, batch);
-                crate::rich_message::attach_cached_rich_messages(self.runtime.session(), batch);
-                crate::widgets::attach_cached_widget_states(self.runtime.session(), batch);
-                crate::dice_pack::attach_and_prefetch_dice_lottie(self, batch);
-            }
-        }
-
-        let mut out = Vec::new();
-        if !delta.deleted.is_empty() {
-            let ids: Vec<MsgId> = delta.deleted.into_iter().map(from_data_msg).collect();
-            out.push(HistoryLiveUpdate::MessagesDeleted(ids));
-        }
-        for msg in added_msgs {
-            out.push(HistoryLiveUpdate::MessageAdded(Box::new(msg)));
-        }
-        for msg in edited_msgs {
-            out.push(HistoryLiveUpdate::MessageEdited(Box::new(msg)));
-        }
-        if let Some(max_id) = outbox_max {
-            out.push(HistoryLiveUpdate::OutboxRead { max_id });
-        }
-        if let Some((unread_count, inbox_read_till)) = unread_state {
-            out.push(HistoryLiveUpdate::UnreadChanged {
-                unread_count,
-                inbox_read_till,
-            });
+    fn drain_history_updates(&mut self, peer_id: PeerId) -> Vec<HistoryLiveUpdate> {
+        let resolutions = self.sends.take_resolved();
+        let mut out = self.drain_history_delta(peer_id);
+        if !resolutions.is_empty() {
+            out.extend(self.send_resolution_updates(peer_id, &resolutions));
         }
         out
     }
@@ -2734,55 +3057,18 @@ impl HistoryBackend for LiveSession {
             silent: request.silent,
             ..SendOptions::default()
         };
-        let rt = Arc::clone(&self.runtime);
-        let text_owned = request.text.text.clone();
-        let outcome = block_on_runtime(self.runtime.tokio_handle(), async move {
-            with_rpc_timeout(
-                LIVE_RPC_TIMEOUT,
-                rt.send_message_with_entities(data_peer, text_owned, entities, reply_to, options),
-            )
-            .await
-        })?;
-
-        let (msg_id, is_sending) = outcome
-            .messages
-            .last()
-            .map(|pending| match pending.state {
-                PendingMessageState::Sent { server_id } => (server_id, false),
-                _ => (pending.local_id.msg, true),
-            })
-            .unwrap_or((DataMsgId(0), false));
-
-        let result = self.read_session(|s| {
-            s.message(DataFullMsgId::new(data_peer, msg_id))
-                .map(|m| message_to_history_message(s, m))
-                .unwrap_or_else(|| {
-                    let self_pid = s.self_peer_id();
-                    HistoryMessage {
-                        id: from_data_msg(msg_id),
-                        peer_id,
-                        from_id: from_data_peer(self_pid),
-                        sender_name: peer_display_title(s, self_pid),
-                        date_unix: now_unix_i32(),
-                        outgoing: true,
-                        is_post: false,
-                        text: request.text.clone(),
-                        media: None,
-                        service: None,
-                        reply: None,
-                        forward: None,
-                        reactions: Vec::new(),
-                        views: None,
-                        edited: false,
-                        is_read: false,
-                        is_sending,
-                        is_pinned: false,
-                        extra: Default::default(),
-                    }
-                })
-        });
-        self.bridge.state().notify_ui();
-        Ok(result)
+        let extras = crate::optimistic_send::QueuedSendExtras {
+            reply_to_msg_id: request.reply_to.map(to_data_msg),
+            ..Default::default()
+        };
+        self.send_text_optimistic(
+            data_peer,
+            &request.text.text,
+            &entities,
+            reply_to,
+            options,
+            &extras,
+        )
     }
 
     fn send_message_extended(
@@ -2990,8 +3276,19 @@ impl HistoryBackend for LiveSession {
         if msg_ids.is_empty() {
             return Ok(());
         }
-        let data_ids: Vec<DataMsgId> = msg_ids.iter().copied().map(to_data_msg).collect();
-        self.delete_messages_via_runtime(peer_id, data_ids, revoke_for_all)?;
+        let (local_ids, data_ids): (Vec<DataMsgId>, Vec<DataMsgId>) = msg_ids
+            .iter()
+            .copied()
+            .map(to_data_msg)
+            .partition(|id| id.is_client());
+        if !local_ids.is_empty() {
+            // A message being sent or failed exists only here (`HistoryItem::destroy`).
+            let data_peer = to_data_peer(peer_id);
+            self.write_session(|s| s.delete_messages(data_peer, &local_ids));
+        }
+        if !data_ids.is_empty() {
+            self.delete_messages_via_runtime(peer_id, data_ids, revoke_for_all)?;
+        }
         self.bridge.state().notify_ui();
         Ok(())
     }
@@ -3071,25 +3368,49 @@ impl HistoryBackend for LiveSession {
         if data_max.0 <= 0 {
             return;
         }
+        // Like `Data::Histories::readInboxTill` (`data/data_histories.cpp:273-284`): the local
+        // read state changes now, `messages.readHistory` goes out without the UI waiting for it.
+        // The runtime applies the same read again when the request is answered.
+        self.write_session(|s| {
+            let still_unread = s
+                .history(data_peer)
+                .and_then(|h| h.top_message_id)
+                .filter(|&top| data_max >= top)
+                .map(|_| 0);
+            s.mark_inbox_read(data_peer, data_max, still_unread);
+        });
         let rt = Arc::clone(&self.runtime);
-        let _ = block_on_runtime(self.runtime.tokio_handle(), async move {
-            with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.mark_read(data_peer, data_max, true)).await
+        self.ui_rpc.push(async move {
+            if let Err(err) =
+                with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.mark_read(data_peer, data_max, true)).await
+            {
+                debug!(peer = data_peer.0, error = %err, "mark_read failed");
+            }
         });
         self.bridge.state().notify_ui();
     }
 
     fn send_typing(&mut self, peer_id: PeerId, action: TypingAction) {
+        // `Api::SendProgressManager` sends `messages.setTyping` without anyone waiting for it;
+        // the queue keeps a cancel behind the typing it cancels.
         let data_peer = to_data_peer(peer_id);
         if let Some(kind) = history_typing_to_send_progress(action) {
             let rt = Arc::clone(&self.runtime);
-            let _ = block_on_runtime(self.runtime.tokio_handle(), async move {
-                with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.send_typing(data_peer, None, kind, 0)).await
+            self.ui_rpc.push(async move {
+                let _ =
+                    with_rpc_timeout(LIVE_RPC_TIMEOUT, rt.send_typing(data_peer, None, kind, 0))
+                        .await;
             });
         } else if let Some(input_peer) = self.input_peer(peer_id) {
-            let _ = self.invoke_rpc(tl_fns::messages::SetTyping {
+            let rpc = self.runtime.rpc().clone();
+            let req = tl_fns::messages::SetTyping {
                 peer: input_peer,
                 top_msg_id: None,
                 action: tl_enums::SendMessageAction::SendMessageCancelAction,
+            };
+            self.ui_rpc.push(async move {
+                let _ =
+                    with_rpc_timeout(LIVE_RPC_TIMEOUT, async move { rpc.invoke(&req).await }).await;
             });
         }
     }
@@ -3217,9 +3538,15 @@ impl HistoryBackend for LiveSession {
                 suggested_post: None,
                 rich_message: None,
             };
-            if let Err(err) = self.invoke_rpc(req) {
-                debug!(peer = peer_id.0, error = %err, "messages.saveDraft failed");
-            }
+            // `ApiWrap::saveDraftToCloudDelayed`: the request goes out in the background.
+            let rpc = self.runtime.rpc().clone();
+            self.ui_rpc.push(async move {
+                let res =
+                    with_rpc_timeout(LIVE_RPC_TIMEOUT, async move { rpc.invoke(&req).await }).await;
+                if let Err(err) = res {
+                    debug!(peer = peer_id.0, error = %err, "messages.saveDraft failed");
+                }
+            });
         }
         let now = now_unix_i32();
         let local_key = DraftKey::local(DataMsgId::ZERO, DataPeerId::ZERO);
@@ -3257,6 +3584,7 @@ impl HistoryBackend for LiveSession {
         if let Ok(mut c) = self.cache.lock() {
             c.dismissed_contact_banners.insert(peer_id);
         }
+        self.bridge.state().mark_views_changed();
     }
 
     fn add_contact(&mut self, peer_id: PeerId) {
@@ -3879,6 +4207,22 @@ impl HistoryBackend for LiveSession {
         crate::chat_helpers::chat_mention_candidates(self, peer_id)
     }
 
+    fn reply_preview_thumb(
+        &self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+    ) -> tg_app_core::info::backend::SharedMediaThumb {
+        crate::reply_targets::reply_preview_thumb(self, peer_id, msg_id)
+    }
+
+    fn start_media_download(&self, peer_id: PeerId, msg_id: MsgId) {
+        crate::media_download::start(self, peer_id, msg_id);
+    }
+
+    fn cancel_media_download(&self, peer_id: PeerId, msg_id: MsgId) {
+        crate::media_download::cancel(self, peer_id, msg_id);
+    }
+
     fn inline_media_descriptor(
         &self,
         peer_id: PeerId,
@@ -3886,10 +4230,21 @@ impl HistoryBackend for LiveSession {
     ) -> Option<InlineMediaDescriptor> {
         let data_peer = to_data_peer(peer_id);
         let data_msg = to_data_msg(msg_id);
-        let msg =
-            self.read_session(|s| s.message(DataFullMsgId::new(data_peer, data_msg)).cloned())?;
-        self.media_cache.inline_media_descriptor_for_message(
+        let settings = self
+            .cache
+            .lock()
+            .map(|c| c.auto_download.clone())
+            .unwrap_or_default();
+        let (msg, photo_autoload) = self.read_session(|s| {
+            let msg = s
+                .message(DataFullMsgId::new(data_peer, data_msg))
+                .cloned()?;
+            let allowed = crate::auto_download_gate::photo_autoload_allowed(s, &settings, &msg);
+            Some((msg, allowed))
+        })?;
+        self.media_cache.inline_media_descriptor_for_message_with(
             &msg,
+            photo_autoload,
             self.runtime.rpc(),
             self.runtime.tokio_handle(),
             self.bridge.state(),
@@ -4226,19 +4581,21 @@ impl HistoryBackend for LiveSession {
     }
 }
 
-fn first_unread_in_history(
-    session: &Session,
-    peer_id: DataPeerId,
-    history: &tg_data::History,
-) -> Option<MsgId> {
-    if history.unread_count.unwrap_or(0) <= 0 {
-        return None;
-    }
-    let read_till = history.inbox_read_till_id();
-    history_messages_ordered(session, peer_id)
-        .into_iter()
-        .find(|m| !m.is_outgoing() && m.id > read_till)
-        .map(|m| from_data_msg(m.id))
+/// The "Unread messages" bar position: the first loaded incoming message after the inbox read
+/// mark while the chat has unread messages (a range query, TGB-2938).
+fn first_unread_in_history(session: &Session, peer_id: DataPeerId) -> Option<MsgId> {
+    session.first_unread_incoming(peer_id).map(from_data_msg)
+}
+
+/// Number of loaded message ids of `history` (`O(slices)`; every id in a loaded range has its
+/// message stored, unloading shrinks the ranges with the messages).
+fn loaded_id_count(history: &tg_data::History) -> usize {
+    history
+        .loaded_ranges
+        .slices()
+        .iter()
+        .map(|slice| slice.messages.len())
+        .sum()
 }
 
 fn build_history_slice(
@@ -4252,45 +4609,42 @@ fn build_history_slice(
     let Some(history) = session.history(peer_id) else {
         return HistorySlice::default();
     };
-    let all = history_messages_ordered(session, peer_id);
-    let total_count = all.len();
-    if total_count == 0 {
-        return HistorySlice {
-            messages: Vec::new(),
-            loaded_at_top: history.loaded_ranges.loaded_at_top(),
-            loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
-            total_count: 0,
-            first_unread_id: None,
-            unread_count: history.unread_count.unwrap_or(0).max(0) as u32,
-        };
-    }
-
     let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
     let window = limit_before.saturating_add(limit_after).max(20);
-    let slice_msgs: Vec<HistoryMessage> = if around_id == MsgId::SHOW_AT_END || around_id.0 <= 0 {
-        let start = total_count.saturating_sub(window);
-        all[start..]
-            .iter()
-            .map(|m| message_to_history_message_with_stickers(session, m, &resolve))
-            .collect()
+    // Range queries over the loaded ids (TGB-2938): a page costs its own length, not the
+    // whole loaded history.
+    let first_unread = first_unread_in_history(session, peer_id);
+    let page = if around_id == MsgId::SHOW_AT_UNREAD
+        && let Some(unread) = first_unread
+    {
+        session.loaded_messages_around(peer_id, to_data_msg(unread), limit_before, limit_after)
+    } else if around_id == MsgId::SHOW_AT_END || around_id.0 <= 0 {
+        session.last_loaded_messages(peer_id, window)
     } else {
-        let target = to_data_msg(around_id);
-        let center = all.partition_point(|m| m.id < target).min(total_count - 1);
-        let start = center.saturating_sub(limit_before);
-        let end = (center.saturating_add(limit_after).saturating_add(1)).min(total_count);
-        all[start..end]
-            .iter()
-            .map(|m| message_to_history_message_with_stickers(session, m, &resolve))
-            .collect()
+        session.loaded_messages_around(peer_id, to_data_msg(around_id), limit_before, limit_after)
     };
+    let slice_msgs: Vec<HistoryMessage> = page
+        .into_iter()
+        .map(|m| message_to_history_message_with_stickers(session, m, &resolve))
+        .collect();
 
     HistorySlice {
         messages: slice_msgs,
         loaded_at_top: history.loaded_ranges.loaded_at_top(),
         loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
-        total_count,
-        first_unread_id: first_unread_in_history(session, peer_id, history),
+        total_count: loaded_id_count(history),
+        first_unread_id: first_unread,
         unread_count: history.unread_count.unwrap_or(0).max(0) as u32,
+    }
+}
+
+/// Appends the chat's local messages (being sent or failed) to a slice that reaches the bottom:
+/// tdesktop keeps them after the newest server message (TGB-2931).
+fn append_local_messages(session: &Session, peer_id: DataPeerId, slice: &mut HistorySlice) {
+    if slice.loaded_at_bottom || slice.messages.is_empty() {
+        slice
+            .messages
+            .extend(crate::optimistic_send::local_messages(session, peer_id));
     }
 }
 
@@ -4312,6 +4666,7 @@ impl InfoBackend for LiveSession {
             }
             profile.group_call.can_manage |= can_manage;
         }
+        crate::peer_emoji_status::request_for_profile(self, &profile);
         Some(profile)
     }
 
@@ -6050,15 +6405,7 @@ impl SettingsBackend for LiveSession {
                 c.scope_notify.clear();
                 c.notify_settings_version = c.notify_settings_version.wrapping_add(1);
             }
-            self.write_session(|s| {
-                let ids = known_peer_ids(s);
-                for pid in ids {
-                    if let Some(p) = s.peer_mut(pid) {
-                        p.common_mut().notify = PeerNotifySettings::default();
-                    }
-                    s.set_history_muted(pid, false);
-                }
-            });
+            self.write_session(crate::notify_sync::reset_session_notify_settings);
             self.bridge.state().notify_ui();
         }
     }
@@ -6084,7 +6431,7 @@ impl SettingsBackend for LiveSession {
     }
 
     fn folders(&self) -> Vec<SettingsChatFolder> {
-        self.ensure_filters_loaded();
+        self.ensure_filters_loaded_now();
         self.read_session(|s| {
             s.filters()
                 .list()
@@ -6169,7 +6516,7 @@ impl SettingsBackend for LiveSession {
     }
 
     fn folder_tags_enabled(&self) -> bool {
-        self.ensure_filters_loaded();
+        self.ensure_filters_loaded_now();
         self.dialog_filter_tags_enabled()
     }
 
@@ -6748,6 +7095,26 @@ impl NotifyBackend for LiveSession {
     fn peer_info(&self, peer_id: PeerId) -> Option<NotifyPeerInfo> {
         self.read_session(|s| peer_to_notify_info(s, to_data_peer(peer_id)))
     }
+
+    fn notify_settings_versions(&self) -> Vec<(u64, u64)> {
+        crate::notify_sync::request_notify_defaults(self);
+        crate::notify_sync::request_wanted_peer_settings(self);
+        vec![(
+            self.session_id,
+            crate::notify_sync::notify_settings_epoch(self),
+        )]
+    }
+
+    fn sync_notify_settings(
+        &self,
+        session_id: u64,
+        store: &mut tg_app_core::notifications::settings::NotifySettingsStore,
+        now_unix: i64,
+    ) {
+        if session_id == self.session_id {
+            crate::notify_sync::sync_store(self, store, now_unix);
+        }
+    }
 }
 
 /// Per-live-session pending Mini App URL overrides keyed by `(session_ptr, bot_bare_id)`.
@@ -6781,13 +7148,9 @@ impl tg_app_core::session_api::AppSession for LiveSession {
         if cleaned.is_empty() {
             return None;
         }
-        InfoBackend::all_peers(self).into_iter().find_map(|peer| {
-            let matched = peer
-                .usernames
-                .iter()
-                .any(|u| u.is_active && u.username.eq_ignore_ascii_case(cleaned));
-            matched.then_some(peer.id)
-        })
+        // The session's username index (TGB-2938) instead of building every peer's profile.
+        self.read_session(|s| s.peer_by_username(cleaned))
+            .map(from_data_peer)
     }
 
     fn is_forum_peer(&self, peer_id: PeerId) -> bool {
@@ -7146,6 +7509,143 @@ pub fn mark_downloaded_file_zone_identifier(path: &Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+impl LiveSession {
+    /// Applies the side effects of finished background sends and returns the history updates
+    /// of those in `peer_id` (TGB-2931). Sends in other chats show up when those chats load.
+    fn send_resolution_updates(
+        &mut self,
+        peer_id: PeerId,
+        resolutions: &[crate::optimistic_send::SendResolution],
+    ) -> Vec<HistoryLiveUpdate> {
+        for resolution in resolutions {
+            match &resolution.outcome {
+                Ok(outcome) => {
+                    for upd in &outcome.updates {
+                        self.apply_updates_side_caches(upd);
+                    }
+                }
+                Err(err) => {
+                    self.apply_slowmode_wait_from_error(from_data_peer(resolution.peer), err);
+                }
+            }
+        }
+        let data_peer = to_data_peer(peer_id);
+        let mut updates = self.read_session(|s| {
+            resolutions
+                .iter()
+                .flat_map(|r| crate::optimistic_send::resolution_updates(s, data_peer, r))
+                .collect::<Vec<_>>()
+        });
+        let mut sent: Vec<HistoryMessage> = updates
+            .iter()
+            .filter_map(|u| match u {
+                HistoryLiveUpdate::LocalMessageSent { message, .. } => Some((**message).clone()),
+                _ => None,
+            })
+            .collect();
+        if !sent.is_empty() {
+            self.decorate_live_messages(peer_id, &mut sent);
+            let mut decorated = sent.into_iter();
+            for upd in &mut updates {
+                if let HistoryLiveUpdate::LocalMessageSent { message, .. } = upd
+                    && let Some(m) = decorated.next()
+                {
+                    **message = m;
+                }
+            }
+        }
+        updates
+    }
+
+    /// Adds the caches a live-arrived message shows with (translations, rich messages, widgets,
+    /// dice, reply targets).
+    fn decorate_live_messages(&mut self, peer_id: PeerId, batch: &mut [HistoryMessage]) {
+        self.decorate_cached_translations(peer_id, batch);
+        crate::rich_message::attach_cached_rich_messages(self.runtime.session(), batch);
+        crate::widgets::attach_cached_widget_states(self.runtime.session(), batch);
+        crate::dice_pack::attach_and_prefetch_dice_lottie(self, batch);
+        crate::reply_targets::attach_reply_targets(self, batch);
+        crate::custom_emoji_loader::request_for_messages(self, batch);
+    }
+
+    fn drain_history_delta(&mut self, peer_id: PeerId) -> Vec<HistoryLiveUpdate> {
+        let data_peer = to_data_peer(peer_id);
+        let Some(delta) = self.bridge.state().take_history_delta(data_peer) else {
+            return Vec::new();
+        };
+        if delta.reload_required {
+            return vec![HistoryLiveUpdate::ReloadRequired];
+        }
+
+        let media_cache = self.media_cache.clone();
+        let (mut added_msgs, mut edited_msgs, outbox_max, unread_state) = self.read_session(|s| {
+            let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
+            let added: Vec<HistoryMessage> = delta
+                .added
+                .iter()
+                .filter_map(|&mid| {
+                    s.message(DataFullMsgId::new(data_peer, mid))
+                        .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
+                })
+                .collect();
+            let edited: Vec<HistoryMessage> = delta
+                .edited
+                .iter()
+                .filter_map(|&mid| {
+                    s.message(DataFullMsgId::new(data_peer, mid))
+                        .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
+                })
+                .collect();
+            let outbox = if delta.outbox_read_changed {
+                s.history(data_peer)
+                    .map(|h| from_data_msg(h.outbox_read_till_id()))
+                    .filter(|id| id.0 > 0)
+            } else {
+                None
+            };
+            let unread = if delta.unread_changed {
+                s.history(data_peer).map(|h| {
+                    (
+                        h.unread_count.unwrap_or(0).max(0) as u32,
+                        from_data_msg(h.inbox_read_till_id()),
+                    )
+                })
+            } else {
+                None
+            };
+            (added, edited, outbox, unread)
+        });
+
+        for batch in [&mut added_msgs, &mut edited_msgs] {
+            if !batch.is_empty() {
+                self.decorate_live_messages(peer_id, batch);
+            }
+        }
+
+        let mut out = Vec::new();
+        if !delta.deleted.is_empty() {
+            let ids: Vec<MsgId> = delta.deleted.into_iter().map(from_data_msg).collect();
+            out.push(HistoryLiveUpdate::MessagesDeleted(ids));
+        }
+        for msg in added_msgs {
+            out.push(HistoryLiveUpdate::MessageAdded(Box::new(msg)));
+        }
+        for msg in edited_msgs {
+            out.push(HistoryLiveUpdate::MessageEdited(Box::new(msg)));
+        }
+        if let Some(max_id) = outbox_max {
+            out.push(HistoryLiveUpdate::OutboxRead { max_id });
+        }
+        if let Some((unread_count, inbox_read_till)) = unread_state {
+            out.push(HistoryLiveUpdate::UnreadChanged {
+                unread_count,
+                inbox_read_till,
+            });
+        }
+        out
     }
 }
 

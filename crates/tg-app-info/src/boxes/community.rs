@@ -89,11 +89,8 @@ impl CommunityBoxState {
         // Header summary: avatar + title + chat count
         ui.horizontal(|ui| {
             let (av_rect, _) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::hover());
-            EmptyUserpic::for_peer(self.community_id.bare(), &details.title, colors).paint_rounded(
-                ui.painter(),
-                av_rect,
-                12.0,
-            );
+            EmptyUserpic::for_peer(self.community_id.bare(), &details.title, colors)
+                .paint_rounded_or_photo(ui.painter(), av_rect, 12.0, self.community_id.0);
             ui.add_space(12.0);
             ui.vertical(|ui| {
                 ui.label(

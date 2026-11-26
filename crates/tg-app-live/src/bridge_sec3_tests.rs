@@ -24,7 +24,11 @@ fn deleted_event(msg: i32) -> IncomingNotifyEvent {
 fn sec3_d4_session_events_are_bounded_and_keep_force_logout() {
     let state = LiveBridgeState::new();
     state.push_session_event(SessionEvent::ForceLogout {
-        notification_type: "AUTH_KEY_DROP_DUPLICATE".to_owned(),
+        reason: tg_session::LogoutReason::ServerDrop {
+            notification_type: "AUTH_KEY_DROP_DUPLICATE".to_owned(),
+            message: "Signed out".to_owned(),
+            entities: Vec::new(),
+        },
     });
     for i in 0..(MAX_QUEUED_SESSION_EVENTS * 4) {
         state.push_session_event(SessionEvent::UserFullRefreshNeeded {

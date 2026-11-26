@@ -328,6 +328,7 @@ pub fn peer_saved_gifts(
     write_session(live, |s| {
         apply_tl_users_and_chats(s, &inner.users, &inner.chats);
     });
+    crate::gift_stickers::register_saved_gift_stickers(live, &inner.gifts);
     let slice = saved_star_gifts_from_tl(&saved_tl, data_peer, is_self);
     if let Some(enabled) = slice.chat_notifications_enabled {
         crate::star_gifts::record_chat_star_gift_notifications_enabled(live, data_peer, enabled);
@@ -380,10 +381,8 @@ pub fn toggle_peer_gift_saved(
 fn saved_gift_to_received_item(saved: &SavedStarGift, session: &Session) -> ReceivedGiftItem {
     let title = if let Some(ref unique) = saved.info.unique {
         unique.display_name()
-    } else if !saved.info.resell_title.is_empty() {
-        saved.info.resell_title.clone()
     } else {
-        format!("Star Gift #{}", saved.info.id)
+        saved.info.resell_title.clone()
     };
     let sender_name = if saved.anonymous || saved.from_id == DataPeerId::ZERO {
         "Anonymous".to_owned()

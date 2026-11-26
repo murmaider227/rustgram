@@ -53,7 +53,7 @@ use crate::calls::top_bar::{CallsTopBar, TopBarAction};
 /// footprint in `app.rs`.
 ///
 /// Interactive demo shortcuts when the desktop window is running:
-/// - `Ctrl+Shift+I`: simulate an incoming 1:1 call (plays original synthesized ringtone)
+/// - `Ctrl+Shift+I`: simulate an incoming 1:1 call (plays the ringtone)
 /// - `Ctrl+Shift+C`: start an outgoing 1:1 call (runs DH key exchange -> emoji fingerprint)
 /// - `Ctrl+Shift+G`: open/join a demo group call with video tiles and speaking participants
 /// - `Ctrl+Shift+H`: open the Recent Calls list box
@@ -244,7 +244,7 @@ impl AppCallsHost {
         &mut self.recent_calls_box
     }
 
-    /// Drives one UI frame: ticks backend state machines & synthesized audio, renders the green
+    /// Drives one UI frame: ticks backend state machines & call sounds, renders the green
     /// top bar over the main window (when in a call), and renders active 1:1 / group call windows
     /// and dialogs.
     pub fn update_and_render(&mut self, ui: &mut egui::Ui) {
@@ -272,7 +272,6 @@ impl AppCallsHost {
                 }
             }
         }
-        self.ringtone.tick(now_ms);
 
         for toast in self.backend.drain_toasts() {
             self.last_toast = Some((toast, now_ms + 3_500));
@@ -809,7 +808,7 @@ mod tests {
         let mut backend = MockCallsBackend::new();
         let mut player = CallRingtonePlayer::headless();
 
-        // Incoming call starts ringing -> plays synthesized ringtone -> Answer -> Established with 4 emoji.
+        // Incoming call starts ringing -> plays the ringtone -> Answer -> Established with 4 emoji.
         backend.simulate_incoming_call(MockCallsBackend::PEER_DESIGN_STUDIO, false, 1_000);
         backend.tick(1_200);
         assert_eq!(

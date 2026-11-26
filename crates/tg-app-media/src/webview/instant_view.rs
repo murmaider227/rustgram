@@ -1050,6 +1050,9 @@ impl InstantViewWindow {
     }
 
     fn show_toast(&mut self, message: String) {
+        let Some(message) = tg_app_core::user_error::visible_toast_text(message) else {
+            return;
+        };
         self.toast = Some((message, Instant::now()));
     }
 

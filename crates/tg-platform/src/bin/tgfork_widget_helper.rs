@@ -9,6 +9,9 @@
 //! inherited named-pipe handle as `argv[1]`. Adopts the client byte pipe, drops its startup
 //! impersonation token into the Low-IL AppContainer lockdown token, verifies sandbox Job Object
 //! limits, and serves the length-prefixed framed IPC loop until stopped or disconnected.
+//! Release builds use the GUI subsystem so the helper never opens a console window.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::process::ExitCode;
 

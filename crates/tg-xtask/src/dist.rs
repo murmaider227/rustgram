@@ -75,6 +75,8 @@ pub struct DistOptions {
     pub iscc_path: Option<PathBuf>,
     /// Fail with an error instead of skipping if `ISCC.exe` is not installed.
     pub require_iscc: bool,
+    /// Fail unless `RUSTGRAM_API_ID` / `RUSTGRAM_API_HASH` are set for the build (release CI).
+    pub require_api_credentials: bool,
 }
 
 /// Artifacts produced by [`run_dist`].
@@ -246,7 +248,19 @@ Major Third-Party Components:
    Complete corresponding FFmpeg source code is available from the FFmpeg
    project and matching build scripts.
 
-3. Rust Crate Dependencies (MIT / Apache-2.0 / BSD / ISC / Zlib / MPL-2.0)
+3. Telegram Desktop sounds (Telegram/Resources/sounds, tag v7.4.5)
+   Copyright (c) 2014-2026 The Telegram Desktop Authors.
+   License: GNU General Public License v3.0 or later with OpenSSL exception
+   Source:  https://github.com/telegramdesktop/tdesktop
+   Embedded unmodified:
+   - msg_incoming.mp3, the default notification sound;
+   - call_incoming.mp3, call_outgoing.mp3, call_connect.mp3, call_busy.mp3,
+     call_end.mp3, the call sounds;
+   - group_call_start.mp3, group_call_connect.mp3, group_call_allowed.mp3,
+     group_call_end.mp3, group_call_recording_start.mp3, the group call
+     sounds.
+
+4. Rust Crate Dependencies (MIT / Apache-2.0 / BSD / ISC / Zlib / MPL-2.0)
    - egui / eframe / wgpu / winit: MIT OR Apache-2.0
    - tokio / tracing / tracing-subscriber / serde / serde_json: MIT OR Apache-2.0
    - reqwest / rustls / webpki-roots: MIT OR Apache-2.0
@@ -563,6 +577,39 @@ impl InnoSetupDefines<'_> {
 }
 
 /// Executes the full distribution workflow.
+/// Checks that a build made with `RUSTGRAM_API_ID` / `RUSTGRAM_API_HASH` set really compiled
+/// them in (`tg-session` reads them with `option_env!`): `app_bytes` must contain the hash.
+/// Returns `Ok(true)` when the check ran, `Ok(false)` when no credentials were set and
+/// `required` is `false`. Error messages never include the values.
+pub fn check_embedded_api_credentials(
+    app_bytes: &[u8],
+    env_id: Option<&str>,
+    env_hash: Option<&str>,
+    required: bool,
+) -> Result<bool, XtaskError> {
+    let id = env_id.map(str::trim).filter(|v| !v.is_empty());
+    let hash = env_hash.map(str::trim).filter(|v| !v.is_empty());
+    match (id, hash) {
+        (None, None) if !required => Ok(false),
+        (Some(_), Some(hash)) => {
+            let needle = hash.as_bytes();
+            if app_bytes.windows(needle.len()).any(|w| w == needle) {
+                Ok(true)
+            } else {
+                Err(XtaskError::InvalidArgument(
+                    "rustgram.exe does not contain the RUSTGRAM_API_HASH set for this build; \
+                     the release would start without Telegram API credentials (rebuild without \
+                     --skip-build so tg-session compiles them in)"
+                        .to_owned(),
+                ))
+            }
+        }
+        _ => Err(XtaskError::InvalidArgument(
+            "both RUSTGRAM_API_ID and RUSTGRAM_API_HASH must be set for a release build".to_owned(),
+        )),
+    }
+}
+
 pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     // Absolute from here on: child processes (cargo for the icon path, ISCC) resolve relative paths
     // against their own working directories, not ours.
@@ -632,6 +679,20 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
         return Err(XtaskError::MissingArtifact(
             widget_helper_exe.display().to_string(),
         ));
+    }
+
+    // With --skip-build the binaries may come from another build, so only a required check runs.
+    if !opts.skip_build || opts.require_api_credentials {
+        let env_id = env::var("RUSTGRAM_API_ID").ok();
+        let env_hash = env::var("RUSTGRAM_API_HASH").ok();
+        if check_embedded_api_credentials(
+            &fs::read(&app_exe)?,
+            env_id.as_deref(),
+            env_hash.as_deref(),
+            opts.require_api_credentials,
+        )? {
+            println!("tg-xtask: rustgram.exe carries the API credentials set for this build");
+        }
     }
 
     let ffmpeg_bin_dir =

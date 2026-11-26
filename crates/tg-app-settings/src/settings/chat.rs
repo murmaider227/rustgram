@@ -55,6 +55,9 @@ pub struct ChatSettingsState {
     pub font_editor_open: bool,
     /// Whether "Choose from gallery" opened the Chat Background gallery box.
     pub gallery_open: bool,
+    /// The system dark-mode value (`Core::Settings::systemDarkMode`), set by the window.
+    /// `None`: the system reports none, and the "Auto-night mode" row is not shown.
+    pub system_dark_mode: Option<bool>,
 }
 
 impl Default for ChatSettingsState {
@@ -71,6 +74,7 @@ impl Default for ChatSettingsState {
             emoji_sets_manager: crate::chat_helpers::EmojiSetsManager::default(),
             font_editor_open: false,
             gallery_open: false,
+            system_dark_mode: None,
         }
     }
 }
@@ -154,24 +158,27 @@ pub fn render_chat_settings_section(
         out.toast = Some(tr::lng_settings_theme_name_color());
     }
 
-    let auto_night_label = if core.system_dark_mode_enabled {
-        tr::lng_settings_auto_night_mode_on()
-    } else {
-        tr::lng_settings_auto_night_mode_off()
-    };
-    if settings_row(
-        ui,
-        &tr::lng_settings_auto_night_mode(),
-        None,
-        Some(&auto_night_label),
-        Some(SettingsIconKind::NightMode),
-        false,
-        false,
-        colors,
-    )
-    .clicked()
-    {
-        core.system_dark_mode_enabled = !core.system_dark_mode_enabled;
+    // `SetupThemeSettings`: the row exists only `if (settings->systemDarkMode().has_value())`.
+    if state.system_dark_mode.is_some() {
+        let auto_night_label = if core.system_dark_mode_enabled {
+            tr::lng_settings_auto_night_mode_on()
+        } else {
+            tr::lng_settings_auto_night_mode_off()
+        };
+        if settings_row(
+            ui,
+            &tr::lng_settings_auto_night_mode(),
+            None,
+            Some(&auto_night_label),
+            Some(SettingsIconKind::NightMode),
+            false,
+            false,
+            colors,
+        )
+        .clicked()
+        {
+            core.system_dark_mode_enabled = !core.system_dark_mode_enabled;
+        }
     }
 
     let default_lbl = tr::lng_settings_call_device_default();
@@ -525,7 +532,8 @@ pub fn render_chat_settings_section(
                             ) {
                                 state.emoji_sets_manager.mark_failed(id, err.clone());
                             }
-                            out.toast = Some(format!("Failed to download {name} emoji set: {err}"));
+                            out.toast =
+                                tg_app_core::user_error::emoji_set_download(&err).into_text();
                         }
                     }
                 }

@@ -592,8 +592,10 @@ impl LiveCallsController {
                     self.process_instance_actions(now_ms);
                 }
                 Err(err) => {
-                    self.toast_queue
-                        .push(format!("Failed to fetch DH config for call: {err}"));
+                    let _ = tg_app_core::user_error::call_silent(
+                        "messages.getDhConfig",
+                        &err.to_string(),
+                    );
                     self.instance.handle_dh_config_response(Err(()));
                     self.process_instance_actions(now_ms);
                 }
@@ -723,8 +725,10 @@ impl LiveCallsController {
                     self.process_group_actions(now_ms);
                 }
                 Err(err) => {
-                    self.toast_queue
-                        .push(format!("Failed to create group call: {err}"));
+                    let _ = tg_app_core::user_error::call_silent(
+                        "phone.createGroupCall",
+                        &err.to_string(),
+                    );
                     if let Some(group) = self.active_group.as_mut() {
                         group.session.fail();
                     }
@@ -745,8 +749,10 @@ impl LiveCallsController {
                     );
                 }
                 Err(err) => {
-                    self.toast_queue
-                        .push(format!("Failed to create conference call: {err}"));
+                    let _ = tg_app_core::user_error::call_silent(
+                        "phone.createConferenceCall",
+                        &err.to_string(),
+                    );
                     if let Some(group) = self.active_group.as_mut() {
                         group.session.handle_join_fail(&err);
                     }
@@ -779,8 +785,14 @@ impl LiveCallsController {
                     self.send_pending_conference_join(now_ms);
                 }
                 Err(err) => {
-                    self.toast_queue
-                        .push(format!("Failed to load conference chain block: {err}"));
+                    if let Some(text) = tg_app_core::user_error::error_type_toast(
+                        "phone.getGroupCallChainBlocks",
+                        &err.to_string(),
+                    )
+                    .into_text()
+                    {
+                        self.toast_queue.push(text);
+                    }
                     if let Some(group) = self.active_group.as_mut() {
                         group.pending_conference_join = None;
                         group.session.handle_join_fail(&err);
@@ -882,8 +894,10 @@ impl LiveCallsController {
                                 );
                             }
                         }
-                        self.toast_queue
-                            .push(format!("Failed to send in-call message: {err}"));
+                        let _ = tg_app_core::user_error::call_silent(
+                            "phone.sendGroupCallMessage",
+                            &err.to_string(),
+                        );
                     }
                 }
                 self.process_group_actions(now_ms);
@@ -913,8 +927,10 @@ impl LiveCallsController {
                                 .messages_mut()
                                 .handle_send_failed(random_id, now_unix_i32());
                         }
-                        self.toast_queue
-                            .push(format!("Failed to send encrypted call message: {err}"));
+                        let _ = tg_app_core::user_error::call_silent(
+                            "phone.sendGroupCallEncryptedMessage",
+                            &err.to_string(),
+                        );
                     }
                 }
                 self.process_group_actions(now_ms);
@@ -1022,8 +1038,11 @@ impl LiveCallsController {
                         }
                         group.session.handle_join_fail(&err);
                     }
-                    self.toast_queue
-                        .push(format!("Failed to join group call: {err}"));
+                    if let Some(text) =
+                        tg_app_core::user_error::join_group_call(&err.to_string()).into_text()
+                    {
+                        self.toast_queue.push(text);
+                    }
                     self.process_group_actions(now_ms);
                 }
             },
@@ -1789,7 +1808,17 @@ impl LiveCallsController {
                 }
             }
             CallAction::ShowError(err) => {
-                self.toast_queue.push(err);
+                let user = self
+                    .instance
+                    .current_call()
+                    .map(|call| {
+                        self.peer_info(PeerId::from_user(call.peer_user_id().raw()))
+                            .name
+                    })
+                    .unwrap_or_default();
+                if let Some(text) = tg_app_core::user_error::call_error(&err, &user).into_text() {
+                    self.toast_queue.push(text);
+                }
             }
             CallAction::NotifyFinished | CallAction::NotifyFailed => {
                 let keep_rating = self
@@ -4680,7 +4709,10 @@ impl CallsBackend for LiveSession {
                             }
                         }
                         Err(err) => {
-                            c.toast_queue.push(format!("Camera unavailable: {err}"));
+                            c.toast_queue.push({
+                                tracing::warn!(%err, "camera unavailable");
+                                tg_lang::tr::lng_call_error_no_camera()
+                            });
                         }
                     }
                 }
@@ -4707,8 +4739,10 @@ impl CallsBackend for LiveSession {
                             }
                         }
                         Err(err) => {
-                            c.toast_queue
-                                .push(format!("Screen capture unavailable: {err}"));
+                            c.toast_queue.push({
+                                tracing::warn!(%err, "screen capture unavailable");
+                                tg_lang::tr::lng_group_call_failed_screen()
+                            });
                         }
                     }
                 }
@@ -5015,8 +5049,10 @@ impl CallsBackend for LiveSession {
                         }
                     }
                     Err(err) => {
-                        c.toast_queue
-                            .push(format!("Screen capture unavailable: {err}"));
+                        c.toast_queue.push({
+                            tracing::warn!(%err, "screen capture unavailable");
+                            tg_lang::tr::lng_group_call_failed_screen()
+                        });
                     }
                 }
             }

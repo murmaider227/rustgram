@@ -261,6 +261,9 @@ impl BusinessScreenHost {
 
     /// Displays a transient toast notification for 3 seconds.
     pub fn show_toast(&mut self, msg: String, now_ms: i64) {
+        let Some(msg) = tg_app_core::user_error::visible_toast_text(msg) else {
+            return;
+        };
         self.toast_message = Some((msg, now_ms + 3_000));
     }
 

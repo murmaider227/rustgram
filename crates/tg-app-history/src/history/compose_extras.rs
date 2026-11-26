@@ -413,6 +413,7 @@ impl VoiceRecorderController {
         Some(VoiceAttachment {
             duration_secs,
             waveform_5bit,
+            size_bytes: 0,
             is_unread: false,
             transcription: None,
         })

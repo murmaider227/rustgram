@@ -184,6 +184,8 @@ bitflags! {
         const STREAMED_DRAFTS      = 1 << 16;
         /// Compose stash changed.
         const COMPOSE_STASH        = 1 << 17;
+        /// Old loaded messages were unloaded to bound memory (`History::unloadBlocks`).
+        const MESSAGES_UNLOADED    = 1 << 18;
     }
 }
 
@@ -211,6 +213,10 @@ bitflags! {
         const REPLY_TO_TOP_ADDED  = 1 << 8;
         /// New unread reaction arrived on message.
         const NEW_UNREAD_REACTION = 1 << 9;
+        /// The new message arrived as a live update (`NewMessageType::Unread`), not with a
+        /// history slice or dialogs page, so it may raise a desktop notification
+        /// (`History::addNewMessage` -> `History::newItemAdded`, `history/history.cpp:674,1674`).
+        const NEW_UNREAD          = 1 << 10;
     }
 }
 
@@ -352,6 +358,9 @@ pub enum ChangeEvent {
     },
     /// Chat filters (folders) list or order changed.
     FiltersChanged,
+    /// A per-type default notification setting (users, groups, channels) changed
+    /// (`Data::NotifySettings::defaultUpdates`).
+    NotifyDefaultsChanged,
     /// Admin rights for a member changed in a group or channel.
     ChatAdminChanged {
         /// Group or channel peer ID.

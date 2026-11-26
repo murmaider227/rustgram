@@ -240,16 +240,46 @@ pub fn format_unread_counter_short(unread_counter: i32) -> String {
 /// Elides single-line text on the right with `'…'` (`U+2026`) so its measured width fits
 /// within `max_width` (`QFontMetrics::elidedText(..., Qt::ElideRight)`).
 ///
-/// `measure` returns the pixel width of any string slice.
+/// `measure` returns the pixel width of any string slice and must not shrink when the slice
+/// grows, which holds for every font. The result keeps the longest prefix that fits together
+/// with the ellipsis. The cut is searched from a first guess proportional to the widths, so it
+/// takes a handful of `measure` calls where measuring every prefix took one per character.
 #[must_use]
-pub fn elide_text_right<F>(text: &str, max_width: i32, mut measure: F) -> String
+pub fn elide_text_right<F>(text: &str, max_width: i32, measure: F) -> String
+where
+    F: FnMut(&str) -> i32,
+{
+    elide_right_from(text, max_width, None, measure)
+}
+
+/// [`elide_text_right`] for a caller that already knows where the cut should be, for example
+/// from the glyph positions of the whole string laid out once.
+///
+/// `hint_end` is the byte length of the prefix expected to be kept. It only tells the search
+/// where to start: the result is the same as [`elide_text_right`]'s for any hint, and a correct
+/// hint is confirmed with two `measure` calls.
+#[must_use]
+pub fn elide_text_right_hinted<F>(text: &str, max_width: i32, hint_end: usize, measure: F) -> String
+where
+    F: FnMut(&str) -> i32,
+{
+    elide_right_from(text, max_width, Some(hint_end), measure)
+}
+
+fn elide_right_from<F>(
+    text: &str,
+    max_width: i32,
+    hint_end: Option<usize>,
+    mut measure: F,
+) -> String
 where
     F: FnMut(&str) -> i32,
 {
     if max_width <= 0 || text.is_empty() {
         return String::new();
     }
-    if measure(text) <= max_width {
+    let full_width = measure(text);
+    if full_width <= max_width {
         return text.to_string();
     }
     const ELLIPSIS: &str = "\u{2026}";
@@ -257,20 +287,96 @@ where
     if ellipsis_w > max_width {
         return String::new();
     }
-    let mut best_byte_end = 0usize;
-    for (byte_idx, ch) in text.char_indices() {
-        let next_end = byte_idx + ch.len_utf8();
-        let candidate = &text[..next_end];
-        if measure(candidate) + ellipsis_w <= max_width {
-            best_byte_end = next_end;
+    let budget = max_width - ellipsis_w;
+    let first_probe = hint_end.unwrap_or_else(|| {
+        let scaled = text.len() as i64 * i64::from(budget) / i64::from(full_width.max(1));
+        usize::try_from(scaled).unwrap_or(0)
+    });
+
+    // The prefix ending at `fits_end` fits (the empty one always does); the one ending at
+    // `wide_end` does not (the whole text is wider than `max_width`). The search narrows the
+    // two to neighbouring characters.
+    let mut fits_end = 0usize;
+    let mut wide_end = text.len();
+    let mut search = CutSearch::Start(first_probe);
+    while let Some(probe) = boundary_between(text, fits_end, wide_end, search.target()) {
+        let fits = measure(&text[..probe]) <= budget;
+        if fits {
+            fits_end = probe;
         } else {
-            break;
+            wide_end = probe;
         }
+        search = search.after(fits, fits_end, wide_end);
     }
-    let mut out = String::with_capacity(best_byte_end + ELLIPSIS.len());
-    out.push_str(&text[..best_byte_end]);
+
+    let mut out = String::with_capacity(fits_end + ELLIPSIS.len());
+    out.push_str(&text[..fits_end]);
     out.push_str(ELLIPSIS);
     out
+}
+
+/// Where [`elide_right_from`] measures next.
+#[derive(Clone, Copy)]
+enum CutSearch {
+    /// The first guess.
+    Start(usize),
+    /// Every probe so far fell on the same side of the cut: step away from the last one, twice
+    /// as far each time. A good first guess ends here after one step.
+    Gallop {
+        target: usize,
+        step: usize,
+        upward: bool,
+    },
+    /// Probes on both sides of the cut: halve the range between them.
+    Bisect(usize),
+}
+
+impl CutSearch {
+    const fn target(self) -> usize {
+        match self {
+            Self::Start(target) | Self::Bisect(target) | Self::Gallop { target, .. } => target,
+        }
+    }
+
+    fn after(self, fits: bool, fits_end: usize, wide_end: usize) -> Self {
+        let gallop = |step: usize| Self::Gallop {
+            target: if fits {
+                fits_end.saturating_add(step)
+            } else {
+                wide_end.saturating_sub(step)
+            },
+            step,
+            upward: fits,
+        };
+        match self {
+            Self::Start(_) => gallop(1),
+            Self::Gallop { step, upward, .. } if upward == fits => gallop(step.saturating_mul(2)),
+            Self::Gallop { .. } | Self::Bisect(_) => {
+                Self::Bisect(fits_end + (wide_end - fits_end) / 2)
+            }
+        }
+    }
+}
+
+/// The character boundary nearest to `target` that lies strictly between `after` and `before`,
+/// or `None` when no character ends between them.
+fn boundary_between(text: &str, after: usize, before: usize, target: usize) -> Option<usize> {
+    if before <= after + 1 {
+        return None;
+    }
+    let target = target.clamp(after + 1, before - 1);
+    let mut down = target;
+    while !text.is_char_boundary(down) {
+        down -= 1;
+    }
+    if down > after {
+        return Some(down);
+    }
+    let mut up = target;
+    while !text.is_char_boundary(up) {
+        up += 1;
+    }
+    (up < before).then_some(up)
 }
 
 /// Unread, mention, reaction, and poll badge flags for a dialog row (`Dialogs::BadgesState`).
@@ -736,4 +842,135 @@ fn place_badges(
     }
 
     initial_right - right
+}
+
+#[cfg(test)]
+mod elide_tests {
+    use super::{elide_text_right, elide_text_right_hinted};
+
+    /// The previous implementation: one measurement per character from the start.
+    fn elide_every_prefix(
+        text: &str,
+        max_width: i32,
+        mut measure: impl FnMut(&str) -> i32,
+    ) -> String {
+        if max_width <= 0 || text.is_empty() {
+            return String::new();
+        }
+        if measure(text) <= max_width {
+            return text.to_string();
+        }
+        let ellipsis_w = measure("\u{2026}");
+        if ellipsis_w > max_width {
+            return String::new();
+        }
+        let mut best = 0usize;
+        for (idx, ch) in text.char_indices() {
+            let end = idx + ch.len_utf8();
+            if measure(&text[..end]) + ellipsis_w <= max_width {
+                best = end;
+            } else {
+                break;
+            }
+        }
+        format!("{}\u{2026}", &text[..best])
+    }
+
+    /// A proportional "font": every character has its own width, wide scripts are wider.
+    fn width(text: &str) -> i32 {
+        text.chars()
+            .map(|c| match c {
+                'i' | 'l' | '.' | ',' | '\'' => 3,
+                ' ' => 4,
+                'm' | 'w' | 'M' | 'W' => 11,
+                '\u{2026}' => 9,
+                c if c.is_ascii() => 7,
+                c if (c as u32) < 0x800 => 8,
+                c if (c as u32) < 0x1_0000 => 13,
+                _ => 16,
+            })
+            .sum()
+    }
+
+    const CORPUS: &[&str] = &[
+        "",
+        "a",
+        "Hello Telegram World",
+        "illlliiii.....,,,,'.'.'.'",
+        "MMMMWWWWmmmmwwww wide letters first",
+        "Planning sync: please review the agenda before the call on Monday morning",
+        "Привет, как дела? Завтра созвон в десять утра по поводу релиза",
+        "日本語のタイトルはとても長い場合があります、省略されるはずです",
+        "mixed ascii и кириллица と 日本語 together in one row",
+        "🙂🙃🙂🙃 emoji 🚀 in the middle 🎉 and at the end 🎈🎈🎈",
+        "a\u{0301}e\u{0301}i\u{0301} combining marks o\u{0301}u\u{0301} everywhere",
+        "x",
+        "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. \
+         The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.",
+    ];
+
+    #[test]
+    fn same_cut_as_measuring_every_prefix() {
+        for text in CORPUS {
+            // Every width for the short strings, a sample of widths for the long one.
+            let step = if text.len() > 120 { 13 } else { 1 };
+            for max_width in (-3..=(width(text) + 12)).step_by(step) {
+                let expected = elide_every_prefix(text, max_width, width);
+                assert_eq!(
+                    elide_text_right(text, max_width, width),
+                    expected,
+                    "text {text:?} at {max_width}px"
+                );
+                // Any hint, also a wrong one or one inside a character, gives the same cut.
+                for hint in [
+                    0,
+                    1,
+                    text.len() / 3,
+                    text.len() / 2,
+                    text.len(),
+                    text.len() + 7,
+                ] {
+                    assert_eq!(
+                        elide_text_right_hinted(text, max_width, hint, width),
+                        expected,
+                        "text {text:?} at {max_width}px, hint {hint}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn measures_a_handful_of_prefixes_not_every_one() {
+        let text = CORPUS[12];
+        let chars = text.chars().count();
+        assert!(chars > 150);
+        let mut worst = 0usize;
+        for max_width in (20..width(text)).step_by(7) {
+            let mut calls = 0usize;
+            let _ = elide_text_right(text, max_width, |s| {
+                calls += 1;
+                width(s)
+            });
+            worst = worst.max(calls);
+        }
+        // Whole text, ellipsis, then a search that halves the range: far below one per character.
+        assert!(worst <= 24, "{worst} measurements for {chars} characters");
+    }
+
+    #[test]
+    fn a_correct_hint_costs_two_confirming_measurements() {
+        let text = CORPUS[5];
+        let max_width = 200;
+        let expected = elide_every_prefix(text, max_width, width);
+        let kept = expected.len() - "\u{2026}".len();
+        let mut calls = 0usize;
+        let out = elide_text_right_hinted(text, max_width, kept, |s| {
+            calls += 1;
+            width(s)
+        });
+        assert_eq!(out, expected);
+        // Whole text, ellipsis, the hinted prefix, the prefix one character longer.
+        assert_eq!(calls, 4);
+    }
 }

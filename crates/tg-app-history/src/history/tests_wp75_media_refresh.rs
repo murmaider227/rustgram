@@ -111,7 +111,7 @@ fn downloading_photo_switches_to_ready_without_reopening_the_chat() {
         msg_id,
         InlineMediaDescriptor {
             photo_load: Some(PhotoLoadState::Ready {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
             }),
             ..InlineMediaDescriptor::default()
         },

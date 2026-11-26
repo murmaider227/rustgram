@@ -34,6 +34,8 @@ pub mod wrap_widget;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_tgb2904;
+#[cfg(test)]
 mod tests_uip4c;
 #[cfg(test)]
 mod tests_wp78;
@@ -239,6 +241,7 @@ fn peer_profile_from_summary(summary: &PeerSummary) -> PeerProfile {
         is_online: summary.status == "online",
         verified: false,
         premium: false,
+        emoji_status_id: None,
         color_index: (summary.id.bare() % 7) as u8,
         phone: (kind == InfoPeerKind::User)
             .then(|| summary.phone_or_link.clone())

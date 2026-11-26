@@ -184,7 +184,7 @@ impl ScheduleBoxState {
                 Ok(target)
             }
             Err(err) => {
-                self.error = Some(err.clone());
+                self.error = Some(err.clone()); // local error: checked before any request
                 Err(err)
             }
         }
@@ -568,7 +568,7 @@ impl PollLinkBoxState {
                 Ok(PollOptionAttachment::Link { url, title })
             }
             Err(err) => {
-                self.error = Some(err.clone());
+                self.error = Some(err.clone()); // local error: checked before any request
                 Err(err)
             }
         }
@@ -1671,7 +1671,7 @@ impl LocationPickerBoxState {
             Err(err) => {
                 self.tile_rgba = None;
                 self.tile_texture = None;
-                self.tile_error = Some(err.clone());
+                self.tile_error = Some(err.clone()); // local error: image decode
                 Err(err)
             }
         }

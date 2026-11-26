@@ -6,7 +6,17 @@
 use egui::{Color32, Visuals};
 use serde::{Deserialize, Serialize};
 use tg_theme::EmbeddedType;
-use tg_ui::theme::{Colors, ThemeManager};
+use tg_ui::theme::{Colors, PaletteColor, ThemeManager};
+
+#[cfg(test)]
+#[path = "theme_palette_cache_tests.rs"]
+mod palette_cache_tests;
+
+thread_local! {
+    /// Last [`Palette::from_theme_manager`] result and the theme key it was built for.
+    static DERIVED_PALETTE: std::cell::Cell<Option<((u64, u64), Palette)>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Selected color scheme mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -55,7 +65,7 @@ impl ThemeMode {
 }
 
 /// Semantic color palette mirroring `tdesktop`'s `colors.palette`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
     /// Primary window surface (`windowBg`).
     pub window_bg: Color32,
@@ -186,47 +196,79 @@ impl Palette {
     /// Builds a [`Palette`] directly from a live `tg-ui` [`ThemeManager`] (respecting
     /// embedded Day/Night/Tinted/DayBlue themes and custom accent colors).
     #[must_use]
+    ///
+    /// The result is cached per thread by [`ThemeManager::palette_cache_key`], which changes on
+    /// every palette change, so the per-frame callers get a copy instead of a rebuild.
     pub fn from_theme_manager(tm: &ThemeManager) -> Self {
-        Self::from_colors(tm, tm.is_dark())
+        let key = tm.palette_cache_key();
+        if let Some((_, cached)) =
+            DERIVED_PALETTE.with(|slot| slot.get().filter(|(k, _)| *k == key))
+        {
+            return cached;
+        }
+        let palette = Self::from_colors(tm, tm.is_dark());
+        DERIVED_PALETTE.with(|slot| slot.set(Some((key, palette))));
+        palette
     }
 
     /// Builds a [`Palette`] from any `tg-ui` [`Colors`] resolver.
     #[must_use]
     pub fn from_colors(colors: &dyn Colors, is_dark: bool) -> Self {
         let fallback = if is_dark { Self::night() } else { Self::day() };
-        let pick = |key: &str, def: Color32| colors.get(key).unwrap_or(def);
+        let pick = |key: PaletteColor, def: Color32| colors.get_at(key).unwrap_or(def);
         let chat_canvas_bg = if is_dark {
-            pick("historyComposeAreaBg", fallback.chat_canvas_bg)
+            pick(
+                PaletteColor::HISTORY_COMPOSE_AREA_BG,
+                fallback.chat_canvas_bg,
+            )
         } else {
             // Classic Day chat canvas backdrop when no image wallpaper is active.
             fallback.chat_canvas_bg
         };
         Self {
-            window_bg: pick("windowBg", fallback.window_bg),
-            window_bg_over: pick("windowBgOver", fallback.window_bg_over),
-            window_fg: pick("windowFg", fallback.window_fg),
-            window_bold_fg: pick("windowBoldFg", fallback.window_bold_fg),
-            window_sub_text_fg: pick("windowSubTextFg", fallback.window_sub_text_fg),
-            window_bg_active: pick("windowBgActive", fallback.window_bg_active),
-            window_fg_active: pick("windowFgActive", fallback.window_fg_active),
-            window_active_text_fg: pick("windowActiveTextFg", fallback.window_active_text_fg),
-            divider: pick("shadowFg", fallback.divider),
-            attention_fg: pick("attentionButtonFg", fallback.attention_fg),
-            input_bg: pick("filterInputInactiveBg", fallback.input_bg),
-            input_active_bg: pick("filterInputActiveBg", fallback.input_active_bg),
-            input_border_active: pick("filterInputBorderFg", fallback.input_border_active),
-            dialogs_bg_active: pick("dialogsBgActive", fallback.dialogs_bg_active),
-            unread_badge_bg: pick("dialogsUnreadBg", fallback.unread_badge_bg),
-            unread_badge_muted_bg: pick("dialogsUnreadBgMuted", fallback.unread_badge_muted_bg),
+            window_bg: pick(PaletteColor::WINDOW_BG, fallback.window_bg),
+            window_bg_over: pick(PaletteColor::WINDOW_BG_OVER, fallback.window_bg_over),
+            window_fg: pick(PaletteColor::WINDOW_FG, fallback.window_fg),
+            window_bold_fg: pick(PaletteColor::WINDOW_BOLD_FG, fallback.window_bold_fg),
+            window_sub_text_fg: pick(
+                PaletteColor::WINDOW_SUB_TEXT_FG,
+                fallback.window_sub_text_fg,
+            ),
+            window_bg_active: pick(PaletteColor::WINDOW_BG_ACTIVE, fallback.window_bg_active),
+            window_fg_active: pick(PaletteColor::WINDOW_FG_ACTIVE, fallback.window_fg_active),
+            window_active_text_fg: pick(
+                PaletteColor::WINDOW_ACTIVE_TEXT_FG,
+                fallback.window_active_text_fg,
+            ),
+            divider: pick(PaletteColor::SHADOW_FG, fallback.divider),
+            attention_fg: pick(PaletteColor::ATTENTION_BUTTON_FG, fallback.attention_fg),
+            input_bg: pick(PaletteColor::FILTER_INPUT_INACTIVE_BG, fallback.input_bg),
+            input_active_bg: pick(
+                PaletteColor::FILTER_INPUT_ACTIVE_BG,
+                fallback.input_active_bg,
+            ),
+            input_border_active: pick(
+                PaletteColor::FILTER_INPUT_BORDER_FG,
+                fallback.input_border_active,
+            ),
+            dialogs_bg_active: pick(PaletteColor::DIALOGS_BG_ACTIVE, fallback.dialogs_bg_active),
+            unread_badge_bg: pick(PaletteColor::DIALOGS_UNREAD_BG, fallback.unread_badge_bg),
+            unread_badge_muted_bg: pick(
+                PaletteColor::DIALOGS_UNREAD_BG_MUTED,
+                fallback.unread_badge_muted_bg,
+            ),
             chat_canvas_bg,
-            msg_in_bg: pick("msgInBg", fallback.msg_in_bg),
-            msg_out_bg: pick("msgOutBg", fallback.msg_out_bg),
-            msg_date_fg: pick("msgInDateFg", fallback.msg_date_fg),
-            sidebar_bg: pick("sideBarBg", fallback.sidebar_bg),
-            sidebar_bg_active: pick("sideBarBgActive", fallback.sidebar_bg_active),
-            sidebar_fg: pick("sideBarTextFg", fallback.sidebar_fg),
-            sidebar_fg_active: pick("sideBarTextFgActive", fallback.sidebar_fg_active),
-            layer_backdrop: pick("layerBg", fallback.layer_backdrop),
+            msg_in_bg: pick(PaletteColor::MSG_IN_BG, fallback.msg_in_bg),
+            msg_out_bg: pick(PaletteColor::MSG_OUT_BG, fallback.msg_out_bg),
+            msg_date_fg: pick(PaletteColor::MSG_IN_DATE_FG, fallback.msg_date_fg),
+            sidebar_bg: pick(PaletteColor::SIDE_BAR_BG, fallback.sidebar_bg),
+            sidebar_bg_active: pick(PaletteColor::SIDE_BAR_BG_ACTIVE, fallback.sidebar_bg_active),
+            sidebar_fg: pick(PaletteColor::SIDE_BAR_TEXT_FG, fallback.sidebar_fg),
+            sidebar_fg_active: pick(
+                PaletteColor::SIDE_BAR_TEXT_FG_ACTIVE,
+                fallback.sidebar_fg_active,
+            ),
+            layer_backdrop: pick(PaletteColor::LAYER_BG, fallback.layer_backdrop),
         }
     }
 

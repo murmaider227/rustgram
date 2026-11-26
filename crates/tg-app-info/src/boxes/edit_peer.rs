@@ -1279,7 +1279,7 @@ impl AdminsListBoxState {
                 Vec2::splat(36.0),
             );
             EmptyUserpic::for_color_index(admin.color_index, &admin.name, colors)
-                .paint_circle(ui.painter(), av_rect);
+                .paint_circle_or_photo(ui.painter(), av_rect, admin.peer_id.0);
 
             let tx = av_rect.max.x + 12.0;
             ui.painter().text(

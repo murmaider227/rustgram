@@ -19,6 +19,7 @@ pub mod compose_ai;
 pub mod confirm;
 pub mod confirm_phone;
 pub mod create_peer;
+pub mod delete_chat;
 pub mod delete_messages;
 pub use tg_app_core::core_types::dto::dictionaries;
 pub mod edit_peer;
@@ -164,8 +165,10 @@ pub enum BoxKind {
     Share(ShareBoxState),
     /// Report peer or messages (`ReportMessagesBox`).
     Report(ReportBoxState),
-    /// Delete messages / leave chat (`DeleteMessagesBox`).
+    /// Delete messages / clear history (`DeleteMessagesBox`).
     DeleteMessages(DeleteMessagesBoxState),
+    /// "Delete chat" / "Leave group" / "Leave channel" (`DeleteChatBox`).
+    DeleteChat(crate::boxes::delete_chat::DeleteChatBoxState),
     /// Edit public username (`UsernameBox`).
     Username(UsernameBoxState),
     /// Photo Crop editor (`tg-editor` crop math).
@@ -283,6 +286,7 @@ impl BoxKind {
             Self::Share(s) => s.to_modal(id),
             Self::Report(s) => s.to_modal(id),
             Self::DeleteMessages(s) => s.to_modal(id),
+            Self::DeleteChat(s) => s.to_modal(id),
             Self::Username(s) => s.to_modal(id),
             Self::PhotoCrop { state, .. } => state.to_modal(id),
             Self::Language(s) => s.to_modal(id),
@@ -391,8 +395,9 @@ pub enum BoxEvent {
         /// Whether deleted for everyone.
         revoked: bool,
     },
-    /// "Clear history" / "Delete chat" / "Leave" was confirmed in `DeleteMessagesBox`; the shell
-    /// runs `ApiWrap::clearHistory` / `deleteConversation` with the checkbox value.
+    /// "Clear history" (`DeleteMessagesBox`) or "Delete chat" / "Leave" (`DeleteChatBox`) was
+    /// confirmed; the shell runs `ApiWrap::clearHistory` / `deleteConversation` with the
+    /// checkbox values.
     ConversationDeleteConfirmed {
         /// Chat to clear, delete or leave.
         peer_id: PeerId,
@@ -400,6 +405,10 @@ pub enum BoxEvent {
         just_clear: bool,
         /// "Also delete for {user}" / "Delete for all members" was checked.
         revoke: bool,
+        /// "Stop and block bot" was checked (`blockedPeers().block`).
+        block_bot: bool,
+        /// "Remove … from all folders" was checked (`RemoveChatFromFilters`).
+        remove_from_folders: bool,
     },
     /// Language pack switched.
     LanguageChanged(String),
@@ -423,6 +432,9 @@ pub enum BoxEvent {
     JoinInviteConfirmed {
         /// Invite hash to pass to `messages.importChatInvite`.
         hash: String,
+        /// The invite is to a group, not a channel (`!chatInvite.broadcast`); picks the
+        /// "request sent" text when joining fails with `INVITE_REQUEST_SENT`.
+        is_group: bool,
     },
     /// External chat history import completed (`messages.startHistoryImport`).
     ChatHistoryImported {
@@ -1381,7 +1393,32 @@ impl BoxHost {
                     peer_id: s.peer_id,
                     just_clear: matches!(s.mode, delete_messages::DeleteMode::ClearHistory),
                     revoke: s.revoke_for_everyone,
+                    block_bot: false,
+                    remove_from_folders: s.remove_from_folders,
                 });
+                should_pop = true;
+            }
+            BoxKind::DeleteChat(s) if action_id == "delete" => {
+                let choice = s.choice();
+                // `leaveAsCreator`: an owner leaving without "Delete for all" first picks the
+                // next owner (`SelectFutureOwnerbox`).
+                if s.needs_future_owner_box()
+                    && let Some(peer) = backend.peer_profile(s.peer_id)
+                {
+                    let mut next = DeleteMessagesBoxState::for_delete_or_leave(&peer, false)
+                        .with_future_creator(s.future_creator.clone());
+                    next.can_revoke_for_everyone = false;
+                    next.remove_from_folders = choice.remove_from_folders;
+                    *deferred_push = Some(BoxKind::DeleteMessages(next));
+                } else {
+                    events.push(BoxEvent::ConversationDeleteConfirmed {
+                        peer_id: choice.peer_id,
+                        just_clear: false,
+                        revoke: choice.revoke,
+                        block_bot: choice.block_bot,
+                        remove_from_folders: choice.remove_from_folders,
+                    });
+                }
                 should_pop = true;
             }
             BoxKind::DeleteMessages(s) if action_id == "delete" => {
@@ -1462,6 +1499,7 @@ impl BoxHost {
             BoxKind::JoinInvite(s) if action_id == "join" => {
                 events.push(BoxEvent::JoinInviteConfirmed {
                     hash: s.hash.clone(),
+                    is_group: !s.is_broadcast,
                 });
                 should_pop = true;
             }
@@ -2190,6 +2228,7 @@ fn render_box_kind_body(
                                         is_online: false,
                                         verified: false,
                                         premium: false,
+                                        emoji_status_id: None,
                                         color_index: (cand.peer_id.bare() % 7) as u8,
                                         phone: None,
                                         usernames,
@@ -2251,7 +2290,19 @@ fn render_box_kind_body(
         }
         BoxKind::Share(s) => s.show_body(ui, all_peers, colors),
         BoxKind::Report(s) => s.show_body(ui, colors),
-        BoxKind::DeleteMessages(s) => s.show_body(ui, colors),
+        BoxKind::DeleteMessages(s) => {
+            if s.show_body(ui, colors) {
+                *deferred_push = Some(BoxKind::AutoDeleteTimer(AutoDeleteTimerBoxState::new(
+                    s.peer_id,
+                    s.auto_delete_ttl.unwrap_or(0),
+                )));
+            }
+        }
+        BoxKind::DeleteChat(s) => {
+            if s.show_body(ui, colors) {
+                *body_refresh_modal = true;
+            }
+        }
         BoxKind::Username(s) => {
             if let Some(act) = s.show_body(ui, backend, colors) {
                 match act {
@@ -2379,8 +2430,14 @@ fn render_box_kind_body(
                             ));
                         }
                         Err(err) => {
-                            s.status_message =
-                                Some(format!("{} ({err})", tr::lng_peer_qr_link_unavailable()));
+                            if let Some(text) = tg_app_core::user_error::share_theme_or_qr(
+                                "contacts.exportContactToken",
+                                &err,
+                            )
+                            .into_text()
+                            {
+                                body_events.push(BoxEvent::Toast(text));
+                            }
                         }
                     },
                     PeerQrBodyAction::ExportNoPaidMessagesToken { revoke, temporary } => {
@@ -2391,8 +2448,14 @@ fn render_box_kind_body(
                                 body_events.push(BoxEvent::Toast(toast));
                             }
                             Err(err) => {
-                                s.status_message =
-                                    Some(format!("{} ({err})", tr::lng_peer_qr_link_unavailable()));
+                                if let Some(text) = tg_app_core::user_error::share_theme_or_qr(
+                                    "contacts.exportNoPaidMessagesToken",
+                                    &err,
+                                )
+                                .into_text()
+                                {
+                                    body_events.push(BoxEvent::Toast(text));
+                                }
                             }
                         }
                     }

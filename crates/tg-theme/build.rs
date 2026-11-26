@@ -473,6 +473,32 @@ fn generate_code(entries: &[PaletteEntry]) -> String {
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out);
 
+    // Typed palette colours (`PaletteColor::WINDOW_BG`): a misspelt colour is a compile error
+    // and a lookup indexes the palette instead of searching names.
+    let _ = writeln!(
+        out,
+        "    /// Looks up a [`PaletteColor`] by original camelCase name (including the special"
+    );
+    let _ = writeln!(out, "    /// `transparent` and `white` slots).");
+    let _ = writeln!(out, "    #[must_use]");
+    let _ = writeln!(
+        out,
+        "    pub fn color_index(name: &str) -> Option<PaletteColor> {{"
+    );
+    let _ = writeln!(out, "        match name {{");
+    let _ = writeln!(
+        out,
+        "            \"transparent\" => Some(PaletteColor::TRANSPARENT),"
+    );
+    let _ = writeln!(out, "            \"white\" => Some(PaletteColor::WHITE),");
+    let _ = writeln!(
+        out,
+        "            _ => Self::index_of_name(name).map(PaletteColor::from_index_unchecked),"
+    );
+    let _ = writeln!(out, "        }}");
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out);
+
     // name_at_index
     let _ = writeln!(
         out,
@@ -532,6 +558,23 @@ fn generate_code(entries: &[PaletteEntry]) -> String {
     let _ = writeln!(out, "            _ => None,");
     let _ = writeln!(out, "        }}");
     let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "impl PaletteColor {{");
+    let _ = writeln!(out, "    /// `transparent` (index 0).");
+    let _ = writeln!(out, "    pub const TRANSPARENT: Self = Self(0);");
+    let _ = writeln!(out, "    /// `white` (index 1).");
+    let _ = writeln!(out, "    pub const WHITE: Self = Self(1);");
+    for (idx, e) in entries.iter().enumerate() {
+        let palette_idx = idx + 2;
+        let _ = writeln!(out, "    /// `{}` (index {palette_idx}).", e.camel_name);
+        let _ = writeln!(
+            out,
+            "    pub const {}: Self = Self({palette_idx});",
+            e.snake_name.to_ascii_uppercase()
+        );
+    }
     let _ = writeln!(out, "}}");
 
     out

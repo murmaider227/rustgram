@@ -715,7 +715,9 @@ fn mini_app_confirm_prepared_message_invokes_live_rpc_and_sends_inline_result() 
             let mut s = s_arc.write().await;
             for uid in [recipient_uid, bot_id] {
                 let pid = tg_data::PeerId::from_user(UserId(uid));
-                s.ensure_history(pid).in_chat_list = true;
+                let history = s.ensure_history(pid);
+                history.in_chat_list = true;
+                history.set_folder(None);
                 s.sync_dialog_lists(pid);
             }
         });

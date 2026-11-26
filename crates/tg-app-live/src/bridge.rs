@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use tg_api::{DcId, InvocationError, RpcClient};
 use tg_data::{
     ChangeEvent, HistoryUpdateFlags, MessageUpdateFlags, MsgId as DataMsgId, PeerId as DataPeerId,
-    Session,
+    PeerUpdateFlags, Session, TopicUpdateFlags,
 };
 use tg_session::{SessionEvent, SessionRuntime};
 use tg_tl::{Deserializable, RemoteCall, Serializable, enums as tl_enums};
@@ -299,12 +299,99 @@ impl PeerHistoryDelta {
     }
 }
 
+/// Most chats with their own version; beyond it the oldest entries fold into the shared epoch.
+const MAX_VERSIONED_CHATS: usize = 4096;
+
+/// Version counters for the UI's cached views.
+///
+/// One sequence counts every change. A change tied to one chat records the new value for that
+/// chat; any other change moves the shared epoch. A chat's version is the larger of the two, the
+/// chat list's version is the sequence itself, so both only grow and change on every relevant
+/// change.
+#[derive(Debug, Default)]
+pub(crate) struct ViewVersions {
+    seq: AtomicU64,
+    epoch: AtomicU64,
+    chats: Mutex<HashMap<DataPeerId, u64>>,
+}
+
+impl ViewVersions {
+    fn next(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    }
+
+    /// A change any view may show.
+    pub(crate) fn bump_all(&self) {
+        let seq = self.next();
+        self.epoch.fetch_max(seq, Ordering::AcqRel);
+    }
+
+    /// A change only `peer`'s chat view and the chat list show.
+    pub(crate) fn bump_chat(&self, peer: DataPeerId) {
+        let seq = self.next();
+        let Ok(mut chats) = self.chats.lock() else {
+            self.epoch.fetch_max(seq, Ordering::AcqRel);
+            return;
+        };
+        if chats.len() >= MAX_VERSIONED_CHATS && !chats.contains_key(&peer) {
+            // Every forgotten chat falls back to the epoch, which must not be older than any
+            // version handed out for it.
+            chats.clear();
+            self.epoch.fetch_max(seq, Ordering::AcqRel);
+            return;
+        }
+        let slot = chats.entry(peer).or_insert(0);
+        *slot = (*slot).max(seq);
+    }
+
+    pub(crate) fn dialogs(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn chat(&self, peer: DataPeerId) -> u64 {
+        let own = self
+            .chats
+            .lock()
+            .ok()
+            .and_then(|chats| chats.get(&peer).copied())
+            .unwrap_or(0);
+        own.max(self.epoch.load(Ordering::Acquire))
+    }
+}
+
+/// The one chat a change event is about, or `None` when other chats' views may show it too
+/// (peer names and statuses appear in every chat that mentions the peer, folders in the list).
+fn change_event_chat(event: &ChangeEvent) -> Option<DataPeerId> {
+    match event {
+        ChangeEvent::MessageUpdated { id, .. } => Some(id.peer),
+        ChangeEvent::HistoryUpdated { peer_id, .. }
+        | ChangeEvent::TopicUpdated { peer_id, .. }
+        | ChangeEvent::ChatAdminChanged { peer_id, .. }
+        | ChangeEvent::UserTyping { peer_id, .. } => Some(*peer_id),
+        ChangeEvent::EntryUpdated { key, .. } => match key {
+            tg_data::DialogKey::History(peer)
+            | tg_data::DialogKey::ForumTopic { peer, .. }
+            | tg_data::DialogKey::SavedSublist { parent: peer, .. } => Some(*peer),
+            tg_data::DialogKey::Folder(_) => None,
+        },
+        ChangeEvent::PeerUpdated { .. }
+        | ChangeEvent::NameUpdated { .. }
+        | ChangeEvent::FiltersChanged
+        | ChangeEvent::NotifyDefaultsChanged => None,
+    }
+}
+
 /// Shared state updated asynchronously by [`LiveRuntimeBridge`] and polled synchronously
 /// from the `egui` UI thread.
 #[derive(Debug)]
 pub struct LiveBridgeState {
     /// Optional `egui::Context` woken whenever backend state mutates.
     pub egui_ctx: Mutex<Option<egui::Context>>,
+    /// A repaint was requested since the UI last started a frame ([`Self::set_egui_ctx`]); more
+    /// changes before that frame need no request of their own.
+    repaint_pending: AtomicBool,
+    /// Repaint requests actually sent to `egui` (diagnostics and tests).
+    repaint_requests: AtomicU64,
     /// Queued notification events translated from incoming `ChangeEvent`s.
     pub notify_events: Mutex<VecDeque<IncomingNotifyEvent>>,
     /// Queued high-level `SessionEvent`s (e.g. `Ready`, `SyncError`, `ForceLogout`).
@@ -324,6 +411,14 @@ pub struct LiveBridgeState {
     pub last_error: Mutex<Option<String>>,
     /// Monotonically increasing change counter bumped on every change event.
     pub generation: AtomicU64,
+    /// Bumped whenever a notification setting of this account may have changed (peer, topic or
+    /// per-type default, or a lagged change stream); see [`crate::notify_sync`].
+    notify_settings_generation: AtomicU64,
+    /// Peers whose own notification settings a notification waits for; see
+    /// [`crate::notify_sync`].
+    pub(crate) notify_peer_requests: Mutex<crate::notify_sync::PeerSettingsRequests>,
+    /// View versions behind `DialogsBackend::dialogs_version` / `HistoryBackend::chat_version`.
+    pub(crate) versions: ViewVersions,
     /// Set when story updates were dropped because the queue was full; the stories lists should
     /// be reloaded from the server ([`Self::take_story_updates_overflowed`]).
     pub story_updates_overflowed: AtomicBool,
@@ -341,6 +436,8 @@ impl LiveBridgeState {
     pub fn new() -> Self {
         Self {
             egui_ctx: Mutex::new(None),
+            repaint_pending: AtomicBool::new(false),
+            repaint_requests: AtomicU64::new(0),
             notify_events: Mutex::new(VecDeque::new()),
             session_events: Mutex::new(VecDeque::new()),
             story_updates: Mutex::new(VecDeque::new()),
@@ -349,6 +446,9 @@ impl LiveBridgeState {
             connection_status: Mutex::new(ConnectionStatus::Connecting),
             last_error: Mutex::new(None),
             generation: AtomicU64::new(0),
+            notify_settings_generation: AtomicU64::new(0),
+            notify_peer_requests: Mutex::default(),
+            versions: ViewVersions::default(),
             story_updates_overflowed: AtomicBool::new(false),
         }
     }
@@ -480,26 +580,86 @@ impl LiveBridgeState {
     }
 
     /// Registers the active `egui::Context` so background updates trigger immediate repaints.
+    ///
+    /// The live host calls it at the start of every frame, before it reads any state: from here
+    /// on a change needs a new repaint request, while changes made before are visible to this
+    /// frame's reads (the data is written before the change is announced).
     pub fn set_egui_ctx(&self, ctx: egui::Context) {
+        self.repaint_pending.store(false, Ordering::Release);
         if let Ok(mut guard) = self.egui_ctx.lock() {
             *guard = Some(ctx);
         }
     }
 
-    /// Bumps the change generation and requests an immediate `egui` repaint if registered.
-    pub fn notify_ui(&self) {
-        self.generation.fetch_add(1, Ordering::Release);
+    /// Requests one repaint per frame however many changes arrive before it starts.
+    fn wake_ui(&self) {
+        if self.repaint_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Ok(guard) = self.egui_ctx.lock()
             && let Some(ctx) = guard.as_ref()
         {
+            self.repaint_requests.fetch_add(1, Ordering::Relaxed);
             ctx.request_repaint();
         }
+    }
+
+    /// Repaint requests sent to `egui` so far.
+    #[must_use]
+    pub fn repaint_requests(&self) -> u64 {
+        self.repaint_requests.load(Ordering::Relaxed)
+    }
+
+    /// Bumps the change generation and requests an immediate `egui` repaint if registered.
+    /// Every view version changes too: the change may touch any chat.
+    pub fn notify_ui(&self) {
+        self.versions.bump_all();
+        self.generation.fetch_add(1, Ordering::Release);
+        self.wake_ui();
     }
 
     /// Current monotonically increasing change generation counter.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Like [`Self::notify_ui`] for a change that only `peer`'s chat view (and the chat list)
+    /// can show: other chats keep their version.
+    pub fn notify_chat_changed(&self, peer: DataPeerId) {
+        self.versions.bump_chat(peer);
+        self.generation.fetch_add(1, Ordering::Release);
+        self.wake_ui();
+    }
+
+    /// Changes every view version without waking the UI (a change the caller shows itself, made
+    /// on the UI thread).
+    pub fn mark_views_changed(&self) {
+        self.versions.bump_all();
+    }
+
+    /// Version of the chat list's data (`DialogsBackend::dialogs_version`).
+    #[must_use]
+    pub fn dialogs_version(&self) -> u64 {
+        self.versions.dialogs()
+    }
+
+    /// Version of `peer`'s chat view data (`HistoryBackend::chat_version`).
+    #[must_use]
+    pub fn chat_version(&self, peer: DataPeerId) -> u64 {
+        self.versions.chat(peer)
+    }
+
+    /// Marks the account's notification settings as changed.
+    pub fn bump_notify_settings(&self) {
+        self.notify_settings_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Counter behind [`Self::bump_notify_settings`].
+    #[must_use]
+    pub fn notify_settings_generation(&self) -> u64 {
+        self.notify_settings_generation.load(Ordering::Acquire)
     }
 
     /// Drains all queued [`IncomingNotifyEvent`]s.
@@ -584,12 +744,17 @@ impl LiveRuntimeBridge {
             loop {
                 match changes_rx.recv().await {
                     Ok(ev) => {
+                        let chat = change_event_chat(&ev);
                         handle_change_event(&session_arc, &state_changes, session_id, ev).await;
-                        state_changes.notify_ui();
+                        match chat {
+                            Some(peer) => state_changes.notify_chat_changed(peer),
+                            None => state_changes.notify_ui(),
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "LiveRuntimeBridge ChangeEvent receiver lagged");
                         state_changes.mark_history_deltas_lagged();
+                        state_changes.bump_notify_settings();
                         state_changes.notify_ui();
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -611,8 +776,8 @@ impl LiveRuntimeBridge {
                             SessionEvent::SyncError(msg) => {
                                 state_events.set_last_error(Some(msg.clone()));
                             }
-                            SessionEvent::ForceLogout { notification_type } => {
-                                warn!(notification_type, "server requested forced logout");
+                            SessionEvent::ForceLogout { reason } => {
+                                warn!(?reason, "account logged out by the server");
                             }
                             SessionEvent::StoryUpdate(_) => {
                                 if let SessionEvent::StoryUpdate(update) = ev {
@@ -663,7 +828,25 @@ async fn handle_change_event(
     event: ChangeEvent,
 ) {
     match event {
+        // Bumped before any later message of the same stream is queued, so the notification
+        // system re-syncs its mute view before it evaluates that message (TGB-2969).
+        ChangeEvent::PeerUpdated { flags, .. }
+            if flags.contains(PeerUpdateFlags::NOTIFICATIONS) =>
+        {
+            state.bump_notify_settings();
+        }
+        ChangeEvent::TopicUpdated { flags, .. }
+            if flags.contains(TopicUpdateFlags::NOTIFICATIONS) =>
+        {
+            state.bump_notify_settings();
+        }
+        ChangeEvent::NotifyDefaultsChanged => state.bump_notify_settings(),
         ChangeEvent::MessageUpdated { id, flags } => {
+            if flags.intersects(MessageUpdateFlags::NEW_ADDED | MessageUpdateFlags::EDITED)
+                && !flags.contains(MessageUpdateFlags::DESTROYED)
+            {
+                log_saved_messages_side(session_lock, id, flags).await;
+            }
             if flags.contains(MessageUpdateFlags::DESTROYED) {
                 state.record_message_deleted(id.peer, id.msg);
                 state.push_notify_event(IncomingNotifyEvent::MessageDeleted {
@@ -673,16 +856,20 @@ async fn handle_change_event(
                 });
             } else if flags.contains(MessageUpdateFlags::NEW_ADDED) {
                 state.record_message_added(id.peer, id.msg);
-                let maybe_notif = {
+                // Only messages that arrived as live updates (`NewMessageType::Unread`) and are
+                // still unread may notify (`History::newItemAdded`, `history/history.cpp:1688-1699`);
+                // history slices, dialogs pages and the startup catch-up never do.
+                let maybe_notif = if flags.contains(MessageUpdateFlags::NEW_UNREAD) {
                     let session = session_lock.read().await;
-                    session.message(id).and_then(|msg| {
-                        // Only emit desktop notifications for incoming regular/service messages
-                        // once initial sync is ready (or any incoming non-outgoing message).
-                        if msg.is_outgoing() {
-                            return None;
-                        }
-                        Some(message_to_incoming_notification(&session, msg, session_id))
-                    })
+                    session
+                        .message(id)
+                        .filter(|msg| show_notification(&session, msg))
+                        .map(|msg| {
+                            crate::notify_sync::want_mention_author_settings(&session, msg, state);
+                            message_to_incoming_notification(&session, msg, session_id)
+                        })
+                } else {
+                    None
                 };
                 if let Some(notif) = maybe_notif {
                     state.push_notify_event(IncomingNotifyEvent::Notification(Box::new(notif)));
@@ -727,6 +914,70 @@ async fn handle_change_event(
     }
 }
 
+/// TGB-2908 diagnostics: logs (INFO, target `saved_side`, reaches `log.txt`) which side the
+/// Saved Messages layout picks for a self-chat message each time it is added or replaced
+/// (`Message::hasOutLayout`). Never logs text or names.
+async fn log_saved_messages_side(
+    session_lock: &Arc<RwLock<Session>>,
+    id: tg_data::FullMsgId,
+    flags: MessageUpdateFlags,
+) {
+    let session = session_lock.read().await;
+    let self_peer = session.self_peer_id();
+    if id.peer != self_peer {
+        return;
+    }
+    let Some(msg) = session.message(id) else {
+        return;
+    };
+    let side = if crate::preview_text::has_saved_messages_out_layout(&session, msg) {
+        "out"
+    } else {
+        "in"
+    };
+    tracing::info!(
+        target: tg_api::saved_side_log::TARGET,
+        stage = "layout",
+        msg_id = id.msg.0,
+        added = flags.contains(MessageUpdateFlags::NEW_ADDED),
+        pending = msg.flags.contains(tg_data::MessageFlags::BEING_SENT),
+        out = msg.is_outgoing(),
+        from = tg_api::saved_side_log::from_kind(msg.from_id, self_peer),
+        fwd = msg.forward_from.is_some(),
+        side,
+        "saved messages: layout side"
+    );
+}
+
+/// Whether a newly added `msg` should raise a desktop notification
+/// (`HistoryItem::showNotification` + `HistoryItem::unread`, `history/history_item.cpp:4641-4671,4900-4908`):
+/// only incoming, server-side unread messages of chats the account is still in.
+pub(crate) fn show_notification(session: &Session, msg: &tg_data::Message) -> bool {
+    let peer_id = msg.peer_id;
+    if msg.is_outgoing() || peer_id == session.self_peer_id() || !msg.is_regular() {
+        return false;
+    }
+    if let Some(peer) = session.peer(peer_id) {
+        if peer.as_channel().is_some_and(|c| !c.am_in()) {
+            return false;
+        }
+        if peer.as_chat().is_some_and(|c| c.migrated_to.is_some()) {
+            return false;
+        }
+    }
+    session
+        .history(peer_id)
+        .is_some_and(|h| h.is_server_side_unread(msg))
+}
+
 #[cfg(test)]
 #[path = "bridge_sec3_tests.rs"]
 mod sec3_tests;
+
+#[cfg(test)]
+#[path = "bridge_notify_tests.rs"]
+mod notify_tests;
+
+#[cfg(test)]
+#[path = "bridge_versions_tests.rs"]
+mod versions_tests;

@@ -430,10 +430,14 @@ fn apply_peer_color(
             }
         }
         Some(tl_enums::PeerColor::Collectible(c)) => {
+            // `Data::ColorIndexFromColor` has no index for a collectible colour, so
+            // `PeerData::changeColor` falls back to the id-based one (`clearColorIndex`).
             let bg = DocumentId::from_tl(c.background_emoji_id);
             if is_profile {
+                common.clear_color_profile_index();
                 common.profile_background_emoji_id = bg;
             } else {
+                common.clear_color_index();
                 common.background_emoji_id = bg;
             }
         }
@@ -895,6 +899,21 @@ pub fn apply_tl_user(session: &mut Session, tl_user: &tl_enums::User) -> Option<
     }
 }
 
+/// Stores the notification settings a `userFull` / `chatFull` / `channelFull` carries
+/// (`NotifySettings::apply(peer, settings)`, called from `ApplyUserUpdate` /
+/// `ApplyChatUpdate` / `ApplyChannelUpdate`). Going through [`Session::set_peer_notify`] keeps
+/// the chat's mute state current and announces `NOTIFICATIONS` only when the settings changed
+/// (TGB-2980): before, a profile refresh rewrote the peer and announced the flag every time,
+/// while the chat list's mute state stayed as it was.
+fn apply_full_notify(session: &mut Session, peer_id: PeerId, notify: PeerNotifySettings) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| {
+            tg_data::TimeId::try_from(d.as_secs()).unwrap_or(tg_data::TimeId::MAX)
+        });
+    session.set_peer_notify(peer_id, notify, now);
+}
+
 /// Applies a TL `UserFull` into `session` (updating bio, block/calls status, settings,
 /// bot info, birthday, personal channel, verification, rating, and marking `LoadedStatus::Full`).
 pub fn apply_tl_user_full(session: &mut Session, tl_full: &tl_enums::UserFull) -> PeerId {
@@ -947,7 +966,7 @@ pub fn apply_tl_user_full(session: &mut Session, tl_full: &tl_enums::UserFull) -
         f.unofficial_security_risk,
     );
 
-    user.common.notify = peer_notify_settings_from_tl(&f.notify_settings);
+    let notify = peer_notify_settings_from_tl(&f.notify_settings);
     user.common.bar_settings = peer_bar_settings_from_tl(&f.settings);
     user.common.messages_ttl = f.ttl_period.unwrap_or(0);
     user.common.theme_token = chat_theme_token_from_tl(f.theme.as_ref());
@@ -1058,11 +1077,9 @@ pub fn apply_tl_user_full(session: &mut Session, tl_full: &tl_enums::UserFull) -
     user.common.loaded_status = LoadedStatus::Full;
     session.upsert_user(
         user,
-        PeerUpdateFlags::FULL_INFO
-            | PeerUpdateFlags::ABOUT
-            | PeerUpdateFlags::NOTIFICATIONS
-            | PeerUpdateFlags::IS_BLOCKED,
+        PeerUpdateFlags::FULL_INFO | PeerUpdateFlags::ABOUT | PeerUpdateFlags::IS_BLOCKED,
     );
+    apply_full_notify(session, peer_id, notify);
     if let Some(folder_id) = f.folder_id {
         session.set_history_folder(peer_id, Some(folder_id));
     }
@@ -1561,7 +1578,7 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
             let mut chat = session.chat(cid).cloned().unwrap_or_else(|| Chat::new(cid));
 
             chat.common.about = f.about.clone();
-            chat.common.notify = peer_notify_settings_from_tl(&f.notify_settings);
+            let notify = peer_notify_settings_from_tl(&f.notify_settings);
             chat.common.messages_ttl = f.ttl_period.unwrap_or(0);
             chat.common.theme_token = f.theme_emoticon.clone().unwrap_or_default();
             chat.flags
@@ -1644,11 +1661,9 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
             chat.common.loaded_status = LoadedStatus::Full;
             session.upsert_chat(
                 chat,
-                PeerUpdateFlags::FULL_INFO
-                    | PeerUpdateFlags::ABOUT
-                    | PeerUpdateFlags::NOTIFICATIONS
-                    | PeerUpdateFlags::MEMBERS,
+                PeerUpdateFlags::FULL_INFO | PeerUpdateFlags::ABOUT | PeerUpdateFlags::MEMBERS,
             );
+            apply_full_notify(session, peer_id, notify);
             if let Some(folder_id) = f.folder_id {
                 session.set_history_folder(peer_id, Some(folder_id));
             }
@@ -1663,7 +1678,7 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
                 .unwrap_or_else(|| Channel::new(chid));
 
             ch.common.about = f.about.clone();
-            ch.common.notify = peer_notify_settings_from_tl(&f.notify_settings);
+            let notify = peer_notify_settings_from_tl(&f.notify_settings);
             ch.common.messages_ttl = f.ttl_period.unwrap_or(0);
             ch.common.theme_token = f.theme_emoticon.clone().unwrap_or_default();
             ch.common.main_profile_tab = profile_tab_from_tl(f.main_tab.as_ref());
@@ -1785,11 +1800,9 @@ pub fn apply_tl_chat_full(session: &mut Session, tl_full: &tl_enums::ChatFull) -
             ch.common.loaded_status = LoadedStatus::Full;
             session.upsert_channel(
                 ch,
-                PeerUpdateFlags::FULL_INFO
-                    | PeerUpdateFlags::ABOUT
-                    | PeerUpdateFlags::NOTIFICATIONS
-                    | PeerUpdateFlags::MEMBERS,
+                PeerUpdateFlags::FULL_INFO | PeerUpdateFlags::ABOUT | PeerUpdateFlags::MEMBERS,
             );
+            apply_full_notify(session, peer_id, notify);
             if let Some(chat_id) = migrated_from {
                 session.apply_migration(chat_id, chid);
             }

@@ -89,6 +89,51 @@ impl FakeRpcClient {
         self.recorded.lock().expect("lock recorded").clone()
     }
 
+    /// The answer to a background chat-list request no test queued (see `invoke`).
+    fn answer_background_list_request(&self, ctor: u32) -> Option<Vec<u8>> {
+        let queued_first = self
+            .responses
+            .lock()
+            .expect("lock responses")
+            .front()
+            .is_some_and(|(expected, _)| *expected == ctor);
+        if queued_first {
+            return None;
+        }
+        if ctor == tl_fns::messages::GetDialogs::CONSTRUCTOR_ID {
+            return Some(
+                tl_enums::messages::Dialogs::Dialogs(tl_types::messages::Dialogs {
+                    dialogs: Vec::new(),
+                    messages: Vec::new(),
+                    chats: Vec::new(),
+                    users: Vec::new(),
+                })
+                .to_bytes(),
+            );
+        }
+        if ctor == tl_fns::messages::GetPeerDialogs::CONSTRUCTOR_ID
+            || ctor == tl_fns::messages::GetPinnedDialogs::CONSTRUCTOR_ID
+        {
+            return Some(
+                tl_enums::messages::PeerDialogs::PeerDialogs(tl_types::messages::PeerDialogs {
+                    dialogs: Vec::new(),
+                    messages: Vec::new(),
+                    chats: Vec::new(),
+                    users: Vec::new(),
+                    state: tl_enums::updates::State::State(tl_types::updates::State {
+                        pts: 1,
+                        qts: 0,
+                        date: 1,
+                        seq: 0,
+                        unread_count: 0,
+                    }),
+                })
+                .to_bytes(),
+            );
+        }
+        None
+    }
+
     fn last_request<R: Deserializable + Identifiable>(&self) -> R {
         let calls = self.recorded_calls();
         let (_, bytes) = calls
@@ -115,6 +160,16 @@ impl RpcClient for FakeRpcClient {
             .expect("lock recorded")
             .push((ctor, bytes));
 
+        // Loading folders starts the background chat-list preload (`ChatFilters::received` ->
+        // `ApiWrap::requestMoreDialogsIfNeeded`), whose `messages.getDialogs` (and the pinned
+        // dialogs / folder peers it asks for) may reach the
+        // fake at any point between the RPCs a test queued (TGB-2941). Unless a test queued an
+        // answer for it, it gets a complete empty list, so the preload ends and the ordered
+        // queue stays with the requests the test is waiting for.
+        if let Some(raw) = self.answer_background_list_request(ctor) {
+            return R::Return::from_bytes(&raw)
+                .map_err(|e| InvocationError::Deserialize(e.to_string()));
+        }
         let next = self.responses.lock().expect("lock responses").pop_front();
         match next {
             Some((expected_ctor, res)) => {
@@ -663,6 +718,7 @@ fn wp36_peer_rank_tag_sanitization_and_rpc() {
         is_online: false,
         verified: false,
         premium: false,
+        emoji_status_id: None,
         color_index: 2,
         phone: None,
         usernames: Vec::new(),

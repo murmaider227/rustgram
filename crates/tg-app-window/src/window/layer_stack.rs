@@ -27,6 +27,24 @@ pub enum ModalBox {
         /// Body copy.
         body: String,
     },
+    /// A Premium limit box (`SimpleLimitBox`, `boxes/premium_limits_box.cpp:400-475`): title,
+    /// text, and "Increase Limit" + "Cancel" (free account) or "OK" (Premium).
+    PremiumLimit {
+        /// Box title.
+        title: String,
+        /// Box text with its bold counts.
+        body: tg_ui::text::RichText,
+        /// `ref` of the Premium screen "Increase Limit" opens; `None`: a single "OK".
+        increase_ref: Option<String>,
+    },
+    /// Informational alert whose text has links (`Ui::MakeInformBox` with a
+    /// `TextWithEntities`); a clicked link opens and closes the box.
+    InformRich {
+        /// Dialog heading (empty: none).
+        title: String,
+        /// Body copy with its link spans.
+        body: tg_ui::text::RichText,
+    },
     /// Configure or clear the local passcode lock.
     PasscodeSetup {
         /// Current input value.
@@ -38,6 +56,27 @@ pub enum ModalBox {
     },
     /// Connection & proxy settings box opened from the bottom-left connection pill.
     ProxySettings,
+    /// Night mode cannot change while auto-night mode follows the system
+    /// (`ToggleNightModeWithConfirmation`): offers to disable it.
+    ConfirmDisableAutoNight,
+    /// The server dropped this session (`AUTH_KEY_DROP_*`): its explanation and one "Log out"
+    /// button (`Application::forceLogOut`, `core/application.cpp:1080-1096`). Escape and an
+    /// outside click do not close it; closing it logs the account out.
+    ForcedLogout {
+        /// The server's text from `updateServiceNotification.message`, with its entities.
+        text: tg_ui::text::RichText,
+        /// The background account (slot) the box is for; `None`: the window's own account.
+        account: Option<i32>,
+    },
+}
+
+impl ModalBox {
+    /// Whether Escape, the back button, an outside click or "hide all layers" may close the
+    /// box (`setCloseByEscape(false)` / `setCloseByOutsideClick(false)` in tdesktop).
+    #[must_use]
+    pub const fn closes_by_escape(&self) -> bool {
+        !matches!(self, Self::ForcedLogout { .. })
+    }
 }
 
 /// Action emitted by the active modal box.
@@ -53,6 +92,15 @@ pub enum LayerAction {
     SetProxyEnabled(bool),
     /// Change simulated connection status.
     SetConnectionStatus(ConnectionStatus),
+    /// Disable auto-night mode and make the night-mode switch that was waiting for it.
+    DisableAutoNight,
+    /// The forced-logout box was closed: log the account out (`Account::forcedLogOut`); a
+    /// background account carries its slot.
+    ForcedLogout(Option<i32>),
+    /// A link in a box's text was clicked.
+    OpenLink(String),
+    /// "Increase Limit" in a limit box: the Premium screen with this `ref`.
+    OpenPremium(String),
 }
 
 /// Ephemeral toast notification displayed near the bottom center.
@@ -117,7 +165,11 @@ impl LayerStack {
     ///
     /// Returns `true` if a layer was closed.
     pub fn close_top_by_back(&mut self) -> bool {
-        if self.boxes.pop().is_some() {
+        if let Some(top) = self.boxes.last() {
+            if !top.closes_by_escape() {
+                return false;
+            }
+            self.boxes.pop();
             return true;
         }
         if self.main_menu_open {
@@ -130,15 +182,50 @@ impl LayerStack {
     /// Hides all layers immediately (`MainWindow::ui_hideSettingsAndLayer`).
     pub fn hide_all(&mut self) {
         self.main_menu_open = false;
-        self.boxes.clear();
+        self.boxes.retain(|modal| !modal.closes_by_escape());
+    }
+
+    /// Returns `true` while the forced-logout box waits for the user.
+    #[must_use]
+    pub fn is_forced_logout_shown(&self) -> bool {
+        self.boxes
+            .iter()
+            .any(|modal| matches!(modal, ModalBox::ForcedLogout { .. }))
+    }
+
+    /// Returns `true` while a forced-logout box for `account` (`None`: the window's own)
+    /// waits for the user.
+    #[must_use]
+    pub fn is_forced_logout_shown_for(&self, account: Option<i32>) -> bool {
+        self.boxes.iter().any(
+            |modal| matches!(modal, ModalBox::ForcedLogout { account: shown, .. } if *shown == account),
+        )
     }
 
     /// Shows a transient toast notification for 3 seconds.
     pub fn show_toast(&mut self, text: impl Into<String>) {
+        let Some(text) = tg_app_core::user_error::visible_toast_text(text.into()) else {
+            return;
+        };
+        self.toast = Some(Toast {
+            text,
+            expires_at: tg_app_core::clock::now() + Duration::from_secs(3),
+        });
+    }
+
+    /// Shows `text` as is, skipping the raw-error filter: renders of the old behaviour only.
+    #[cfg(test)]
+    pub(crate) fn show_raw_toast_for_test(&mut self, text: impl Into<String>) {
         self.toast = Some(Toast {
             text: text.into(),
             expires_at: tg_app_core::clock::now() + Duration::from_secs(3),
         });
+    }
+
+    /// The top-most modal box, if any.
+    #[cfg(test)]
+    pub(crate) fn top_box(&self) -> Option<&ModalBox> {
+        self.boxes.last()
     }
 
     /// Returns the text of the currently active toast notification, if any.
@@ -175,6 +262,10 @@ impl LayerStack {
 
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 close_requested = true;
+            }
+            // Escape and the scrim never close a box that refuses it; its own button does.
+            if self.boxes.last().is_some_and(|top| !top.closes_by_escape()) {
+                close_requested = false;
             }
 
             let box_width = 360.0_f32.min(screen.width() - 32.0).max(260.0);
@@ -245,6 +336,58 @@ impl LayerStack {
     }
 }
 
+/// Draws a box text with clickable links; a click sets [`LayerAction::OpenLink`] and returns
+/// `true`.
+fn box_rich_text(
+    ui: &mut Ui,
+    id: &str,
+    text: &tg_ui::text::RichText,
+    palette: &Palette,
+    action: &mut Option<LayerAction>,
+) -> bool {
+    let colors = box_text_palette(palette);
+    let style = box_text_style();
+    let width = ui.available_width();
+    let response = tg_ui::text::render_rich_text(
+        ui,
+        Id::unique(id),
+        text,
+        &style,
+        &colors,
+        palette.window_fg,
+        width,
+    );
+    match response.clicked_link {
+        Some(url) => {
+            *action = Some(LayerAction::OpenLink(url));
+            true
+        }
+        None => false,
+    }
+}
+
+/// `st::boxLabel`'s palette over the window palette: links in the active text colour.
+fn box_text_palette(palette: &Palette) -> tg_ui::style::TextPalette {
+    tg_ui::style::TextPalette {
+        link_fg: palette.window_active_text_fg,
+        mono_fg: palette.window_fg,
+        mark_bg: palette.layer_backdrop,
+        spoiler_fg: palette.window_sub_text_fg,
+        select_bg: palette.layer_backdrop,
+        select_fg: palette.window_fg,
+        select_link_fg: palette.window_active_text_fg,
+        select_mono_fg: palette.window_fg,
+        select_spoiler_fg: palette.window_sub_text_fg,
+        select_overlay: palette.layer_backdrop,
+        link_always_active: false,
+    }
+}
+
+/// `st::boxLabel`'s text style (`Ui::MakeInformBox`).
+fn box_text_style() -> tg_ui::style::TextStyle {
+    tg_ui::style::TextStyle::box_label()
+}
+
 fn render_modal_box(
     ui: &mut Ui,
     modal: &mut ModalBox,
@@ -302,7 +445,97 @@ fn render_modal_box(
                 }
             });
         }
+        ModalBox::ConfirmDisableAutoNight => {
+            ui.label(
+                RichText::new(tg_lang::tr::lng_settings_auto_night_warning())
+                    .size(13.5)
+                    .color(palette.window_fg),
+            );
+            ui.add_space(18.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let disable = ui.add(
+                    egui::Button::new(
+                        RichText::new(tg_lang::tr::lng_settings_auto_night_disable())
+                            .strong()
+                            .color(palette.window_active_text_fg),
+                    )
+                    .frame(false),
+                );
+                if disable.clicked() {
+                    action = Some(LayerAction::DisableAutoNight);
+                    dismiss = true;
+                }
+                ui.add_space(12.0);
+                let cancel = ui.add(
+                    egui::Button::new(
+                        RichText::new(strings.cancel()).color(palette.window_active_text_fg),
+                    )
+                    .frame(false),
+                );
+                if cancel.clicked() {
+                    dismiss = true;
+                }
+            });
+        }
+        ModalBox::ForcedLogout { text, account } => {
+            // The box stays: the account logs out only through its button.
+            let _ = box_rich_text(ui, "tg_forced_logout_text", text, palette, &mut action);
+            ui.add_space(18.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(tg_lang::tr::lng_passcode_logout())
+                                .strong()
+                                .color(palette.window_active_text_fg),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    action = Some(LayerAction::ForcedLogout(*account));
+                    dismiss = true;
+                }
+            });
+        }
         ModalBox::Inform { title, body } => {
+            // `Ui::MakeInformBox` has no title; an empty one is not drawn.
+            if !title.is_empty() {
+                ui.label(
+                    RichText::new(title.as_str())
+                        .size(17.0)
+                        .strong()
+                        .color(palette.window_bold_fg),
+                );
+                ui.add_space(10.0);
+            }
+            ui.label(
+                RichText::new(body.as_str())
+                    .size(13.5)
+                    .color(palette.window_fg),
+            );
+            ui.add_space(18.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(strings.close())
+                                .strong()
+                                .color(palette.window_active_text_fg),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    dismiss = true;
+                }
+            });
+        }
+        ModalBox::PremiumLimit {
+            title,
+            body,
+            increase_ref,
+        } => {
             ui.label(
                 RichText::new(title.as_str())
                     .size(17.0)
@@ -310,11 +543,60 @@ fn render_modal_box(
                     .color(palette.window_bold_fg),
             );
             ui.add_space(10.0);
-            ui.label(
-                RichText::new(body.as_str())
-                    .size(13.5)
-                    .color(palette.window_fg),
-            );
+            let _ = box_rich_text(ui, "tg_premium_limit_text", body, palette, &mut action);
+            ui.add_space(18.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let primary = increase_ref
+                    .as_ref()
+                    .map_or_else(tg_lang::tr::lng_box_ok, |_| {
+                        tg_lang::tr::lng_limits_increase()
+                    });
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(primary)
+                                .strong()
+                                .color(palette.window_active_text_fg),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    if let Some(referral) = increase_ref.clone() {
+                        action = Some(LayerAction::OpenPremium(referral));
+                    }
+                    dismiss = true;
+                }
+                if increase_ref.is_some() {
+                    ui.add_space(12.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(tg_lang::tr::lng_cancel())
+                                    .color(palette.window_active_text_fg),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        dismiss = true;
+                    }
+                }
+            });
+        }
+        ModalBox::InformRich { title, body } => {
+            if !title.is_empty() {
+                ui.label(
+                    RichText::new(title.as_str())
+                        .size(17.0)
+                        .strong()
+                        .color(palette.window_bold_fg),
+                );
+                ui.add_space(10.0);
+            }
+            if box_rich_text(ui, "tg_inform_rich_text", body, palette, &mut action) {
+                dismiss = true;
+            }
             ui.add_space(18.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui

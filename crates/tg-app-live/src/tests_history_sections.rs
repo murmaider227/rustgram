@@ -1519,6 +1519,8 @@ fn forward_messages_with_options_and_rich_draft_roundtrip() {
         no_webpage: true,
     };
     live.save_rich_draft(thread, Some(draft.clone()));
+    // `messages.saveDraft` goes out from the background queue.
+    assert!(live.flush_background_rpcs(std::time::Duration::from_secs(10)));
 
     let draft_req: tl_fns::messages::SaveDraft = rpc.last_request();
     assert!(draft_req.no_webpage);

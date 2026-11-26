@@ -910,7 +910,7 @@ impl ShortcutManager {
             }
         }
 
-        let header = "// This is a list of your own shortcuts for Rustgram / Telegram Desktop\n\
+        let header = "// This is a list of your own shortcuts for Rustgram\n\
 // You can see full list of commands in the 'shortcuts-default.json' file\n\n";
         let body = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_owned());
         format!("{header}{body}\n")

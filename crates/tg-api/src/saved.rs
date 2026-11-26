@@ -462,7 +462,7 @@ pub async fn load_saved_history<C: RpcClient>(
             if latest_top.is_none_or(|(id, _)| msg.id > id) {
                 latest_top = Some((msg.id, msg.date));
             }
-            session.insert_message(msg);
+            session.insert_existing_message(msg);
         }
     }
 

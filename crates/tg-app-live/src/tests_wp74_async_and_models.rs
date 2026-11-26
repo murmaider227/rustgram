@@ -410,7 +410,14 @@ fn emoji_groups_fetches_server_mood_groups_and_caches_hash() {
         &server_groups,
     );
 
-    let groups = live.emoji_groups().expect("initial emoji_groups");
+    // The first call starts the background refresh and returns the (empty) cache at once.
+    assert!(
+        live.emoji_groups()
+            .expect("initial emoji_groups")
+            .is_empty()
+    );
+    assert!(live.wait_panel_background_idle(std::time::Duration::from_secs(10)));
+    let groups = live.emoji_groups().expect("loaded emoji_groups");
     assert_eq!(
         groups,
         vec![

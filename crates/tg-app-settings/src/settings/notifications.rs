@@ -752,6 +752,21 @@ pub fn render_corner_picker(
     });
 }
 
+/// Stored value of the "Default" sound (tdesktop's `msg_incoming.mp3`).
+pub const SOUND_DEFAULT: &str = "Default";
+/// Stored value of "No sound".
+pub const SOUND_NONE: &str = "None";
+
+/// The built-in entries of tdesktop's notification sound list, in its order (`RingtonesBox`,
+/// `boxes/ringtones_box.cpp:237-247`): "Default", then "No sound". Saved cloud ringtones follow.
+#[must_use]
+pub fn scope_sound_choices() -> [(&'static str, String); 2] {
+    [
+        (SOUND_DEFAULT, tr::lng_ringtones_box_default()),
+        (SOUND_NONE, tr::lng_ringtones_box_no_sound()),
+    ]
+}
+
 fn render_scope_editor(
     ui: &mut Ui,
     scope: NotifyScope,
@@ -789,9 +804,11 @@ fn render_scope_editor(
                     .font(font_id_from_style(st::normal_font))
                     .color(colors.color("windowFg")),
             );
-            for sound in ["Default", "Chime", "Note", "None"] {
-                if ui.selectable_label(cfg.sound == sound, sound).clicked() {
-                    cfg.sound = sound.to_owned();
+            for (value, label) in scope_sound_choices() {
+                let selected = cfg.sound.eq_ignore_ascii_case(value)
+                    || (value == SOUND_DEFAULT && cfg.sound.is_empty());
+                if ui.selectable_label(selected, label).clicked() {
+                    cfg.sound = value.to_owned();
                     changed = true;
                 }
             }
@@ -996,5 +1013,19 @@ fn ringtone_mime_for_filename(name: &str) -> &'static str {
         "audio/wav"
     } else {
         "audio/mpeg"
+    }
+}
+
+#[cfg(test)]
+mod sound_list_tests {
+    use super::*;
+
+    #[test]
+    fn scope_sound_list_matches_tdesktop_ringtones_box() {
+        let choices = scope_sound_choices();
+        let values: Vec<&str> = choices.iter().map(|(value, _)| *value).collect();
+        assert_eq!(values, [SOUND_DEFAULT, SOUND_NONE]);
+        assert_eq!(choices[0].1, tr::lng_ringtones_box_default());
+        assert_eq!(choices[1].1, tr::lng_ringtones_box_no_sound());
     }
 }

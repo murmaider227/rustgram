@@ -217,8 +217,11 @@ fn member_row(
         rect.min + Vec2::new(MEMBER_PHOTO_LEFT, MEMBER_PHOTO_TOP),
         Vec2::splat(MEMBER_PHOTO_SIZE),
     );
-    EmptyUserpic::for_color_index(member.color_index, &member.name, colors)
-        .paint_circle(ui.painter(), av_rect);
+    EmptyUserpic::for_color_index(member.color_index, &member.name, colors).paint_circle_or_photo(
+        ui.painter(),
+        av_rect,
+        member.peer_id.0,
+    );
 
     let text_left = rect.min.x + MEMBER_TEXT_LEFT;
 
@@ -439,7 +442,7 @@ impl CommonGroupsSection {
                 Vec2::splat(38.0),
             );
             EmptyUserpic::for_color_index(group.color_index, &group.title, colors)
-                .paint_circle(ui.painter(), av_rect);
+                .paint_circle_or_photo(ui.painter(), av_rect, group.peer_id.0);
 
             let text_x = av_rect.max.x + 12.0;
             ui.painter().text(

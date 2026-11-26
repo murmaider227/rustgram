@@ -6,12 +6,18 @@
 //! `Telegram/SourceFiles/ui/chat/chats_filter_tag.cpp`,
 //! and `Telegram/SourceFiles/dialogs/dialogs.style`.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use egui::{
+    Align2, Color32, CornerRadius, FontId, Galley, Id, Painter, Pos2, Rect, Stroke, StrokeKind,
+    Vec2,
+};
 use tg_history::datetime::format_time_short;
+use tg_history::dialogs::elide_text_right_hinted;
 use tg_history::{
     AvatarCornerBadge, DialogChatTypeIcon, DialogRowInput, DialogRowLayout, DialogRowMode,
     DialogRowStyle, DialogSendState, DialogsDateKind, FontMetrics, LocalDateTime,
@@ -34,9 +40,9 @@ use crate::dialogs::backend::{
     ArchiveSummary, DialogItem, DialogPeerKind, FolderTagBadge, GlobalPeerResult,
     MessageSearchResult, SpecialRowKind,
 };
+use crate::dialogs::emoji_status;
 use crate::dialogs::mini_preview::{PreviewLineColors, paint_preview_line};
 use crate::dialogs::search_snippet::message_search_snippet;
-use crate::dialogs::strings;
 use tg_app_core::stand_in::theme::Palette;
 use tg_ui::widgets::media_marker::{paint_media_marker, split_media_marker};
 
@@ -380,7 +386,7 @@ pub fn compute_item_layout(
         measure_text_i32(painter, &counter_text, badge_font)
     };
 
-    let peer_badge_width = if item.verified || item.premium { 18 } else { 0 };
+    let peer_badge_width = row_peer_badge_width(item);
     let send_state = if let Some(draft) = item.effective_draft() {
         if draft.saving {
             DialogSendState::Sending
@@ -442,8 +448,94 @@ pub fn paint_dialog_row(
     colors: &DialogColors<'_>,
 ) -> Option<Rect> {
     let _ = palette;
-    let (layout, date_text, counter_text) =
-        compute_item_layout(painter, item, now, rect.width(), state);
+    let prepared = prepare_dialog_row(painter, item, now, rect.width(), state);
+    paint_prepared_dialog_row(painter, rect, item, &prepared, state, colors)
+}
+
+/// The part of a dialog row that does not depend on where or in which state it is painted:
+/// its geometry and the strings already formatted for one row width.
+///
+/// Built by [`prepare_dialog_row`]. The chat list keeps it for every painted row and builds it
+/// again only when the row, its width or the fonts change, so a frame without changes formats
+/// and measures nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedDialogRow {
+    layout: DialogRowLayout,
+    date_text: String,
+    counter_text: String,
+    /// The title cut to the name column, when it does not fit.
+    elided_title: Option<String>,
+    /// "typing" / "Sam is typing" of the row's send action.
+    typing_label: Option<String>,
+    /// "Draft: " in front of the row's unsent draft.
+    draft_prefix: Option<String>,
+}
+
+impl PreparedDialogRow {
+    /// Geometry of the row.
+    #[must_use]
+    pub const fn layout(&self) -> &DialogRowLayout {
+        &self.layout
+    }
+}
+
+fn draft_prefix_text() -> String {
+    format!(
+        "{} ",
+        tg_lang::tr::lng_dialogs_text_from_wrapped(&tg_lang::tr::lng_from_draft())
+    )
+}
+
+/// Formats and measures everything [`paint_prepared_dialog_row`] needs to paint `item` in a row
+/// `width` wide.
+#[must_use]
+pub fn prepare_dialog_row(
+    painter: &Painter,
+    item: &DialogItem,
+    now: LocalDateTime,
+    width: f32,
+    state: RowPaintState,
+) -> PreparedDialogRow {
+    let (layout, date_text, counter_text) = compute_item_layout(painter, item, now, width, state);
+    // The compact rail paints the avatar and its badges only.
+    let with_text = !state.narrow;
+    let elided_title = (with_text && layout.name_elided).then(|| {
+        elide_text(
+            painter,
+            &item.title,
+            layout.name_rect.width,
+            &font_id_from_style(st::semibold_font),
+        )
+    });
+    let typing_label = item
+        .typing
+        .as_ref()
+        .filter(|_| with_text && layout.typing_rect.is_some())
+        .map(|typing| typing.label());
+    let draft_prefix = (with_text && item.effective_draft().is_some()).then(draft_prefix_text);
+    PreparedDialogRow {
+        layout,
+        date_text,
+        counter_text,
+        elided_title,
+        typing_label,
+        draft_prefix,
+    }
+}
+
+/// [`paint_dialog_row`] with the row's text already prepared by [`prepare_dialog_row`] for the
+/// same `item` and the width of `rect`.
+pub fn paint_prepared_dialog_row(
+    painter: &Painter,
+    rect: Rect,
+    item: &DialogItem,
+    prepared: &PreparedDialogRow,
+    state: RowPaintState,
+    colors: &DialogColors<'_>,
+) -> Option<Rect> {
+    let layout = &prepared.layout;
+    let date_text = prepared.date_text.as_str();
+    let counter_text = prepared.counter_text.as_str();
     let origin = rect.min;
 
     // 1. Row background (`dialogsBgActive` / `dialogsBgOver` / `dialogsBg`).
@@ -467,14 +559,26 @@ pub fn paint_dialog_row(
 
     // 2. Userpic / special avatar (`EmptyUserpic` + Saved Messages / Replies / VerificationCodes).
     let photo_rect = to_egui_rect(origin, layout.photo_rect);
-    paint_peer_avatar(
-        painter,
-        photo_rect,
-        item.special,
-        item.color_index,
-        &item.title,
-        colors,
-    );
+    if item.kind == DialogPeerKind::Forum && item.special == SpecialRowKind::None {
+        // `PeerData::userpicShape`: a forum (and a community) is a rounded square.
+        EmptyUserpic::for_color_index(item.color_index, &item.title, colors)
+            .paint_rounded_or_photo(
+                painter,
+                photo_rect,
+                photo_rect.width() * FORUM_USERPIC_RADIUS_MULTIPLIER,
+                item.peer_id.0,
+            );
+    } else {
+        paint_peer_userpic(
+            painter,
+            photo_rect,
+            item.peer_id,
+            item.special,
+            item.color_index,
+            &item.title,
+            colors,
+        );
+    }
 
     // 3. Avatar corner badge (green online dot or active call badge).
     if let Some(badge_r) = layout.avatar_badge_rect {
@@ -488,7 +592,7 @@ pub fn paint_dialog_row(
 
     // 4. Narrow compact rail stops after avatar + overlaid badges (`dialogs_layout.cpp:556-561`).
     if state.narrow {
-        paint_row_badges(painter, origin, &layout, item, &counter_text, state, colors);
+        paint_row_badges(painter, origin, layout, item, counter_text, state, colors);
         return None;
     }
 
@@ -539,7 +643,7 @@ pub fn paint_dialog_row(
         painter.text(
             Pos2::new(r.right(), r.center().y),
             Align2::RIGHT_CENTER,
-            &date_text,
+            date_text,
             font_id_from_style(st::dialogs_date_font),
             date_fg,
         );
@@ -569,28 +673,24 @@ pub fn paint_dialog_row(
     // 8. Chat title (elided to `layout.name_rect.width` with semibold visual weight).
     let name_r = to_egui_rect(origin, layout.name_rect);
     let name_font = font_id_from_style(st::semibold_font);
-    let title_str = if layout.name_elided {
-        elide_text_right(&item.title, layout.name_rect.width, |s| {
-            measure_text_i32(painter, s, name_font.clone())
-        })
-    } else {
-        item.title.clone()
-    };
+    let title_str = prepared.elided_title.as_deref().unwrap_or(&item.title);
     paint_semibold_text(
         painter,
         Pos2::new(name_r.left(), name_r.center().y),
         Align2::LEFT_CENTER,
-        &title_str,
+        title_str,
         name_font,
         name_fg,
     );
 
-    // 9. Verified or Premium peer badge immediately after title.
+    // 9. Verified check, emoji status or Premium star immediately after title
+    // (`PeerBadge::drawGetWidth`: a verified row paints only the check).
     if let Some(pb_r) = layout.peer_badge_rect {
         let r = to_egui_rect(origin, pb_r);
         if item.verified {
             paint_verified_badge(painter, r, state.active, state.selected, colors);
-        } else if item.premium {
+        } else if !paint_row_emoji_status(painter, r, item, state, colors) && item.premium {
+            // Until the status document loads, a Premium peer keeps the star in its place.
             paint_premium_star(painter, r, state.active, state.selected, colors);
         }
     }
@@ -608,16 +708,20 @@ pub fn paint_dialog_row(
 
     // 11. Bottom-right badges (unread pill, mention @, reaction heart, poll, pin, bot "Open").
     let right_btn_rect =
-        paint_row_badges(painter, origin, &layout, item, &counter_text, state, colors);
+        paint_row_badges(painter, origin, layout, item, counter_text, state, colors);
 
     // 12. Preview line: typing animation OR red "Draft: " prefix OR sender + last message.
     if let Some(typing_r) = layout.typing_rect
         && let Some(typing) = &item.typing
     {
+        let label = prepared
+            .typing_label
+            .as_deref()
+            .map_or_else(|| Cow::Owned(typing.label()), Cow::Borrowed);
         paint_typing_indicator(
             painter,
             to_egui_rect(origin, typing_r),
-            &typing.label(),
+            &label,
             state.anim_time_secs,
             service_fg,
         );
@@ -630,10 +734,10 @@ pub fn paint_dialog_row(
                 .intersect(r.expand2(Vec2::new(0.0, 2.0))),
         );
         if let Some(draft) = item.effective_draft() {
-            let prefix = format!(
-                "{} ",
-                tg_lang::tr::lng_dialogs_text_from_wrapped(&tg_lang::tr::lng_from_draft())
-            );
+            let prefix = prepared
+                .draft_prefix
+                .clone()
+                .unwrap_or_else(draft_prefix_text);
             let draft_fg = colors.draft_fg(state.active);
             let prefix_g = clipped.layout_no_wrap(prefix, preview_font.clone(), draft_fg);
             let prefix_w = prefix_g.size().x;
@@ -643,9 +747,7 @@ pub fn paint_dialog_row(
                 draft_fg,
             );
             let avail = (r.width() - prefix_w).max(0.0) as i32;
-            let body = elide_text_right(&draft.text, avail, |s| {
-                measure_text_i32(painter, s, preview_font.clone())
-            });
+            let body = elide_text(painter, &draft.text, avail, &preview_font);
             clipped.text(
                 Pos2::new(r.left() + prefix_w, r.center().y),
                 Align2::LEFT_CENTER,
@@ -667,15 +769,9 @@ pub fn paint_dialog_row(
                 },
                 colors,
             );
-        } else {
-            clipped.text(
-                Pos2::new(r.left(), r.center().y),
-                Align2::LEFT_CENTER,
-                strings::PREVIEW_HISTORY_CLEARED,
-                preview_font,
-                sub_fg,
-            );
         }
+        // No last message, or one that displays nothing (`item->isEmpty()`): tdesktop
+        // paints no preview line (`Dialogs::Ui::PaintRow`).
     }
 
     // 13. Folder filter tags beneath preview (`ui/chat/chats_filter_tag.cpp`, `tagTop = 52px`).
@@ -835,9 +931,7 @@ pub fn paint_archive_row(
             let preview_joined = summary.preview_titles.join(", ");
             let preview_w = (right_edge - badge_reserved - text_left).max(0.0) as i32;
             let preview_font = font_id_from_style(st::dialogs_text_font);
-            let elided = elide_text_right(&preview_joined, preview_w, |s| {
-                measure_text_i32(painter, s, preview_font.clone())
-            });
+            let elided = elide_text(painter, &preview_joined, preview_w, &preview_font);
             painter.text(
                 Pos2::new(text_left, rect.top() + 43.0),
                 Align2::LEFT_CENTER,
@@ -885,9 +979,10 @@ pub fn paint_global_peer_row(
         ),
         Vec2::splat(st::default_dialog_row.photo_size.0 as f32),
     );
-    paint_peer_avatar(
+    paint_peer_userpic(
         painter,
         photo_rect,
+        peer.peer_id,
         SpecialRowKind::None,
         peer.color_index,
         &peer.title,
@@ -930,9 +1025,7 @@ pub fn paint_global_peer_row(
     };
     let name_max_w = (right_edge - name_left - badge_w).max(16.0) as i32;
     let name_font = font_id_from_style(st::semibold_font);
-    let elided_title = elide_text_right(&peer.title, name_max_w, |s| {
-        measure_text_i32(painter, s, name_font.clone())
-    });
+    let elided_title = elide_text(painter, &peer.title, name_max_w, &name_font);
     let actual_w = measure_text_i32(painter, &elided_title, name_font.clone()) as f32;
     paint_semibold_text(
         painter,
@@ -970,9 +1063,7 @@ pub fn paint_global_peer_row(
     let sub_font = font_id_from_style(st::dialogs_text_font);
     let sub_max_w =
         (right_edge - (rect.left() + st::default_dialog_row.name_left.0 as f32)).max(16.0) as i32;
-    let elided_sub = elide_text_right(&peer.subtitle, sub_max_w, |s| {
-        measure_text_i32(painter, s, sub_font.clone())
-    });
+    let elided_sub = elide_text(painter, &peer.subtitle, sub_max_w, &sub_font);
     painter.text(
         Pos2::new(
             rect.left() + st::default_dialog_row.name_left.0 as f32,
@@ -1015,9 +1106,10 @@ pub fn paint_sponsored_peer_row(
         ),
         Vec2::splat(st::default_dialog_row.photo_size.0 as f32),
     );
-    paint_peer_avatar(
+    paint_peer_userpic(
         painter,
         photo_rect,
+        peer.peer_id,
         SpecialRowKind::None,
         peer.color_index,
         &peer.title,
@@ -1087,9 +1179,7 @@ pub fn paint_sponsored_peer_row(
     };
     let name_max_w = (ad_rect.left() - 8.0 - name_left - badge_w).max(16.0) as i32;
     let name_font = font_id_from_style(st::semibold_font);
-    let elided_title = elide_text_right(&peer.title, name_max_w, |s| {
-        measure_text_i32(painter, s, name_font.clone())
-    });
+    let elided_title = elide_text(painter, &peer.title, name_max_w, &name_font);
     let actual_w = measure_text_i32(painter, &elided_title, name_font.clone()) as f32;
     paint_semibold_text(
         painter,
@@ -1135,9 +1225,7 @@ pub fn paint_sponsored_peer_row(
     };
     let sub_font = font_id_from_style(st::dialogs_text_font);
     let sub_max_w = (right_edge - name_left).max(16.0) as i32;
-    let elided_sub = elide_text_right(&subtitle, sub_max_w, |s| {
-        measure_text_i32(painter, s, sub_font.clone())
-    });
+    let elided_sub = elide_text(painter, &subtitle, sub_max_w, &sub_font);
     painter.text(
         Pos2::new(name_left, rect.top() + 43.0),
         Align2::LEFT_CENTER,
@@ -1180,9 +1268,10 @@ pub fn paint_message_search_row(
         ),
         Vec2::splat(st::default_dialog_row.photo_size.0 as f32),
     );
-    paint_peer_avatar(
+    paint_peer_userpic(
         painter,
         photo_rect,
+        msg.peer_id,
         msg.special,
         msg.color_index,
         &msg.peer_title,
@@ -1259,9 +1348,7 @@ pub fn paint_message_search_row(
 
     let name_font = font_id_from_style(st::semibold_font);
     let name_avail = (right_edge - top_right_w - 8.0 - name_x).max(16.0) as i32;
-    let elided_name = elide_text_right(&msg.peer_title, name_avail, |s| {
-        measure_text_i32(painter, s, name_font.clone())
-    });
+    let elided_name = elide_text(painter, &msg.peer_title, name_avail, &name_font);
     paint_semibold_text(
         painter,
         Pos2::new(name_x, rect.top() + 19.0),
@@ -1292,9 +1379,51 @@ pub fn paint_message_search_row(
         Some((icon, rest)) => (Some(icon), rest),
         None => (None, msg.text.as_str()),
     };
+    // Photo / video / file results draw the chat list's mini image or type icon
+    // (`MessageView::prepare` with `ItemPreview` images).
+    let media = msg.media_preview.as_ref().filter(|p| {
+        marker.is_none()
+            && (crate::dialogs::mini_preview::preview_has_image(clipped.ctx(), Some(p))
+                || crate::dialogs::mini_preview::preview_type_icon(p.kind).is_some())
+    });
+    let line_h = clipped
+        .layout_no_wrap("Ag".to_owned(), preview_font.clone(), sub_fg)
+        .size()
+        .y;
+    let line_top = clip_rect.center().y - line_h * 0.5;
     // With a left icon the sender is cut off into `_senderCache` and drawn before it;
     // otherwise it stays inside the text and counts in the search cut (`PreviewWithSender`).
-    let inline_sender = if let Some(icon) = marker {
+    let inline_sender = if let Some(preview) = media {
+        let has_images =
+            crate::dialogs::mini_preview::preview_has_image(clipped.ctx(), Some(preview));
+        if let Some(sender) = sender {
+            let wrapped = tg_lang::tr::lng_dialogs_text_from_wrapped(sender);
+            let prefix = if has_images {
+                wrapped
+            } else {
+                format!("{wrapped} ")
+            };
+            let g = clipped.layout_no_wrap(prefix, preview_font.clone(), service_fg);
+            let w = g.size().x;
+            clipped.galley(Pos2::new(x, line_top), g, service_fg);
+            x += w;
+            if has_images {
+                x += (st::dialogs_mini_preview_skip.0 + st::dialogs_mini_preview_right.0) as f32;
+            }
+        }
+        let colored =
+            crate::dialogs::mini_preview::colorized_prefix_len(Some(preview), has_images, msg_text);
+        x += crate::dialogs::mini_preview::paint_leading_media(
+            &clipped,
+            x,
+            line_top,
+            clip_rect.right(),
+            preview,
+            if colored > 0 { service_fg } else { sub_fg },
+            colors,
+        );
+        None
+    } else if let Some(icon) = marker {
         if let Some(sender) = sender {
             let prefix = format!("{} ", tg_lang::tr::lng_dialogs_text_from_wrapped(sender));
             let g = clipped.layout_no_wrap(prefix, preview_font.clone(), service_fg);
@@ -1321,7 +1450,19 @@ pub fn paint_message_search_row(
     } else {
         sender
     };
-    let snippet = message_search_snippet(inline_sender, msg_text, query);
+    let mut snippet = message_search_snippet(inline_sender, msg_text, query);
+    // Caption-less media ("Photo") and service text are drawn in `dialogsTextFgService`.
+    if let Some(preview) = media {
+        let has_images =
+            crate::dialogs::mini_preview::preview_has_image(clipped.ctx(), Some(preview));
+        let colored =
+            crate::dialogs::mini_preview::colorized_prefix_len(Some(preview), has_images, msg_text);
+        if colored > 0 && colored >= msg_text.len() {
+            for run in &mut snippet.runs {
+                run.service = true;
+            }
+        }
+    }
     let job = snippet.layout_job(
         &preview_font,
         sub_fg,
@@ -1504,6 +1645,29 @@ pub fn paint_section_bar(
 // ---------------------------------------------------------------------------
 // Internal helpers: avatars, badges, icons, typing animation, filter tags
 // ---------------------------------------------------------------------------
+
+/// Paints `peer_id`'s real photo userpic when it is loaded (`PeerData::paintUserpic`), else the
+/// avatar of [`paint_peer_avatar`]. Special rows always keep their special avatar.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_peer_userpic(
+    painter: &Painter,
+    rect: Rect,
+    peer_id: tg_app_core::stand_in::types::PeerId,
+    special: SpecialRowKind,
+    color_index: u8,
+    title: &str,
+    colors: &DialogColors<'_>,
+) {
+    if matches!(special, SpecialRowKind::None)
+        && tg_ui::userpic_images::paint_userpic_image(painter, rect, peer_id.0)
+    {
+        return;
+    }
+    paint_peer_avatar(painter, rect, special, color_index, title, colors);
+}
+
+/// `Ui::ForumUserpicRadiusMultiplier()`: corner radius of a forum userpic per pixel of its size.
+pub const FORUM_USERPIC_RADIUS_MULTIPLIER: f32 = 0.3;
 
 /// Paints an avatar for a normal peer or special row (`SavedMessages`, `Replies`, `VerificationCodes`).
 pub fn paint_peer_avatar(
@@ -1759,6 +1923,52 @@ fn paint_verified_badge(
     paint_style_icon(painter, rect, icon, colors, None);
 }
 
+/// Width of the badge after a chat-list row's name (`PeerBadge::drawGetWidth`): the verified
+/// check wins over an emoji status, which takes [`emoji_status::ROW_STATUS_WIDTH`]; otherwise the
+/// Premium star.
+#[must_use]
+pub fn row_peer_badge_width(item: &DialogItem) -> i32 {
+    if item.verified {
+        18
+    } else if item.emoji_status_id.is_some() {
+        emoji_status::ROW_STATUS_WIDTH
+    } else if item.premium {
+        18
+    } else {
+        0
+    }
+}
+
+/// Paints the row's emoji status in the badge rect `r`; `false` when the row has none or its
+/// document is not loaded yet. Tinted with `premiumFg` (`dialogsVerifiedIconBg*`).
+fn paint_row_emoji_status(
+    painter: &Painter,
+    r: Rect,
+    item: &DialogItem,
+    state: RowPaintState,
+    colors: &DialogColors<'_>,
+) -> bool {
+    let Some(document_id) = item.emoji_status_id else {
+        return false;
+    };
+    let tint = colors.color(if state.active {
+        "dialogsVerifiedIconBgActive"
+    } else if state.selected {
+        "dialogsVerifiedIconBgOver"
+    } else {
+        "dialogsVerifiedIconBg"
+    });
+    emoji_status::paint_status(
+        painter,
+        Id::unique(("tg_dialog_row_status", item.peer_id.0)),
+        document_id,
+        emoji_status::status_rect(r.min),
+        tint,
+        state.anim_time_secs,
+        emoji_status::StatusLoops::Limited(emoji_status::ROW_PLAY_LOOPS),
+    )
+}
+
 fn paint_premium_star(
     painter: &Painter,
     rect: Rect,
@@ -1825,7 +2035,7 @@ fn paint_typing_indicator(
     let text_left = rect.left() + 21.0;
     let avail = (rect.right() - text_left).max(0.0) as i32;
     let font = font_id_from_style(st::dialogs_text_font);
-    let elided = elide_text_right(label, avail, |s| measure_text_i32(painter, s, font.clone()));
+    let elided = elide_text(painter, label, avail, &font);
     painter.text(
         Pos2::new(text_left, rect.center().y),
         Align2::LEFT_CENTER,
@@ -1899,4 +2109,151 @@ pub fn measure_text_i32(painter: &Painter, text: &str, font_id: FontId) -> i32 {
         .size()
         .x
         .ceil() as i32
+}
+
+/// Everything outside a row's own data that its measured text depends on: the fonts, the display
+/// scale and the language. Caches of measured or elided text are dropped when it changes.
+///
+/// egui has no counter of font changes (fonts registered in one frame apply from the next one),
+/// so the fonts are identified by the width of a probe string in the two chat-list families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextEpoch {
+    font_probes: [u32; 2],
+    pixels_per_point: u32,
+    language: u64,
+}
+
+/// The [`TextEpoch`] of this frame.
+#[must_use]
+pub fn text_epoch(painter: &Painter) -> TextEpoch {
+    const PROBE: &str = "Ag\u{2026}0";
+    let probe = |font_id: FontId| {
+        painter
+            .layout_no_wrap(PROBE.to_owned(), font_id, Color32::WHITE)
+            .size()
+            .x
+            .to_bits()
+    };
+    TextEpoch {
+        font_probes: [
+            probe(font_id_from_style(st::semibold_font)),
+            probe(font_id_from_style(st::dialogs_text_font)),
+        ],
+        pixels_per_point: painter.pixels_per_point().to_bits(),
+        language: tg_lang::global_generation(),
+    }
+}
+
+/// Elided strings of the last two frames, kept in the egui context.
+#[derive(Clone, Default)]
+struct ElisionMemo(Arc<Mutex<ElisionMemoState>>);
+
+#[derive(Default)]
+struct ElisionMemoState {
+    frame: u64,
+    epoch: Option<TextEpoch>,
+    /// By hash of `(text, max_width, font)`.
+    entries: HashMap<u64, ElisionEntry>,
+}
+
+struct ElisionEntry {
+    used_frame: u64,
+    /// `None` when the text fits as it is.
+    elided: Option<Box<str>>,
+}
+
+/// Elides `text` on the right with `'…'` to `max_width` logical pixels in `font_id`
+/// ([`elide_text_right`] measured with [`measure_text_i32`]).
+///
+/// The string is laid out once: its glyph positions give the cut, and
+/// [`elide_text_right_hinted`] confirms it with the prefix measurements the rows always used,
+/// so the result is the one that measuring every prefix gives. The result is remembered while
+/// the same string is elided on consecutive frames, which makes a repeated row free.
+#[must_use]
+pub fn elide_text(painter: &Painter, text: &str, max_width: i32, font_id: &FontId) -> String {
+    if max_width <= 0 || text.is_empty() {
+        return String::new();
+    }
+    let ctx = painter.ctx();
+    let memo = ctx.data_mut(|d| d.get_temp_mut_or_default::<ElisionMemo>(Id::NULL).clone());
+    let mut memo = memo.0.lock().unwrap_or_else(PoisonError::into_inner);
+    // The root viewport's frame counter: a separate chat window is a viewport with its own.
+    let frame = ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT);
+    if memo.epoch.is_none() || memo.frame != frame {
+        memo.frame = frame;
+        let epoch = text_epoch(painter);
+        if memo.epoch == Some(epoch) {
+            memo.entries
+                .retain(|_, entry| frame.wrapping_sub(entry.used_frame) <= 1);
+        } else {
+            memo.entries.clear();
+            memo.epoch = Some(epoch);
+        }
+    }
+    let key = egui::util::hash((text, max_width, font_id));
+    if let Some(entry) = memo.entries.get_mut(&key) {
+        entry.used_frame = frame;
+        return entry.elided.as_deref().unwrap_or(text).to_owned();
+    }
+    let elided = elide_text_uncached(painter, text, max_width, font_id);
+    memo.entries.insert(
+        key,
+        ElisionEntry {
+            used_frame: frame,
+            elided: (elided != text).then(|| elided.as_str().into()),
+        },
+    );
+    elided
+}
+
+/// Forgets the elided strings kept in `ctx`, so that a test can compare a frame that elides
+/// everything anew with one that reuses them.
+#[cfg(test)]
+pub(crate) fn forget_elided_text(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<ElisionMemo>(Id::NULL));
+}
+
+fn elide_text_uncached(painter: &Painter, text: &str, max_width: i32, font_id: &FontId) -> String {
+    let galley = painter.layout_no_wrap(text.to_owned(), font_id.clone(), Color32::WHITE);
+    let full_width = galley.size().x.ceil() as i32;
+    if full_width <= max_width {
+        return text.to_owned();
+    }
+    let ellipsis_width = measure_text_i32(painter, "\u{2026}", font_id.clone());
+    let measure = |prefix: &str| {
+        if prefix.len() == text.len() {
+            full_width
+        } else {
+            measure_text_i32(painter, prefix, font_id.clone())
+        }
+    };
+    match galley_cut_hint(&galley, text, max_width - ellipsis_width) {
+        Some(hint_end) => elide_text_right_hinted(text, max_width, hint_end, measure),
+        None => elide_text_right(text, max_width, measure),
+    }
+}
+
+/// Byte length of the longest prefix of `text` whose glyphs end within `budget` pixels in
+/// `galley` (the whole `text` laid out on one row), or `None` if the galley does not hold one
+/// glyph per character on a single row.
+fn galley_cut_hint(galley: &Galley, text: &str, budget: i32) -> Option<usize> {
+    let [placed_row] = galley.rows.as_slice() else {
+        return None;
+    };
+    let glyphs = &placed_row.row.glyphs;
+    let mut chars = text.chars();
+    let mut end = 0usize;
+    let mut hint = 0usize;
+    for glyph in glyphs {
+        let ch = chars.next()?;
+        if ch != glyph.chr {
+            return None;
+        }
+        end += ch.len_utf8();
+        if glyph.max_x().ceil() as i32 > budget {
+            break;
+        }
+        hint = end;
+    }
+    Some(hint)
 }

@@ -203,6 +203,9 @@ pub struct DialogItem {
     pub verified: bool,
     /// Premium star badge.
     pub premium: bool,
+    /// Custom emoji status document painted after the name instead of the premium star
+    /// (`Ui::PeerBadge`): set for Premium users and channels with a shown status.
+    pub emoji_status_id: Option<u64>,
     /// Online presence dot (users only).
     pub online: bool,
     /// Active group call badge (groups/channels).
@@ -655,6 +658,9 @@ pub struct MessageSearchResult {
     pub send_state: DialogSendState,
     /// Whether this result belongs to an archived chat.
     pub archived: bool,
+    /// Media thumbnail / type icon of the matched message, drawn before the text like the chat
+    /// list's preview (`MessageView::prepare` with `ItemPreview` images).
+    pub media_preview: Option<DialogMediaPreview>,
 }
 
 /// Top (frequently contacted) peer item shown in the horizontal `TopPeersStrip`.
@@ -787,6 +793,17 @@ pub trait DialogsBackend: Send {
     /// `EmptyState::Loading`) instead of "no chats".
     fn chats_list_loaded(&self) -> bool {
         true
+    }
+
+    /// Version of everything the chat-list read methods return (`dialog_slice`,
+    /// `dialog_by_peer`, `archive_summary`, `chat_folders`, `chats_list_loaded`, ...): it
+    /// changes whenever their result may have changed, so a caller may keep the last result while
+    /// the version stays the same. Read it *before* the data it guards. Text derived from the
+    /// clock (relative dates, "typing" expiry, "last seen") is not covered.
+    ///
+    /// The default never repeats a value, so callers that cache by it always reload.
+    fn dialogs_version(&self) -> u64 {
+        crate::history::backend::unversioned_backend_version()
     }
 
     /// Looks up a single dialog item by `peer_id`.
@@ -1066,6 +1083,35 @@ pub trait DialogsBackend: Send {
     /// The first name of user `peer_id` for "Also delete for {user}" (`UserData::firstName`).
     fn peer_first_name(&self, _peer_id: PeerId) -> Option<String> {
         None
+    }
+
+    /// `CanDeleteChatForEveryone` (`boxes/moderate_messages_box.cpp`): a channel or supergroup
+    /// the account may delete (`ChannelData::canDelete`), else [`Self::can_revoke_full_history`].
+    /// Drives the "Delete for all members" checkbox of `DeleteChatBox`.
+    fn can_delete_chat_for_everyone(&self, peer_id: PeerId) -> bool {
+        self.can_revoke_full_history(peer_id)
+    }
+
+    /// `FiltersWithChat`: the folders that list `peer_id` among their included chats and would
+    /// still be valid without it (`ChatFilter::withoutAlways`). The default uses the dialog's
+    /// folder memberships.
+    fn folders_including_peer(&self, peer_id: PeerId) -> Vec<FilterId> {
+        self.dialog_by_peer(peer_id)
+            .map(|d| {
+                d.folders
+                    .into_iter()
+                    .filter(|&f| f != FilterId::ALL)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `RemoveChatFromFilters`: drops `peer_id` from the included chats of every folder of
+    /// [`Self::folders_including_peer`] (`messages.updateDialogFilter`).
+    fn remove_peer_from_all_folders(&mut self, peer_id: PeerId) {
+        for filter_id in self.folders_including_peer(peer_id) {
+            self.remove_peer_from_folder(peer_id, filter_id);
+        }
     }
 
     /// Unblocks `peer_id` (`contacts.unblock`) and, when `peer_id` is a non-support bot, sends

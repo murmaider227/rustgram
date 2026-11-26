@@ -15,6 +15,7 @@ pub mod geometry;
 pub mod grouped;
 pub mod list;
 pub mod media;
+pub mod reactions;
 pub mod selection;
 
 pub use consts::{FontMetrics, LayoutConsts};
@@ -32,7 +33,7 @@ pub use element::{
     compute_sequence_attach_states, count_bubble_rounding, count_message_rounding,
     count_service_date_rect, count_service_line_widths, date_badge_height, is_same_day,
     layout_message, layout_service_message, min_width_for_media, should_display_date,
-    unread_bar_height, unread_bar_margin_top, wide_chat_width,
+    skip_block_height, skip_block_width, unread_bar_height, unread_bar_margin_top, wide_chat_width,
 };
 pub use geometry::{
     BubbleCornerRounding, BubbleRounding, BubbleSelectionInterval, Margins, Point, Rect, RectParts,
@@ -49,16 +50,20 @@ pub use list::{
     is_message_position_valid,
 };
 pub use media::{
-    CallInput, ContactInput, DocumentInput, DocumentKind, GifInput, GifKind, LocationInput,
-    MediaInput, MediaLayout, PhotoInput, PollAnswerInput, PollInput, StickerInput, StickerKind,
-    WebPageInput, count_call_optimal_size, count_contact_optimal_size, count_desired_media_size,
-    count_document_current_size, count_document_optimal_size, count_gif_current_size,
-    count_gif_optimal_size, count_gif_thumb_size, count_location_current_size,
-    count_location_optimal_size, count_media_size, count_photo_current_size,
-    count_photo_media_size, count_photo_optimal_size, count_poll_current_size,
-    count_poll_optimal_size, count_sticker_optimal_size, count_web_page_current_size,
-    count_web_page_optimal_size, frame_resize_may_expand, sticker_emoji_size, sticker_max_size,
-    waveform_bar_count,
+    CallInput, ContactInput, DocumentInput, DocumentKind, ExpandDecision, GifInput, GifKind,
+    LocationInput, MediaInput, MediaLayout, PhotoInput, PollAnswerInput, PollInput, StickerInput,
+    StickerKind, WebPageInput, count_call_optimal_size, count_contact_optimal_size,
+    count_desired_media_size, count_document_current_size, count_document_optimal_size,
+    count_gif_current_size, count_gif_optimal_size, count_gif_thumb_size,
+    count_location_current_size, count_location_optimal_size, count_media_size,
+    count_photo_current_size, count_photo_media_size, count_photo_optimal_size,
+    count_poll_current_size, count_poll_optimal_size, count_sticker_optimal_size,
+    count_web_page_current_size, count_web_page_optimal_size, decide_frame_resize,
+    frame_resize_may_expand, sticker_emoji_size, sticker_max_size, waveform_bar_count,
+};
+pub use reactions::{
+    InlineReactionsLayout, format_count_to_short, inline_reactions_optimal_size,
+    layout_inline_reactions, reaction_count_button_width,
 };
 pub use selection::{
     ALL_TEXT_SELECTION, FULL_SELECTION, FlatSelectionEndpoint, HistorySelection,

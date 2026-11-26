@@ -84,11 +84,20 @@ impl EntryMenuRow {
         })
     }
 
-    /// Visible label of an item row (`None` for separators).
+    /// Visible label of an item row, without its shortcut (`None` for separators).
     #[must_use]
     pub fn label(&self) -> Option<&str> {
         match self {
-            Self::Item(item) => Some(&item.label),
+            Self::Item(item) => Some(split_shortcut(&item.label).0),
+            Self::Separator | Self::ExpandedSeparator => None,
+        }
+    }
+
+    /// Right-aligned shortcut text of an item row ("2h" in "Unmute\t2h").
+    #[must_use]
+    pub fn shortcut(&self) -> Option<&str> {
+        match self {
+            Self::Item(item) => split_shortcut(&item.label).1,
             Self::Separator | Self::ExpandedSeparator => None,
         }
     }
@@ -127,6 +136,16 @@ struct Metrics {
     top_shift: f32,
 }
 
+/// `Action::processAction`: the text before a `'\t'` is the label, the text after it is drawn
+/// right-aligned like a shortcut (e.g. "Unmute\t2h"). An empty shortcut draws nothing.
+#[must_use]
+pub fn split_shortcut(label: &str) -> (&str, Option<&str>) {
+    match label.split_once('\t') {
+        Some((text, shortcut)) => (text, (!shortcut.is_empty()).then_some(shortcut)),
+        None => (label, None),
+    }
+}
+
 /// Width of `menuIconSubmenuArrow` (24 px at 100%).
 fn submenu_arrow_width() -> f32 {
     st::menu_icon_submenu_arrow
@@ -155,15 +174,23 @@ fn measure(ctx: &egui::Context, rows: &[EntryMenuRow], style: &PopupMenuStyle) -
             }
             EntryMenuRow::Item(item) => {
                 y += row_h;
+                let (text, shortcut) = split_shortcut(&item.label);
                 let text_w = painter
-                    .layout_no_wrap(item.label.clone(), font.clone(), egui::Color32::WHITE)
+                    .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
                     .size()
                     .x;
-                // `Action::setMarkedText`: `itemRightSkip + arrow.width()` for submenu rows.
-                let arrow = if item.submenu.is_empty() {
-                    0.0
-                } else {
+                // `Action::setMarkedText`: `itemRightSkip + arrow.width()` for submenu rows,
+                // `itemRightSkip + font->width(shortcut)` for rows with a shortcut.
+                let arrow = if !item.submenu.is_empty() {
                     menu.item_right_skip + submenu_arrow_width()
+                } else if let Some(shortcut) = shortcut {
+                    menu.item_right_skip
+                        + painter
+                            .layout_no_wrap(shortcut.to_owned(), font.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x
+                } else {
+                    0.0
                 };
                 width =
                     width.max(menu.item_padding.left + text_w + arrow + menu.item_padding.right);
@@ -258,7 +285,11 @@ fn paint_rows(
                         );
                         out.item_rects.push((idx, item_rect));
                         let resp = ui.interact(item_rect, id.with(("row", idx)), Sense::click());
-                        let label = item.label.clone();
+                        let (text, shortcut) = split_shortcut(&item.label);
+                        let label = match shortcut {
+                            Some(shortcut) => format!("{text} {shortcut}"),
+                            None => text.to_owned(),
+                        };
                         resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &label));
                         if resp.hovered() {
                             out.hovered = Some(idx);
@@ -302,7 +333,7 @@ fn paint_rows(
                                 item_rect.center().y,
                             ),
                             Align2::LEFT_CENTER,
-                            &item.label,
+                            text,
                             font.clone(),
                             fg,
                         );
@@ -323,8 +354,28 @@ fn paint_rows(
                                 colors,
                                 Some(menu.item_fg),
                             );
-                        } else if resp.clicked() || (trigger_selected && selected == Some(idx)) {
-                            out.triggered = Some(item.id.clone());
+                        } else {
+                            if let Some(shortcut) = shortcut {
+                                // `p.drawTextRight(itemPadding.right(), ...)` in
+                                // `itemFgShortcut` / `itemFgShortcutOver`.
+                                painter.text(
+                                    Pos2::new(
+                                        item_rect.max.x - menu.item_padding.right,
+                                        item_rect.center().y,
+                                    ),
+                                    Align2::RIGHT_CENTER,
+                                    shortcut,
+                                    font.clone(),
+                                    if active {
+                                        menu.item_fg_shortcut_over
+                                    } else {
+                                        menu.item_fg_shortcut
+                                    },
+                                );
+                            }
+                            if resp.clicked() || (trigger_selected && selected == Some(idx)) {
+                                out.triggered = Some(item.id.clone());
+                            }
                         }
                         y += metrics.row_h;
                     }

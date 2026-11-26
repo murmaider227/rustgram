@@ -137,6 +137,7 @@ fn dist_stages_portable_folder_with_ffmpeg_and_licenses_zip_update_and_checksums
         // Point to non-existent ISCC path to verify graceful skip
         iscc_path: Some(tmp.path().join("nonexistent-iscc.exe")),
         require_iscc: false,
+        require_api_credentials: false,
     })
     .unwrap();
 
@@ -172,6 +173,24 @@ fn dist_stages_portable_folder_with_ffmpeg_and_licenses_zip_update_and_checksums
     let notices = fs::read_to_string(output.portable_dir.join(THIRD_PARTY_NOTICES_NAME)).unwrap();
     assert!(notices.contains("GPL-3.0"));
     assert!(notices.contains("FFmpeg"));
+    // TGB-2969: tdesktop's notification sound ships embedded and is credited.
+    assert!(notices.contains("msg_incoming.mp3"));
+    // TGB-2979: so do tdesktop's ten call and group-call sounds.
+    for key in [
+        "call_incoming",
+        "call_outgoing",
+        "call_connect",
+        "call_busy",
+        "call_end",
+        "group_call_start",
+        "group_call_connect",
+        "group_call_allowed",
+        "group_call_end",
+        "group_call_recording_start",
+    ] {
+        assert!(notices.contains(&format!("{key}.mp3")), "{key} is credited");
+    }
+    assert!(notices.contains("The Telegram Desktop Authors"));
     let privacy = fs::read_to_string(output.portable_dir.join(PRIVACY_NOTICE_NAME)).unwrap();
     assert!(privacy.contains("# Privacy policy"));
     assert!(
@@ -383,6 +402,7 @@ fn dist_file_list_and_installers_include_all_three_executables() {
         signing_key_path: Some(key_path),
         iscc_path: Some(tmp.path().join("missing-iscc.exe")),
         require_iscc: false,
+        require_api_credentials: false,
     })
     .unwrap();
 
@@ -672,4 +692,30 @@ fn inno_setup_paths_are_absolute_for_relative_out_dir() {
     assert!(
         args.contains(&"/DMyOutputBaseFilename=Rustgram-Setup-0.1.0-alpha.1-win-x64".to_owned())
     );
+}
+
+#[test]
+fn release_check_requires_the_api_credentials_compiled_in() {
+    use tg_xtask::dist::check_embedded_api_credentials;
+
+    // Synthetic placeholder values only.
+    let hash = "0123456789abcdef0123456789abcdef";
+    let with_hash = [b"MZ..prefix..".as_slice(), hash.as_bytes(), b"..suffix"].concat();
+    let without_hash = b"MZ..a build without credentials..".to_vec();
+
+    // No credentials for this build: nothing to check unless required.
+    assert!(!check_embedded_api_credentials(&without_hash, None, None, false).unwrap());
+    assert!(check_embedded_api_credentials(&without_hash, None, Some(" "), true).is_err());
+
+    // Credentials set: the binary must contain them.
+    assert!(check_embedded_api_credentials(&with_hash, Some("99001"), Some(hash), true).unwrap());
+    let err = check_embedded_api_credentials(&without_hash, Some("99001"), Some(hash), false)
+        .expect_err("missing embedded hash must fail");
+    assert!(
+        !err.to_string().contains(hash),
+        "the error must not print the secret"
+    );
+
+    // Half-set secrets fail the release.
+    assert!(check_embedded_api_credentials(&with_hash, Some("99001"), None, false).is_err());
 }

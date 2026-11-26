@@ -5,8 +5,9 @@
 //! `Telegram/SourceFiles/intro/intro_widget.cpp` (`createLanguageLink`).
 
 use egui::{Align, Key, Layout, RichText, Ui};
-use tg_lang::{Language, tr, with_current, with_current_mut};
+use tg_lang::{tr, with_current};
 
+use crate::intro::language_link::LanguageSuggestion;
 use crate::intro::style::{INTRO_NEXT_BUTTON_WIDTH, link_button, primary_intro_button};
 use tg_app_core::stand_in::theme::Palette;
 
@@ -15,17 +16,20 @@ use tg_app_core::stand_in::theme::Palette;
 pub enum StartStepAction {
     /// User clicked "Start Messaging" (or pressed Enter).
     StartMessaging,
-    /// User clicked the language switch link below the primary button.
+    /// User clicked the language link below the primary button (switch to the suggested
+    /// language, or back to English).
     ToggleLanguage,
 }
 
 /// Local UI state for the Start step (`intro_start.cpp`).
 #[derive(Debug, Clone)]
 pub struct StartStepState {
-    /// Suggested alternate language code offered by the bottom switch link.
-    pub suggested_lang_id: String,
-    /// Localized prompt text for switching to the suggested language.
-    pub suggested_lang_label: String,
+    /// Server-suggested language and its `lng_switch_to_this` text; `None` until
+    /// `help.getConfig` suggests a language whose strings loaded.
+    pub suggestion: Option<LanguageSuggestion>,
+    /// Whether the language link may be shown. tdesktop hides it when an account is already
+    /// logged in (the add-account intro).
+    pub language_link_enabled: bool,
 }
 
 impl Default for StartStepState {
@@ -35,85 +39,44 @@ impl Default for StartStepState {
 }
 
 impl StartStepState {
-    /// Creates a new `StartStepState` with a default alternate language suggestion.
+    /// Creates a new `StartStepState` with no language suggestion (no link until the server
+    /// suggests a language).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            suggested_lang_id: "de".to_owned(),
-            suggested_lang_label: "Auf Deutsch fortfahren".to_owned(),
+            suggestion: None,
+            language_link_enabled: true,
         }
     }
 
-    /// Returns the label for the language switch link (`Intro::Widget::createLanguageLink`).
+    /// Returns the label for the language switch link, or `None` when there is no link
+    /// (`Intro::Widget::createLanguageLink`).
     ///
-    /// When the active `tg-lang` pack is not the default English pack, displays the original
-    /// `"Continue in English"` (`get_original_value(lng_switch_to_this)`); otherwise offers
-    /// the suggested language label.
+    /// When the active `tg-lang` pack is not the default English pack, the link offers the
+    /// original `"Continue in English"` (`get_original_value(lng_switch_to_this)`); otherwise it
+    /// offers the server-suggested language with the server's `lng_switch_to_this` text.
     #[must_use]
-    pub fn language_link_label(&self) -> String {
+    pub fn language_link_label(&self) -> Option<String> {
         let current_id = with_current(|inst| tg_lang::language_id_or_default(inst.id()).to_owned());
-        let default_id = tg_lang::default_language_id();
-        if current_id != default_id {
-            tg_lang::get_original_value(tg_lang::key_ids::lng_switch_to_this).to_owned()
-        } else {
-            self.suggested_lang_label.clone()
-        }
+        self.language_link_label_for(&current_id)
     }
 
-    /// Toggles `tg-lang`'s active global language pack between default English and a sample
-    /// localized intro pack (demonstrating live `tg-lang::tr::*` updates without network).
-    pub fn toggle_language(&mut self) {
-        let current_id = with_current(|inst| tg_lang::language_id_or_default(inst.id()).to_owned());
-        let default_id = tg_lang::default_language_id();
-        if current_id != default_id {
-            with_current_mut(|inst| {
-                inst.switch_to_id(&Language::default_english());
-            });
-        } else {
-            let suggested = self.suggested_lang_id.clone();
-            with_current_mut(|inst| {
-                inst.switch_to_id(&Language {
-                    id: suggested.clone(),
-                    plural_id: suggested.clone(),
-                    base_id: String::new(),
-                    name: "German".to_owned(),
-                    native_name: "Deutsch".to_owned(),
-                });
-                let diff = tg_lang::LangPackDifference {
-                    lang_code: suggested,
-                    from_version: 0,
-                    version: 1,
-                    strings: vec![
-                        tg_lang::LangPackString::Normal {
-                            key: "lng_intro_about".to_owned(),
-                            value: "Willkommen bei Rustgram Desktop.\nSchnell und sicher."
-                                .to_owned(),
-                        },
-                        tg_lang::LangPackString::Normal {
-                            key: "lng_start_msgs".to_owned(),
-                            value: "Messaging starten".to_owned(),
-                        },
-                        tg_lang::LangPackString::Normal {
-                            key: "lng_intro_qr_title".to_owned(),
-                            value: "Mit mobilem Telegram scannen".to_owned(),
-                        },
-                        tg_lang::LangPackString::Normal {
-                            key: "lng_intro_qr_phone".to_owned(),
-                            value: "Mit Telefonnummer anmelden".to_owned(),
-                        },
-                        tg_lang::LangPackString::Normal {
-                            key: "lng_phone_title".to_owned(),
-                            value: "Deine Telefonnummer".to_owned(),
-                        },
-                        tg_lang::LangPackString::Normal {
-                            key: "lng_intro_next".to_owned(),
-                            value: "Weiter".to_owned(),
-                        },
-                    ],
-                };
-                let _ = inst.apply_difference(tg_lang::Pack::Current, &diff);
-            });
+    /// [`Self::language_link_label`] for an explicit active language id.
+    #[must_use]
+    pub fn language_link_label_for(&self, current_id: &str) -> Option<String> {
+        if !self.language_link_enabled {
+            return None;
         }
+        let current_id = tg_lang::language_id_or_default(current_id);
+        if current_id != tg_lang::default_language_id() {
+            return Some(
+                tg_lang::get_original_value(tg_lang::key_ids::lng_switch_to_this).to_owned(),
+            );
+        }
+        self.suggestion
+            .as_ref()
+            .filter(|s| s.lang_id != current_id)
+            .map(|s| s.label.clone())
     }
 
     /// Renders the Start step body below the gradient cover (`StartWidget`).
@@ -149,10 +112,11 @@ impl StartStepState {
                 action = Some(StartStepAction::StartMessaging);
             }
 
-            ui.add_space(18.0);
-            let lang_label = self.language_link_label();
-            if link_button(ui, &lang_label, palette).clicked() {
-                action = Some(StartStepAction::ToggleLanguage);
+            if let Some(lang_label) = self.language_link_label() {
+                ui.add_space(18.0);
+                if link_button(ui, &lang_label, palette).clicked() {
+                    action = Some(StartStepAction::ToggleLanguage);
+                }
             }
         });
 

@@ -111,6 +111,56 @@ impl BubbleHoverQuickActions {
 }
 
 #[cfg(test)]
+mod tests_strip_side {
+    use super::*;
+
+    fn rect(l: f32, r: f32) -> Rect {
+        Rect::from_min_max(Pos2::new(l, 100.0), Pos2::new(r, 140.0))
+    }
+
+    const STRIP_W: f32 = 56.0; // two 26px buttons + 4px gap
+
+    fn overlaps(bubble: Rect, strip_left: f32) -> bool {
+        strip_left < bubble.right() && strip_left + STRIP_W > bubble.left()
+    }
+
+    #[test]
+    fn short_left_aligned_outgoing_bubble_gets_buttons_outside_on_the_right() {
+        // Wide chat mode: an outgoing bubble sits at the left edge (owner's screenshot).
+        let row = rect(0.0, 700.0);
+        let bubble = rect(12.0, 120.0);
+        let x = quick_action_strip_left(bubble, row, STRIP_W, false);
+        assert!(
+            x >= bubble.right(),
+            "strip starts at {x}, bubble ends at {}",
+            bubble.right()
+        );
+        assert!(!overlaps(bubble, x));
+    }
+
+    #[test]
+    fn right_aligned_bubble_gets_buttons_on_the_left() {
+        let row = rect(0.0, 700.0);
+        let bubble = rect(600.0, 688.0);
+        let x = quick_action_strip_left(bubble, row, STRIP_W, true);
+        assert!(x + STRIP_W <= bubble.left());
+    }
+
+    #[test]
+    fn no_room_on_preferred_side_switches_side_instead_of_overlapping() {
+        let row = rect(0.0, 700.0);
+        // Right-aligned flag but the bubble hugs the left edge: no room on the left.
+        let bubble = rect(6.0, 90.0);
+        let x = quick_action_strip_left(bubble, row, STRIP_W, true);
+        assert!(!overlaps(bubble, x), "strip at {x} overlaps bubble");
+        // Left-aligned bubble that reaches the right edge: buttons go to its left.
+        let wide = rect(300.0, 696.0);
+        let x = quick_action_strip_left(wide, row, STRIP_W, false);
+        assert!(!overlaps(wide, x), "strip at {x} overlaps bubble");
+    }
+}
+
+#[cfg(test)]
 mod tests_wp75 {
     use super::*;
 
@@ -129,13 +179,45 @@ mod tests_wp75 {
     }
 }
 
+/// Left x of the hover quick-action strip (`total_w` wide) beside `bubble_rect`.
+///
+/// tdesktop (`Message::reactionButtonParameters`) puts the corner buttons on the left of a
+/// right-aligned bubble (`hasRightLayout()`) and on the right of every other bubble, outside
+/// the bubble geometry. The side is chosen by the bubble's alignment, not by "outgoing": in a
+/// wide chat an outgoing bubble is left-aligned. If the preferred side has no room inside the
+/// row the strip goes to the other side; it never overlaps the bubble when either side fits.
+#[must_use]
+pub fn quick_action_strip_left(
+    bubble_rect: Rect,
+    row_rect: Rect,
+    total_w: f32,
+    has_right_layout: bool,
+) -> f32 {
+    const MARGIN_X: f32 = 8.0;
+    const EDGE: f32 = 6.0;
+    let left_x = bubble_rect.left() - MARGIN_X - total_w;
+    let right_x = bubble_rect.right() + MARGIN_X;
+    let fits_left = left_x >= row_rect.left() + EDGE;
+    let fits_right = right_x + total_w <= row_rect.right() - EDGE;
+    match (has_right_layout, fits_left, fits_right) {
+        (true, true, _) | (false, true, false) => left_x,
+        (false, _, true) | (true, false, true) => right_x,
+        // Neither side fits (a bubble as wide as the row): keep tdesktop's clamp to the row.
+        (true, false, false) => row_rect.left() + EDGE,
+        (false, false, false) => row_rect.right() - EDGE - total_w,
+    }
+}
+
 /// Paints compact hover corner quick-action buttons beside `bubble_rect` (Quick Reply, Quick
 /// React) and returns any triggered [`HistoryQuickActionOutcome`].
+///
+/// `has_right_layout` is the bubble's `MessageLayout::has_right_layout`.
 #[allow(clippy::too_many_arguments)]
 pub fn show_bubble_hover_quick_actions(
     ui: &mut Ui,
     bubble_rect: Rect,
     row_rect: Rect,
+    has_right_layout: bool,
     msg: &HistoryMessage,
     corner_reply: bool,
     corner_reaction: bool,
@@ -148,7 +230,6 @@ pub fn show_bubble_hover_quick_actions(
     }
     let btn_size = 26.0;
     let gap = 4.0;
-    let margin_x = 8.0;
 
     let mut buttons: Vec<(
         tg_ui::tg_style::Icon,
@@ -184,11 +265,7 @@ pub fn show_bubble_hover_quick_actions(
     }
 
     let total_w = buttons.len() as f32 * btn_size + buttons.len().saturating_sub(1) as f32 * gap;
-    let start_x = if msg.outgoing {
-        (bubble_rect.left() - margin_x - total_w).max(row_rect.left() + 6.0)
-    } else {
-        (bubble_rect.right() + margin_x).min(row_rect.right() - total_w - 6.0)
-    };
+    let start_x = quick_action_strip_left(bubble_rect, row_rect, total_w, has_right_layout);
     let center_y = (bubble_rect.bottom() - 16.0).clamp(
         bubble_rect.top() + btn_size * 0.5,
         bubble_rect.bottom() - btn_size * 0.5,

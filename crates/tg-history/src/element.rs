@@ -25,7 +25,8 @@ use crate::consts::{
 };
 use crate::datetime::{CivilDate, LocalDateTime};
 use crate::geometry::{BubbleCornerRounding, BubbleRounding, Rect, Size};
-use crate::media::{MediaInput, MediaLayout};
+use crate::media::{GifKind, MediaInput, MediaLayout};
+use crate::reactions::{inline_reactions_optimal_size, layout_inline_reactions};
 use tg_data::{MsgId, PeerId, TimeId};
 
 /// Chat layout mode affecting bubble alignment and max width (`HistoryView::ElementChatMode`).
@@ -620,8 +621,12 @@ pub struct MessageInput {
     /// True if bottom info is hidden (e.g. certain service-like states).
     pub hides_bottom_info: bool,
 
-    /// Reactions bar optimal size (`Size::ZERO` if no reactions).
+    /// Reactions bar optimal size (`Size::ZERO` if no reactions). Ignored when
+    /// `reaction_button_widths` is set.
     pub reactions_size: Size,
+    /// Width of each reaction chip in display order (`InlineList` buttons). When set, the
+    /// chips wrap onto rows and the bottom info gets a skip block after the last chip.
+    pub reaction_button_widths: Vec<i32>,
     /// True if reactions are embedded inside the bubble rather than below it.
     pub reactions_in_bubble: bool,
 
@@ -672,6 +677,9 @@ pub struct MessageLayout {
     pub bottom_info: BottomInfoLayout,
     /// Reactions bar rectangle (empty if no reactions).
     pub reactions_rect: Rect,
+    /// One rectangle per reaction chip in element coordinates (empty unless
+    /// `MessageInput::reaction_button_widths` was set).
+    pub reaction_buttons: Vec<Rect>,
     /// Inline keyboard rectangle below the bubble (empty if no keyboard).
     pub keyboard_rect: Rect,
     /// Comments button rectangle at the bottom of the bubble (empty if absent).
@@ -789,6 +797,20 @@ pub fn min_width_for_media(
     result
 }
 
+/// Width of the skip block the bottom info reserves after the last text line or reaction
+/// chip (`Element::skipBlockWidth`: `msgDateSpace + infoWidth - msgDateDelta.x`).
+#[must_use]
+pub const fn skip_block_width(info_width: i32) -> i32 {
+    MSG_DATE_SPACE + info_width - MSG_DATE_DELTA.x
+}
+
+/// Height of the bottom info skip block (`Element::skipBlockHeight`:
+/// `msgDateFont->height - msgDateDelta.y`).
+#[must_use]
+pub const fn skip_block_height(fonts: &FontMetrics) -> i32 {
+    fonts.date.height - MSG_DATE_DELTA.y
+}
+
 /// Computes the complete layout of a chat message at `viewport_width`
 /// (`Message::performCountOptimalSize`, `Message::resizeContentGetHeight`, `Message::countGeometry`).
 #[must_use]
@@ -856,6 +878,7 @@ pub fn layout_message(
             bottom_info_display: InfoDisplayType::Default,
             bottom_info: BottomInfoLayout::default(),
             reactions_rect: Rect::ZERO,
+            reaction_buttons: Vec::new(),
             keyboard_rect: Rect::ZERO,
             comments_rect: Rect::ZERO,
             media_layout: None,
@@ -883,17 +906,39 @@ pub fn layout_message(
         .as_ref()
         .map(|m| m.layout(MSG_MAX_WIDTH, has_header, has_visible_text, fonts));
 
+    // `Message::drawBubble`: unwrapped media (stickers, round videos) never get a bubble for a
+    // header alone (`UnwrappedMedia::needsBubble`, `Gif::needsBubble` for video messages);
+    // their reply / via / forwarded info goes to a side plate instead.
     let draw_bubble = match &probe_media {
-        Some(ml) => has_visible_text || ml.needs_bubble || has_header,
+        Some(ml) => has_visible_text || ml.needs_bubble || (has_header && !ml.unwrapped),
         None => !input.is_empty,
     };
     let unwrapped = match &probe_media {
-        Some(ml) => !has_visible_text && ml.unwrapped && !has_header,
+        Some(ml) => !has_visible_text && ml.unwrapped,
         None => input.is_empty,
     };
+    let is_round_video = matches!(
+        input.media,
+        Some(MediaInput::Gif(ref g)) if matches!(g.kind, GifKind::VideoMessage)
+    );
 
-    let has_reactions = !input.reactions_size.is_empty();
+    let chips = &input.reaction_button_widths;
+    let has_reactions = !chips.is_empty() || !input.reactions_size.is_empty();
     let reactions_in_bubble = has_reactions && input.reactions_in_bubble && draw_bubble;
+    // `Message::refreshInfoSkipBlock`: in-bubble reactions carry the bottom info's skip block.
+    let reactions_skip = if reactions_in_bubble && !input.hides_bottom_info {
+        Size::new(
+            skip_block_width(bottom_info_opt.optimal_size.width),
+            skip_block_height(fonts),
+        )
+    } else {
+        Size::ZERO
+    };
+    let reactions_optimal = if chips.is_empty() {
+        input.reactions_size
+    } else {
+        inline_reactions_optimal_size(chips, reactions_skip, reactions_in_bubble)
+    };
 
     // 1. Optimal size (performCountOptimalSize, history_view_message.cpp:1514-1733).
     // Text skip block reserved for the bottom info on the last line (`Ui::Text::String`
@@ -903,7 +948,7 @@ pub fn layout_message(
         && !has_reactions
         && probe_media.is_none()
     {
-        MSG_DATE_SPACE + bottom_info_opt.optimal_size.width
+        skip_block_width(bottom_info_opt.optimal_size.width)
     } else {
         0
     };
@@ -923,11 +968,22 @@ pub fn layout_message(
             min_height = input.text_min_height.max(fonts.normal.height);
         }
         if reactions_in_bubble {
-            let reactions_max_w = MSG_PADDING.horizontal() + input.reactions_size.width;
+            let reactions_max_w = MSG_PADDING.horizontal() + reactions_optimal.width;
             let limited = MSG_MAX_WIDTH.min(reactions_max_w);
             max_width = max_width.max(limited);
             non_text_max = non_text_max.max(limited);
-            min_height += MEDIA_IN_BUBBLE_SKIP + input.reactions_size.height;
+            min_height += MEDIA_IN_BUBBLE_SKIP;
+            min_height += if chips.is_empty() || max_width >= reactions_max_w {
+                reactions_optimal.height
+            } else {
+                layout_inline_reactions(
+                    chips,
+                    reactions_skip,
+                    max_width - MSG_PADDING.horizontal(),
+                    true,
+                )
+                .height
+            };
         }
         let media_on_bottom = probe_media.as_ref().is_some_and(|m| m.is_bubble_bottom);
         let media_on_top = probe_media.as_ref().is_some_and(|m| m.is_bubble_top);
@@ -1104,6 +1160,7 @@ pub fn layout_message(
     let mut text_rect = Rect::ZERO;
     let mut media_rect = Rect::ZERO;
     let mut reactions_rect = Rect::ZERO;
+    let mut reaction_buttons = Vec::new();
     let mut comments_rect = Rect::ZERO;
 
     if draw_bubble {
@@ -1198,13 +1255,25 @@ pub fn layout_message(
 
         if reactions_in_bubble {
             y += MEDIA_IN_BUBBLE_SKIP;
-            reactions_rect = Rect::new(
-                content_left + MSG_PADDING.left,
-                y,
-                inner_width.min(input.reactions_size.width),
-                input.reactions_size.height,
-            );
-            y += input.reactions_size.height;
+            let left = content_left + MSG_PADDING.left;
+            if chips.is_empty() {
+                reactions_rect = Rect::new(
+                    left,
+                    y,
+                    inner_width.min(input.reactions_size.width),
+                    input.reactions_size.height,
+                );
+                y += input.reactions_size.height;
+            } else {
+                let block = layout_inline_reactions(chips, reactions_skip, inner_width, true);
+                reactions_rect = Rect::new(left, y, inner_width, block.height);
+                reaction_buttons = block
+                    .buttons
+                    .iter()
+                    .map(|b| Rect::new(left + b.x, y + b.y, b.width, b.height))
+                    .collect();
+                y += block.height;
+            }
         }
 
         if !media_on_bottom {
@@ -1244,14 +1313,37 @@ pub fn layout_message(
     }
     if has_reactions && !reactions_in_bubble {
         let r_top = margin_top + total_content_height + MEDIA_IN_BUBBLE_SKIP;
-        let r_w = input.reactions_size.width.min(content_width);
+        let block = (!chips.is_empty())
+            .then(|| layout_inline_reactions(chips, Size::ZERO, content_width, false));
+        let (r_w, r_h) = match &block {
+            Some(b) => (
+                b.buttons
+                    .iter()
+                    .map(|r| r.x + r.width)
+                    .max()
+                    .unwrap_or(0)
+                    .min(content_width),
+                b.height,
+            ),
+            None => (
+                input.reactions_size.width.min(content_width),
+                input.reactions_size.height,
+            ),
+        };
         let r_x = if has_right_layout {
             content_left + content_width - r_w
         } else {
             content_left
         };
-        reactions_rect = Rect::new(r_x, r_top, r_w, input.reactions_size.height);
-        total_content_height += MEDIA_IN_BUBBLE_SKIP + input.reactions_size.height;
+        reactions_rect = Rect::new(r_x, r_top, r_w, r_h);
+        if let Some(b) = block {
+            reaction_buttons = b
+                .buttons
+                .iter()
+                .map(|r| Rect::new(r_x + r.x, r_top + r.y, r.width, r.height))
+                .collect();
+        }
+        total_content_height += MEDIA_IN_BUBBLE_SKIP + r_h;
     }
 
     let total_height = margin_top + total_content_height + margin_bottom;
@@ -1265,6 +1357,29 @@ pub fn layout_message(
     // 4. Bottom info placement rectangle.
     let (bottom_info_display, bottom_info_rect) = if input.hides_bottom_info {
         (InfoDisplayType::Default, Rect::ZERO)
+    } else if unwrapped && is_round_video {
+        // `Gif::draw` (history_view_gif.cpp:1052-1084): the info pill hangs off the circle's
+        // bottom-right, left-aligned at `infoWidth - normalFont->height` past the circle edge.
+        let pill_w = bottom_info.current_size.width + 2 * MSG_DATE_IMG_PADDING.x;
+        let pill_h = bottom_info.current_size.height + 2 * MSG_DATE_IMG_PADDING.y;
+        let circle = media_rect.width.min(media_rect.height);
+        let mut full_right = media_rect.x + circle;
+        if !has_right_layout {
+            let max_right = viewport_width
+                - MSG_MARGIN.left
+                - if input.has_from_photo {
+                    MSG_MARGIN.right
+                } else {
+                    MSG_MARGIN.left
+                };
+            full_right = (full_right + bottom_info_opt.optimal_size.width - fonts.normal.height)
+                .min(max_right);
+        }
+        let y = media_rect.y + media_rect.height - MSG_DATE_IMG_DELTA - pill_h;
+        (
+            InfoDisplayType::Background,
+            Rect::new(full_right - pill_w, y, pill_w, pill_h),
+        )
     } else if unwrapped {
         let pill_w = bottom_info.current_size.width + 2 * MSG_DATE_IMG_PADDING.x;
         let pill_h = bottom_info.current_size.height + 2 * MSG_DATE_IMG_PADDING.y;
@@ -1331,6 +1446,7 @@ pub fn layout_message(
         bottom_info_display,
         bottom_info,
         reactions_rect,
+        reaction_buttons,
         keyboard_rect,
         comments_rect,
         media_layout: final_media,

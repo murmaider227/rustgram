@@ -1504,13 +1504,16 @@ impl WindowShellExtras {
 
     /// Renders active preview / switcher overlays and separate chat viewports.
     ///
+    /// `dialogs` builds the main chat list. It is called only when a separate chat window opens
+    /// (for its title) or is open (for its preview), so a frame without one never builds the list.
+    ///
     /// Returns an optional `PeerId` to open in the main window if the user selected one.
     pub fn show_overlays(
         &mut self,
         ctx: &egui::Context,
         viewport_rect: Rect,
         palette: &Palette,
-        dialogs: &[tg_app_core::stand_in::types::DialogEntry],
+        dialogs: &dyn Fn() -> Vec<tg_app_core::stand_in::types::DialogEntry>,
     ) -> Option<PeerId> {
         let mut open_peer = None;
 
@@ -1518,10 +1521,10 @@ impl WindowShellExtras {
             match act {
                 ChatPreviewAction::OpenChat(peer) => open_peer = Some(peer),
                 ChatPreviewAction::OpenSeparateWindow(peer) => {
-                    let title = dialogs
-                        .iter()
+                    let title = dialogs()
+                        .into_iter()
                         .find(|d| d.peer.id == peer)
-                        .map_or_else(|| format!("Chat {}", peer.0), |d| d.peer.title.clone());
+                        .map_or_else(|| format!("Chat {}", peer.0), |d| d.peer.title);
                     self.saved_windows
                         .open_window(SavedChatWindow::new(peer, title));
                 }
@@ -1538,6 +1541,7 @@ impl WindowShellExtras {
         }
 
         if !self.saved_windows.open_windows().is_empty() {
+            let dialogs = dialogs();
             let _ = self.saved_windows.show_viewports(ctx, palette, |peer| {
                 dialogs
                     .iter()
@@ -1722,5 +1726,47 @@ mod tests {
             Some(ChatSwitchAction::Choose(PeerId::from_user(3)))
         );
         assert!(!harness.state().0.is_active());
+    }
+
+    /// The per-frame overlay pass must not build the chat list: it used to convert every chat
+    /// of the account on every frame for a lookup that only separate chat windows need.
+    #[test]
+    fn overlays_build_the_chat_list_only_for_separate_windows() {
+        use std::cell::Cell;
+
+        let ctx = egui::Context::default();
+        let palette = Palette::for_mode(ThemeMode::Day);
+        let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let mut extras = WindowShellExtras::new();
+        let built = Cell::new(0_u32);
+        let dialogs = || {
+            built.set(built.get() + 1);
+            Vec::new()
+        };
+        let run_frames = |extras: &mut WindowShellExtras, frames: usize| {
+            for _ in 0..frames {
+                let input = egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                };
+                ctx.run_ui(input, |ui| {
+                    let _ = extras.show_overlays(ui.ctx(), viewport, &palette, &dialogs);
+                })
+                .drop_without_applying_deltas();
+            }
+        };
+
+        run_frames(&mut extras, 60);
+        assert_eq!(built.get(), 0, "idle frames must not build the chat list");
+
+        extras
+            .saved_windows
+            .open_window(SavedChatWindow::new(PeerId::from_user(10), "Saved Notes"));
+        run_frames(&mut extras, 3);
+        assert_eq!(
+            built.get(),
+            3,
+            "an open separate window reads the list once per frame"
+        );
     }
 }

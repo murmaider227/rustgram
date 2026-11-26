@@ -7,7 +7,8 @@
 //! `tray_win.cpp` (`IsDarkTaskbar`), and `main_window_win.cpp` (dark title bar).
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::registration::RegistryRoot;
@@ -358,6 +359,19 @@ pub fn system_country() -> String {
     }
 }
 
+/// Decimal separator of the user's regional format (`QLocale().decimalPoint()`), `'.'` when
+/// it cannot be read.
+pub fn system_decimal_point() -> char {
+    #[cfg(windows)]
+    {
+        win_sys::system_decimal_point()
+    }
+    #[cfg(not(windows))]
+    {
+        '.'
+    }
+}
+
 /// Return the BCP-47 UI language tag for the current user (e.g. `"en-US"`).
 pub fn system_language() -> String {
     #[cfg(windows)]
@@ -402,9 +416,29 @@ pub fn is_dark_mode_in(root: &RegistryRoot) -> Option<bool> {
     }
 }
 
+/// How long [`is_dark_taskbar`] reuses its last registry read.
+const DARK_TASKBAR_TTL: Duration = Duration::from_secs(2);
+
+/// Last [`is_dark_taskbar`] answer and when the registry was read for it.
+static DARK_TASKBAR_CACHE: Mutex<Option<(Instant, Option<bool>)>> = Mutex::new(None);
+
 /// Check whether the Windows taskbar uses dark mode (`SystemUsesLightTheme == 0`).
+///
+/// The app asks every frame, so the registry is read at most every [`DARK_TASKBAR_TTL`]; a
+/// changed taskbar theme shows within that time. [`is_dark_taskbar_in`] always reads.
 pub fn is_dark_taskbar() -> Option<bool> {
-    is_dark_taskbar_in(&RegistryRoot::hkcu())
+    let now = Instant::now();
+    if let Ok(cache) = DARK_TASKBAR_CACHE.lock()
+        && let Some((read_at, value)) = *cache
+        && now.duration_since(read_at) < DARK_TASKBAR_TTL
+    {
+        return value;
+    }
+    let value = is_dark_taskbar_in(&RegistryRoot::hkcu());
+    if let Ok(mut cache) = DARK_TASKBAR_CACHE.lock() {
+        *cache = Some((now, value));
+    }
+    value
 }
 
 /// Parameterized variant of [`is_dark_taskbar`] reading from `root` for unit testing.
@@ -627,7 +661,8 @@ mod win_sys {
         WPARAM,
     };
     use windows::Win32::Globalization::{
-        GetLocaleInfoEx, GetUserDefaultUILanguage, LOCALE_SISO3166CTRYNAME, LOCALE_SNAME,
+        GetLocaleInfoEx, GetUserDefaultUILanguage, LOCALE_SDECIMAL, LOCALE_SISO3166CTRYNAME,
+        LOCALE_SNAME,
     };
     use windows::Win32::Graphics::Dwm::{
         DWMWA_USE_IMMERSIVE_DARK_MODE, DwmGetColorizationColor, DwmSetWindowAttribute,
@@ -785,6 +820,20 @@ mod win_sys {
             String::from_utf16_lossy(&buf[..(len as usize - 1)])
         } else {
             String::new()
+        }
+    }
+
+    pub(crate) fn system_decimal_point() -> char {
+        let mut buf = [0u16; 8];
+        // SAFETY: Valid output buffer for GetLocaleInfoEx (NULL = LOCALE_NAME_USER_DEFAULT).
+        let len = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_SDECIMAL, Some(&mut buf)) };
+        if len > 1 {
+            char::decode_utf16(buf[..(len as usize - 1)].iter().copied())
+                .next()
+                .and_then(|unit| unit.ok())
+                .unwrap_or('.')
+        } else {
+            '.'
         }
     }
 
@@ -1346,6 +1395,31 @@ mod win_sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dark_taskbar_is_read_from_the_registry_at_most_every_ttl() {
+        const CALLS: u32 = 2000;
+        let fresh = is_dark_taskbar_in(&RegistryRoot::hkcu());
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            assert_eq!(is_dark_taskbar_in(&RegistryRoot::hkcu()), fresh);
+        }
+        let registry = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            assert_eq!(is_dark_taskbar(), fresh);
+        }
+        let cached = started.elapsed();
+        println!(
+            "measured: registry read {:.2} us/frame, cached {:.3} us/frame",
+            registry.as_secs_f64() * 1e6 / f64::from(CALLS),
+            cached.as_secs_f64() * 1e6 / f64::from(CALLS)
+        );
+        let cache = DARK_TASKBAR_CACHE.lock().map(|c| *c).ok().flatten();
+        assert_eq!(cache.map(|(_, value)| value), Some(fresh));
+        #[cfg(windows)]
+        assert!(cached < registry);
+    }
 
     #[test]
     fn sec2a_l8_open_url_allows_location_settings_only() {

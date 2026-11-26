@@ -580,14 +580,9 @@ fn wp75_channel_pull_bar_hidden_at_rest_and_shown_on_overscroll() {
         h.query_by_label_contains(&prompt).is_none(),
         "no pull-to-next-channel bar at rest"
     );
-    let now = h.ctx.input(|i| i.time);
-    h.state_mut()
-        .controller
-        .main_widget_mut()
-        .history_mut()
-        .pull_next_channel_mut()
-        .feed_bottom_overscroll(20.0, now, true);
-    step_frames(&mut h, 1);
+    // A phased pull past the bottom (`e2e_tgb2971_pull_next_channel`); a wheel never shows it.
+    let at = crate::e2e_tgb2971_pull_next_channel::list_point(WORKSPACE);
+    crate::e2e_tgb2971_pull_next_channel::pull(&mut h, at, 50.0);
     assert!(
         h.query_by_label_contains(&prompt).is_some(),
         "over-scrolling past the bottom shows the bar"

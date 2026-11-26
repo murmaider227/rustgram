@@ -13,12 +13,15 @@ use tg_ui::icons::paint_style_icon;
 use tg_ui::tg_style::st;
 use tg_ui::theme::Colors;
 
-use crate::dialogs::backend::{DialogListQuery, DialogsBackend};
+use std::sync::Arc;
+
+use crate::dialogs::backend::{ChatFolder, DialogListQuery, DialogsBackend};
 use crate::dialogs::filters_menu::{
     FiltersMenuAction, FiltersMenuWidget, show_horizontal_folder_tabs,
 };
 use crate::dialogs::inner::{DialogsInnerWidget, InnerAction};
 use crate::dialogs::layout::{DialogColors, paint_semibold_text};
+use crate::dialogs::list_cache::VersionedRead;
 use crate::dialogs::search::{
     DialogsSearchState, HashOrCashtag, SearchKeyboardItem, SearchViewAction,
     collect_search_keyboard_items_with_sponsored, fix_hashtag_search_query,
@@ -229,6 +232,8 @@ pub struct DialogsPanel {
     last_promo_snapshot: Option<PromoDataSnapshot>,
     last_birthdays_date: Option<(i32, u8, u8)>,
     request_search_focus: bool,
+    /// Folder list for the sidebar and the tabs, read only when the backend's version moves.
+    folders: VersionedRead<Vec<ChatFolder>>,
 }
 
 /// `dialogsMenuToggle` width / height.
@@ -261,7 +266,23 @@ impl DialogsPanel {
             last_promo_snapshot: None,
             last_birthdays_date: None,
             request_search_focus: false,
+            folders: VersionedRead::default(),
         }
+    }
+
+    /// The folders shown by the sidebar and the tabs. Counting a folder's unread chats walks
+    /// its chats, so the list is read when [`DialogsBackend::dialogs_version`] moves, not on
+    /// every frame.
+    fn shown_folders(&mut self, ui: &Ui, backend: &dyn DialogsBackend) -> Arc<Vec<ChatFolder>> {
+        let version = backend.dialogs_version();
+        let time = ui.input(|i| i.time);
+        self.folders.get(version, time, || backend.chat_folders())
+    }
+
+    /// Times the folder list was read from the backend for the sidebar and the tabs.
+    #[must_use]
+    pub const fn folder_list_reads(&self) -> u64 {
+        self.folders.reads()
     }
 
     /// Forces a fresh `DialogsBackend::contact_birthdays` query on the next render frame.
@@ -514,7 +535,7 @@ impl DialogsPanel {
         backend: &mut dyn DialogsBackend,
         palette: &Palette,
     ) -> Option<DialogsPanelAction> {
-        let folders = backend.chat_folders();
+        let folders = self.shown_folders(ui, &*backend);
         let act = self
             .filters_sidebar
             .show(ui, &folders, self.active_filter, palette)?;
@@ -534,12 +555,14 @@ impl DialogsPanel {
             }
             FiltersMenuAction::MarkFolderRead(fid) => {
                 backend.mark_folder_read(fid);
+                self.folders.invalidate();
                 Some(DialogsPanelAction::Toast(
                     strings::TOAST_FOLDER_MARKED_READ.to_owned(),
                 ))
             }
             FiltersMenuAction::ReorderFolders(order) => {
                 backend.reorder_folders(&order);
+                self.folders.invalidate();
                 None
             }
         }
@@ -605,7 +628,7 @@ impl DialogsPanel {
             && !self.search_active
             && !self.opened_archive
         {
-            let folders = backend.chat_folders();
+            let folders = self.shown_folders(ui, &*backend);
             if folders.len() > 1
                 && let Some(fid) =
                     show_horizontal_folder_tabs(ui, &folders, self.active_filter, palette)

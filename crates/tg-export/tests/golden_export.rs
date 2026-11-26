@@ -2040,9 +2040,7 @@ async fn golden_full_account_json_and_html_export() {
     assert!(chat2_html.contains("media_game"));
     assert!(chat2_html.contains("bot_buttons_table"));
     assert!(chat2_html.contains("rich_collage_box"));
-    assert!(
-        chat2_html.contains("This message is not supported by this version of Telegram Desktop.")
-    );
+    assert!(chat2_html.contains("This message is not supported by this version of Rustgram."));
     assert!(chat2_html.trim_end().ends_with("</html>"));
 
     let _ = fs::remove_dir_all(&dir);

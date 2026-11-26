@@ -19,7 +19,10 @@ use tg_api::RpcClient;
 use tg_api::convert::{apply_tl_users_and_chats, peer_id_from_tl, peer_notify_settings_from_tl};
 use tg_core::settings::WindowPosition as CoreWindowPosition;
 use tg_core::{CoreSettings, GlobalConfig};
-use tg_data::{Peer, PeerId as DataPeerId, PeerNotifySettings as DataPeerNotifySettings};
+use tg_data::{
+    DefaultNotifyScope as DataDefaultNotifyScope, Peer, PeerId as DataPeerId,
+    PeerNotifySettings as DataPeerNotifySettings,
+};
 use tg_session::{
     AccountManager, StoredAutoDownload, StoredAutoDownloadSource, StoredAutoDownloadType,
     StoredSessionSettings,
@@ -41,7 +44,7 @@ use tg_app_core::settings::backend::{
     MAX_AUTO_DOWNLOAD_BYTES, NotifyException, NotifyScope, ProfilePhotoUpload, ScopeNotifySettings,
 };
 use tg_app_core::stand_in::settings::WindowPosition as ShellWindowPosition;
-use tg_app_core::stand_in::types::{PeerId, PeerKind};
+use tg_app_core::stand_in::types::{MsgId, PeerId, PeerKind};
 
 /// Upload part size used for Telegram file uploads (512 KiB).
 pub const UPLOAD_PART_SIZE: usize = 512 * 1024;
@@ -1012,7 +1015,14 @@ pub fn fetch_scope_notify_live(live: &LiveSession, scope: NotifyScope) -> ScopeN
         peer: notify_scope_to_tl(scope),
     }) {
         Ok(tl_enums::PeerNotifySettings::PeerNotifySettings(resp)) => {
-            notify_settings_from_tl(&resp)
+            let parsed = notify_settings_from_tl(&resp);
+            let data = peer_notify_settings_from_tl(
+                &tl_enums::PeerNotifySettings::PeerNotifySettings(resp),
+            );
+            let data_scope = notify_scope_to_data_scope(scope);
+            let now = now_unix_i32();
+            live.write_session(|session| session.set_notify_default(data_scope, Some(data), now));
+            parsed
         }
         Err(err) => {
             debug!(?scope, error = %err, "account.getNotifySettings failed");
@@ -1081,6 +1091,10 @@ pub fn save_scope_notify_live(
         warn!(?scope, error = %err, "account.updateNotifySettings (scope) failed");
         return;
     }
+    let data_scope = notify_scope_to_data_scope(scope);
+    let data_default = scope_settings_to_data(&settings);
+    let now = now_unix_i32();
+    live.write_session(|session| session.set_notify_default(data_scope, Some(data_default), now));
 
     let next_map: BTreeMap<i64, &NotifyException> =
         settings.exceptions.iter().map(|e| (e.peer.id, e)).collect();
@@ -1179,84 +1193,134 @@ pub fn save_scope_notify_live(
     live.bridge.state().notify_ui();
 }
 
-/// Synchronizes scope defaults and all known per-peer notification overrides from
-/// [`LiveSession`] and `tg_data::Session` into [`NotifySettingsStore`].
+/// Synchronizes the per-type defaults, every known per-peer override and every loaded forum
+/// topic override from `tg_data::Session` into [`NotifySettingsStore`]
+/// (`Data::NotifySettings`, `data/notify/data_notify_settings.cpp`).
+///
+/// A default that is not loaded yet stays unknown in `store`, so the notification system waits
+/// for it (`SkipState::Unknown`) instead of guessing "unmuted".
 pub fn sync_notify_settings_store_live(
     live: &LiveSession,
     store: &mut NotifySettingsStore,
     now_unix: i64,
 ) {
-    let (cached_scopes, extra_peers): (
-        BTreeMap<NotifyScope, ScopeNotifySettings>,
-        Vec<DataPeerId>,
-    ) = live
+    type TopicSnapshot = (PeerId, MsgId, Option<PeerNotifySettingsValue>);
+    // Mention authors whose own settings are still being requested: unknown until they arrive
+    // (`NotifySettings::muteUnknown(notifyBy)`).
+    let (awaiting, requested): (BTreeSet<DataPeerId>, Vec<DataPeerId>) = live
+        .bridge_state()
+        .notify_peer_requests
+        .lock()
+        .map(|requests| (requests.awaiting().collect(), requests.finished().collect()))
+        .unwrap_or_default();
+    let extra_peers: Vec<DataPeerId> = live
         .cache
         .lock()
-        .map(|c| {
-            (
-                c.scope_notify.clone(),
-                c.notify_exception_peers.iter().copied().collect(),
-            )
-        })
+        .map(|c| c.notify_exception_peers.iter().copied().collect())
         .unwrap_or_default();
 
-    for (scope, scope_cfg) in &cached_scopes {
-        let default_scope = notify_scope_to_default_notify(*scope);
-        let value = PeerNotifySettingsValue {
-            mute_until: Some(if scope_cfg.enabled { 0 } else { i32::MAX }),
-            sound: Some(sound_name_to_notify_sound(&scope_cfg.sound)),
-            show_previews: Some(scope_cfg.show_preview),
-            silent_posts: None,
-            stories_muted: None,
-        };
-        store.apply_default(default_scope, Some(value));
+    let (defaults, peer_snapshots, topic_snapshots) = live.read_session(|session| {
+        let defaults: Vec<(DefaultNotify, Option<PeerNotifySettingsValue>)> =
+            DataDefaultNotifyScope::ALL
+                .into_iter()
+                .filter_map(|scope| {
+                    let value = session.notify_default(scope)?;
+                    Some((
+                        data_scope_to_default_notify(scope),
+                        data_notify_value(value),
+                    ))
+                })
+                .collect();
+        let mut candidates = BTreeSet::new();
+        candidates.extend(known_peer_ids(session));
+        candidates.extend(session.peers_with_notify_settings());
+        candidates.extend(extra_peers);
+        candidates.extend(awaiting.iter().copied());
+        candidates.extend(requested);
+        let mut peers = Vec::with_capacity(candidates.len());
+        let mut topics: Vec<TopicSnapshot> = Vec::new();
+        for data_pid in candidates {
+            let Some(peer) = session.peer(data_pid) else {
+                continue;
+            };
+            let peer_id = from_data_peer(data_pid);
+            peers.push((
+                peer_id,
+                data_peer_kind(peer),
+                data_notify_value(&peer.common().notify),
+            ));
+            if let Some(forum) = session.forum(data_pid) {
+                for (root_id, topic) in &forum.topics {
+                    let value = data_notify_value(&topic.notify);
+                    if value.is_some() {
+                        topics.push((peer_id, MsgId(root_id.0 as i32), value));
+                    }
+                }
+            }
+        }
+        (defaults, peers, topics)
+    });
+
+    for (scope, value) in defaults {
+        store.apply_default(scope, value);
     }
-
-    let peer_snapshots: Vec<(PeerId, PeerKind, Option<PeerNotifySettingsValue>)> = live
-        .read_session(|session| {
-            let mut candidates = BTreeSet::new();
-            for data_pid in known_peer_ids(session) {
-                candidates.insert(data_pid);
-            }
-            for data_pid in extra_peers {
-                candidates.insert(data_pid);
-            }
-            let mut list = Vec::new();
-            for data_pid in candidates {
-                let Some(peer) = session.peer(data_pid) else {
-                    continue;
-                };
-                let kind = data_peer_kind(peer);
-                let notify = &peer.common().notify;
-                let history_muted = session.history(data_pid).is_some_and(|h| h.muted);
-                let mute_until = notify
-                    .mute_until
-                    .or_else(|| history_muted.then_some(i32::MAX));
-                let sound = notify.sound.as_deref().map(sound_name_to_notify_sound);
-                let snapshot = if mute_until.is_some()
-                    || sound.is_some()
-                    || notify.show_previews.is_some()
-                    || notify.silent.is_some()
-                    || notify.stories_muted.is_some()
-                {
-                    Some(PeerNotifySettingsValue {
-                        mute_until,
-                        sound,
-                        show_previews: notify.show_previews,
-                        silent_posts: notify.silent,
-                        stories_muted: notify.stories_muted,
-                    })
-                } else {
-                    None
-                };
-                list.push((from_data_peer(data_pid), kind, snapshot));
-            }
-            list
-        });
-
     for (peer_id, kind, snapshot) in peer_snapshots {
         store.register_peer_kind(peer_id, kind);
-        store.apply_peer(peer_id, snapshot, now_unix);
+        if awaiting.contains(&to_data_peer(peer_id)) {
+            store.mark_peer_unknown(peer_id);
+        } else {
+            store.apply_peer(peer_id, snapshot, now_unix);
+        }
+    }
+    for (peer_id, root_id, snapshot) in topic_snapshots {
+        store.apply_topic(peer_id, root_id, snapshot, now_unix);
+    }
+}
+
+/// Maps a `tg_data` default scope to the notification system's [`DefaultNotify`].
+const fn data_scope_to_default_notify(scope: DataDefaultNotifyScope) -> DefaultNotify {
+    match scope {
+        DataDefaultNotifyScope::Users => DefaultNotify::User,
+        DataDefaultNotifyScope::Chats => DefaultNotify::Group,
+        DataDefaultNotifyScope::Broadcasts => DefaultNotify::Broadcast,
+    }
+}
+
+/// Maps a settings-screen scope to the `tg_data` default scope.
+const fn notify_scope_to_data_scope(scope: NotifyScope) -> DataDefaultNotifyScope {
+    match scope {
+        NotifyScope::PrivateChats => DataDefaultNotifyScope::Users,
+        NotifyScope::Groups => DataDefaultNotifyScope::Chats,
+        NotifyScope::Channels => DataDefaultNotifyScope::Broadcasts,
+    }
+}
+
+/// `tg_data` notification settings as a store snapshot; `None` when nothing is overridden.
+fn data_notify_value(notify: &DataPeerNotifySettings) -> Option<PeerNotifySettingsValue> {
+    let value = PeerNotifySettingsValue {
+        mute_until: notify.mute_until,
+        sound: notify.sound.as_deref().map(sound_name_to_notify_sound),
+        show_previews: notify.show_previews,
+        silent_posts: notify.silent,
+        stories_muted: notify.stories_muted,
+    };
+    (value != PeerNotifySettingsValue::default()).then_some(value)
+}
+
+/// The scope default a settings-screen save sends, as `tg_data` settings.
+fn scope_settings_to_data(settings: &ScopeNotifySettings) -> DataPeerNotifySettings {
+    let sound = match crate::convert::sound_name_to_api_sound(&settings.sound) {
+        tg_api::account::NotifySound::Default => "default".to_owned(),
+        tg_api::account::NotifySound::None => "none".to_owned(),
+        tg_api::account::NotifySound::Ringtone(id) => format!("ringtone:{id}"),
+        tg_api::account::NotifySound::Local { data, .. } => data,
+    };
+    DataPeerNotifySettings {
+        mute_until: Some(if settings.enabled { 0 } else { i32::MAX }),
+        silent: None,
+        show_previews: Some(settings.show_preview),
+        sound: Some(sound),
+        stories_muted: None,
     }
 }
 

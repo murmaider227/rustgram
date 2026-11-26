@@ -212,6 +212,8 @@ fn render_frame(
         });
     });
     out.textures_delta.clear();
+    // Read receipts and typing go out from the session's background queue.
+    assert!(live.flush_background_rpcs(std::time::Duration::from_secs(10)));
 }
 
 fn wait_for_generation_above(live: &LiveSession, baseline: u64) {

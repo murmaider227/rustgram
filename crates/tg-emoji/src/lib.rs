@@ -6,11 +6,20 @@
 #![deny(clippy::all)]
 
 pub mod atlas;
+pub mod background;
 pub mod egui_ext;
+#[cfg(test)]
+mod tests_shared_textures;
+#[cfg(test)]
+mod tests_tile_metrics;
+#[cfg(test)]
+mod tests_tile_pixels;
+mod tile_worker;
 
 pub use atlas::{
-    AtlasStats, CELL_SIZE_PX, EMOJIS_PER_SHEET, EmojiAtlas, EmojiError, EmojiSheetImage,
-    EmojiSprite, SHEET_COLS, SHEET_COUNT, SHEET_HEIGHT_PX, SHEET_ROWS, SHEET_WIDTH_PX,
+    AtlasStats, CELL_SIZE_PX, EMOJIS_PER_SHEET, EmojiAtlas, EmojiError, EmojiSprite,
+    EmojiTileImage, SHEET_COLS, SHEET_COUNT, SHEET_HEIGHT_PX, SHEET_ROWS, SHEET_WIDTH_PX,
+    TILE_COUNT, TILE_HEIGHT_PX, TILE_WIDTH_PX,
 };
 pub use egui_ext::{EmojiTextureCache, InlineEmojiSegment, split_inline_emoji};
 
@@ -43,6 +52,7 @@ mod tests {
             assert!(sprite.sheet < SHEET_COUNT);
             assert!(sprite.col < SHEET_COLS);
             assert!(sprite.row < SHEET_ROWS);
+            assert_eq!(sprite.tile, sprite.sheet * SHEET_ROWS + sprite.row);
             assert!(sprite.uv[0] < sprite.uv[2]);
             assert!(sprite.uv[1] < sprite.uv[3]);
         }
@@ -56,7 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn sheet_decoding_and_single_emoji_rgba_non_empty() {
+    fn tile_decoding_and_single_emoji_rgba_non_empty() {
         let atlas = EmojiAtlas::new();
         let grin = emoji::find_emoji("😀", 0).unwrap().0;
         let rgba = atlas.emoji_rgba(grin).unwrap().unwrap();
@@ -69,10 +79,14 @@ mod tests {
             "expected opaque center pixel, got alpha={center_alpha}"
         );
 
-        // Out-of-bounds sheet returns structured error.
+        // Out-of-bounds and empty tiles return structured errors.
         assert!(matches!(
-            atlas.decode_sheet(SHEET_COUNT),
-            Err(EmojiError::SheetOutOfBounds(SHEET_COUNT))
+            atlas.decode_tile(TILE_COUNT),
+            Err(EmojiError::TileOutOfBounds(TILE_COUNT))
+        ));
+        assert!(matches!(
+            atlas.decode_tile(TILE_COUNT - 1),
+            Err(EmojiError::EmptyTile(_))
         ));
     }
 

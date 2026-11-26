@@ -348,10 +348,8 @@ fn saved_list_to_items(live: &LiveSession, list: Vec<SavedStarGift>) -> Vec<Rece
             .map(|(idx, saved)| {
                 let title = if let Some(ref u) = saved.info.unique {
                     u.display_name()
-                } else if !saved.info.resell_title.is_empty() {
-                    saved.info.resell_title.clone()
                 } else {
-                    format!("Star Gift #{}", saved.info.id)
+                    saved.info.resell_title.clone()
                 };
                 let sender_name = if saved.anonymous || saved.from_id == DataPeerId::ZERO {
                     "Anonymous".to_owned()
@@ -421,6 +419,7 @@ impl StarGiftsMarketplaceBackend for LiveSession {
         write_session(self, |s| {
             apply_tl_users_and_chats(s, &inner.users, &inner.chats);
         });
+        crate::gift_stickers::register_saved_gift_stickers(self, &inner.gifts);
         let slice = saved_star_gifts_from_tl(&saved_tl, peer_id, is_self);
 
         if let Some(enabled) = slice.chat_notifications_enabled {

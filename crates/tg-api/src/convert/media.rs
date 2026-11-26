@@ -8,10 +8,10 @@ use tg_data::{
     DocumentKind, ExtendedMedia, GameData, GameId, GeoPoint, GiveawayData, GiveawayResultsData,
     InvoiceData, LiveLocationData, MediaWebPageFlags, MessageMedia, MessageReactionCount,
     MessageReactionsSummary, MsgId, PaidMediaData, PeerId, PhoneCallDiscardReason, PhotoData,
-    PhotoId, PhotoSize, PollAnswer, PollAnswerVoters, PollData, PollId, PollResults, ReactionId,
-    RecentReactor, ServiceAction, StarsAmount, StickerMeta, StoryMediaData, TextWithEntities,
-    TodoCompletionData, TodoItemData, TodoListData, UserId, VenueData, VideoStreamData,
-    WallPaperId, WebPageData, WebPageId, WidgetData,
+    PhotoId, PhotoSize, PollAnswer, PollAnswerVoters, PollData, PollId, PollMedia, PollResults,
+    ReactionId, RecentReactor, ServiceAction, StarsAmount, StickerMeta, StoryMediaData,
+    TextWithEntities, TodoCompletionData, TodoItemData, TodoListData, UserId, VenueData,
+    VideoStreamData, WallPaperId, WebDocumentData, WebPageData, WebPageId, WidgetData,
 };
 use tg_tl::enums as tl_enums;
 use tg_tl::types as tl_types;
@@ -237,6 +237,7 @@ pub fn document_from_tl(doc: &tl_enums::Document) -> Option<DocumentData> {
         spoiler: false,
         ttl_seconds: None,
         video_timestamp: None,
+        video_cover: None,
     })
 }
 
@@ -249,7 +250,7 @@ pub fn webpage_from_tl(wp: &tl_enums::WebPage) -> Option<WebPageData> {
             id: WebPageId::from_tl(p.id),
             url: p.url.clone().unwrap_or_default(),
             display_url: p.url.clone().unwrap_or_default(),
-            kind: "pending".to_owned(),
+            kind: WebPageData::KIND_PENDING.to_owned(),
             ..WebPageData::default()
         }),
         tl_enums::WebPage::WebPage(w) => {
@@ -265,8 +266,10 @@ pub fn webpage_from_tl(wp: &tl_enums::WebPage) -> Option<WebPageData> {
                 site_name: w.site_name.clone(),
                 title: w.title.clone(),
                 description: w.description.clone(),
+                author: w.author.clone(),
                 photo: w.photo.as_ref().and_then(photo_from_tl),
                 document: w.document.as_ref().and_then(document_from_tl),
+                photo_is_video_cover: w.video_cover_photo,
                 flags,
             })
         }
@@ -383,6 +386,35 @@ fn extended_media_from_tl(em: &tl_enums::MessageExtendedMedia) -> ExtendedMedia 
     }
 }
 
+/// Converts a TL `WebDocument` (`Images::FromWebDocument`): its location and image size.
+fn web_document_from_tl(doc: &tl_enums::WebDocument) -> WebDocumentData {
+    let (url, access_hash, size, mime_type, attributes) = match doc {
+        tl_enums::WebDocument::WebDocument(d) => (
+            &d.url,
+            Some(d.access_hash),
+            d.size,
+            &d.mime_type,
+            &d.attributes,
+        ),
+        tl_enums::WebDocument::NoProxy(d) => (&d.url, None, d.size, &d.mime_type, &d.attributes),
+    };
+    let (width, height) = attributes
+        .iter()
+        .find_map(|attr| match attr {
+            tl_enums::DocumentAttribute::ImageSize(s) => Some((s.w, s.h)),
+            _ => None,
+        })
+        .unwrap_or((0, 0));
+    WebDocumentData {
+        url: url.clone(),
+        access_hash,
+        size,
+        mime_type: mime_type.clone(),
+        width,
+        height,
+    }
+}
+
 fn poll_answer_from_tl(answer: &tl_enums::PollAnswer) -> PollAnswer {
     match answer {
         tl_enums::PollAnswer::PollAnswer(a) => PollAnswer {
@@ -440,6 +472,7 @@ pub fn message_media_from_tl(media: &tl_enums::MessageMedia) -> MessageMedia {
             data.spoiler = d.spoiler;
             data.ttl_seconds = d.ttl_seconds;
             data.video_timestamp = d.video_timestamp;
+            data.video_cover = d.video_cover.as_ref().and_then(photo_from_tl).map(Box::new);
             if d.round {
                 data.kind = DocumentKind::RoundVideo;
             } else if d.voice {
@@ -450,7 +483,11 @@ pub fn message_media_from_tl(media: &tl_enums::MessageMedia) -> MessageMedia {
             MessageMedia::Document(Box::new(data))
         }
         tl_enums::MessageMedia::WebPage(w) => {
-            let mut data = webpage_from_tl(&w.webpage).unwrap_or_default();
+            // `CreateMedia` (`history/history_item.cpp`): `webPageEmpty` and
+            // `webPageNotModified` create no media at all.
+            let Some(mut data) = webpage_from_tl(&w.webpage) else {
+                return MessageMedia::Empty;
+            };
             data.flags
                 .set(MediaWebPageFlags::FORCE_LARGE_MEDIA, w.force_large_media);
             data.flags
@@ -514,6 +551,7 @@ pub fn message_media_from_tl(media: &tl_enums::MessageMedia) -> MessageMedia {
                 .extended_media
                 .as_deref()
                 .map(|em| Box::new(extended_media_from_tl(em))),
+            photo: inv.photo.as_ref().map(web_document_from_tl),
         })),
         tl_enums::MessageMedia::Poll(p) => {
             let tl_enums::Poll::Poll(poll) = &p.poll;
@@ -563,6 +601,22 @@ pub fn message_media_from_tl(media: &tl_enums::MessageMedia) -> MessageMedia {
                 close_period: poll.close_period,
                 close_date: poll.close_date,
                 results,
+                attached_media: p
+                    .attached_media
+                    .as_deref()
+                    .and_then(|m| PollMedia::from_media(&message_media_from_tl(m)))
+                    .map(Box::new),
+                answer_media: poll
+                    .answers
+                    .iter()
+                    .filter_map(|answer| match answer {
+                        tl_enums::PollAnswer::PollAnswer(a) => {
+                            let media = a.media.as_ref().map(message_media_from_tl)?;
+                            Some((a.option.clone(), PollMedia::from_media(&media)?))
+                        }
+                        tl_enums::PollAnswer::InputPollAnswer(_) => None,
+                    })
+                    .collect(),
             }))
         }
         tl_enums::MessageMedia::Story(s) => MessageMedia::Story(StoryMediaData {

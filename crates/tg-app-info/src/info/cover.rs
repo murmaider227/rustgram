@@ -245,7 +245,7 @@ impl ProfileCover {
             EmptyUserpic::paint_saved_messages(ui.painter(), av_rect, colors);
         } else {
             EmptyUserpic::for_color_index(peer.color_index, &peer.title, colors)
-                .paint_circle(ui.painter(), av_rect);
+                .paint_circle_or_photo(ui.painter(), av_rect, peer.id.0);
         }
         if av_resp.hovered() && peer.can_edit {
             ui.painter().circle_filled(
@@ -308,8 +308,11 @@ impl ProfileCover {
             family_semibold(),
         );
         let bold_fg = colors.color("windowBoldFg");
+        // `Info::Profile::BadgeContentForPeer`: the premium badge shows the emoji status when
+        // there is one, else the star for a Premium peer without the verified check.
+        let status_badge = peer.emoji_status_id.is_some() || (peer.premium && !peer.verified);
         let badge_space = (if peer.verified { 20.0 } else { 0.0 })
-            + (if peer.premium { 20.0 } else { 0.0 })
+            + (if status_badge { 20.0 } else { 0.0 })
             + (if peer.kind == InfoPeerKind::Bot {
                 36.0
             } else {
@@ -355,16 +358,33 @@ impl ProfileCover {
             );
             badge_x += 20.0;
         }
-        if peer.premium {
+        if status_badge {
             let icon_rect =
                 Rect::from_center_size(Pos2::new(badge_x + 9.0, badge_cy), Vec2::splat(18.0));
-            paint_style_icon(
-                ui.painter(),
-                icon_rect,
-                st::info_peer_badge.premium,
-                &resolver,
-                None,
-            );
+            let painted = peer.emoji_status_id.is_some_and(|document_id| {
+                crate::dialogs::emoji_status::paint_status(
+                    ui.painter(),
+                    ui.make_persistent_id(("info_cover_status", peer.id.0)),
+                    document_id,
+                    Rect::from_center_size(
+                        icon_rect.center(),
+                        Vec2::splat(crate::dialogs::emoji_status::CUSTOM_EMOJI_SIZE as f32),
+                    ),
+                    colors.color("profileVerifiedCheckBg"),
+                    ui.ctx().input(|i| i.time),
+                    crate::dialogs::emoji_status::StatusLoops::Forever,
+                )
+            });
+            // Until the status document loads, a Premium peer keeps the star in its place.
+            if !painted && peer.premium {
+                paint_style_icon(
+                    ui.painter(),
+                    icon_rect,
+                    st::info_peer_badge.premium,
+                    &resolver,
+                    None,
+                );
+            }
             badge_x += 20.0;
         }
         if peer.kind == InfoPeerKind::Bot {

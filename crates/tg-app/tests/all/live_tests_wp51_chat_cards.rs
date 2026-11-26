@@ -852,58 +852,80 @@ fn wp51_ui_round_video_seek_ring_drag_kittest() {
         .last_painted_bubble_rect(round_video_id)
         .expect("round video bubble painted");
 
-    // Drag along the circular seek ring rim: start near 12 o'clock, drag to 3 o'clock (0.25), then 6 o'clock (0.50).
-    let center = bubble_rect.center();
-    let rim_r = (bubble_rect.width().min(bubble_rect.height()) * 0.5) - 6.0;
-    let p_top = Pos2::new(center.x, center.y - rim_r);
-    let p_right = Pos2::new(center.x + rim_r, center.y);
-    let p_bottom = Pos2::new(center.x, center.y + rim_r);
-
-    h.input_mut().events.push(Event::PointerMoved(p_top));
+    // `Gif::isRoundSeekable`: the ring seeks only while the round plays with sound, so click
+    // the circle first. The circle is a square of the media's smaller side at its top-left.
+    let side = bubble_rect.width().min(bubble_rect.height());
+    let center = bubble_rect.min + Vec2::splat(side * 0.5);
+    h.input_mut().events.push(Event::PointerMoved(center));
     step_frames(&mut h, 1);
-    h.input_mut().events.push(Event::PointerButton {
-        pos: p_top,
-        button: PointerButton::Primary,
-        pressed: true,
-        modifiers: Modifiers::NONE,
-    });
-    step_frames(&mut h, 1);
-    h.input_mut().events.push(Event::PointerMoved(p_right));
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+    }
     step_frames(&mut h, 2);
+    assert!(
+        h.state()
+            .controller
+            .main_widget()
+            .history()
+            .inner()
+            .media_runtime()
+            .is_round_video_unmuted(round_video_id),
+        "click starts the round with sound"
+    );
 
-    let progress_q1 = h
+    // The top audio bar now pushes the chat down: re-read where the circle is.
+    let bubble_rect = h
         .state()
         .controller
         .main_widget()
         .history()
         .inner()
-        .media_runtime()
-        .round_video_seek_progress(round_video_id)
-        .expect("seek progress recorded at 3 o'clock");
+        .last_painted_bubble_rect(round_video_id)
+        .expect("round video still painted");
+    let center = bubble_rect.min + Vec2::splat(side * 0.5);
+
+    // Drag along the rim from 12 o'clock and release: the player seeks on release.
+    let rim_r = side * 0.5 - 6.0;
+    let p_top = Pos2::new(center.x, center.y - rim_r);
+    let drag_to = |h: &mut egui_kittest::Harness<'_, AppTestState>, to: Pos2| -> f64 {
+        h.input_mut().events.push(Event::PointerMoved(p_top));
+        step_frames(h, 1);
+        h.input_mut().events.push(Event::PointerButton {
+            pos: p_top,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        });
+        step_frames(h, 1);
+        h.input_mut().events.push(Event::PointerMoved(to));
+        step_frames(h, 2);
+        h.input_mut().events.push(Event::PointerButton {
+            pos: to,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        });
+        step_frames(h, 1);
+        h.state()
+            .controller
+            .main_widget()
+            .history()
+            .inner()
+            .media_runtime()
+            .round_video_seek_progress(round_video_id)
+            .expect("seek progress recorded on release")
+    };
+    let progress_q1 = drag_to(&mut h, Pos2::new(center.x + rim_r, center.y));
     assert!(
         (progress_q1 - 0.25).abs() < 0.08,
         "expected ~0.25 at 3 o'clock, got {progress_q1}"
     );
-
-    h.input_mut().events.push(Event::PointerMoved(p_bottom));
-    step_frames(&mut h, 2);
-    h.input_mut().events.push(Event::PointerButton {
-        pos: p_bottom,
-        button: PointerButton::Primary,
-        pressed: false,
-        modifiers: Modifiers::NONE,
-    });
-    step_frames(&mut h, 1);
-
-    let progress_q2 = h
-        .state()
-        .controller
-        .main_widget()
-        .history()
-        .inner()
-        .media_runtime()
-        .round_video_seek_progress(round_video_id)
-        .expect("seek progress recorded at 6 o'clock");
+    let progress_q2 = drag_to(&mut h, Pos2::new(center.x, center.y + rim_r));
     assert!(
         (progress_q2 - 0.50).abs() < 0.08,
         "expected ~0.50 at 6 o'clock, got {progress_q2}"

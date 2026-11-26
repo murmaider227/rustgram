@@ -14,8 +14,8 @@ use tg_data::{
     ChannelUpdateEnvelope, ChatAdminRights, ChatFlags, ChatId, ChatUpdateVersionStatus,
     CommonUpdateEnvelope, DeletedScheduledInfo, DialogKey, DraftKey, FolderId, FullMsgId,
     LoadedStatus, Message, MessageContent, MessageFlags, MessageUpdateFlags, MsgId, PeerId,
-    PeerNotifySettings, PeerUpdateFlags, SERVER_MAX_MSG_ID, Session, ShortcutIdChange, TimeId,
-    TopicUpdateFlags, UpdateAction, UpdatesStateMachine, UserId, UserStatusInput, Username,
+    PeerUpdateFlags, SERVER_MAX_MSG_ID, Session, ShortcutIdChange, TimeId, TopicUpdateFlags,
+    UpdateAction, UpdatesStateMachine, UserId, UserStatusInput, Username,
     scheduled_remote_to_local_id,
 };
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
@@ -124,6 +124,11 @@ pub enum UpdateEvent {
     ForceLogout {
         /// Raw notification type string.
         notification_type: String,
+        /// The notification's text: the server's explanation that tdesktop shows in the
+        /// forced-logout box (`Application::forceLogOut`, `core/application.cpp:1080`).
+        message: String,
+        /// The text's entities (links), `Api::EntitiesFromMTP` (`api/api_updates.cpp:2370-2377`).
+        entities: Vec<tg_data::TextEntity>,
     },
     /// Server pushed a `langPackDifference` (`updateLangPack`).
     LangPackDifference(tg_lang::LangPackDifference),
@@ -283,6 +288,88 @@ enum PostUpdateRpc {
     ReloadPrivacy { key: PrivacyKey },
 }
 
+/// Write access to the [`Session`] that [`UpdatesHandler`] applies updates to.
+///
+/// The handler calls [`Self::get`] before every in-memory step and [`Self::release`] before
+/// every network request (`getDifference`, `getChannelDifference`, post-update reloads,
+/// `account.updateStatus`), so a lock-backed implementation ([`SharedSession`]) is never held
+/// while the server is being waited for. Plain [`Session`] and an already held write guard
+/// implement it without any locking, for callers that own the session.
+pub trait SessionAccess: Send {
+    /// Returns the session, taking the write lock first if it is not held.
+    fn get(&mut self) -> impl Future<Output = &mut Session> + Send;
+
+    /// Releases the write lock, if this access holds one. Called before each network request.
+    fn release(&mut self);
+}
+
+impl SessionAccess for Session {
+    fn get(&mut self) -> impl Future<Output = &mut Session> + Send {
+        std::future::ready(self)
+    }
+
+    fn release(&mut self) {}
+}
+
+impl SessionAccess for tokio::sync::RwLockWriteGuard<'_, Session> {
+    fn get(&mut self) -> impl Future<Output = &mut Session> + Send {
+        std::future::ready(&mut **self)
+    }
+
+    fn release(&mut self) {}
+}
+
+/// [`SessionAccess`] over a shared `RwLock<Session>`: the write lock is taken lazily on the
+/// first in-memory step, kept across consecutive steps (a batch is applied atomically, as
+/// before), and dropped before every network request, so readers (the UI) never wait for the
+/// server.
+pub struct SharedSession<'a> {
+    lock: &'a tokio::sync::RwLock<Session>,
+    guard: Option<tokio::sync::RwLockWriteGuard<'a, Session>>,
+    acquisitions: u64,
+}
+
+impl<'a> SharedSession<'a> {
+    /// Wraps `lock` without taking it.
+    #[must_use]
+    pub const fn new(lock: &'a tokio::sync::RwLock<Session>) -> Self {
+        Self {
+            lock,
+            guard: None,
+            acquisitions: 0,
+        }
+    }
+
+    /// Returns `true` while this access holds the write lock.
+    #[must_use]
+    pub const fn is_locked(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    /// Number of times the write lock was taken through this access.
+    #[must_use]
+    pub const fn acquisitions(&self) -> u64 {
+        self.acquisitions
+    }
+}
+
+impl SessionAccess for SharedSession<'_> {
+    async fn get(&mut self) -> &mut Session {
+        let guard = match self.guard.take() {
+            Some(guard) => guard,
+            None => {
+                self.acquisitions += 1;
+                self.lock.write().await
+            }
+        };
+        &mut **self.guard.insert(guard)
+    }
+
+    fn release(&mut self) {
+        self.guard = None;
+    }
+}
+
 /// Coordinates Telegram updates ordering, gap recovery, and application to [`Session`].
 #[derive(Debug)]
 pub struct UpdatesHandler {
@@ -294,9 +381,12 @@ pub struct UpdatesHandler {
     last_set_online_ms: Option<u64>,
     is_idle: bool,
     other_online: TimeId,
-    default_notify_users: Option<PeerNotifySettings>,
-    default_notify_chats: Option<PeerNotifySettings>,
-    default_notify_broadcasts: Option<PeerNotifySettings>,
+    /// Set while the startup catch-up `getDifference` (resumed from the persisted state) runs:
+    /// its messages arrived while the app was closed, so they are added like history
+    /// (`NewMessageType::Existing`) and never notify. tdesktop has no such catch-up: it calls
+    /// `updates.getState` on start (`Api::Updates::Updates`, `api/api_updates.cpp`) and loads
+    /// those messages with the dialogs list, which does not notify either.
+    startup_catch_up: bool,
 }
 
 impl Default for UpdatesHandler {
@@ -321,10 +411,21 @@ impl UpdatesHandler {
             last_set_online_ms: None,
             is_idle: false,
             other_online: 0,
-            default_notify_users: None,
-            default_notify_chats: None,
-            default_notify_broadcasts: None,
+            startup_catch_up: false,
         }
+    }
+
+    /// Marks the start (`true`) or the end (`false`) of the startup catch-up: messages fed by
+    /// `getDifference` meanwhile are added without [`tg_data::MessageUpdateFlags::NEW_UNREAD`],
+    /// so no desktop notification is raised for them.
+    pub fn set_startup_catch_up(&mut self, active: bool) {
+        self.startup_catch_up = active;
+    }
+
+    /// Returns `true` while the startup catch-up `getDifference` is being applied.
+    #[must_use]
+    pub const fn startup_catch_up(&self) -> bool {
+        self.startup_catch_up
     }
 
     /// Returns a reference to the underlying `tg_data::UpdatesStateMachine`.
@@ -406,12 +507,13 @@ impl UpdatesHandler {
     }
 
     /// Initializes the updates state by calling `updates.getState` (`Updates::stateDone`).
-    pub async fn initialize<I: Invoker>(
+    pub async fn initialize<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         now_ms: u64,
     ) -> Result<tl_types::updates::State, ApiError> {
+        session.release();
         let state = invoker.updates_get_state().await?;
         self.initialize_with_state(invoker, session, &state, now_ms)
             .await?;
@@ -420,10 +522,10 @@ impl UpdatesHandler {
 
     /// Like [`Self::initialize`] for an `updates.State` the caller already received, so the
     /// caller does not hold `session` while `updates.getState` is in flight.
-    pub async fn initialize_with_state<I: Invoker>(
+    pub async fn initialize_with_state<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         state: &tl_types::updates::State,
         now_ms: u64,
     ) -> Result<(), ApiError> {
@@ -442,10 +544,10 @@ impl UpdatesHandler {
     /// client error (e.g. expired PTS/date), falls back cleanly to `updates.getState`.
     /// Returns `Ok(true)` if resumed via `getDifference`, or `Ok(false)` if it fell back
     /// to a fresh `updates.getState`.
-    pub async fn resume_from_state<I: Invoker>(
+    pub async fn resume_from_state<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         state: &PersistedUpdatesState,
         now_ms: u64,
     ) -> Result<bool, ApiError> {
@@ -476,10 +578,10 @@ impl UpdatesHandler {
 
     /// Handles a transport reconnect, sleep wake-up, or network change:
     /// resets `seq = 0`, fetches common `updates.getDifference`, and refreshes active channels.
-    pub async fn on_reconnect<I: Invoker>(
+    pub async fn on_reconnect<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         now_ms: u64,
     ) -> Result<(), ApiError> {
         let actions = self.machine.on_reconnect(now_ms);
@@ -489,10 +591,10 @@ impl UpdatesHandler {
 
     /// Feeds a pts-only response from `messages.readHistory` / `messages.deleteMessages` /
     /// `channels.deleteMessages` (`ApiWrap::applyAffectedMessages`).
-    pub async fn apply_affected_messages<I: Invoker>(
+    pub async fn apply_affected_messages<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         channel_id: Option<ChannelId>,
         affected: &tl_types::messages::AffectedMessages,
         now_ms: u64,
@@ -509,10 +611,10 @@ impl UpdatesHandler {
     }
 
     /// Feeds a pts-only response from `messages.deleteHistory` (`ApiWrap::applyAffectedHistory`).
-    pub async fn apply_affected_history<I: Invoker>(
+    pub async fn apply_affected_history<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         affected: &tl_types::messages::AffectedHistory,
         now_ms: u64,
     ) -> Result<(), ApiError> {
@@ -528,10 +630,10 @@ impl UpdatesHandler {
     }
 
     /// Feeds a raw `(pts, pts_count)` increment into the common or channel PTS waiter.
-    pub async fn apply_pts_only<I: Invoker>(
+    pub async fn apply_pts_only<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         channel_id: Option<ChannelId>,
         pts: i32,
         pts_count: i32,
@@ -568,10 +670,10 @@ impl UpdatesHandler {
     /// `ApiWrap::applyAffectedHistory` in `apiwrap.cpp:2342-2343`) directly into that channel's
     /// `PtsWaiter`, gating only on the channel's own `requesting` flag rather than common
     /// `getDifference` state.
-    pub async fn apply_channel_pts<I: Invoker>(
+    pub async fn apply_channel_pts<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         channel_id: ChannelId,
         pts: i32,
         pts_count: i32,
@@ -595,10 +697,10 @@ impl UpdatesHandler {
 
     /// Handles a `new_session_created` signal from MTProto (`Updates::mtpNewSessionCreated`):
     /// resets `seq = 0` and calls `updates.getDifference`.
-    pub async fn on_new_session_created<I: Invoker>(
+    pub async fn on_new_session_created<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         now_ms: u64,
     ) -> Result<(), ApiError> {
         let actions = self.machine.on_new_session_created();
@@ -608,10 +710,10 @@ impl UpdatesHandler {
 
     /// Advances time to `now_ms`, triggering any due `getDifference` / `getChannelDifference`
     /// gap, short-poll, or backoff-retry timers.
-    pub async fn on_tick<I: Invoker>(
+    pub async fn on_tick<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         now_ms: u64,
     ) -> Result<bool, ApiError> {
         let actions = self.machine.on_tick(now_ms);
@@ -621,10 +723,10 @@ impl UpdatesHandler {
     }
 
     /// Processes a single incoming `tg_tl::enums::Updates` container (`Updates::applyUpdates`).
-    pub async fn handle_updates<I: Invoker>(
+    pub async fn handle_updates<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         updates: tl_enums::Updates,
         sent_random_id: Option<i64>,
         now_ms: u64,
@@ -633,6 +735,7 @@ impl UpdatesHandler {
         // E2E chain block updates must still be applied immediately (`api/api_updates.cpp:904-909,
         // 957-977`, `Updates::mtpUpdateReceived` / `Updates::applyGroupCallParticipantUpdates`).
         if self.machine.requesting_difference() {
+            let session = session.get().await;
             self.extract_force_logouts_and_group_call_updates(session, &updates);
             return Ok(());
         }
@@ -679,13 +782,14 @@ impl UpdatesHandler {
                 self.machine.advance_date(s.date);
             }
             tl_enums::Updates::UpdateShortMessage(s) => {
-                if !short_message_data_loaded(session, &s) {
+                let self_user_id = session.get().await.self_user_id();
+                if !short_message_data_loaded(session.get().await, &s) {
                     let actions = self.machine.on_updates_too_long(now_ms);
                     self.process_actions(invoker, session, actions, now_ms)
                         .await?;
                     return Ok(());
                 }
-                let msg = message_from_short_message(&s, session.self_user_id());
+                let msg = message_from_short_message(&s, self_user_id);
                 let actions = self.machine.on_common_update(
                     CommonUpdateEnvelope {
                         pts: s.pts,
@@ -700,13 +804,14 @@ impl UpdatesHandler {
                     .await?;
             }
             tl_enums::Updates::UpdateShortChatMessage(s) => {
-                if !short_chat_message_data_loaded(session, &s) {
+                let self_user_id = session.get().await.self_user_id();
+                if !short_chat_message_data_loaded(session.get().await, &s) {
                     let actions = self.machine.on_updates_too_long(now_ms);
                     self.process_actions(invoker, session, actions, now_ms)
                         .await?;
                     return Ok(());
                 }
-                let msg = message_from_short_chat_message(&s, session.self_user_id());
+                let msg = message_from_short_chat_message(&s, self_user_id);
                 let actions = self.machine.on_common_update(
                     CommonUpdateEnvelope {
                         pts: s.pts,
@@ -726,6 +831,7 @@ impl UpdatesHandler {
                 if !is_server_msg_id {
                     warn!(msg_id = s.id, "bad msg_id in updateShortSentMessage");
                 } else if let Some(random_id) = sent_random_id {
+                    let session = session.get().await;
                     let self_id = session.self_user_id();
                     if let Some(local_full_id) = session.resolve_random_id(random_id, msg_id) {
                         let promoted_id = FullMsgId::new(local_full_id.peer, msg_id);
@@ -786,10 +892,10 @@ impl UpdatesHandler {
     ///
     /// If the receiver reports `Lagged`, triggers `updates.getDifference` automatically
     /// to recover any dropped updates.
-    pub async fn pump_updates_stream<I: Invoker>(
+    pub async fn pump_updates_stream<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         rx: &mut broadcast::Receiver<tl_enums::Updates>,
         now_ms: u64,
     ) -> Result<usize, ApiError> {
@@ -846,10 +952,10 @@ impl UpdatesHandler {
     /// events, sending `account.updateStatus` only when required by tdesktop's exact rules
     /// (`Updates::updateOnline`, `api/api_updates.cpp:995-1064`).
     #[allow(clippy::too_many_arguments)]
-    pub async fn update_online_timed<I: Invoker>(
+    pub async fn update_online_timed<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         window_active: bool,
         last_non_idle_ms: u64,
         now_ms: u64,
@@ -883,6 +989,7 @@ impl UpdatesHandler {
         if should_send {
             self.last_was_online = is_online;
             self.last_set_online_ms = Some(now_ms);
+            session.release();
             let _ = invoker
                 .account_update_status(tl_fns::account::UpdateStatus {
                     offline: !is_online,
@@ -895,6 +1002,7 @@ impl UpdatesHandler {
             } else {
                 now_secs.saturating_sub(1)
             };
+            let session = session.get().await;
             session.update_user_status(session.self_user_id(), UserStatusInput::Online { expires });
         } else if is_online && let Some(last) = self.last_set_online_ms {
             let remaining = last
@@ -913,10 +1021,10 @@ impl UpdatesHandler {
 
     /// Checks whether user activity resumed while idle (`Updates::checkIdleFinish`,
     /// `api/api_updates.cpp:1066-1078`).
-    pub async fn check_idle_finish<I: Invoker>(
+    pub async fn check_idle_finish<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         window_active: bool,
         last_non_idle_ms: u64,
         now_ms: u64,
@@ -967,46 +1075,14 @@ impl UpdatesHandler {
         self.last_was_online
     }
 
-    /// Seeds cached scope default notification settings used to resolve inherited mute state
-    /// when `updateNotifySettings` arrives with `mute_until == None`.
-    pub fn set_default_notify_settings(
-        &mut self,
-        scope: DefaultNotifyScope,
-        settings: PeerNotifySettings,
-    ) {
-        match scope {
-            DefaultNotifyScope::Users => self.default_notify_users = Some(settings),
-            DefaultNotifyScope::Chats => self.default_notify_chats = Some(settings),
-            DefaultNotifyScope::Broadcasts => self.default_notify_broadcasts = Some(settings),
-        }
-    }
-
-    fn effective_peer_muted(&self, session: &Session, peer_id: PeerId, now_secs: TimeId) -> bool {
-        if let Some(peer) = session.peer(peer_id) {
-            if let Some(until) = peer.common().notify.mute_until {
-                return until > now_secs;
-            }
-            let scope = DefaultNotifyScope::for_peer(peer);
-            let default = match scope {
-                DefaultNotifyScope::Users => self.default_notify_users.as_ref(),
-                DefaultNotifyScope::Chats => self.default_notify_chats.as_ref(),
-                DefaultNotifyScope::Broadcasts => self.default_notify_broadcasts.as_ref(),
-            };
-            if let Some(until) = default.and_then(|d| d.mute_until) {
-                return until > now_secs;
-            }
-        }
-        false
-    }
-
     // -------------------------------------------------------------------------
     // Internal action & update dispatch
     // -------------------------------------------------------------------------
 
-    async fn process_actions<I: Invoker>(
+    async fn process_actions<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         actions: Vec<UpdateAction<UpdatePayload>>,
         now_ms: u64,
     ) -> Result<(), ApiError> {
@@ -1048,7 +1124,7 @@ impl UpdatesHandler {
                     // snapshot messages so the UI reloads recent history across the skipped gap
                     // (`api/api_updates.cpp:414`, `history->setNotLoadedAtBottom()`).
                     let peer_id = PeerId::from_channel(channel_id);
-                    session.invalidate_history_bottom(peer_id);
+                    session.get().await.invalidate_history_bottom(peer_id);
                     self.events.push(UpdateEvent::ChannelTooLong {
                         channel_id,
                         pts: self.machine.channel_pts(channel_id),
@@ -1062,24 +1138,28 @@ impl UpdatesHandler {
         Ok(())
     }
 
-    async fn apply_payload<I: Invoker>(
+    async fn apply_payload<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         payload: UpdatePayload,
         now_ms: u64,
     ) -> Result<(), ApiError> {
         match payload {
             UpdatePayload::PtsOnly | UpdatePayload::ShortSent { .. } => {}
             UpdatePayload::ShortMessage(msg) => {
-                session.insert_message(*msg);
+                let peer_id = msg.peer_id;
+                let session = session.get().await;
+                session.insert_new_unread_message(*msg);
+                session.request_dialog_entry_if_folder_unknown(peer_id);
             }
             UpdatePayload::SeqBatch {
                 mut updates,
                 users,
                 chats,
             } => {
-                apply_tl_users_and_chats(session, &users, &chats);
+                let s = session.get().await;
+                apply_tl_users_and_chats(s, &users, &chats);
                 // Match `Updates::feedUpdateVector` (`api/api_updates.cpp:305-328`):
                 // stable-sort `updateGroupCallChainBlocks` (0) before
                 // `updateGroupCallParticipants` (1) before all other updates (2).
@@ -1096,11 +1176,11 @@ impl UpdatesHandler {
                 // if `updateNewScheduledMessage` and `updateMessageID` share a server ID and the
                 // local pending message was not scheduled, destroy the regular pending message
                 // and emit `SentConvertedToScheduled` BEFORE `UpdateMessageID` promotes it.
-                self.apply_convert_to_scheduled_on_send(session, &updates);
+                self.apply_convert_to_scheduled_on_send(s, &updates);
                 // Process UpdateMessageID first so local messages resolve before NewMessage arrives.
                 for u in &updates {
                     if let tl_enums::Update::MessageID(m) = u {
-                        self.apply_message_id(session, m.random_id, MsgId(i64::from(m.id)));
+                        self.apply_message_id(s, m.random_id, MsgId(i64::from(m.id)));
                     }
                 }
                 for u in updates {
@@ -1119,12 +1199,13 @@ impl UpdatesHandler {
                 // trigger `getDifference` instead of inserting a message for an unknown peer.
                 if let tl_enums::Update::NewMessage(ref u) = *update
                     && !self.machine.requesting_difference()
-                    && !message_peer_loaded(session, &u.message)
+                    && !message_peer_loaded(session.get().await, &u.message)
                 {
                     let actions = self.machine.on_updates_too_long(now_ms);
                     return Box::pin(self.process_actions(invoker, session, actions, now_ms)).await;
                 }
-                if let Some(rpc) = self.apply_confirmed_update(session, *update, now_ms) {
+                let confirmed = self.apply_confirmed_update(session.get().await, *update, now_ms);
+                if let Some(rpc) = confirmed {
                     self.execute_post_update_rpcs(invoker, session, vec![rpc], now_ms)
                         .await;
                 }
@@ -1133,10 +1214,10 @@ impl UpdatesHandler {
         Ok(())
     }
 
-    async fn route_single_update<I: Invoker>(
+    async fn route_single_update<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         update: tl_enums::Update,
         date: Option<TimeId>,
         now_ms: u64,
@@ -1148,7 +1229,7 @@ impl UpdatesHandler {
         if let tl_enums::Update::NewMessage(ref u) = update
             && !self.machine.requesting_difference()
             && u.pts <= self.machine.pts().saturating_add(u.pts_count)
-            && !message_peer_loaded(session, &u.message)
+            && !message_peer_loaded(session.get().await, &u.message)
         {
             let actions = self.machine.on_updates_too_long(now_ms);
             return Box::pin(self.process_actions(invoker, session, actions, now_ms)).await;
@@ -1173,13 +1254,16 @@ impl UpdatesHandler {
         if let tl_enums::Update::NewChannelMessage(ref u) = update
             && let Some(cid) = message_channel_id(&u.message)
             && !self.machine.requesting_difference()
-            && !session.channel_loaded(cid)
+            && !session.get().await.channel_loaded(cid)
         {
             self.machine.on_missing_channel(now_ms);
             return Ok(());
         }
         if let tl_enums::Update::ChannelReadMessagesContents(ref u) = update
-            && !session.channel_loaded(ChannelId::from_tl(u.channel_id))
+            && !session
+                .get()
+                .await
+                .channel_loaded(ChannelId::from_tl(u.channel_id))
         {
             self.machine.on_missing_channel(now_ms);
             return Ok(());
@@ -1218,7 +1302,8 @@ impl UpdatesHandler {
         }
 
         // Non-PTS/QTS updates apply immediately.
-        if let Some(rpc) = self.apply_confirmed_update(session, update, now_ms) {
+        let confirmed = self.apply_confirmed_update(session.get().await, update, now_ms);
+        if let Some(rpc) = confirmed {
             self.execute_post_update_rpcs(invoker, session, vec![rpc], now_ms)
                 .await;
         }
@@ -1238,8 +1323,9 @@ impl UpdatesHandler {
                 self.apply_message_id(session, m.random_id, MsgId(i64::from(m.id)));
             }
             tl_enums::Update::NewMessage(u) => {
+                crate::saved_side_log::log_server_message(session, &u.message, "update");
                 if let Some(msg) = message_from_tl(&u.message, session.self_user_id()) {
-                    session.apply_sent_or_new_message(msg);
+                    session.apply_sent_or_new_message_typed(msg, !self.startup_catch_up);
                 }
             }
             tl_enums::Update::NewChannelMessage(u) => {
@@ -1249,7 +1335,7 @@ impl UpdatesHandler {
                     let date = msg.date;
                     let outgoing = msg.is_outgoing();
                     let topic_root = msg.topic_root_id();
-                    session.apply_sent_or_new_message(msg);
+                    session.apply_sent_or_new_message_typed(msg, !self.startup_catch_up);
                     if let Some(root_id) = topic_root
                         && let Some(topic) = session
                             .forum_mut(peer_id)
@@ -1843,31 +1929,11 @@ impl UpdatesHandler {
                 match &u.peer {
                     tl_enums::NotifyPeer::NotifyPeer(np) => {
                         let peer_id = peer_id_from_tl(&np.peer);
-                        if let Some(peer) = session.peer_mut(peer_id) {
-                            peer.common_mut().notify = settings;
-                        }
-                        let muted = self.effective_peer_muted(session, peer_id, now_secs);
-                        let prev_muted = session.history(peer_id).map(|h| h.muted);
-                        session.set_history_muted(peer_id, muted);
-                        if prev_muted == Some(muted) {
-                            session
-                                .changes()
-                                .peer_updated(peer_id, PeerUpdateFlags::NOTIFICATIONS);
-                        }
+                        session.set_peer_notify(peer_id, settings, now_secs);
                     }
                     tl_enums::NotifyPeer::NotifyCommunity(c) => {
                         let peer_id = PeerId::from_channel(ChannelId::from_tl(c.community_id));
-                        if let Some(peer) = session.peer_mut(peer_id) {
-                            peer.common_mut().notify = settings;
-                        }
-                        let muted = self.effective_peer_muted(session, peer_id, now_secs);
-                        let prev_muted = session.history(peer_id).map(|h| h.muted);
-                        session.set_history_muted(peer_id, muted);
-                        if prev_muted == Some(muted) {
-                            session
-                                .changes()
-                                .peer_updated(peer_id, PeerUpdateFlags::NOTIFICATIONS);
-                        }
+                        session.set_peer_notify(peer_id, settings, now_secs);
                     }
                     tl_enums::NotifyPeer::NotifyUsers
                     | tl_enums::NotifyPeer::NotifyChats
@@ -1877,26 +1943,8 @@ impl UpdatesHandler {
                             tl_enums::NotifyPeer::NotifyChats => DefaultNotifyScope::Chats,
                             _ => DefaultNotifyScope::Broadcasts,
                         };
-                        self.set_default_notify_settings(scope, settings);
-                        let peer_ids: Vec<PeerId> = session
-                            .main_dialogs()
-                            .iter()
-                            .chain(session.archive_dialogs().iter())
-                            .filter_map(|k| match k {
-                                DialogKey::History(pid) => Some(*pid),
-                                _ => None,
-                            })
-                            .collect();
-                        for pid in peer_ids {
-                            let inherits = session.peer(pid).is_some_and(|p| {
-                                DefaultNotifyScope::for_peer(p) == scope
-                                    && p.common().notify.mute_until.is_none()
-                            });
-                            if inherits {
-                                let muted = self.effective_peer_muted(session, pid, now_secs);
-                                session.set_history_muted(pid, muted);
-                            }
-                        }
+                        // `NotifySettings::apply(DefaultNotify)` + `updateLocal(DefaultNotify)`.
+                        session.set_notify_default(scope, Some(settings), now_secs);
                     }
                     tl_enums::NotifyPeer::NotifyForumTopic(nft) => {
                         // Match `api/api_updates.cpp:2482` (`notifyForumTopic`).
@@ -1989,6 +2037,8 @@ impl UpdatesHandler {
                 if u.r#type.starts_with("AUTH_KEY_DROP_") {
                     self.events.push(UpdateEvent::ForceLogout {
                         notification_type: u.r#type,
+                        message: u.message,
+                        entities: crate::convert::messages::entities_from_tl(&u.entities),
                     });
                 }
             }
@@ -2365,10 +2415,10 @@ impl UpdatesHandler {
         post_rpc
     }
 
-    async fn execute_post_update_rpcs<I: Invoker>(
+    async fn execute_post_update_rpcs<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         rpcs: Vec<PostUpdateRpc>,
         now_ms: u64,
     ) {
@@ -2376,6 +2426,7 @@ impl UpdatesHandler {
         for rpc in rpcs {
             match rpc {
                 PostUpdateRpc::ReloadPinnedDialogs { folder_id } => {
+                    session.release();
                     match invoker
                         .messages_get_pinned_dialogs(tl_fns::messages::GetPinnedDialogs {
                             folder_id,
@@ -2385,7 +2436,11 @@ impl UpdatesHandler {
                         Ok(pd) => {
                             let req_folder = (folder_id != 0).then_some(folder_id);
                             apply_tl_peer_dialogs_for_folder(
-                                session, &pd, req_folder, true, now_secs,
+                                session.get().await,
+                                &pd,
+                                req_folder,
+                                true,
+                                now_secs,
                             );
                         }
                         Err(err) => {
@@ -2394,8 +2449,10 @@ impl UpdatesHandler {
                     }
                 }
                 PostUpdateRpc::ReloadDialogFilters => {
+                    session.release();
                     match invoker.messages_get_dialog_filters().await {
                         Ok(resp) => {
+                            let session = session.get().await;
                             let self_id = Some(session.self_user_id());
                             let parsed: Vec<_> = resp
                                 .filters
@@ -2410,13 +2467,17 @@ impl UpdatesHandler {
                     }
                 }
                 PostUpdateRpc::RefetchChannel { channel_id } => {
-                    if session
-                        .channel(channel_id)
-                        .is_some_and(|ch| ch.is_forbidden())
-                    {
-                        continue;
-                    }
-                    let input = input_channel_for(session, channel_id);
+                    let input = {
+                        let session = session.get().await;
+                        if session
+                            .channel(channel_id)
+                            .is_some_and(|ch| ch.is_forbidden())
+                        {
+                            continue;
+                        }
+                        input_channel_for(session, channel_id)
+                    };
+                    session.release();
                     match invoker
                         .channels_get_channels(tl_fns::channels::GetChannels { id: vec![input] })
                         .await
@@ -2426,7 +2487,7 @@ impl UpdatesHandler {
                                 tl_enums::messages::Chats::Chats(c) => c.chats,
                                 tl_enums::messages::Chats::Slice(c) => c.chats,
                             };
-                            apply_tl_users_and_chats(session, &[], &chats);
+                            apply_tl_users_and_chats(session.get().await, &[], &chats);
                         }
                         Err(err) => {
                             // Match `Updates::applyUpdateNoPtsCheck(mtpc_updateChannel)`
@@ -2440,7 +2501,7 @@ impl UpdatesHandler {
                                     if r.name == "CHANNEL_PRIVATE" || r.name == "CHANNEL_INVALID"
                             );
                             if is_inaccessible {
-                                if let Some(ch) = session.channel_mut(channel_id) {
+                                if let Some(ch) = session.get().await.channel_mut(channel_id) {
                                     ch.flags.insert(ChannelFlags::FORBIDDEN);
                                 }
                                 self.machine.remove_channel(channel_id);
@@ -2451,6 +2512,7 @@ impl UpdatesHandler {
                     }
                 }
                 PostUpdateRpc::ReloadFullChat { chat_id } => {
+                    session.release();
                     match invoker
                         .messages_get_full_chat(tl_fns::messages::GetFullChat {
                             chat_id: chat_id.to_tl(),
@@ -2458,6 +2520,7 @@ impl UpdatesHandler {
                         .await
                     {
                         Ok(full) => {
+                            let session = session.get().await;
                             apply_tl_users_and_chats(session, &full.users, &full.chats);
                             apply_tl_chat_full(session, &full.full_chat);
                         }
@@ -2467,6 +2530,7 @@ impl UpdatesHandler {
                     }
                 }
                 PostUpdateRpc::ReloadPrivacy { key } => {
+                    session.release();
                     match invoker
                         .account_get_privacy(tl_fns::account::GetPrivacy {
                             key: privacy_key_to_tl(key),
@@ -2474,6 +2538,7 @@ impl UpdatesHandler {
                         .await
                     {
                         Ok(resp) => {
+                            let session = session.get().await;
                             apply_tl_users_and_chats(session, &resp.users, &resp.chats);
                             let rule = privacy_rules_from_tl(&resp.rules, session);
                             self.events.push(UpdateEvent::PrivacyUpdated { key, rule });
@@ -2487,10 +2552,10 @@ impl UpdatesHandler {
         }
     }
 
-    async fn execute_get_difference<I: Invoker>(
+    async fn execute_get_difference<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         mut pts: i32,
         mut date: TimeId,
         mut qts: i32,
@@ -2505,6 +2570,7 @@ impl UpdatesHandler {
                 qts,
                 qts_limit: None,
             };
+            session.release();
             let diff = match invoker.updates_get_difference(req).await {
                 Ok(d) => d,
                 Err(err) => {
@@ -2521,6 +2587,7 @@ impl UpdatesHandler {
                 }
                 tl_enums::updates::Difference::Difference(d) => {
                     let tl_enums::updates::State::State(st) = d.state;
+                    let session = session.get().await;
                     apply_tl_users_and_chats(session, &d.users, &d.chats);
                     let (fu, rpcs) = self.feed_difference_payload(
                         session,
@@ -2542,6 +2609,7 @@ impl UpdatesHandler {
                 }
                 tl_enums::updates::Difference::Slice(s) => {
                     let tl_enums::updates::State::State(st) = s.intermediate_state;
+                    let session = session.get().await;
                     apply_tl_users_and_chats(session, &s.users, &s.chats);
                     let (fu, rpcs) = self.feed_difference_payload(
                         session,
@@ -2601,10 +2669,10 @@ impl UpdatesHandler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn execute_get_channel_difference<I: Invoker>(
+    async fn execute_get_channel_difference<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         channel_id: ChannelId,
         mut pts: i32,
         mut force: bool,
@@ -2613,14 +2681,17 @@ impl UpdatesHandler {
     ) -> Result<(), ApiError> {
         let now_secs = (now_ms / 1_000) as TimeId;
         loop {
-            if session
-                .channel(channel_id)
-                .is_some_and(|ch| ch.is_forbidden())
-            {
-                self.machine.remove_channel(channel_id);
-                return Ok(());
-            }
-            let channel = input_channel_for(session, channel_id);
+            let channel = {
+                let session = session.get().await;
+                if session
+                    .channel(channel_id)
+                    .is_some_and(|ch| ch.is_forbidden())
+                {
+                    self.machine.remove_channel(channel_id);
+                    return Ok(());
+                }
+                input_channel_for(session, channel_id)
+            };
             let req = tl_fns::updates::GetChannelDifference {
                 force,
                 channel,
@@ -2628,6 +2699,7 @@ impl UpdatesHandler {
                 pts,
                 limit,
             };
+            session.release();
             let diff = match invoker.updates_get_channel_difference(req).await {
                 Ok(d) => d,
                 Err(err) => {
@@ -2642,7 +2714,7 @@ impl UpdatesHandler {
                             if r.name == "CHANNEL_PRIVATE" || r.name == "CHANNEL_INVALID"
                     );
                     if is_inaccessible {
-                        if let Some(ch) = session.channel_mut(channel_id) {
+                        if let Some(ch) = session.get().await.channel_mut(channel_id) {
                             ch.flags.insert(ChannelFlags::FORBIDDEN);
                         }
                         self.machine.remove_channel(channel_id);
@@ -2659,6 +2731,7 @@ impl UpdatesHandler {
                     .machine
                     .on_channel_difference_empty(channel_id, e.pts, e.r#final, e.timeout, now_ms),
                 tl_enums::updates::ChannelDifference::ChannelDifference(d) => {
+                    let session = session.get().await;
                     apply_tl_users_and_chats(session, &d.users, &d.chats);
                     let (_, rpcs) = self.feed_difference_payload(
                         session,
@@ -2678,29 +2751,30 @@ impl UpdatesHandler {
                     )
                 }
                 tl_enums::updates::ChannelDifference::TooLong(t) => {
-                    apply_tl_users_and_chats(session, &t.users, &t.chats);
+                    let s = session.get().await;
+                    apply_tl_users_and_chats(s, &t.users, &t.chats);
                     let peer_id = PeerId::from_channel(channel_id);
                     // Capture loaded history range and prior `pts` BEFORE invalidating history
                     // bottom and applying snapshot messages so we can run range validation
                     // (`Updates::channelDifferenceDone` + `requestChannelRangeDifference` in
                     // `api/api_updates.cpp:409-431, 797-890`).
                     let old_pts = pts;
-                    let range = session
+                    let range = s
                         .history(peer_id)
                         .map(|h| h.range_for_difference_request())
                         .unwrap_or_default();
                     // Invalidate history bottom BEFORE applying the latest snapshot messages
                     // so prior loaded slices do not falsely merge across the skipped gap
                     // (`api_updates.cpp:414`).
-                    session.invalidate_history_bottom(peer_id);
+                    s.invalidate_history_bottom(peer_id);
                     let dialog_pts = match &t.dialog {
                         tl_enums::Dialog::Dialog(d) => d.pts,
                         _ => None,
                     };
                     for msg in &t.messages {
-                        apply_tl_message(session, msg);
+                        apply_tl_message(s, msg);
                     }
-                    apply_tl_dialog(session, &t.dialog, now_secs);
+                    apply_tl_dialog(s, &t.dialog, now_secs);
                     let actions = self.machine.on_channel_difference_too_long(
                         channel_id, dialog_pts, t.r#final, t.timeout, now_ms,
                     );
@@ -2754,10 +2828,10 @@ impl UpdatesHandler {
     /// deletions to already-loaded messages in `[from, till)` are reconciled without touching
     /// the channel's main `pts` watermark.
     #[allow(clippy::too_many_arguments)]
-    async fn execute_channel_range_difference<I: Invoker>(
+    async fn execute_channel_range_difference<I: Invoker, A: SessionAccess>(
         &mut self,
         invoker: &I,
-        session: &mut Session,
+        session: &mut A,
         channel_id: ChannelId,
         mut range_pts: i32,
         from: MsgId,
@@ -2770,7 +2844,7 @@ impl UpdatesHandler {
         // Safety cap on non-final slices to prevent infinite loops on misbehaving servers.
         const MAX_RANGE_SLICES: usize = 32;
         for _ in 0..MAX_RANGE_SLICES {
-            let channel = input_channel_for(session, channel_id);
+            let channel = input_channel_for(session.get().await, channel_id);
             let req = tl_fns::updates::GetChannelDifference {
                 force: true,
                 channel,
@@ -2785,6 +2859,7 @@ impl UpdatesHandler {
                 pts: range_pts,
                 limit,
             };
+            session.release();
             let diff = match invoker.updates_get_channel_difference(req).await {
                 Ok(d) => d,
                 Err(err) => {
@@ -2799,6 +2874,7 @@ impl UpdatesHandler {
             let (is_final, next_pts) = match diff {
                 tl_enums::updates::ChannelDifference::Empty(e) => (e.r#final, e.pts),
                 tl_enums::updates::ChannelDifference::ChannelDifference(d) => {
+                    let session = session.get().await;
                     apply_tl_users_and_chats(session, &d.users, &d.chats);
                     let _ = self.feed_difference_payload(
                         session,
@@ -2837,9 +2913,18 @@ impl UpdatesHandler {
                 self.apply_message_id(session, m.random_id, MsgId(i64::from(m.id)));
             }
         }
-        // 2. new_messages
+        // 2. new_messages (`processMessages(msgs, NewMessageType::Unread)`,
+        //    `api/api_updates.cpp:626`), except during the startup catch-up.
         for msg in new_messages {
-            apply_tl_message(session, msg);
+            crate::saved_side_log::log_server_message(session, msg, "difference");
+            if self.startup_catch_up {
+                apply_tl_message(session, msg);
+            } else if let Some(m) = message_from_tl(msg, session.self_user_id()) {
+                session.insert_new_unread_message(m);
+            }
+            if let Some((peer_id, _, _)) = crate::convert::tl_message_meta(msg) {
+                session.request_dialog_entry_if_folder_unknown(peer_id);
+            }
         }
         // 3. other_updates (skipping MessageID; common PTS updates bypass common PtsWaiter,
         //    while channel updates & ChannelTooLong inside common getDifference still update
@@ -2943,7 +3028,8 @@ impl UpdatesHandler {
     }
 
     fn apply_message_id(&mut self, session: &mut Session, random_id: i64, server_id: MsgId) {
-        session.resolve_random_id(random_id, server_id);
+        let local = session.resolve_random_id(random_id, server_id);
+        crate::saved_side_log::log_resolved(local, session, random_id, server_id);
         self.events.push(UpdateEvent::MessageIdMapped {
             random_id,
             server_id,
@@ -2965,6 +3051,8 @@ impl UpdatesHandler {
                 {
                     self.events.push(UpdateEvent::ForceLogout {
                         notification_type: n.r#type.clone(),
+                        message: n.message.clone(),
+                        entities: crate::convert::messages::entities_from_tl(&n.entities),
                     });
                 }
                 tl_enums::Update::GroupCallParticipants(_)
@@ -3003,6 +3091,8 @@ impl UpdatesHandler {
                 {
                     self.events.push(UpdateEvent::ForceLogout {
                         notification_type: n.r#type.clone(),
+                        message: n.message.clone(),
+                        entities: crate::convert::messages::entities_from_tl(&n.entities),
                     });
                 }
                 tl_enums::Update::GroupCallParticipants(_)

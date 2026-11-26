@@ -132,7 +132,9 @@ impl ConfirmPhoneCodeBoxState {
         {
             tr::lng_bad_code()
         } else {
-            rpc_err.to_owned()
+            // `Lang::Hard::ServerError()`; the raw error only goes to the log.
+            let _ = tg_app_core::user_error::confirm_phone(rpc_err);
+            tg_lang::hardcoded::server_error().to_owned()
         };
         self.error = Some(display);
     }
@@ -198,7 +200,7 @@ impl ConfirmPhoneCodeBoxState {
         ui.add_space(6.0);
         if let Some(ref err) = self.error {
             ui.label(
-                egui::RichText::new(format!("! {err}"))
+                egui::RichText::new(err.as_str())
                     .font(FontId::new(12.5, family_semibold()))
                     .color(colors.color("boxTextFgError")),
             );

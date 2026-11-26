@@ -545,3 +545,20 @@ pub fn type_text<S>(harness: &mut Harness<'_, S>, text: &str) {
 pub fn color_luminance(c: egui::Color32) -> f32 {
     0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())
 }
+
+/// Chat-list requests the live session sends on its own, at moments no test controls: the
+/// runtime's dialog-entry requests for a chat that got a message while its folder was unknown
+/// (`Histories::sendDialogRequests` -> `messages.getPeerDialogs`) and the chat-list preload
+/// (`ApiWrap::requestMoreDialogsIfNeeded` -> `messages.getDialogs`, `messages.getPinnedDialogs`).
+///
+/// A fake RPC client that hands out queued answers must not give such a request the answer a
+/// test queued for the request it is waiting for (TGB-2941): unless a test queued one for it,
+/// it gets no answer, which the live session treats like a failed background request.
+#[must_use]
+pub fn is_background_list_request(ctor: u32) -> bool {
+    use tg_tl::Identifiable;
+    use tg_tl::functions::messages::{GetDialogs, GetPeerDialogs, GetPinnedDialogs};
+    ctor == GetPeerDialogs::CONSTRUCTOR_ID
+        || ctor == GetDialogs::CONSTRUCTOR_ID
+        || ctor == GetPinnedDialogs::CONSTRUCTOR_ID
+}

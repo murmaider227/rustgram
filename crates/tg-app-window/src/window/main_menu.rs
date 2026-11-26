@@ -14,6 +14,7 @@ use tg_ui::stand_in::Colors;
 use tg_ui::stand_in::{PopupMenuStyle, ToggleStyle};
 use tg_ui::tg_style::{DefaultPaletteResolver, Icon, st};
 use tg_ui::userpic::{UserpicBgColors, paint_vertical_gradient_circle, userpic_colors};
+use tg_ui::userpic_images::paint_userpic_image;
 use tg_ui::widgets::checkbox::paint_toggle_view;
 use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
 
@@ -693,16 +694,18 @@ fn paint_cover(
         Pos2::new(rect.left() + 24.0, rect.top() + 20.0),
         Vec2::splat(MAIN_MENU_USERPIC_SIZE),
     );
-    paint_vertical_gradient_circle(painter, userpic_rect, userpic.color1, userpic.color2);
-    let mut initials_font = font_id_from_style(st::semibold_font);
-    initials_font.size = ((MAIN_MENU_USERPIC_SIZE as i32 * 13) / 33) as f32;
-    painter.text(
-        userpic_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        &user.initials,
-        initials_font,
-        Color32::WHITE,
-    );
+    if !paint_userpic_image(painter, userpic_rect, user.id.0) {
+        paint_vertical_gradient_circle(painter, userpic_rect, userpic.color1, userpic.color2);
+        let mut initials_font = font_id_from_style(st::semibold_font);
+        initials_font.size = ((MAIN_MENU_USERPIC_SIZE as i32 * 13) / 33) as f32;
+        painter.text(
+            userpic_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            &user.initials,
+            initials_font,
+            Color32::WHITE,
+        );
+    }
 
     let semibold = font_id_from_style(st::semibold_font);
     let normal = font_id_from_style(st::normal_font);

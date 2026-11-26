@@ -124,8 +124,11 @@ fn similar_channel_row(ui: &mut Ui, ch: &SimilarChannelEntry, colors: &dyn Color
         Pos2::new(rect.min.x + 16.0 + 20.0, rect.center().y),
         Vec2::splat(40.0),
     );
-    EmptyUserpic::for_color_index(ch.color_index, &ch.title, colors)
-        .paint_circle(ui.painter(), av_rect);
+    EmptyUserpic::for_color_index(ch.color_index, &ch.title, colors).paint_circle_or_photo(
+        ui.painter(),
+        av_rect,
+        ch.peer_id.0,
+    );
 
     let text_x = av_rect.max.x + 12.0;
     let title_fg = colors.color("windowBoldFg");

@@ -1190,6 +1190,8 @@ pub enum DeepLinkOutcome {
     ShowModal(ModalBox),
     /// Show a transient toast notification.
     Toast(String),
+    /// Show a failed request that needs the window's state (a Premium limit box).
+    UserError(tg_app_core::user_error::UserFacingError),
     /// Open the hamburger Main Menu drawer.
     OpenMainMenu,
     /// Focus global dialogs search (`tg://chats/search`).
@@ -1313,7 +1315,9 @@ fn dispatch_parsed_deep_link(
                 color_index,
                 participant_names,
             })),
-            Err(err) => DeepLinkOutcome::Toast(format!("Invalid invite link: {err}")),
+            Err(err) => {
+                DeepLinkOutcome::from_user_error(tg_app_core::user_error::check_chat_invite(&err))
+            }
         },
         DeepLink::AddList { slug } => match backend.check_chatlist_invite(&slug) {
             Ok(preview) => {
@@ -1345,7 +1349,9 @@ fn dispatch_parsed_deep_link(
                     },
                 )))
             }
-            Err(err) => DeepLinkOutcome::Toast(format!("Folder invite unavailable: {err}")),
+            Err(err) => DeepLinkOutcome::from_user_error(
+                tg_app_core::user_error::check_chatlist_invite(&err),
+            ),
         },
         DeepLink::AddStickers {
             short_name,
@@ -1354,14 +1360,18 @@ fn dispatch_parsed_deep_link(
             Ok(pack) => DeepLinkOutcome::show_box(BoxKind::StickerSet(
                 StickerSetBoxState::from_preview(pack),
             )),
-            Err(err) => DeepLinkOutcome::Toast(format!("Could not load sticker pack: {err}")),
+            Err(err) => {
+                DeepLinkOutcome::from_user_error(tg_app_core::user_error::sticker_set(&err))
+            }
         },
         DeepLink::AddTheme { slug } => match backend.resolve_cloud_theme(&slug) {
             Ok(theme) => DeepLinkOutcome::OpenOverlay(DeepLinkOverlayRequest::OpenTheme {
                 slug: theme.slug,
                 title: Some(theme.title),
             }),
-            Err(err) => DeepLinkOutcome::Toast(format!("Could not load theme '{slug}': {err}")),
+            Err(err) => {
+                DeepLinkOutcome::from_user_error(tg_app_core::user_error::resolve_cloud_theme(&err))
+            }
         },
         DeepLink::AddStyle { slug } => {
             let resolved = backend
@@ -1377,7 +1387,7 @@ fn dispatch_parsed_deep_link(
                     PreviewAiToneBoxState::new(tone, installed),
                 )),
                 Err(err) => {
-                    DeepLinkOutcome::Toast(format!("Could not load AI style '{slug}': {err}"))
+                    DeepLinkOutcome::from_user_error(tg_app_core::user_error::resolve_ai_tone(&err))
                 }
             }
         }
@@ -1476,7 +1486,9 @@ fn dispatch_parsed_deep_link(
                             rotation,
                         })
                     }
-                    Err(err) => DeepLinkOutcome::Toast(format!("Could not load background: {err}")),
+                    Err(err) => DeepLinkOutcome::from_user_error(
+                        tg_app_core::user_error::resolve_wallpaper(&err),
+                    ),
                 }
             }
         }
@@ -1503,12 +1515,8 @@ fn dispatch_parsed_deep_link(
                                 }
                                 Ok(_) => {}
                                 Err(err) => {
-                                    fee_toast =
-                                        Some(if err.to_ascii_uppercase().contains("FLOOD") {
-                                            tg_lang::tr::lng_flood_error()
-                                        } else {
-                                            format!("Could not apply fee-waiver token: {err}")
-                                        });
+                                    fee_toast = tg_app_core::user_error::import_no_paid_token(&err)
+                                        .into_text();
                                 }
                             }
                         }
@@ -1561,20 +1569,27 @@ fn dispatch_parsed_deep_link(
         DeepLink::LoginCode { code } => DeepLinkOutcome::LoginCode(code),
         DeepLink::Boost { domain, channel_id } => {
             let resolved = if let Some(ref user) = domain {
-                backend.resolve_username_remote(user, None)
-            } else if let Some(cid) = channel_id {
                 backend
-                    .resolve_private_channel_peer(cid)
-                    .ok_or_else(|| format!("Private channel {cid} is not loaded."))
+                    .resolve_username_remote(user, None)
+                    .map_err(|err| tg_app_core::user_error::resolve_username(&err, user))
+            } else if let Some(cid) = channel_id {
+                backend.resolve_private_channel_peer(cid).ok_or_else(|| {
+                    tg_app_core::user_error::private_channel_unavailable(&format!(
+                        "private channel {cid} is not loaded"
+                    ))
+                })
             } else {
-                Err("Missing boost channel target.".to_owned())
+                Err(tg_app_core::user_error::no_handler(
+                    "boost link",
+                    "missing boost channel target",
+                ))
             };
             match resolved {
                 Ok(peer_id) => {
                     session.show_statistics(peer_id, StatisticsScreen::Boosts);
                     DeepLinkOutcome::Handled
                 }
-                Err(err) => DeepLinkOutcome::Toast(format!("Could not open Boosts: {err}")),
+                Err(err) => DeepLinkOutcome::from_user_error(err),
             }
         }
         DeepLink::BusinessChatLink { slug } => match backend.resolve_business_chat_link(&slug) {
@@ -1586,7 +1601,9 @@ fn dispatch_parsed_deep_link(
                     DeepLinkOutcome::PrefillCompose { peer_id, text: msg }
                 }
             }
-            Err(err) => DeepLinkOutcome::Toast(format!("Business link invalid: {err}")),
+            Err(err) => DeepLinkOutcome::from_user_error(
+                tg_app_core::user_error::resolve_business_chat_link(&err),
+            ),
         },
         DeepLink::StarsTopUp { amount, purpose } => {
             let slug = if purpose.is_empty() {
@@ -1645,11 +1662,11 @@ fn dispatch_parsed_deep_link(
                 },
                 Err(err) => match handle_url_auth_request_error(&source, &err) {
                     UrlAuthErrorAction::ShowExpiredToast => {
-                        DeepLinkOutcome::Toast("This authorization link has expired.".to_owned())
+                        DeepLinkOutcome::Toast(tg_lang::tr::lng_url_auth_phone_toast_bad_expired())
                     }
-                    UrlAuthErrorAction::OpenDefaultUrl { .. } => {
-                        DeepLinkOutcome::Toast(format!("OAuth authorization failed: {err}"))
-                    }
+                    UrlAuthErrorAction::OpenDefaultUrl { .. } => DeepLinkOutcome::from_user_error(
+                        tg_app_core::user_error::request_url_auth(&err),
+                    ),
                 },
             }
         }
@@ -1683,7 +1700,9 @@ fn dispatch_parsed_deep_link(
                     )))
                 }
             }
-            Err(err) => DeepLinkOutcome::Toast(format!("Gift code invalid: {err}")),
+            Err(err) => {
+                DeepLinkOutcome::from_user_error(tg_app_core::user_error::check_gift_code(&err))
+            }
         },
         DeepLink::Phone { phone } => {
             let digits = normalize_phone_digits(&phone);
@@ -3790,7 +3809,10 @@ pub fn route_newbot_deep_link(
             );
             DeepLinkOutcome::show_box(BoxKind::CreateManagedBot(box_state))
         }
-        Err(err) => DeepLinkOutcome::Toast(format!("Could not find @{manager}: {err}")),
+        Err(err) => DeepLinkOutcome::from_user_error(tg_app_core::user_error::no_handler(
+            "contacts.resolveUsername (bot manager)",
+            &err,
+        )),
     }
 }
 

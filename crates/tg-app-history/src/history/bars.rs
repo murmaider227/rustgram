@@ -427,7 +427,11 @@ pub fn paint_top_bar(
         );
         if peer.summary.is_saved_messages {
             EmptyUserpic::paint_saved_messages(ui.painter(), photo, &ui_colors);
-        } else {
+        } else if !tg_ui::userpic_images::paint_userpic_image(
+            ui.painter(),
+            photo,
+            peer.summary.id.0,
+        ) {
             EmptyUserpic::for_peer(peer.summary.id.bare(), &peer.summary.title, &ui_colors)
                 .paint_circle(ui.painter(), photo);
         }
@@ -1316,15 +1320,18 @@ pub fn paint_join_requests_bar(
     let step = 16.0;
     let left_pad = 14.0;
     let shown = summary.recent_requesters.len().min(3);
-    for (idx, (_, name, color_idx)) in summary.recent_requesters.iter().take(3).enumerate() {
+    for (idx, (peer_id, name, color_idx)) in summary.recent_requesters.iter().take(3).enumerate() {
         let cx = rect.left() + left_pad + avatar_size * 0.5 + idx as f32 * step;
         let av_rect =
             Rect::from_center_size(Pos2::new(cx, rect.center().y), Vec2::splat(avatar_size));
         // Subtle ring separating overlapping circles
         ui.painter()
             .circle_filled(av_rect.center(), avatar_size * 0.5 + 1.5, bg);
-        EmptyUserpic::for_color_index(*color_idx, name, &ui_colors)
-            .paint_circle(ui.painter(), av_rect);
+        EmptyUserpic::for_color_index(*color_idx, name, &ui_colors).paint_circle_or_photo(
+            ui.painter(),
+            av_rect,
+            peer_id.0,
+        );
     }
 
     let avatars_w = if shown > 0 {
@@ -1404,8 +1411,11 @@ pub fn paint_business_bot_bar(
         Pos2::new(rect.left() + 26.0, rect.center().y),
         Vec2::splat(28.0),
     );
-    EmptyUserpic::for_peer(state.bot_id.bare(), &state.bot_name, &ui_colors)
-        .paint_circle(ui.painter(), av_rect);
+    EmptyUserpic::for_peer(state.bot_id.bare(), &state.bot_name, &ui_colors).paint_circle_or_photo(
+        ui.painter(),
+        av_rect,
+        state.bot_id.0,
+    );
 
     // Right-side action controls: Remove (×), Manage (optional), Pause/Resume pill
     let mut right_x = rect.right() - 10.0;

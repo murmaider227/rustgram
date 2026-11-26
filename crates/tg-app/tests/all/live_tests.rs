@@ -48,7 +48,7 @@ use tg_app::settings::backend::{
 };
 use tg_app::stand_in::settings::ShellSettings;
 use tg_app::stand_in::types::{FilterId, MsgId, PeerId};
-use tg_app::startup::{StartupPlan, StartupPrefs, parse_live_mode_env};
+use tg_app::startup::{StartupPlan, StartupPrefs, parse_live_mode_env, select_live_mode};
 use tg_app::webview::backend::{WebViewBackend, WebViewRequest};
 use tg_text::TextWithEntities;
 
@@ -290,6 +290,9 @@ impl RpcClient for FakeRpcClient {
             let mut q = self.responses.lock().expect("lock responses");
             if let Some(pos) = q.iter().position(|(c, _)| *c == ctor) {
                 q.remove(pos).map(|(_, r)| r)
+            } else if crate::common::is_background_list_request(ctor) {
+                // Never the answer a test queued for another request (TGB-2941).
+                None
             } else {
                 q.pop_front().map(|(_, r)| r)
             }
@@ -427,6 +430,37 @@ impl LiveTestHarness {
 // Test 1: Dialogs page + History slice over tg-session + FakeRpcClient
 // =============================================================================
 
+/// TGB-2941: the runtime's background dialog-entry request (`messages.getPeerDialogs`, sent
+/// after a forward into Saved Messages) used to take the answer queued for the test's next
+/// request, so `delete_messages` got "request dropped" 1 run in 6.
+#[test]
+fn fake_never_gives_a_background_chat_list_request_another_requests_answer() {
+    let fake = FakeRpcClient::new(2);
+    fake.enqueue_ok(
+        tl_fns::messages::DeleteMessages::CONSTRUCTOR_ID,
+        &tl_enums::messages::AffectedMessages::AffectedMessages(
+            tl_types::messages::AffectedMessages {
+                pts: 104,
+                pts_count: 1,
+            },
+        ),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let background =
+        rt.block_on(fake.invoke(&tl_fns::messages::GetPeerDialogs { peers: Vec::new() }));
+    assert!(
+        matches!(background, Err(InvocationError::Dropped)),
+        "an unqueued background request gets no answer: {background:?}"
+    );
+    let deleted = rt.block_on(fake.invoke(&tl_fns::messages::DeleteMessages {
+        revoke: true,
+        id: vec![21],
+    }));
+    assert!(deleted.is_ok(), "the delete keeps its answer: {deleted:?}");
+}
+
 #[test]
 fn live_session_dialogs_and_history_slice() {
     let h = LiveTestHarness::start();
@@ -509,6 +543,11 @@ fn live_session_send_edit_delete_forward_read_typing_draft() {
         },
     )
     .expect("send_message");
+    // Shown at once as a pending message; the server answer swaps in the server id.
+    assert!(sent.id.is_local() && sent.is_sending);
+    assert_eq!(sent.text.text, "Reply to Bob");
+    assert!(sent.outgoing);
+    let sent = crate::send_wait::wait_sent(&mut h.live, h.bob_peer, sent.id);
     assert_eq!(sent.id, MsgId(21));
     assert_eq!(sent.text.text, "Reply to Bob");
     assert!(sent.outgoing);
@@ -637,6 +676,11 @@ fn live_session_send_edit_delete_forward_read_typing_draft() {
     h.live.save_draft(h.bob_peer, None);
     assert!(h.live.load_draft(h.bob_peer).is_none());
 
+    // Typing, read receipts and drafts go out from the background queue.
+    assert!(
+        h.live
+            .flush_background_rpcs(std::time::Duration::from_secs(10))
+    );
     let ctors = h.fake.recorded_ctors();
     assert!(ctors.contains(&tl_fns::messages::SendMessage::CONSTRUCTOR_ID));
     assert!(ctors.contains(&tl_fns::messages::EditMessage::CONSTRUCTOR_ID));
@@ -1197,6 +1241,8 @@ fn live_session_over_mtproto_fake_transport() {
         },
     )
     .expect("send_message over MTProto");
+    assert!(sent.id.is_local());
+    let sent = crate::send_wait::wait_sent(&mut live, bob_peer, sent.id);
     assert_eq!(sent.id, MsgId(42));
     assert_eq!(sent.text.text, "MTProto live hello");
 
@@ -1210,7 +1256,7 @@ fn live_session_over_mtproto_fake_transport() {
 }
 
 // =============================================================================
-// Test 8: Mode selection (--live / RUSTGRAM_LIVE=1) & missing credentials UI
+// Test 8: Mode selection (credentials, --demo, --live / RUSTGRAM_LIVE=1) & missing credentials UI
 // =============================================================================
 
 #[test]
@@ -1223,10 +1269,40 @@ fn live_mode_selection_and_missing_credentials_ui() {
     };
     let prefs = StartupPrefs::default();
 
-    // Default run keeps MockSession demo mode (`live_mode == false`).
+    // A plain run carries no explicit mode switch.
     let default_plan =
         StartupPlan::build(["rustgram"], &env, Some(Path::new("rustgram.exe")), &prefs);
     assert!(!default_plan.live_mode);
+    assert!(!default_plan.demo_mode);
+
+    // Default mode: live when credentials are available (env or built in), demo otherwise.
+    assert!(select_live_mode(false, false, false, true));
+    assert!(!select_live_mode(false, false, false, false));
+    // `--demo` always wins, for screenshots and tests.
+    assert!(!select_live_mode(false, true, false, true));
+    assert!(!select_live_mode(true, true, true, true));
+    // `--live` / `RUSTGRAM_LIVE=1` force live mode even without credentials (setup screen) and
+    // are a no-op when credentials exist.
+    assert!(select_live_mode(true, false, false, false));
+    assert!(select_live_mode(false, false, true, false));
+    assert!(select_live_mode(true, false, false, true));
+
+    let demo_plan = StartupPlan::build(
+        ["rustgram", "--demo"],
+        &env,
+        Some(Path::new("rustgram.exe")),
+        &prefs,
+    );
+    assert!(demo_plan.demo_mode);
+    assert!(!demo_plan.live_mode);
+    assert!(
+        !demo_plan
+            .parsed_args
+            .start_urls
+            .iter()
+            .any(|u| u == "--demo"),
+        "`--demo` must not reach tdesktop's argument parser"
+    );
 
     // `--live` switch enables LiveSession mode.
     let live_plan = StartupPlan::build(

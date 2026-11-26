@@ -125,9 +125,9 @@ pub fn is_default_export_path(path: &str, default_download_path: &str) -> bool {
 pub fn display_export_path(path: &str, default_download_path: &str) -> String {
     if is_default_export_path(path, default_download_path) {
         if cfg!(windows) {
-            "Downloads\\Telegram Desktop".to_owned()
+            "Downloads\\Rustgram".to_owned()
         } else {
-            "Downloads/Telegram Desktop".to_owned()
+            "Downloads/Rustgram".to_owned()
         }
     } else if cfg!(windows) {
         path.replace('/', "\\")
@@ -602,7 +602,7 @@ impl SettingsView {
         actions: &mut Vec<SettingsViewAction>,
     ) {
         ui.add_space(6.0);
-        // Compact `"Format: [HTML v], Path: Downloads\Telegram Desktop"` row
+        // Compact `"Format: [HTML v], Path: Downloads\Rustgram"` row
         // (port of `export_view_format_button.cpp:CreateFormatAndLocation`).
         let path_display = display_export_path(&settings.path, default_download_path);
         let fmt_label = format_short_label(settings.format);

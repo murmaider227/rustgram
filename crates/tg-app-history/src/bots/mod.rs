@@ -290,7 +290,10 @@ impl BotsDemoScreen {
 
     /// Displays a transient toast notification for 3 seconds starting at `now_ms`.
     pub fn show_toast(&mut self, msg: impl Into<String>, now_ms: u64) {
-        self.toast = Some((msg.into(), now_ms.saturating_add(3_000)));
+        let Some(msg) = tg_app_core::user_error::visible_toast_text(msg.into()) else {
+            return;
+        };
+        self.toast = Some((msg, now_ms.saturating_add(3_000)));
     }
 
     /// Switches the demo tab and prepares its corresponding widgets deterministically.
@@ -1384,7 +1387,7 @@ impl BotsDemoScreen {
                 self.apply_callback_answer(request, &answer, now_ms);
             }
             Err(err) => {
-                self.show_toast(format!("Callback error: {err}"), now_ms);
+                let _ = tg_app_core::user_error::bot_callback(&err);
             }
         }
     }
@@ -1485,7 +1488,7 @@ impl BotsDemoScreen {
                                 }
                             },
                             Err(err) => {
-                                self.show_toast(format!("Login failed: {err}"), now_ms);
+                                let _ = tg_app_core::user_error::accept_url_auth_button(&err);
                             }
                         }
                     }

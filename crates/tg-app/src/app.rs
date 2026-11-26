@@ -15,6 +15,7 @@ use crate::stand_in::backend::Backend;
 use crate::stand_in::mock_session::{MockSession, session_peers};
 use crate::stand_in::settings::{ShellSettings, WindowPosition};
 use crate::stand_in::strings::Strings;
+use crate::stand_in::theme::{Palette, ThemeMode};
 use crate::stand_in::types::{PeerId, PeerKind};
 use crate::startup::StartupContext;
 use crate::startup::crash_window::{CRASH_WINDOW_HEIGHT, CRASH_WINDOW_WIDTH, CrashRecoveryAction};
@@ -36,7 +37,8 @@ use crate::window::platform_shell::{
 pub struct AppConfig {
     /// Skip intro and open straight into the signed-in mock main workspace (`--start-main`).
     pub start_signed_in: bool,
-    /// Use real `tg-session` + `LiveSession` instead of `MockSession` (`--live` or `RUSTGRAM_LIVE=1`).
+    /// Use real `tg-session` + `LiveSession` instead of `MockSession` (the default when API
+    /// credentials are available; `--demo` selects `MockSession`).
     pub live_mode: bool,
     /// Optional override for `CoreSettings::native_window_frame` (`false` = custom frameless bar).
     pub native_window_frame: Option<bool>,
@@ -50,23 +52,29 @@ pub struct AppConfig {
 /// and [`AppWebViewHost`] over ONE shared [`MockSession`], or delegating to
 /// [`crate::live::LiveAppHost`] when launched in live mode (`--live` / `RUSTGRAM_LIVE=1`).
 pub struct TgforkApp {
-    controller: WindowController,
+    /// The demo workspace; `None` in live mode, where the live host owns the real ones.
+    demo: Option<Box<DemoShell>>,
     live_host: Option<crate::live::LiveAppHost>,
+    /// Window size restored when the crash recovery screen is left.
+    restore_position: WindowPosition,
+    startup: Option<StartupContext>,
+    initial_activations_dispatched: bool,
+    started_hidden_to_tray: bool,
+    platform_shell: PlatformWindowShell,
+}
+
+/// The demo-mode workspace over one shared [`MockSession`] (`--demo`).
+struct DemoShell {
+    controller: WindowController,
     applied_theme_gen: u64,
     notify_tray: AppNotifyTrayHost,
     webview_host: AppWebViewHost,
     calls_host: crate::calls::AppCallsHost,
-    startup: Option<StartupContext>,
-    initial_activations_dispatched: bool,
-    started_hidden_to_tray: bool,
     stories: crate::stories::AppStoriesHost,
-    platform_shell: PlatformWindowShell,
 }
 
-impl TgforkApp {
-    /// Creates a new `TgforkApp` wired to one shared [`MockSession`].
-    #[must_use]
-    pub fn with_session(
+impl DemoShell {
+    fn new(
         cc: &eframe::CreationContext<'_>,
         mock_session: MockSession,
         settings: ShellSettings,
@@ -96,12 +104,30 @@ impl TgforkApp {
 
         Self {
             controller,
-            live_host: None,
             applied_theme_gen,
             notify_tray,
             webview_host,
             calls_host: crate::calls::AppCallsHost::new(),
             stories: crate::stories::AppStoriesHost::new(),
+        }
+    }
+}
+
+impl TgforkApp {
+    /// Creates a new `TgforkApp` wired to one shared [`MockSession`].
+    #[must_use]
+    pub fn with_session(
+        cc: &eframe::CreationContext<'_>,
+        mock_session: MockSession,
+        settings: ShellSettings,
+        settings_path: PathBuf,
+    ) -> Self {
+        let restore_position = settings.window_position;
+        let demo = DemoShell::new(cc, mock_session, settings, settings_path);
+        Self {
+            demo: Some(Box::new(demo)),
+            live_host: None,
+            restore_position,
             startup: None,
             initial_activations_dispatched: false,
             started_hidden_to_tray: false,
@@ -134,38 +160,41 @@ impl TgforkApp {
         prefetch: Option<crate::live::LiveBootstrapPrefetch>,
     ) -> Self {
         crate::startup::profiler::mark("new_live_enter");
-        // The shell parts below need no network, so they are built while the prefetch thread is
-        // still connecting; joining it comes last.
-        let mock = MockSession::new(false);
-        crate::startup::profiler::mark("new_live_after_mock_session");
-        let mut app = Self::with_session(cc, mock, settings.clone(), settings_path.clone());
+        // Live mode builds no demo workspace: the live host owns the real controller, tray,
+        // web view, calls and stories hosts, and applies the same settings-derived theme to
+        // egui that the demo controller used to apply after it.
+        let restore_position = settings.window_position;
         let egui_ctx = Some(cc.egui_ctx.clone());
+        // Auto-night mode: the live windows of the real app follow the system dark mode.
+        crate::window::controller::follow_platform_dark_mode();
         let mut live_host = match prefetch {
             Some(prefetch) => crate::live::LiveAppHost::bootstrap_prefetched(
                 egui_ctx,
-                settings.clone(),
-                settings_path.clone(),
+                settings,
+                settings_path,
                 working_dir,
                 data_name,
                 prefetch,
             ),
             None => crate::live::LiveAppHost::bootstrap(
                 egui_ctx,
-                settings.clone(),
-                settings_path.clone(),
+                settings,
+                settings_path,
                 working_dir,
                 data_name,
             ),
         };
         crate::startup::profiler::mark("new_live_after_bootstrap");
         live_host.set_window_hwnd(crate::live::passkeys::win32_hwnd_from_window_handle(cc));
-        // Keep the egui style the shell controller applied last, as when it was built after the
-        // live host.
-        app.controller
-            .theme_manager_mut()
-            .apply_to_egui(&cc.egui_ctx);
-        app.live_host = Some(live_host);
-        app
+        Self {
+            demo: None,
+            live_host: Some(live_host),
+            restore_position,
+            startup: None,
+            initial_activations_dispatched: false,
+            started_hidden_to_tray: false,
+            platform_shell: PlatformWindowShell::new_win32(),
+        }
     }
 
     /// Attaches a live [`StartupContext`] (single-instance pipe queue, crash recovery,
@@ -179,18 +208,20 @@ impl TgforkApp {
     ) -> Self {
         startup.activation_queue.set_repaint_ctx(ctx.clone());
         let initial_snapshot = startup.update_controller.snapshot();
-        let _ = crate::startup::apply_profile_data_paths_native(
-            &startup.plan.resolved_working_dir.path,
-            &mut self.webview_host,
-            &mut self.controller,
-        );
         let widget_helper_path = startup.plan.widget_helper_path.clone();
         if let Some(live) = self.live_host.as_mut() {
             live.set_update_snapshot(initial_snapshot.clone());
             live.set_widget_helper_path(widget_helper_path.clone());
         }
-        self.controller.set_update_snapshot(initial_snapshot);
-        self.controller.set_widget_helper_path(widget_helper_path);
+        if let Some(demo) = self.demo.as_deref_mut() {
+            let _ = crate::startup::apply_profile_data_paths_native(
+                &startup.plan.resolved_working_dir.path,
+                &mut demo.webview_host,
+                &mut demo.controller,
+            );
+            demo.controller.set_update_snapshot(initial_snapshot);
+            demo.controller.set_widget_helper_path(widget_helper_path);
+        }
         self.started_hidden_to_tray = started_hidden_to_tray;
         self.startup = Some(startup);
         self
@@ -214,11 +245,28 @@ impl TgforkApp {
         )
     }
 
-    /// Returns a mutable reference to the inner [`WindowController`].
-    pub fn controller_mut(&mut self) -> &mut WindowController {
-        &mut self.controller
+    /// Returns a mutable reference to the demo workspace's [`WindowController`] (`None` in
+    /// live mode, where [`crate::live::LiveAppHost`] owns the controllers).
+    pub fn controller_mut(&mut self) -> Option<&mut WindowController> {
+        self.demo.as_deref_mut().map(|demo| &mut demo.controller)
     }
 
+    /// Dark mode and palette for the crash recovery screen and the title bar.
+    fn shell_theme(&self) -> (bool, Palette) {
+        if let Some(live) = self.live_host.as_ref() {
+            return (live.is_dark_theme(), live.current_palette());
+        }
+        match self.demo.as_deref() {
+            Some(demo) => (
+                demo.controller.theme_mode() == ThemeMode::Night,
+                demo.controller.palette(),
+            ),
+            None => (false, Palette::day()),
+        }
+    }
+}
+
+impl DemoShell {
     fn sync_theme(&mut self, ctx: &egui::Context) {
         let current_gen = self.controller.theme_generation();
         if self.applied_theme_gen != current_gen {
@@ -282,6 +330,9 @@ impl TgforkApp {
             }
         }
     }
+}
+
+impl TgforkApp {
     fn process_startup_hooks(&mut self, ctx: &egui::Context) {
         let mut incoming_batch = Vec::new();
         let mut open_settings_now = false;
@@ -310,14 +361,16 @@ impl TgforkApp {
         if let Some(snap) = latest_update_snapshot {
             if let Some(live) = self.live_host.as_mut() {
                 live.set_update_snapshot(snap);
-            } else {
-                self.controller.set_update_snapshot(snap);
+            } else if let Some(demo) = self.demo.as_deref_mut() {
+                demo.controller.set_update_snapshot(snap);
             }
         }
         let update_prefs_change = if let Some(live) = self.live_host.as_mut() {
             live.take_update_prefs_change()
         } else {
-            self.controller.take_update_prefs_change()
+            self.demo
+                .as_deref_mut()
+                .and_then(|demo| demo.controller.take_update_prefs_change())
         };
         if let Some((auto_update, install_beta)) = update_prefs_change
             && let Some(startup) = self.startup.as_ref()
@@ -333,8 +386,8 @@ impl TgforkApp {
         if open_settings_now {
             if let Some(live) = self.live_host.as_mut() {
                 live.open_settings();
-            } else {
-                self.controller.open_settings();
+            } else if let Some(demo) = self.demo.as_deref_mut() {
+                demo.controller.open_settings();
             }
         }
 
@@ -351,15 +404,17 @@ impl TgforkApp {
             }
             if let Some(live) = self.live_host.as_mut() {
                 live.handle_incoming_activation(act, ctx);
-            } else {
-                self.controller.handle_incoming_activation(act, ctx);
+            } else if let Some(demo) = self.demo.as_deref_mut() {
+                demo.controller.handle_incoming_activation(act, ctx);
             }
         }
 
         let update_action = if let Some(live) = self.live_host.as_mut() {
             live.take_update_action()
         } else {
-            self.controller.take_update_action()
+            self.demo
+                .as_deref_mut()
+                .and_then(|demo| demo.controller.take_update_action())
         };
         if let Some(action) = update_action {
             match action {
@@ -388,8 +443,8 @@ impl TgforkApp {
                             let msg = format!("Could not launch updater: {err}");
                             if let Some(live) = self.live_host.as_mut() {
                                 live.show_toast(msg);
-                            } else {
-                                self.controller.show_toast(msg);
+                            } else if let Some(demo) = self.demo.as_deref_mut() {
+                                demo.controller.show_toast(msg);
                             }
                         }
                     }
@@ -407,31 +462,172 @@ impl TgforkApp {
     }
 }
 
+impl DemoShell {
+    /// First half of a demo frame, up to the startup hooks: window frame, title bar, geometry.
+    /// Returns `(dark_mode, passcode_locked)`.
+    fn begin_frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        hwnd: isize,
+        has_crash_recovery: bool,
+        platform_shell: &mut PlatformWindowShell,
+    ) -> (bool, bool) {
+        self.controller.set_window_hwnd(hwnd);
+        self.controller.set_native_hwnd(hwnd);
+        let native_frame = self.controller.sync_native_window_frame_setting();
+        let dark_mode = self.controller.theme_mode() == ThemeMode::Night;
+        let passcode_locked = self.controller.root_screen() == RootScreen::PasscodeLock;
+        platform_shell.sync_window_frame(
+            Some(ctx),
+            hwnd,
+            dark_mode,
+            native_frame,
+            has_crash_recovery,
+            passcode_locked,
+        );
+        let title_palette = self.controller.palette();
+        platform_shell.show_frameless_title_bar(
+            ui,
+            "Rustgram",
+            &title_palette,
+            native_frame,
+            has_crash_recovery,
+        );
+
+        self.track_window_geometry(ctx);
+        (dark_mode, passcode_locked)
+    }
+
+    /// Second half of a demo frame: calls, the workspace, overlays, tray and web views.
+    fn finish_frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        hwnd: isize,
+        dark_mode: bool,
+        passcode_locked: bool,
+        platform_shell: &mut PlatformWindowShell,
+    ) {
+        self.calls_host.set_passcode_locked(passcode_locked);
+        self.calls_host.update_and_render(ui);
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            self.controller
+                .show_with_stories(ui, Some(&mut self.stories));
+        });
+        self.calls_host
+            .set_passcode_locked(self.controller.root_screen() == RootScreen::PasscodeLock);
+        let dark_taskbar = tg_platform::system_info::is_dark_taskbar().unwrap_or(dark_mode);
+        let audio_bar = self.controller.main_widget_mut().audio_player_bar_mut();
+        let _ = platform_shell.poll_and_dispatch_taskbar_clicks(audio_bar);
+        platform_shell.sync_taskbar_from_audio_bar(hwnd, audio_bar, dark_taskbar);
+        if self.controller.take_open_recent_calls_request() {
+            self.calls_host.open_recent_calls();
+        }
+        if let Some((peer_id, video)) = self.controller.take_start_call_request() {
+            self.calls_host.start_outgoing_call(peer_id, video);
+        }
+        self.controller.dispatch_demo_overlay_requests(ctx);
+
+        self.dispatch_webview_requests();
+        let locked = self.controller.root_screen() == RootScreen::PasscodeLock;
+        self.webview_host.set_passcode_locked(locked);
+        if locked {
+            close_demo_overlays_for_passcode_lock(ctx);
+            self.stories.close_for_passcode_lock();
+        }
+
+        self.notify_tray
+            .set_active_peer(self.controller.active_focused_peer());
+        self.notify_tray.update_and_render(
+            ctx,
+            &self.controller.palette(),
+            self.controller.root_screen() == RootScreen::PasscodeLock,
+        );
+        self.controller.poll_notification_opens(Some(ctx));
+
+        self.webview_host
+            .update_and_render(ctx, self.controller.theme_mode());
+        for ev in self.webview_host.take_events() {
+            self.controller.handle_webview_event(ev, ctx);
+        }
+        if locked {
+            return;
+        }
+        crate::statistics::AppStatisticsHost::update_and_render(
+            ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::export::AppExportHost::update_and_render(
+            ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::payments::AppPaymentsHost::update_and_render(
+            ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::wallet::AppWalletHost::update_and_render(
+            ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::business::AppBusinessHost::update_and_render(
+            ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::bots::AppBotsHost::update_and_render(
+            ctx,
+            &self.controller.palette(),
+            self.controller.theme_mode(),
+        );
+        crate::themes::AppThemesHost::update_and_render(
+            ctx,
+            self.controller.palette().layer_backdrop,
+            self.controller.palette().divider,
+        );
+        self.stories
+            .update_and_render(ctx, &self.controller.palette());
+        if self.stories.take_update_app_request() {
+            self.controller.request_update_check();
+        }
+    }
+}
+
 impl eframe::App for TgforkApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let _first_frame_marks = crate::startup::profiler::FrameMarks::begin();
+        let _frame_trace =
+            crate::startup::frame_trace::begin_frame(ui.ctx(), frame.info().cpu_usage);
         let ctx = ui.ctx().clone();
         let hwnd = extract_eframe_hwnd(frame);
         let has_crash_recovery = self
             .startup
             .as_ref()
             .is_some_and(|s| s.crash_recovery.is_some());
-        self.sync_theme(&ctx);
+        if let Some(demo) = self.demo.as_deref_mut() {
+            demo.sync_theme(&ctx);
+        }
 
         // If the previous launch exited uncleanly (`tdata/working`), show the crash recovery
         // screen before entering the main workspace (`LastCrashedWindow`).
-        if let Some(startup) = self.startup.as_mut()
-            && let Some(recovery) = startup.crash_recovery.as_mut()
+        if self
+            .startup
+            .as_ref()
+            .is_some_and(|s| s.crash_recovery.is_some())
         {
-            self.platform_shell.sync_window_frame(
-                Some(&ctx),
-                hwnd,
-                self.controller.theme_mode() == crate::stand_in::theme::ThemeMode::Night,
-                true,
-                true,
-                false,
-            );
-            let palette = self.controller.palette();
+            let (dark_mode, palette) = self.shell_theme();
+            self.platform_shell
+                .sync_window_frame(Some(&ctx), hwnd, dark_mode, true, true, false);
+            let Some(startup) = self.startup.as_mut() else {
+                return;
+            };
+            let Some(recovery) = startup.crash_recovery.as_mut() else {
+                return;
+            };
             let decision = CentralPanel::default()
                 .frame(Frame::NONE)
                 .show(ui, |ui| recovery.show(ui, &palette))
@@ -441,7 +637,7 @@ impl eframe::App for TgforkApp {
                     CrashRecoveryAction::Continue => {
                         let _ = startup.crash_manager.restart();
                         startup.crash_recovery = None;
-                        let pos = self.controller.settings().window_position.clamped();
+                        let pos = self.restore_position.clamped();
                         ctx.send_viewport_cmd(ViewportCommand::Title("Rustgram".to_owned()));
                         ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
                             pos.width, pos.height,
@@ -509,129 +705,37 @@ impl eframe::App for TgforkApp {
             return;
         }
 
-        self.controller.set_window_hwnd(hwnd);
-        self.controller.set_native_hwnd(hwnd);
-        let native_frame = self.controller.sync_native_window_frame_setting();
-        let dark_mode = self.controller.theme_mode() == crate::stand_in::theme::ThemeMode::Night;
-        let passcode_locked = self.controller.root_screen() == RootScreen::PasscodeLock;
-        self.platform_shell.sync_window_frame(
-            Some(&ctx),
-            hwnd,
-            dark_mode,
-            native_frame,
-            has_crash_recovery,
-            passcode_locked,
-        );
-        let title_palette = self.controller.palette();
-        self.platform_shell.show_frameless_title_bar(
-            ui,
-            "Rustgram",
-            &title_palette,
-            native_frame,
-            has_crash_recovery,
-        );
-
-        self.track_window_geometry(&ctx);
-        self.process_startup_hooks(&ctx);
-
-        self.calls_host.set_passcode_locked(passcode_locked);
-        self.calls_host.update_and_render(ui);
-        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
-            self.controller
-                .show_with_stories(ui, Some(&mut self.stories));
-        });
-        self.calls_host
-            .set_passcode_locked(self.controller.root_screen() == RootScreen::PasscodeLock);
-        let dark_taskbar = tg_platform::system_info::is_dark_taskbar().unwrap_or(dark_mode);
-        let audio_bar = self.controller.main_widget_mut().audio_player_bar_mut();
-        let _ = self
-            .platform_shell
-            .poll_and_dispatch_taskbar_clicks(audio_bar);
-        self.platform_shell
-            .sync_taskbar_from_audio_bar(hwnd, audio_bar, dark_taskbar);
-        if self.controller.take_open_recent_calls_request() {
-            self.calls_host.open_recent_calls();
-        }
-        if let Some((peer_id, video)) = self.controller.take_start_call_request() {
-            self.calls_host.start_outgoing_call(peer_id, video);
-        }
-        self.controller.dispatch_demo_overlay_requests(&ctx);
-
-        self.dispatch_webview_requests();
-        let locked = self.controller.root_screen() == RootScreen::PasscodeLock;
-        self.webview_host.set_passcode_locked(locked);
-        if locked {
-            close_demo_overlays_for_passcode_lock(&ctx);
-            self.stories.close_for_passcode_lock();
-        }
-
-        self.notify_tray
-            .set_active_peer(self.controller.active_focused_peer());
-        self.notify_tray.update_and_render(
-            &ctx,
-            &self.controller.palette(),
-            self.controller.root_screen() == RootScreen::PasscodeLock,
-        );
-        self.controller.poll_notification_opens(Some(&ctx));
-
-        self.webview_host
-            .update_and_render(&ctx, self.controller.theme_mode());
-        for ev in self.webview_host.take_events() {
-            self.controller.handle_webview_event(ev, &ctx);
-        }
-        if locked {
+        let Some(demo) = self.demo.as_deref_mut() else {
             return;
-        }
-        crate::statistics::AppStatisticsHost::update_and_render(
-            &ctx,
-            &self.controller.palette(),
-            self.controller.theme_mode(),
-        );
-        crate::export::AppExportHost::update_and_render(
-            &ctx,
-            &self.controller.palette(),
-            self.controller.theme_mode(),
-        );
-        crate::payments::AppPaymentsHost::update_and_render(
-            &ctx,
-            &self.controller.palette(),
-            self.controller.theme_mode(),
-        );
-        crate::wallet::AppWalletHost::update_and_render(
-            &ctx,
-            &self.controller.palette(),
-            self.controller.theme_mode(),
-        );
-        crate::business::AppBusinessHost::update_and_render(
-            &ctx,
-            &self.controller.palette(),
-            self.controller.theme_mode(),
-        );
-        crate::bots::AppBotsHost::update_and_render(
-            &ctx,
-            &self.controller.palette(),
-            self.controller.theme_mode(),
-        );
-        crate::themes::AppThemesHost::update_and_render(
-            &ctx,
-            self.controller.palette().layer_backdrop,
-            self.controller.palette().divider,
-        );
-        self.stories
-            .update_and_render(&ctx, &self.controller.palette());
-        if self.stories.take_update_app_request() {
-            self.controller.request_update_check();
+        };
+        let (dark_mode, passcode_locked) =
+            demo.begin_frame(ui, &ctx, hwnd, has_crash_recovery, &mut self.platform_shell);
+        self.process_startup_hooks(&ctx);
+        if let Some(demo) = self.demo.as_deref_mut() {
+            demo.finish_frame(
+                ui,
+                &ctx,
+                hwnd,
+                dark_mode,
+                passcode_locked,
+                &mut self.platform_shell,
+            );
         }
     }
 
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        crate::startup::frame_trace::raw_input_hook(ctx, raw_input);
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::startup::frame_trace::shutdown();
         if let Some(live) = self.live_host.as_mut() {
             live.on_exit();
-        } else {
-            self.calls_host.on_exit();
-            self.webview_host.on_exit();
-            self.notify_tray.on_exit();
-            self.controller.flush_settings();
+        } else if let Some(demo) = self.demo.as_deref_mut() {
+            demo.calls_host.on_exit();
+            demo.webview_host.on_exit();
+            demo.notify_tray.on_exit();
+            demo.controller.flush_settings();
         }
 
         if let Some(mut startup) = self.startup.take() {

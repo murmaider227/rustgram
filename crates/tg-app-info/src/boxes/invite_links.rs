@@ -1213,8 +1213,11 @@ fn render_importer_row(
         Pos2::new(rect.min.x + 18.0, rect.center().y),
         Vec2::splat(34.0),
     );
-    EmptyUserpic::for_color_index(user.color_index, &user.name, colors)
-        .paint_circle(ui.painter(), av_rect);
+    EmptyUserpic::for_color_index(user.color_index, &user.name, colors).paint_circle_or_photo(
+        ui.painter(),
+        av_rect,
+        user.user_id.0,
+    );
 
     let text_x = av_rect.max.x + 10.0;
     ui.painter().text(
@@ -1334,7 +1337,7 @@ fn render_admin_with_invites_row(
         Vec2::splat(34.0),
     );
     EmptyUserpic::for_color_index((admin.admin_id.bare() % 7) as u8, &admin.name, colors)
-        .paint_circle(ui.painter(), av_rect);
+        .paint_circle_or_photo(ui.painter(), av_rect, admin.admin_id.0);
 
     let text_x = av_rect.max.x + 10.0;
     let right_badge_w = 30.0;

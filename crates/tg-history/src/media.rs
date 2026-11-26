@@ -83,7 +83,65 @@ fn scaled_keep_aspect_ratio_by_expanding(original: Size, bounds: Size) -> Size {
     }
 }
 
-/// Port of `Media::Streaming::FrameResizeMayExpand` (`media_streaming_utility.cpp:371-411`).
+/// How a picture of `original` size is fitted into an `outer` box
+/// (`Media::Streaming::ExpandDecision`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpandDecision {
+    /// Size the picture is scaled to, keeping its aspect ratio.
+    pub result: Size,
+    /// `true`: `result` covers `outer` and is cropped to it (centered). `false`: `result` fits
+    /// inside `outer`, centered over the blurred background.
+    pub expanding: bool,
+}
+
+/// Port of `Media::Streaming::DecideFrameResize` (`media_streaming_utility.cpp:371-387`).
+///
+/// The picture covers the box when no more than `1 - nominator / denominator` of its height
+/// is cut off (tdesktop's defaults are `(3, 4)`); otherwise it fits inside the box.
+#[must_use]
+pub fn decide_frame_resize(
+    outer: Size,
+    original: Size,
+    min_visible_nominator: i32,
+    min_visible_denominator: i32,
+) -> ExpandDecision {
+    decide_frame_resize_i64(
+        outer,
+        original,
+        i64::from(min_visible_nominator),
+        i64::from(min_visible_denominator),
+    )
+}
+
+fn decide_frame_resize_i64(
+    outer: Size,
+    original: Size,
+    min_visible_nominator: i64,
+    min_visible_denominator: i64,
+) -> ExpandDecision {
+    if outer.is_empty() {
+        return ExpandDecision {
+            result: original,
+            expanding: true,
+        };
+    }
+    let big = scaled_keep_aspect_ratio_by_expanding(original, outer);
+    if big.width <= outer.width
+        && i64::from(big.height) * min_visible_nominator
+            <= i64::from(outer.height) * min_visible_denominator
+    {
+        return ExpandDecision {
+            result: big,
+            expanding: true,
+        };
+    }
+    ExpandDecision {
+        result: original.scaled_keep_aspect_ratio(outer),
+        expanding: false,
+    }
+}
+
+/// Port of `Media::Streaming::FrameResizeMayExpand` (`media_streaming_utility.cpp:389-411`).
 ///
 /// Default nominator/denominator in tdesktop are `(3, 4)`.
 #[must_use]
@@ -110,8 +168,7 @@ pub fn frame_resize_may_expand(
     let num =
         i64::from(min_visible_nominator) * i64::from(min_dim) - i64::from(min_visible_denominator);
     let den = i64::from(min_visible_denominator) * i64::from(min_dim);
-    let big = scaled_keep_aspect_ratio_by_expanding(original, outer);
-    big.width <= outer.width && i64::from(big.height) * num <= i64::from(outer.height) * den
+    decide_frame_resize_i64(outer, original, num, den).expanding
 }
 
 // ---------------------------------------------------------------------------

@@ -8,9 +8,10 @@ use tg_app_core::core_types::dto::engagement::FutureChatCreatorInfo;
 use tg_lang::tr;
 use tg_ui::fonts::{family_regular, family_semibold};
 use tg_ui::layers::{BoxButton, BoxModal};
-use tg_ui::stand_in::{CheckStyle, CheckboxStyle, Colors, FlatLabelStyle};
+use tg_ui::stand_in::{CheckStyle, CheckboxStyle, Colors, FlatLabelStyle, LinkButtonStyle};
 use tg_ui::tg_style::st;
 use tg_ui::userpic::EmptyUserpic;
+use tg_ui::widgets::buttons::LinkButton;
 use tg_ui::widgets::checkbox::Checkbox;
 use tg_ui::widgets::labels::FlatLabel;
 
@@ -53,6 +54,31 @@ pub struct DeleteMessagesBoxState {
     pub future_creator: Option<FutureChatCreatorInfo>,
     /// The user's first name for "Also delete for {user}" (`UserData::firstName`).
     pub first_name: Option<String>,
+    /// "Clear history" shows the "Enable Auto-Delete" / "Edit Auto-Delete Settings" link when
+    /// the account may set the chat's timer (`TTLMenu::TTLValidator::can`); holds the current
+    /// timer in seconds (`0` = off).
+    pub auto_delete_ttl: Option<u32>,
+    /// Carried from `DeleteChatBox` when this box is the next-owner step of leaving a chat.
+    pub remove_from_folders: bool,
+}
+
+/// Bare ids of the service notifications user (`PeerData::isNotificationsUser`) and of
+/// "Verification Codes" (`UserData::isVerifyCodes`).
+const SERVICE_NOTIFICATIONS_USER: u64 = 777_000;
+const VERIFY_CODES_USER: u64 = 489_000;
+
+/// `TTLMenu::TTLValidator::can`: another (non-service) user, or a group / channel whose info
+/// the account may edit.
+#[must_use]
+pub fn can_set_auto_delete(peer: &PeerProfile) -> bool {
+    match peer.kind {
+        InfoPeerKind::User | InfoPeerKind::Bot => !matches!(
+            peer.id.bare(),
+            SERVICE_NOTIFICATIONS_USER | VERIFY_CODES_USER
+        ),
+        InfoPeerKind::SavedMessages => false,
+        InfoPeerKind::Group | InfoPeerKind::Supergroup | InfoPeerKind::Channel => peer.can_edit,
+    }
 }
 
 impl DeleteMessagesBoxState {
@@ -71,6 +97,8 @@ impl DeleteMessagesBoxState {
             remember_choice: false,
             future_creator: None,
             first_name: None,
+            auto_delete_ttl: None,
+            remove_from_folders: false,
         }
     }
 
@@ -87,6 +115,9 @@ impl DeleteMessagesBoxState {
             } else {
                 DeleteMode::DeleteAndLeave
             },
+            auto_delete_ttl: (just_clear && can_set_auto_delete(peer))
+                .then_some(peer.auto_delete_ttl_seconds),
+            remove_from_folders: false,
             can_revoke_for_everyone: can_revoke,
             default_revoke: false,
             revoke_for_everyone: false,
@@ -260,9 +291,23 @@ impl DeleteMessagesBoxState {
         modal
     }
 
-    /// Renders the confirmation copy, optional future-owner transfer callout, and delete-for-everyone
-    /// checkboxes.
-    pub fn show_body(&mut self, ui: &mut Ui, colors: &dyn Colors) {
+    /// Text of the auto-delete link: "Edit Auto-Delete Settings" when a timer is set, else
+    /// "Enable Auto-Delete" (`None` when the box has no link).
+    #[must_use]
+    pub fn auto_delete_link_text(&self) -> Option<String> {
+        self.auto_delete_ttl.map(|ttl| {
+            if ttl > 0 {
+                tr::lng_edit_auto_delete_settings()
+            } else {
+                tr::lng_enable_auto_delete()
+            }
+        })
+    }
+
+    /// Renders the confirmation copy, optional future-owner transfer callout, delete-for-everyone
+    /// checkboxes and the auto-delete link. Returns `true` when the auto-delete link was clicked
+    /// (`validator.showBox()`: the caller opens the Auto-Delete box on top).
+    pub fn show_body(&mut self, ui: &mut Ui, colors: &dyn Colors) -> bool {
         let prompt = self.prompt_text();
         FlatLabel::plain(&prompt, FlatLabelStyle::box_label(colors))
             .id_salt("delete_prompt")
@@ -311,9 +356,8 @@ impl DeleteMessagesBoxState {
                 Pos2::new(card_rect.left() + 28.0, card_rect.center().y),
                 Vec2::splat(36.0),
             );
-            let color_idx = (creator.user_id.bare() % 8) as u8;
-            EmptyUserpic::for_color_index(color_idx, &creator.name, colors)
-                .paint_circle(ui.painter(), av_rect);
+            EmptyUserpic::for_peer(creator.user_id.bare(), &creator.name, colors)
+                .paint_circle_or_photo(ui.painter(), av_rect, creator.user_id.0);
 
             let text_left = av_rect.right() + 12.0;
             let header_text = match creator.username.as_deref() {
@@ -358,6 +402,22 @@ impl DeleteMessagesBoxState {
                 .show(ui);
             }
         }
+
+        // `_autoDeleteSettings` (`delete_messages_box.cpp:246-262`), placed `boxMediumSkip`
+        // below the revoke checkbox, or `2 * boxMediumSkip - boxLittleSkip` below the text.
+        let Some(link) = self.auto_delete_link_text() else {
+            return false;
+        };
+        let medium = st::box_medium_skip.0 as f32;
+        let little = st::box_little_skip.0 as f32;
+        ui.add_space(if self.can_revoke_for_everyone {
+            medium
+        } else {
+            2.0 * medium - little
+        });
+        LinkButton::new(&link, LinkButtonStyle::box_link(colors))
+            .show(ui)
+            .clicked()
     }
 }
 

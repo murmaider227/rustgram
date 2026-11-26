@@ -672,9 +672,13 @@ fn live_inline_photo_downloads_async_caches_and_serves_without_redownload() {
     assert!(
         matches!(
             desc1.photo_load,
-            Some(PhotoLoadState::Loading { .. } | PhotoLoadState::Ready { .. })
+            Some(
+                PhotoLoadState::Loading { .. }
+                    | PhotoLoadState::Ready { .. }
+                    | PhotoLoadState::Pending
+            )
         ),
-        "first call must be Loading or Ready"
+        "first call must be Loading, Ready or Pending (disk cache read in the background)"
     );
 
     // Wait for async download to finish and notify UI.
@@ -694,7 +698,7 @@ fn live_inline_photo_downloads_async_caches_and_serves_without_redownload() {
         .inline_media_descriptor(peer_id, MsgId(101))
         .expect("ready descriptor");
     match desc_ready.photo_load {
-        Some(PhotoLoadState::Ready { bytes }) => assert_eq!(bytes, photo_bytes),
+        Some(PhotoLoadState::Ready { bytes }) => assert_eq!(&*bytes, photo_bytes.as_slice()),
         other => panic!("expected Ready photo bytes, got {other:?}"),
     }
     // Calling again hits MediaCacheIndex without issuing a second upload.getFile RPC.
@@ -893,6 +897,8 @@ fn live_inline_tgs_sticker_decompresses_into_lottie_json_and_video_document_thum
     for mid in [201, 202, 203, 204, 205] {
         let _ = live.inline_media_descriptor(peer_id, MsgId(mid));
     }
+    // A voice message is downloaded by its first play, not when it is listed (TGB-2958).
+    live.start_media_download(peer_id, MsgId(205));
 
     // Wait for all 5 background downloads to land in MediaCache.
     assert!(wait_until(|| {
@@ -947,7 +953,7 @@ fn live_inline_tgs_sticker_decompresses_into_lottie_json_and_video_document_thum
         .inline_media_descriptor(peer_id, MsgId(202))
         .expect("vid desc");
     match d_vid.photo_load {
-        Some(PhotoLoadState::Ready { bytes }) => assert_eq!(bytes, video_thumb_bytes),
+        Some(PhotoLoadState::Ready { bytes }) => assert_eq!(&*bytes, video_thumb_bytes.as_slice()),
         other => panic!("expected video thumb Ready, got {other:?}"),
     }
 
@@ -955,7 +961,7 @@ fn live_inline_tgs_sticker_decompresses_into_lottie_json_and_video_document_thum
         .inline_media_descriptor(peer_id, MsgId(203))
         .expect("doc desc");
     match d_doc.photo_load {
-        Some(PhotoLoadState::Ready { bytes }) => assert_eq!(bytes, doc_thumb_bytes),
+        Some(PhotoLoadState::Ready { bytes }) => assert_eq!(&*bytes, doc_thumb_bytes.as_slice()),
         other => panic!("expected doc thumb Ready, got {other:?}"),
     }
 
@@ -1200,6 +1206,7 @@ fn convert_all_message_media_variants() {
             shipping_address_requested: false,
             test: false,
             extended_media: None,
+            ..InvoiceData::default()
         })),
         MessageFlags::empty(),
     );
@@ -1222,6 +1229,7 @@ fn convert_all_message_media_variants() {
             shipping_address_requested: false,
             test: false,
             extended_media: None,
+            ..InvoiceData::default()
         })),
         MessageFlags::empty(),
     );
@@ -1372,6 +1380,7 @@ fn convert_all_message_media_variants() {
                 recent_voters: Vec::new(),
                 solution: Some(DataText::plain("Memory safety!")),
             },
+            ..PollData::default()
         })),
         MessageFlags::empty(),
     );
@@ -1391,9 +1400,11 @@ fn convert_all_message_media_variants() {
             site_name: Some("Example".to_owned()),
             title: Some("Reference Guide".to_owned()),
             description: Some("Full specification".to_owned()),
+            author: None,
             photo: None,
             document: None,
             flags: MediaWebPageFlags::FORCE_LARGE_MEDIA,
+            ..WebPageData::default()
         })),
         MessageFlags::INVERT_MEDIA,
     );
@@ -1756,7 +1767,7 @@ fn live_inline_gif_video_sticker_static_sticker_audio_and_reopened_tgs_disk_cach
         .inline_media_descriptor(peer_id, MsgId(303))
         .expect("webp desc");
     assert!(
-        matches!(d_webp.photo_load, Some(PhotoLoadState::Ready { bytes }) if bytes == webp_bytes)
+        matches!(d_webp.photo_load, Some(PhotoLoadState::Ready { bytes }) if *bytes == *webp_bytes)
     );
 
     let d_audio = live
@@ -1773,3 +1784,5 @@ fn live_inline_gif_video_sticker_static_sticker_audio_and_reopened_tgs_disk_cach
         Some(expected_json)
     );
 }
+
+mod wave4_downloads;

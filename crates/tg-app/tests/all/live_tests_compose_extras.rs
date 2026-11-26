@@ -125,6 +125,9 @@ impl RpcClient for FakeRpcClient {
             let mut q = self.responses.lock().expect("lock responses");
             if let Some(pos) = q.iter().position(|(c, _)| *c == ctor) {
                 q.remove(pos).map(|(_, r)| r)
+            } else if crate::common::is_background_list_request(ctor) {
+                // Never the answer a test queued for another request (TGB-2941).
+                None
             } else {
                 q.pop_front().map(|(_, r)| r)
             }
@@ -500,6 +503,7 @@ fn build_live_fixture(
                     recent_voters: vec![DataPeerId::from_user(self_uid)],
                     solution: None,
                 },
+                ..PollData::default()
             })),
         };
         s.add_history_slice(
@@ -683,6 +687,8 @@ fn send_as_fetches_caches_saves_default_and_forwards_on_send() {
             },
         )
         .expect("send as channel");
+    assert!(sent.id.is_local());
+    let sent = crate::send_wait::wait_sent(&mut live, chan_peer, sent.id);
     assert_eq!(sent.id, MsgId(500));
 
     let send_bytes = rpc
@@ -839,14 +845,20 @@ fn slow_mode_server_wait_error_updates_cooldown() {
         InvocationError::Rpc(RpcError::new(420, "SLOWMODE_WAIT_42")),
     );
 
-    let res = live.send_message_extended(
-        chan_peer,
-        SendMessageExtended {
-            text: TextWithEntities::simple("Triggered server slowmode"),
-            ..SendMessageExtended::default()
-        },
-    );
-    assert!(res.is_err());
+    let pending = live
+        .send_message_extended(
+            chan_peer,
+            SendMessageExtended {
+                text: TextWithEntities::simple("Triggered server slowmode"),
+                ..SendMessageExtended::default()
+            },
+        )
+        .expect("the send is queued");
+    // The server's SLOWMODE_WAIT arrives with the failed send (TGB-2931).
+    match crate::send_wait::wait_send_end(&mut live, chan_peer, pending.id) {
+        crate::send_wait::SendEnd::Failed(error) => assert!(error.is_some()),
+        crate::send_wait::SendEnd::Sent(m) => panic!("unexpected success {m:?}"),
+    }
     let sm = live.slow_mode_state(chan_peer);
     let rem = sm.remaining_secs(now_unix_i64());
     assert!(

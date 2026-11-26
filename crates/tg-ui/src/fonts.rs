@@ -9,8 +9,17 @@
 //!   `Telegram/lib_ui/fonts/`, includes full Latin and Cyrillic coverage).
 //! - `Hack-Regular.ttf`: MIT + Bitstream Vera license (see `assets/fonts/Hack-Regular.txt`),
 //!   with `OpenSans-Regular` configured as fallback so Cyrillic renders in monospace spans.
+//!
+//! Monospace: tdesktop does not bundle a monospace font. `MonospaceFont()` in
+//! `style_core_font.cpp` asks the system for "Cascadia Mono", "Consolas", "Liberation Mono",
+//! "Menlo", "Courier" in that order (Windows always prefers that list). The app does the same
+//! after [`enable_system_monospace`]: it reads the first of those files the system has and
+//! never ships it. Hack stays as the bundled stand-in for systems without any of them and for
+//! deterministic test renders.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use egui::{FontData, FontDefinitions, FontFamily, FontId, Id, TextStyle as EguiTextStyle};
 use tg_style::{Font, FontFlags, Scale, scale as current_scale, st};
@@ -26,6 +35,114 @@ pub const OPEN_SANS_SEMIBOLD_ITALIC_BYTES: &[u8] =
     include_bytes!("../assets/fonts/OpenSans-SemiBoldItalic.ttf");
 /// Hack Regular monospace TTF bytes (MIT + Bitstream Vera).
 pub const HACK_REGULAR_BYTES: &[u8] = include_bytes!("../assets/fonts/Hack-Regular.ttf");
+
+/// `font_data` key of the system monospace face resolved by [`resolve_system_monospace`].
+pub const SYSTEM_MONOSPACE_KEY: &str = "system_monospace";
+
+/// tdesktop's `ManualMonospaceFont()` try-list (`style_core_font.cpp`), in order.
+pub const MONOSPACE_TRY_FIRST: [&str; 5] = [
+    "Cascadia Mono",
+    "Consolas",
+    "Liberation Mono",
+    "Menlo",
+    "Courier",
+];
+
+static SYSTEM_MONOSPACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Let [`build_tdesktop_font_definitions`] use the system monospace font like tdesktop.
+///
+/// Called once by the app binary before the window opens. Tests leave it off so their
+/// renders do not depend on the fonts of the machine they run on.
+pub fn enable_system_monospace() {
+    SYSTEM_MONOSPACE_ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// A monospace face read from the system font directory.
+#[derive(Debug, Clone)]
+pub struct SystemMonospace {
+    /// Family name from [`MONOSPACE_TRY_FIRST`].
+    pub family: &'static str,
+    /// File the face was read from.
+    pub path: PathBuf,
+    /// Face index inside the file (`.ttc` collections).
+    pub index: u32,
+    /// Raw font file bytes.
+    pub bytes: Arc<Vec<u8>>,
+}
+
+/// Candidate files for [`MONOSPACE_TRY_FIRST`] on this platform, in try order.
+#[must_use]
+pub fn monospace_candidate_files() -> Vec<(&'static str, PathBuf, u32)> {
+    let mut out = Vec::new();
+    if cfg!(windows) {
+        let mut dirs = Vec::new();
+        if let Some(win) = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")) {
+            dirs.push(PathBuf::from(win).join("Fonts"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(
+                PathBuf::from(local)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Fonts"),
+            );
+        }
+        let files: [(&'static str, &str); 4] = [
+            ("Cascadia Mono", "CascadiaMono.ttf"),
+            ("Consolas", "consola.ttf"),
+            ("Liberation Mono", "LiberationMono-Regular.ttf"),
+            ("Courier", "cour.ttf"),
+        ];
+        for (family, file) in files {
+            for dir in &dirs {
+                out.push((family, dir.join(file), 0));
+            }
+        }
+    } else if cfg!(target_os = "macos") {
+        out.push(("Menlo", PathBuf::from("/System/Library/Fonts/Menlo.ttc"), 0));
+        out.push((
+            "Courier",
+            PathBuf::from("/System/Library/Fonts/Courier.ttc"),
+            0,
+        ));
+    }
+    // Linux: tdesktop prefers the fontconfig monospace font there; without fontconfig the
+    // bundled Hack (a DejaVu Sans Mono derivative, the usual Linux default) stands in.
+    out
+}
+
+/// `true` if `bytes` starts like a TrueType / OpenType font or collection.
+#[must_use]
+pub fn looks_like_font_file(bytes: &[u8]) -> bool {
+    bytes.len() > 1024
+        && matches!(
+            bytes.get(..4),
+            Some([0, 1, 0, 0] | b"OTTO" | b"true" | b"ttcf")
+        )
+}
+
+/// Resolve tdesktop's monospace family from the system (first readable file of
+/// [`monospace_candidate_files`]). Cached for the process.
+#[must_use]
+pub fn resolve_system_monospace() -> Option<SystemMonospace> {
+    static CACHE: OnceLock<Option<SystemMonospace>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            monospace_candidate_files()
+                .into_iter()
+                .find_map(|(family, path, index)| {
+                    let bytes = std::fs::read(&path).ok()?;
+                    looks_like_font_file(&bytes).then(|| SystemMonospace {
+                        family,
+                        path,
+                        index,
+                        bytes: Arc::new(bytes),
+                    })
+                })
+        })
+        .clone()
+}
 
 /// Custom `egui` font family name for `OpenSans-SemiBold` (bold/semibold).
 pub const FAMILY_NAME_SEMIBOLD: &str = "tg_semibold";
@@ -70,7 +187,8 @@ pub fn family_semibold_italic() -> FontFamily {
     FontFamily::Name(Arc::from(FAMILY_NAME_SEMIBOLD_ITALIC))
 }
 
-/// Monospace font family (`Hack-Regular` with `OpenSans-Regular` Cyrillic fallback).
+/// Monospace font family (system monospace if enabled, then `Hack-Regular`, then
+/// `OpenSans-Regular` for scripts the monospace faces lack).
 #[must_use]
 pub fn family_monospace() -> FontFamily {
     FontFamily::Monospace
@@ -113,8 +231,22 @@ pub fn font_id_from_style_at(font: Font, target_scale: Scale) -> FontId {
 
 /// Build `egui::FontDefinitions` populated with Open Sans (Regular, SemiBold, Italic,
 /// SemiBoldItalic), Hack monospace, and egui's built-in emoji/icon fallbacks.
+///
+/// After [`enable_system_monospace`] the monospace family starts with the system face
+/// tdesktop would pick ([`resolve_system_monospace`]).
 #[must_use]
 pub fn build_tdesktop_font_definitions() -> FontDefinitions {
+    let system_mono = if SYSTEM_MONOSPACE_ENABLED.load(Ordering::Relaxed) {
+        resolve_system_monospace()
+    } else {
+        None
+    };
+    build_font_definitions_with(system_mono.as_ref())
+}
+
+/// [`build_tdesktop_font_definitions`] with an explicit system monospace face.
+#[must_use]
+pub fn build_font_definitions_with(system_mono: Option<&SystemMonospace>) -> FontDefinitions {
     let mut defs = FontDefinitions::default();
 
     defs.font_data.insert(
@@ -178,15 +310,20 @@ pub fn build_tdesktop_font_definitions() -> FontDefinitions {
             "open_sans_regular".to_owned(),
         ]),
     );
-    // Include OpenSans-Regular after Hack-Regular so Cyrillic and extended Unicode
+    // Include OpenSans-Regular after the monospace faces so Cyrillic and extended Unicode
     // render cleanly inside inline code and `<pre>` blocks.
-    defs.families.insert(
-        FontFamily::Monospace,
-        with_fallbacks(vec![
-            "hack_regular".to_owned(),
-            "open_sans_regular".to_owned(),
-        ]),
-    );
+    let mut mono = Vec::new();
+    if let Some(sys) = system_mono {
+        defs.font_data.insert(
+            SYSTEM_MONOSPACE_KEY.to_owned(),
+            Arc::new(FontData::from_blob(sys.bytes.clone(), sys.index)),
+        );
+        mono.push(SYSTEM_MONOSPACE_KEY.to_owned());
+    }
+    mono.push("hack_regular".to_owned());
+    mono.push("open_sans_regular".to_owned());
+    defs.families
+        .insert(FontFamily::Monospace, with_fallbacks(mono));
 
     defs
 }
@@ -249,3 +386,7 @@ pub fn ensure_tdesktop_fonts(ctx: &egui::Context) {
 fn fonts_registered_id() -> Id {
     Id::unique("tg_ui_fonts_registered_scale")
 }
+
+#[cfg(test)]
+#[path = "fonts_tests.rs"]
+mod fonts_tests;

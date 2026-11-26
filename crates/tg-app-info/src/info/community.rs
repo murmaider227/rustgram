@@ -59,11 +59,8 @@ impl CommunityInfoSection {
         ui.horizontal(|ui| {
             ui.add_space(16.0);
             let (av_rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
-            EmptyUserpic::for_peer(details.id.bare(), &details.title, colors).paint_rounded(
-                ui.painter(),
-                av_rect,
-                14.0,
-            );
+            EmptyUserpic::for_peer(details.id.bare(), &details.title, colors)
+                .paint_rounded_or_photo(ui.painter(), av_rect, 14.0, details.id.0);
             ui.add_space(12.0);
             ui.vertical(|ui| {
                 ui.add_space(4.0);

@@ -1329,17 +1329,21 @@ impl PaymentsBackend for LiveSession {
 
         // 2. Catalog via `payments.getStarGifts`.
         let catalog_tl = invoke_rpc(self, build_get_star_gifts(0))?;
+        if let tl_enums::payments::StarGifts::StarGifts(ref list) = catalog_tl {
+            crate::gift_stickers::register_gift_stickers(
+                self,
+                &crate::gift_stickers::sticker_documents(&list.gifts),
+            );
+        }
         let catalog: Vec<CatalogGiftItem> = star_gifts_from_tl(&catalog_tl)
             .map(|(_, list)| {
                 list.into_iter()
                     .enumerate()
                     .map(|(idx, gift)| {
-                        let title = if !gift.resell_title.is_empty() {
-                            gift.resell_title.clone()
-                        } else if let Some(ref u) = gift.unique {
+                        let title = if let Some(ref u) = gift.unique {
                             u.display_name()
                         } else {
-                            format!("Star Gift #{}", gift.id)
+                            gift.resell_title.clone()
                         };
                         CatalogGiftItem {
                             gift,
@@ -1374,6 +1378,7 @@ impl PaymentsBackend for LiveSession {
         write_session(self, |s| {
             apply_tl_users_and_chats(s, &saved_inner.users, &saved_inner.chats);
         });
+        crate::gift_stickers::register_saved_gift_stickers(self, &saved_inner.gifts);
         let saved_slice = saved_star_gifts_from_tl(&saved_tl, self_pid, true);
 
         with_payments_state(self, |st| {
@@ -1391,10 +1396,8 @@ impl PaymentsBackend for LiveSession {
                 .map(|(idx, saved)| {
                     let title = if let Some(ref u) = saved.info.unique {
                         u.display_name()
-                    } else if !saved.info.resell_title.is_empty() {
-                        saved.info.resell_title.clone()
                     } else {
-                        format!("Star Gift #{}", saved.info.id)
+                        saved.info.resell_title.clone()
                     };
                     let sender_name = if saved.anonymous || saved.from_id == DataPeerId::ZERO {
                         "Anonymous".to_owned()
@@ -1411,10 +1414,18 @@ impl PaymentsBackend for LiveSession {
                 .collect()
         });
 
-        let default_recipient = read_session(self, |s| peer_display_title(s, s.self_peer_id()));
+        // The gift box shows your own name and userpic ("Buy a Gift"), not "Saved Messages".
+        let default_recipient = read_session(self, |s| {
+            s.peer(s.self_peer_id())
+                .map(|p| p.name().to_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| peer_display_title(s, s.self_peer_id()))
+        });
         Ok(StarGiftsBundle {
             balance,
             default_recipient,
+            recipient_peer_id: self_pid.0,
+            recipient_is_self: true,
             catalog,
             received,
         })

@@ -431,7 +431,7 @@ impl SeenByModalWidget {
                             Vec2::splat(36.0),
                         );
                         EmptyUserpic::for_color_index(reader.color_index, &reader.name, &ui_colors)
-                            .paint_circle(ui.painter(), av_rect);
+                            .paint_circle_or_photo(ui.painter(), av_rect, reader.user_id.0);
 
                         let read_time =
                             format_read_timestamp(reader.read_date_unix, self.reference_now_unix);

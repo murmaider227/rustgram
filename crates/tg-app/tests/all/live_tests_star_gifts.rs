@@ -107,6 +107,9 @@ impl RpcClient for FakeRpcClient {
             let mut q = self.responses.lock().expect("lock responses");
             if let Some(pos) = q.iter().position(|(c, _)| *c == ctor) {
                 q.remove(pos).map(|(_, r)| r)
+            } else if crate::common::is_background_list_request(ctor) {
+                // Never the answer a test queued for another request (TGB-2941).
+                None
             } else {
                 q.pop_front().map(|(_, r)| r)
             }
@@ -1357,6 +1360,8 @@ fn mock_session_and_ui_screens_exercise_wp16_end_to_end() {
     let ctx = egui::Context::default();
     let palette = Palette::day();
     let mut host = PaymentsScreenHost::with_mock();
+    // The tabbed screens below are the developer view (`TGFORK_PAYMENTS_DEV_OVERLAY=1`).
+    host.set_dev_tabs(true);
 
     let screens_and_tabs: Vec<(PaymentsScreen, Option<StarGiftsTab>)> = vec![
         (PaymentsScreen::StarGifts, Some(StarGiftsTab::Received)),

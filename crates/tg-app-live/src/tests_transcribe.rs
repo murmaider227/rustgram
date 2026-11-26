@@ -369,12 +369,13 @@ fn transcribe_premium_trial_limits_cooldown_and_too_long() {
         TranscribeToggleOutcome::TooLong { max_secs: 120 }
     );
 
-    // Server-side `MSG_VOICE_TOO_LONG` error marks `entry.too_long = true`.
+    // Server-side `MSG_VOICE_TOO_LONG` error marks `entry.too_long = true`; the bubble shows
+    // it, so the outcome is a plain failure, not the local length-check toast (TGB-2978).
     rpc.push_rpc_error(400, "MSG_VOICE_TOO_LONG");
     let srv_too_long = live.toggle_transcribe_audio(peer_id, MsgId(604), 60, false);
-    assert_eq!(
-        srv_too_long,
-        TranscribeToggleOutcome::TooLong { max_secs: 120 }
+    assert!(
+        matches!(&srv_too_long, TranscribeToggleOutcome::Failed(err) if err.contains("MSG_VOICE_TOO_LONG")),
+        "{srv_too_long:?}"
     );
     let err_entry = live
         .transcribe_audio_state(peer_id, MsgId(604))

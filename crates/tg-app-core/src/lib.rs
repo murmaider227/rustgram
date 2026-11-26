@@ -6,6 +6,7 @@ pub mod core_types;
 pub mod session_api;
 pub mod stand_in;
 pub mod ui_icons;
+pub mod user_error;
 
 pub mod bots {
     pub mod backend;
@@ -41,6 +42,7 @@ pub mod notifications {
 }
 pub mod payments {
     pub mod backend;
+    pub mod gift_stickers;
     pub mod marketplace_backend;
     pub mod verification;
 }

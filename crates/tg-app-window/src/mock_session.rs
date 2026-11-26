@@ -7,9 +7,12 @@
 //! All names, handles, phone numbers (`+999 661 ...`), messages, media, and URLs are strictly
 //! synthetic placeholders (no real people's names or real Telegram accounts).
 
+mod bench_data;
+mod versioned_state;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::Value;
 use tg_audio::{AudioDataSource, AudioMsgId, PlaylistProvider};
@@ -324,7 +327,7 @@ impl PeerRecord {
     }
 }
 
-/// Shared mutable state locked behind `Arc<Mutex<...>>` so every screen and backend handle sees
+/// Shared mutable state locked behind `Arc<VersionedState<...>>` so every screen and backend handle sees
 /// identical live state.
 struct MockSessionState {
     signed_in: bool,
@@ -624,8 +627,10 @@ impl MockSessionState {
             avatar_rgb: [0x40, 0xA7, 0xE3],
         };
 
-        let peers = build_initial_peers(&user);
-        let (histories, pinned_messages, first_unread, msg_media_map) = build_initial_histories();
+        let mut peers = build_initial_peers(&user);
+        let (mut histories, pinned_messages, first_unread, msg_media_map) =
+            build_initial_histories();
+        bench_data::extend_from_env(&mut peers, &mut histories);
         let (forum_topics, topic_messages, replies) = build_initial_forum_and_replies();
         let members = build_initial_members();
         let media_items = build_initial_media_items();
@@ -1040,6 +1045,7 @@ impl MockSessionState {
             color_index: peer.color_index,
             verified: peer.verified,
             premium: peer.premium,
+            emoji_status_id: None,
             online: peer.is_online,
             active_call: false,
             muted: peer.muted,
@@ -1081,6 +1087,7 @@ impl MockSessionState {
             is_online: peer.is_online,
             verified: peer.verified,
             premium: peer.premium,
+            emoji_status_id: None,
             color_index: peer.color_index,
             phone: peer.phone.clone(),
             usernames: peer.usernames.clone(),
@@ -1321,6 +1328,8 @@ impl MockSessionState {
                     author_color_id: target.from_id.bare(),
                     preview_text: target.preview_snippet(),
                     preview_thumb_rgb: None,
+                    preview_thumb: None,
+                    preview_colored_len: 0,
                     quote_text: None,
                 })
         });
@@ -1521,11 +1530,21 @@ impl MockSessionState {
 /// data with [`MockSession`].
 #[derive(Clone)]
 pub struct SharedSessionHandle {
-    state: Arc<Mutex<MockSessionState>>,
+    state: Arc<versioned_state::VersionedState<MockSessionState>>,
     media_base: Arc<MockMediaBackend>,
+    /// Chat rows converted by the chat-list reads so far (TGB-2949 frame-cost checks).
+    dialog_items_built: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SharedSessionHandle {
+    /// Chat rows the chat-list reads (`dialog_slice`, `dialog_by_peer`) converted so far. A
+    /// frame that leaves it unchanged rebuilt no chat.
+    #[must_use]
+    pub fn dialog_items_built(&self) -> u64 {
+        self.dialog_items_built
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Sets the active peer target used when [`StatsBackend`] screens load.
     pub fn set_stats_target_peer(&self, peer_id: PeerId) {
         if let Ok(mut st) = self.state.lock() {
@@ -1571,9 +1590,16 @@ impl SharedSessionHandle {
 
     /// Drains any pending notification click navigations (`open_chat` calls).
     pub fn take_pending_chat_opens(&self) -> Vec<PendingChatOpen> {
+        // Polled every frame: an empty queue is only read, so the session's version stays.
         self.state
             .lock()
-            .map(|mut st| std::mem::take(&mut st.pending_chat_opens))
+            .map(|mut st| {
+                if st.pending_chat_opens.is_empty() {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut st.pending_chat_opens)
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -1871,6 +1897,8 @@ pub struct MockSession {
     autocomplete_last_authors: Vec<UserId>,
     autocomplete_bot_commands: HashMap<UserId, Vec<BotCommand>>,
     recent_inline_bots: Vec<UserId>,
+    /// Failures queued by [`MockSession::fail_next_request`].
+    request_failures: std::collections::VecDeque<String>,
 }
 
 impl Default for MockSession {
@@ -1980,8 +2008,9 @@ impl MockSession {
 
         Self {
             handle: SharedSessionHandle {
-                state: Arc::new(Mutex::new(state)),
+                state: Arc::new(versioned_state::VersionedState::new(state)),
                 media_base: Arc::new(MockMediaBackend::new()),
+                dialog_items_built: Arc::default(),
             },
             cached_user,
             cached_signed_in: start_signed_in,
@@ -1998,7 +2027,18 @@ impl MockSession {
             autocomplete_last_authors,
             autocomplete_bot_commands,
             recent_inline_bots,
+            request_failures: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Makes the next invite join, folder join or gift-code redeem fail with `err`, the text a
+    /// live backend hands the UI (e.g. `RPC error 400: USERS_TOO_MUCH`).
+    pub fn fail_next_request(&mut self, err: impl Into<String>) {
+        self.request_failures.push_back(err.into());
+    }
+
+    fn take_request_failure(&mut self) -> Result<(), String> {
+        self.request_failures.pop_front().map_or(Ok(()), Err)
     }
 
     /// Returns a clonable [`SharedSessionHandle`] sharing this session's live state.
@@ -2324,6 +2364,10 @@ impl DialogsBackend for SharedSessionHandle {
         SESSION_NOW
     }
 
+    fn dialogs_version(&self) -> u64 {
+        self.state.version()
+    }
+
     fn dialog_slice(&self, list: DialogListQuery, offset: usize, limit: usize) -> DialogSlice {
         let Ok(st) = self.state.lock() else {
             return DialogSlice {
@@ -2343,6 +2387,8 @@ impl DialogsBackend for SharedSessionHandle {
             })
             .map(|p| st.build_dialog_item(p, list))
             .collect();
+        self.dialog_items_built
+            .fetch_add(matching.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
         // Sort pinned first (preserving explicit pin order), then newest last message time.
         matching.sort_by(|a, b| match (a.pinned, b.pinned) {
@@ -2387,6 +2433,8 @@ impl DialogsBackend for SharedSessionHandle {
         } else {
             DialogListQuery::Filter(FilterId::ALL)
         };
+        self.dialog_items_built
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(st.build_dialog_item(peer, list))
     }
 
@@ -2465,6 +2513,27 @@ impl DialogsBackend for SharedSessionHandle {
                 f.included_peers.push(peer_id.0);
             }
         }
+    }
+
+    fn folders_including_peer(&self, peer_id: PeerId) -> Vec<FilterId> {
+        // `FiltersWithChat`: the chat is an included chat and the folder keeps another included
+        // chat or a type rule (`CanRemoveFromChatFilter`).
+        let Ok(st) = self.state.lock() else {
+            return Vec::new();
+        };
+        st.folders
+            .iter()
+            .filter(|f| {
+                let rules = f.include_contacts
+                    || f.include_non_contacts
+                    || f.include_groups
+                    || f.include_channels
+                    || f.include_bots
+                    || f.shareable;
+                f.included_peers.contains(&peer_id.0) && (f.included_peers.len() > 1 || rules)
+            })
+            .map(|f| FilterId(f.id))
+            .collect()
     }
 
     fn remove_peer_from_folder(&mut self, peer_id: PeerId, filter_id: FilterId) {
@@ -2887,6 +2956,7 @@ impl DialogsBackend for SharedSessionHandle {
                                 (true, false, false) => DialogSendState::Sent,
                             },
                             archived: peer.archived,
+                            media_preview: dialog_media_preview(Some(m)),
                         });
                     }
                 }
@@ -3090,6 +3160,9 @@ impl DialogsBackend for MockSession {
     fn current_time(&self) -> LocalDateTime {
         self.handle.current_time()
     }
+    fn dialogs_version(&self) -> u64 {
+        self.handle.dialogs_version()
+    }
     fn dialog_slice(&self, list: DialogListQuery, offset: usize, limit: usize) -> DialogSlice {
         self.handle.dialog_slice(list, offset, limit)
     }
@@ -3110,6 +3183,9 @@ impl DialogsBackend for MockSession {
     }
     fn remove_peer_from_folder(&mut self, peer_id: PeerId, filter_id: FilterId) {
         self.handle.remove_peer_from_folder(peer_id, filter_id);
+    }
+    fn folders_including_peer(&self, peer_id: PeerId) -> Vec<FilterId> {
+        self.handle.folders_including_peer(peer_id)
     }
     fn mark_folder_read(&mut self, filter_id: FilterId) {
         self.handle.mark_folder_read(filter_id);
@@ -3322,8 +3398,14 @@ impl HistoryBackend for SharedSessionHandle {
                 ..HistorySlice::default()
             };
         }
-        let anchor_idx = if around_id == MsgId::SHOW_AT_END || around_id == MsgId::SHOW_AT_UNREAD {
+        let first_unread = st.first_unread.get(&peer_id).copied().flatten();
+        let anchor_idx = if around_id == MsgId::SHOW_AT_END {
             total - 1
+        } else if around_id == MsgId::SHOW_AT_UNREAD {
+            // `ShowAtUnreadMsgId`: around the first unread message, else the bottom.
+            first_unread
+                .and_then(|id| all.iter().position(|m| m.id == id))
+                .unwrap_or(total - 1)
         } else {
             all.iter()
                 .position(|m| m.id >= around_id)
@@ -4045,6 +4127,8 @@ impl HistoryBackend for SharedSessionHandle {
                 author_color_id,
                 preview_text,
                 preview_thumb_rgb: None,
+                preview_thumb: None,
+                preview_colored_len: 0,
                 quote_text: request.reply_quote.as_ref().map(|q| q.text.clone()),
             }
         });
@@ -4109,6 +4193,9 @@ impl HistoryBackend for SharedSessionHandle {
                 poll_extras: None,
                 round_video_path: request.round_video_path,
                 summary_from_language: None,
+                send_failed: false,
+                sender_badge: None,
+                sender_status: None,
             },
         };
 
@@ -11033,9 +11120,16 @@ impl ChatHelpersBackend for MockSession {
 
 impl NotifyBackend for SharedSessionHandle {
     fn poll_events(&mut self) -> Vec<IncomingNotifyEvent> {
+        // Polled every frame: an empty queue is only read, so the session's version stays.
         self.state
             .lock()
-            .map(|mut st| st.notify_events.drain(..).collect())
+            .map(|mut st| {
+                if st.notify_events.is_empty() {
+                    Vec::new()
+                } else {
+                    st.notify_events.drain(..).collect()
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -13049,6 +13143,7 @@ fn build_initial_histories() -> (
                 media: Some(HistoryMedia::Voice(VoiceAttachment {
                     duration_secs: 18,
                     waveform_5bit: sample_voice_waveform_5bit(7),
+                    size_bytes: 72_400,
                     is_unread: true,
                     transcription: Some(
                         "AudioPlayerBar plays real synthesized WAV tracks via tg-audio.".to_owned(),
@@ -13089,6 +13184,8 @@ fn build_initial_histories() -> (
                     preview_text: "Unified App Checklist: dialogs, history, info/boxes..."
                         .to_owned(),
                     preview_thumb_rgb: None,
+                    preview_thumb: None,
+                    preview_colored_len: 0,
                     quote_text: None,
                 }),
                 forward: None,
@@ -14202,6 +14299,8 @@ fn build_initial_forum_and_replies() -> (
         preview_text: "Awesome Instant View writeup! Does the layout cache stay bounded on resize?"
             .to_owned(),
         preview_thumb_rgb: None,
+        preview_thumb: None,
+        preview_colored_len: 0,
         quote_text: None,
     });
     let r3 = make_thread_msg(
@@ -14394,6 +14493,24 @@ tg_app_info::delegate_marketplace_via_registry!(MockSession);
 impl tg_app_core::session_api::AppSession for MockSession {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn import_chat_invite(&mut self, _hash: &str) -> Result<PeerId, String> {
+        self.take_request_failure()?;
+        Ok(session_peers::GROUP_CORE)
+    }
+
+    fn join_chatlist_invite(&mut self, _slug: &str, peers: &[PeerId]) -> Result<usize, String> {
+        self.take_request_failure()?;
+        Ok(peers.len())
+    }
+
+    fn apply_gift_code(&mut self, slug: &str) -> Result<(), String> {
+        self.take_request_failure()?;
+        if slug.trim().is_empty() {
+            return Err("Gift code slug is empty.".to_owned());
+        }
+        Ok(())
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

@@ -87,13 +87,26 @@ pub const fn from_data_peer(peer: DataPeerId) -> PeerId {
 #[inline]
 #[must_use]
 pub const fn to_data_msg(msg: MsgId) -> DataMsgId {
-    DataMsgId(msg.0 as i64)
+    match msg.local_index() {
+        Some(index) => match DataMsgId::client_by_index(index) {
+            Some(id) => id,
+            None => DataMsgId(msg.0 as i64),
+        },
+        None => DataMsgId(msg.0 as i64),
+    }
 }
 
 /// Converts a `tg-data` [`DataMsgId`] into a `tg-app` [`MsgId`].
 #[inline]
 #[must_use]
 pub const fn from_data_msg(msg: DataMsgId) -> MsgId {
+    // Client (local) ids map one to one onto the UI's local range, so two messages being sent
+    // never share an id; any other id out of `i32` range clamps.
+    if let Some(index) = msg.client_index()
+        && let Some(local) = MsgId::local(index)
+    {
+        return local;
+    }
     let clamped = if msg.0 > i32::MAX as i64 {
         i32::MAX
     } else if msg.0 < i32::MIN as i64 {
@@ -185,6 +198,43 @@ pub fn history_messages_ordered(session: &Session, peer_id: DataPeerId) -> Vec<&
     out
 }
 
+/// Every stored message of `peer_id` oldest to newest: the loaded history plus messages stored
+/// from other pages (search results, topic and comment pages, reply targets), like the items a
+/// tdesktop `History` owns (`History::_items`). For lookups by id, media or file reference and
+/// for changes that apply to every item (`History::unpinMessagesFor`).
+pub fn stored_messages_ordered(session: &Session, peer_id: DataPeerId) -> Vec<&Message> {
+    session
+        .stored_message_ids(peer_id)
+        .filter_map(|id| session.message(tg_data::FullMsgId::new(peer_id, id)))
+        .collect()
+}
+
+/// The loaded messages of `peer_id` oldest to newest, like [`history_messages_ordered`] but
+/// without collecting them: a page read walks only as far as it needs from either end.
+///
+/// Items that display nothing are skipped, as tdesktop's history skips them
+/// (`History::isDisplayedEmpty`, `Element::recountDisplayDateInBlocks`).
+pub fn history_messages_iter(
+    session: &Session,
+    peer_id: DataPeerId,
+) -> impl DoubleEndedIterator<Item = &Message> {
+    session
+        .history(peer_id)
+        .into_iter()
+        .flat_map(|history| history.loaded_ranges.slices().iter())
+        .flat_map(|slice| slice.messages.iter())
+        .filter_map(move |&mid| session.message(tg_data::FullMsgId::new(peer_id, mid)))
+        .filter(|msg| !displays_nothing(msg))
+}
+
+/// `true` for a message tdesktop draws as nothing: the "history cleared" service item
+/// (`messageActionHistoryClear`) has empty text (`PrepareEmptyText`, `history_item.cpp`), so its
+/// view has no bubble, no date and no height.
+#[must_use]
+pub fn displays_nothing(msg: &Message) -> bool {
+    matches!(msg.service_action(), Some(DataServiceAction::HistoryClear))
+}
+
 /// Returns all unique peer IDs known via self, main dialogs, and archive dialogs.
 #[must_use]
 pub fn known_peer_ids(session: &Session) -> Vec<DataPeerId> {
@@ -202,6 +252,12 @@ pub fn known_peer_ids(session: &Session) -> Vec<DataPeerId> {
         if let tg_data::DialogKey::History(pid) = *key
             && seen.insert(pid)
         {
+            out.push(pid);
+        }
+    }
+    // Chats with messages whose folder is still being requested are out of both lists.
+    for pid in session.histories_awaiting_folder() {
+        if seen.insert(pid) {
             out.push(pid);
         }
     }
@@ -919,9 +975,13 @@ pub fn dialog_item_from_session(
         }
     }
 
-    let top_msg = history
+    let loaded_top = history
         .top_message_id
         .and_then(|mid| session.message(tg_data::FullMsgId::new(peer_id, mid)));
+    // An item that displays nothing (`item->isEmpty()`) paints no date, preview or ticks in
+    // the row (`Dialogs::Ui::PaintRow`), like a chat with no last message.
+    let top_is_empty = loaded_top.is_some_and(displays_nothing);
+    let top_msg = loaded_top.filter(|msg| !displays_nothing(msg));
     let (last_message_id, last_message, last_sender, last_message_time, send_state) =
         if let Some(msg) = top_msg {
             let preview = crate::preview_text::message_preview_text(session, msg);
@@ -936,7 +996,11 @@ pub fn dialog_item_from_session(
             )
         } else {
             (
-                history.top_message_id.map_or(MsgId(0), from_data_msg),
+                if top_is_empty {
+                    MsgId(0)
+                } else {
+                    history.top_message_id.map_or(MsgId(0), from_data_msg)
+                },
                 String::new(),
                 None,
                 unix_to_local_datetime(history.chat_list_time_id),
@@ -988,6 +1052,9 @@ pub fn dialog_item_from_session(
         color_index,
         verified,
         premium,
+        emoji_status_id: peer
+            .filter(|_| special == SpecialRowKind::None)
+            .and_then(|p| crate::peer_emoji_status::row_emoji_status_id(p, now)),
         online,
         active_call: peer.is_some_and(Peer::has_active_group_call),
         muted: history.muted,
@@ -1021,15 +1088,31 @@ fn outgoing_always_read(peer: Option<&Peer>) -> bool {
     }
 }
 
-/// Delivery ticks of `msg` in chat-list and search rows: none for incoming messages and Saved
-/// Messages, a clock while sending, one tick while the peer has not read it
+/// Delivery ticks of `msg` in chat-list and search rows: none for incoming messages, sent notes
+/// in Saved Messages and items that display nothing, a clock while sending, one tick while the
+/// peer has not read it
 /// (`HistoryItem::unread`), two ticks otherwise.
 #[must_use]
 pub fn message_send_state(session: &Session, msg: &tg_data::Message) -> DialogSendState {
     let peer_id = msg.peer_id;
-    if !msg.is_outgoing() || peer_id == session.self_peer_id() {
+    // A failed send shows the sending clock too (`Dialogs::Ui::PaintRow`).
+    let being_sent = msg
+        .flags
+        .intersects(MessageFlags::BEING_SENT | MessageFlags::SENDING_FAILED);
+    // `item && !item->isEmpty() && item->needCheck()` (`dialogs_layout.cpp`), where
+    // `HistoryItem::needCheck` is `(out() && !isEmpty()) || (!isRegular() && peer->isSelf())`:
+    // notes in Saved Messages are never `out`, so only a pending one shows the clock.
+    if displays_nothing(msg) {
         DialogSendState::None
-    } else if msg.flags.contains(MessageFlags::BEING_SENT) {
+    } else if peer_id == session.self_peer_id() {
+        if being_sent {
+            DialogSendState::Sending
+        } else {
+            DialogSendState::None
+        }
+    } else if !msg.is_outgoing() {
+        DialogSendState::None
+    } else if being_sent {
         DialogSendState::Sending
     } else if session
         .history(peer_id)
@@ -1097,6 +1180,238 @@ pub fn dialog_entry_from_session(
     })
 }
 
+/// What is known about the message a reply points to (`HistoryMessageReply::resolvedMessage`
+/// and `_unavailable` in `history/history_item_components.cpp`).
+#[derive(Clone, Copy, Debug)]
+pub enum ReplyTargetState<'a> {
+    /// The replied message is available locally.
+    Found(&'a Message),
+    /// The replied message is not loaded yet and is being requested.
+    Loading,
+    /// The server says the replied message is gone (`messageEmpty`) or unavailable.
+    Deleted,
+}
+
+impl<'a> ReplyTargetState<'a> {
+    /// Looks up `msg`'s reply target in `session` only: a missing target is [`Self::Loading`].
+    #[must_use]
+    pub fn from_session(session: &'a Session, msg: &Message) -> Self {
+        let target = msg
+            .reply_to
+            .as_ref()
+            .and_then(|r| r.target_full_msg_id(msg.peer_id));
+        match target.and_then(|id| session.message(id)) {
+            Some(found) => Self::Found(found),
+            None => Self::Loading,
+        }
+    }
+}
+
+/// What is known about the story a reply points to (`HistoryMessageReply::resolvedStory`).
+#[derive(Clone, Copy, Debug)]
+pub enum StoryReplyState<'a> {
+    /// The story is being requested.
+    Loading,
+    /// The story exists; its caption may be empty.
+    Found {
+        /// Story caption text.
+        caption: &'a str,
+        /// The story's photo or video, shown as the header's preview.
+        media: Option<&'a tg_data::MessageMedia>,
+    },
+    /// The story was deleted or is not available.
+    Deleted,
+}
+
+/// Builds the reply header of a reply to `story` (`Reply::update` with `resolvedStory`): the
+/// story owner's name and `lng_in_dlg_story` ("Story", or "Story, caption"), "Loading..." while
+/// it is requested, or `lng_deleted_story`.
+#[must_use]
+pub fn story_reply_header(
+    session: &Session,
+    holder: &Message,
+    story: tg_data::FullStoryId,
+    state: StoryReplyState<'_>,
+) -> ReplyHeader {
+    let state_header = |text: String| ReplyHeader {
+        reply_to_msg_id: MsgId(0),
+        author_name: String::new(),
+        author_color_id: 0,
+        preview_text: text,
+        preview_thumb_rgb: None,
+        preview_thumb: None,
+        preview_colored_len: 0,
+        quote_text: None,
+    };
+    match state {
+        StoryReplyState::Loading => state_header(tg_lang::tr::lng_profile_loading()),
+        StoryReplyState::Deleted => state_header(tg_lang::tr::lng_deleted_story()),
+        StoryReplyState::Found { caption, media } => {
+            let author_name = session
+                .peer(story.peer)
+                .map(|p| p.name().to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("Peer {}", story.peer.bare()));
+            let kind = tg_lang::tr::lng_in_dlg_story();
+            let caption = caption.trim().replace(['\r', '\n'], " ");
+            let preview_text = if caption.is_empty() {
+                kind
+            } else {
+                tg_lang::tr::lng_dialogs_text_media(
+                    &tg_lang::tr::lng_dialogs_text_media_wrapped(&kind),
+                    &caption,
+                )
+            };
+            let preview_thumb = crate::reply_preview::reply_thumb(
+                holder,
+                crate::reply_preview::ReplyTargets {
+                    message: None,
+                    story: media,
+                },
+            );
+            ReplyHeader {
+                reply_to_msg_id: MsgId(0),
+                author_name,
+                author_color_id: story.peer.bare(),
+                preview_text,
+                preview_thumb_rgb: preview_thumb
+                    .as_ref()
+                    .map(|_| avatar_rgb_for_color_index((story.story.unsigned_abs() % 7) as u8)),
+                preview_thumb: preview_thumb.flatten(),
+                preview_colored_len: 0,
+                quote_text: None,
+            }
+        }
+    }
+}
+
+/// Builds `msg`'s reply header for a known `target` state.
+///
+/// Port of `HistoryView::Reply::update` / `updateName` (`history_view_reply.cpp`): a resolved
+/// target shows its author and a text/media preview; while it loads the header shows
+/// `lng_profile_loading`, and a deleted target shows `lng_deleted_message` unless the reply
+/// carries its own quote (then the quote is shown under the external sender name). A header
+/// with an empty `author_name` is drawn as that one-line state (`Reply::_stateText`).
+#[must_use]
+pub fn reply_header_for(
+    session: &Session,
+    msg: &Message,
+    target: ReplyTargetState<'_>,
+) -> Option<ReplyHeader> {
+    let r = msg.reply_to.as_ref()?;
+    let Some(target_id) = r.reply_to_msg_id else {
+        let story = r.reply_to_story?;
+        return Some(story_reply_header(
+            session,
+            msg,
+            story,
+            StoryReplyState::Loading,
+        ));
+    };
+    let quote = r
+        .quote_text
+        .as_ref()
+        .map(|q| q.text.clone())
+        .filter(|q| !q.trim().is_empty());
+    let target = match target {
+        ReplyTargetState::Found(orig) if matches!(orig.content, MessageContent::Empty) => {
+            ReplyTargetState::Deleted
+        }
+        other => other,
+    };
+    let state_header = |text: String| ReplyHeader {
+        reply_to_msg_id: from_data_msg(target_id),
+        author_name: String::new(),
+        author_color_id: 0,
+        preview_text: text,
+        preview_thumb_rgb: None,
+        preview_thumb: None,
+        preview_colored_len: 0,
+        quote_text: None,
+    };
+    match target {
+        ReplyTargetState::Found(orig) => {
+            let author_pid = orig.from_id.unwrap_or(orig.peer_id);
+            let author_name = session
+                .peer(author_pid)
+                .map(|p| p.name().to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("Peer {}", author_pid.bare()));
+            let preview = crate::reply_preview::reply_preview_text(session, orig);
+            let preview_thumb = crate::reply_preview::reply_thumb(
+                msg,
+                crate::reply_preview::ReplyTargets {
+                    message: Some(orig),
+                    story: None,
+                },
+            );
+            Some(ReplyHeader {
+                reply_to_msg_id: from_data_msg(target_id),
+                author_name,
+                author_color_id: author_pid.bare(),
+                preview_text: preview.text,
+                preview_thumb_rgb: preview_thumb
+                    .as_ref()
+                    .map(|_| avatar_rgb_for_color_index((target_id.0.unsigned_abs() % 7) as u8)),
+                preview_thumb: preview_thumb.flatten(),
+                preview_colored_len: preview.colored_len,
+                quote_text: quote,
+            })
+        }
+        ReplyTargetState::Loading => Some(state_header(tg_lang::tr::lng_profile_loading())),
+        ReplyTargetState::Deleted => {
+            let external = r.reply_from.as_ref().and_then(|f| {
+                f.from_name.clone().or_else(|| {
+                    f.from_id
+                        .and_then(|pid| session.peer(pid))
+                        .map(|p| p.name().to_owned())
+                })
+            });
+            // `Reply::update`: a reply to a message of another chat shows the quote, or the
+            // text of the media sent along with it (`externalMedia->toPreview`), and that
+            // media's thumbnail.
+            let external_media = r.reply_media.as_deref();
+            let media_text = external_media
+                .map(|media| crate::preview_text::regular_preview(media, "", false))
+                .filter(|text| !text.is_empty());
+            let colored_len = if quote.is_none() {
+                media_text.as_ref().map_or(0, String::len)
+            } else {
+                0
+            };
+            match (
+                quote.clone().or(media_text),
+                external.filter(|n| !n.is_empty()),
+            ) {
+                (Some(text), Some(name)) => {
+                    let color = r
+                        .reply_from
+                        .as_ref()
+                        .and_then(|f| f.from_id)
+                        .map_or(0, DataPeerId::bare);
+                    let preview_thumb = crate::reply_preview::reply_thumb(
+                        msg,
+                        crate::reply_preview::ReplyTargets::default(),
+                    );
+                    Some(ReplyHeader {
+                        reply_to_msg_id: from_data_msg(target_id),
+                        author_name: name,
+                        author_color_id: color,
+                        preview_text: text,
+                        preview_thumb_rgb: preview_thumb.as_ref().map(|_| {
+                            avatar_rgb_for_color_index((target_id.0.unsigned_abs() % 7) as u8)
+                        }),
+                        preview_thumb: preview_thumb.flatten(),
+                        preview_colored_len: colored_len,
+                        quote_text: quote,
+                    })
+                }
+                _ => Some(state_header(tg_lang::tr::lng_deleted_message())),
+            }
+        }
+    }
+}
+
 /// Converts a `tg_data::Message` into a rich [`HistoryMessage`].
 #[must_use]
 pub fn message_to_history_message(session: &Session, msg: &Message) -> HistoryMessage {
@@ -1135,7 +1450,10 @@ pub fn message_to_history_message_with_resolvers(
     let peer_id = from_data_peer(msg.peer_id);
     let from_data_id = msg.from_id.unwrap_or(msg.peer_id);
     let from_id = from_data_peer(from_data_id);
-    let sender_name = if let Some(author) = &msg.post_author {
+    let anonymous_admin = session
+        .peer(from_data_id)
+        .is_some_and(tg_data::Peer::is_megagroup);
+    let sender_name = if let Some(author) = msg.post_author.as_ref().filter(|_| !anonymous_admin) {
         author.clone()
     } else if let Some(p) = session.peer(from_data_id) {
         if p.name().is_empty() {
@@ -1173,41 +1491,7 @@ pub fn message_to_history_message_with_resolvers(
         }
     };
 
-    let reply = msg.reply_to.as_ref().and_then(|r| {
-        let target_id = r.reply_to_msg_id?;
-        let target_peer = r.reply_to_peer_id.unwrap_or(msg.peer_id);
-        let (author_name, author_color_id, preview_text) =
-            if let Some(orig) = session.message(tg_data::FullMsgId::new(target_peer, target_id)) {
-                let author_pid = orig.from_id.unwrap_or(orig.peer_id);
-                let name = session
-                    .peer(author_pid)
-                    .map(|p| p.name().to_owned())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| format!("Peer {}", author_pid.bare()));
-                (
-                    name,
-                    author_pid.bare(),
-                    tg_session::runtime::format_message_preview(orig),
-                )
-            } else {
-                (
-                    "Message".to_owned(),
-                    target_peer.bare(),
-                    r.quote_text
-                        .as_ref()
-                        .map(|q| q.text.clone())
-                        .unwrap_or_else(|| format!("Message #{}", target_id.0)),
-                )
-            };
-        Some(ReplyHeader {
-            reply_to_msg_id: from_data_msg(target_id),
-            author_name,
-            author_color_id,
-            preview_text,
-            preview_thumb_rgb: None,
-            quote_text: r.quote_text.as_ref().map(|q| q.text.clone()),
-        })
-    });
+    let reply = reply_header_for(session, msg, ReplyTargetState::from_session(session, msg));
 
     let forward = msg.forward_from.as_ref().map(|fwd| {
         let from_name = fwd
@@ -1290,6 +1574,14 @@ pub fn message_to_history_message_with_resolvers(
         _ => None,
     };
 
+    // `Message::hasOutLayout`: in Saved Messages the server's `out` flag does not say who
+    // wrote a message (`NewMessageFlags` never sets it there), so only the Saved Messages
+    // rule decides the side.
+    let outgoing = if msg.peer_id == session.self_peer_id() {
+        crate::preview_text::has_saved_messages_out_layout(session, msg)
+    } else {
+        msg.is_outgoing()
+    };
     let extra = MessageExtra {
         thread_id: msg
             .reply_to
@@ -1322,6 +1614,14 @@ pub fn message_to_history_message_with_resolvers(
             .flags
             .contains(MessageFlags::CAN_BE_SUMMARIZED)
             .then(|| "auto".to_owned()),
+        send_failed: msg.flags.contains(MessageFlags::SENDING_FAILED),
+        sender_badge: crate::sender_badge::sender_badge(session, msg, outgoing && !msg.is_post()),
+        sender_status: crate::sender_badge::sender_name_status(
+            session,
+            from_data_id,
+            msg.peer_id,
+            now_unix_i32(),
+        ),
     };
 
     HistoryMessage {
@@ -1330,8 +1630,7 @@ pub fn message_to_history_message_with_resolvers(
         from_id,
         sender_name,
         date_unix: msg.date,
-        outgoing: msg.is_outgoing()
-            || crate::preview_text::has_saved_messages_out_layout(session, msg),
+        outgoing,
         is_post: msg.is_post(),
         text,
         media,
@@ -1342,7 +1641,10 @@ pub fn message_to_history_message_with_resolvers(
         views: msg.views.map(|v| v.max(0) as u32),
         edited: msg.edit_date.is_some() && !msg.flags.contains(MessageFlags::HIDE_EDITED),
         is_read,
-        is_sending: msg.flags.contains(MessageFlags::BEING_SENT),
+        // A failed send keeps the clock (`HistoryView::BottomInfo`, `Flag::Sending`).
+        is_sending: msg
+            .flags
+            .intersects(MessageFlags::BEING_SENT | MessageFlags::SENDING_FAILED),
         is_pinned: msg.is_pinned(),
         extra,
     }
@@ -1548,6 +1850,7 @@ fn convert_message_media(
                 DocumentKind::Voice => HistoryMedia::Voice(VoiceAttachment {
                     duration_secs,
                     waveform_5bit: doc.waveform.clone().unwrap_or_default(),
+                    size_bytes: doc.size.max(0) as u64,
                     is_unread: ctx.msg.flags.contains(MessageFlags::MEDIA_IS_UNREAD),
                     transcription: None,
                 }),
@@ -1590,14 +1893,14 @@ fn convert_message_media(
             };
             (Some(hist_media), None, None)
         }
+        MessageMedia::WebPage(wp) if !crate::web_page_view::web_page_is_drawn(wp) => {
+            (None, None, None)
+        }
         MessageMedia::WebPage(wp) => {
             let lp = LinkPreviewData {
                 url: wp.url.clone(),
-                site_name: wp
-                    .site_name
-                    .clone()
-                    .unwrap_or_else(|| wp.display_url.clone()),
-                title: wp.title.clone().unwrap_or_else(|| wp.url.clone()),
+                site_name: crate::web_page_view::displayed_site_name(wp),
+                title: crate::web_page_view::displayed_title(wp),
                 description: wp.description.clone().unwrap_or_default(),
                 large_media: wp
                     .flags
@@ -2646,6 +2949,9 @@ pub fn peer_to_info_profile(
         is_online,
         verified,
         premium,
+        emoji_status_id: (kind != InfoPeerKind::SavedMessages)
+            .then(|| crate::peer_emoji_status::profile_emoji_status_id(peer, now))
+            .flatten(),
         color_index: peer.common().color_index % 7,
         phone,
         usernames,

@@ -1,31 +1,72 @@
-//! Pull-to-next-unread-channel overscroll indicator & footer hint for broadcast channels.
+//! Pull to the next unread channel: the gesture, its indicator and the hint over the bottom bar.
 //!
 //! Port origin:
 //! - `Telegram/SourceFiles/history/history_view_pull_to_next_channel.h`
 //! - `Telegram/SourceFiles/history/history_view_pull_to_next_channel.cpp`
+//! - `Telegram/lib_ui/ui/widgets/elastic_scroll.cpp` (the bottom pull edge the gesture rides on)
 //! - `Telegram/SourceFiles/chat_helpers/chat_helpers.style` (`historyPullNext*`)
+//!
+//! tdesktop reads the gesture from the scroll area's overscroll: only a phased scroll (a finger
+//! on a touch screen, or a trackpad that reports begin and end) can stretch the list past its
+//! bottom. A classic mouse wheel has no phase and never stretches it, so wheel scrolling, however
+//! fast, never switches the channel. The switch needs the stretch to pass the threshold, stay
+//! there for [`READY_DWELL_SECS`] with the fingers still down, and then the fingers to lift.
+//!
+//! Internal design: tdesktop spreads this over `ElasticScroll` (a widget), two child widgets and
+//! reactive streams. Here it is two plain state machines ([`BottomStretch`] and the widget's
+//! gesture fields) fed once per frame; nothing is allocated or rebuilt between frames.
 
 use egui::accesskit::Role;
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Pos2, Rect, Sense, Shape, Stroke,
-    StrokeKind, Ui, Vec2, WidgetInfo,
+    Color32, CornerRadius, Event, FontId, Id, MouseWheelSource, MouseWheelUnit, Pos2, Rect, Sense,
+    Shape, Stroke, TouchPhase, Ui, Vec2, WidgetInfo,
 };
 use tg_app_core::stand_in::types::PeerId;
 use tg_lang::tr;
+use tg_ui::anim::Transition;
 use tg_ui::fonts::{family_regular, family_semibold};
 use tg_ui::tg_style::st;
 use tg_ui::userpic::EmptyUserpic;
 
 use crate::history::theme::HistoryColors;
 
-/// Exact tdesktop animation durations (`history_view_pull_to_next_channel.cpp:50-55`).
-const RELEASE_SHOW_DURATION_SECS: f64 = 0.250;
-const RELEASE_HIDE_DURATION_SECS: f64 = 0.250;
+/// `kResetReachedOn`.
+const RESET_REACHED_ON: f32 = 0.95;
+/// `kReverseEase`.
+const REVERSE_EASE: f32 = 1.5;
+/// `kReadyDwell`: how long the stretch stays past the threshold, fingers down, before it arms.
+pub const READY_DWELL_SECS: f64 = 0.120;
+/// `kExpandDuration`.
+const EXPAND_DURATION_SECS: f64 = 0.250;
+/// `kReleaseShowDuration` / `kReleaseHideDuration`.
+const RELEASE_DURATION_SECS: f64 = 0.250;
+/// `kPanelDuration`.
 const PANEL_DURATION_SECS: f64 = 0.320;
+/// `kBounceDuration`.
 const BOUNCE_DURATION_SECS: f64 = 0.400;
 
-/// Footer bar height for the broadcast channel pull-to-next-channel hint strip.
-pub const PULL_NEXT_FOOTER_HEIGHT: f32 = 46.0;
+/// `kPullBandStiffness`: input travel per pixel of stretch within the pull distance.
+const PULL_BAND_STIFFNESS: f32 = 2.5;
+/// `kRubberBandStiffness`: input travel per pixel of stretch past the pull distance.
+const RUBBER_BAND_STIFFNESS: f32 = 20.0;
+/// `kRubberBandAmplitude`.
+const RUBBER_BAND_AMPLITUDE: f32 = 0.31;
+/// `kRubberBandPeriod`.
+const RUBBER_BAND_PERIOD: f32 = 1.6;
+/// `kRubberBandMaxReturnDuration`.
+const MAX_RETURN_SECS: f64 = 1.0;
+/// `kVelocityZeroingTimeout`.
+const VELOCITY_ZEROING_SECS: f64 = 0.100;
+/// `kMaxTrackedVelocity`.
+const MAX_TRACKED_VELOCITY: f32 = 6000.0;
+/// `kTouchOverscrollMultiplier`.
+const TOUCH_OVERSCROLL_MULTIPLIER: f32 = 2.0;
+/// `st::historyScroll.width`: the indicator is centred in the list without its scroll bar.
+const HISTORY_SCROLL_WIDTH: f32 = 12.0;
+/// The growing userpic shows its initials from this size on (smaller, the text would spill).
+const MIN_SIZE_WITH_INITIALS: f32 = 20.0;
+/// egui's size of one wheel line, for a phased gesture that reports lines.
+const WHEEL_LINE_POINTS: f32 = 50.0;
 
 /// Summary of the next unread broadcast channel candidate (`FindNextUnreadChannel`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,43 +102,309 @@ pub fn bounce_progress(t: f64) -> f64 {
     }
 }
 
-/// Exact tdesktop `easeOutQuint` curve (`anim::easeOutQuint`).
-#[must_use]
-fn ease_out_quint(t: f64) -> f64 {
-    let u = 1.0 - t.clamp(0.0, 1.0);
-    1.0 - u * u * u * u * u
-}
-
-/// Exact tdesktop `sineInOut` curve (`anim::sineInOut`).
-#[must_use]
-fn sine_in_out(t: f64) -> f64 {
-    0.5 * (1.0 - (std::f64::consts::PI * t.clamp(0.0, 1.0)).cos())
-}
-
-/// Pull threshold matching `PullThreshold()` (`st::historyPullNextThreshold * 2`,
-/// `history_view_pull_to_next_channel.cpp:57-63`).
+/// Stretch past the bottom that arms the switch: `PullThreshold()`
+/// (`st::historyPullNextThreshold * 2`, `history_view_pull_to_next_channel.cpp:57-63`).
 #[must_use]
 pub fn pull_threshold_px() -> f32 {
-    (st::history_pull_next_threshold.0 as f32 * 2.0).max(96.0)
+    st::history_pull_next_threshold.0 as f32 * 2.0
 }
 
-/// Stateful pull-to-next-unread-channel controller (`HistoryView::PullToNextChannel`).
+/// Phase of one scroll event (`Qt::ScrollPhase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelPhase {
+    /// A classic mouse wheel step (`Qt::NoScrollPhase`): it never stretches the list.
+    Unphased,
+    /// The fingers touched down (`Qt::ScrollBegin`).
+    Begin,
+    /// The fingers moved (`Qt::ScrollUpdate`).
+    Update,
+    /// Inertia after the fingers lifted (`Qt::ScrollMomentum`).
+    Momentum,
+    /// The gesture ended (`Qt::ScrollEnd`).
+    End,
+}
+
+/// What the scroll is doing (`Ui::ElasticScrollMovement`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollMovement {
+    /// At rest.
+    #[default]
+    None,
+    /// Fingers down.
+    Progress,
+    /// Inertia.
+    Momentum,
+    /// The stretch springs back.
+    Returning,
+}
+
+/// `PullOverscrollFromAccumulated`: the stretch that `accumulated` input travel gives.
+fn stretch_from_accumulated(accumulated: f32, distance: f32) -> f32 {
+    let soft = distance * PULL_BAND_STIFFNESS;
+    if accumulated <= soft {
+        accumulated / PULL_BAND_STIFFNESS
+    } else {
+        distance + (accumulated - soft) / RUBBER_BAND_STIFFNESS
+    }
+}
+
+/// `PullAccumulatedFromOverscroll`: the input travel that gives `stretch`.
+fn accumulated_from_stretch(stretch: f32, distance: f32) -> f32 {
+    if stretch <= distance {
+        stretch * PULL_BAND_STIFFNESS
+    } else {
+        distance * PULL_BAND_STIFFNESS + (stretch - distance) * RUBBER_BAND_STIFFNESS
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReturnSpring {
+    start: f64,
+    x0: f32,
+    v0: f32,
+    peak_time: f64,
+}
+
+/// The bottom edge of `Ui::ElasticScroll` as a pull edge: turns phased scroll input past the
+/// bottom into a stretch, and springs it back when the fingers lift.
+#[derive(Debug, Default)]
+struct BottomStretch {
+    /// Input travel past the bottom (`_overscrollAccumulated`).
+    accumulated: f32,
+    /// Stretch past the bottom (`_overscroll`).
+    stretch: f32,
+    movement: ScrollMovement,
+    spring: Option<ReturnSpring>,
+    /// `_ignoreMomentumFromOverscroll`: inertia that follows a release adds no stretch.
+    ignore_momentum: bool,
+    velocity: f32,
+    velocity_time: Option<f64>,
+    last_event_time: Option<f64>,
+    last_was_momentum: bool,
+}
+
+impl BottomStretch {
+    /// `ElasticScroll::handleWheelEvent` for input at the bottom edge. `down` is the travel
+    /// towards newer messages; `allowed` says the pull edge is live (`setOverscrollEdges`,
+    /// `setOverscrollPullDistances`).
+    fn feed(&mut self, phase: WheelPhase, down: f32, touch: bool, allowed: bool, now: f64) {
+        if phase == WheelPhase::Unphased {
+            if self.stretch > 0.0 {
+                if self.spring.is_none() {
+                    self.start_return(now);
+                }
+            } else {
+                self.movement = ScrollMovement::None;
+            }
+            return;
+        }
+        let momentum = matches!(phase, WheelPhase::Momentum | WheelPhase::End);
+        self.track_velocity(phase, down, now);
+        if self.ignore_momentum {
+            if !momentum {
+                self.ignore_momentum = false;
+            } else if down >= 0.0 {
+                return;
+            } else if self.spring.is_some() {
+                // Opposite input during the bounce is a new gesture whose begin was lost.
+                self.ignore_momentum = false;
+                self.cancel_return();
+            }
+        }
+        if !momentum {
+            self.cancel_return();
+        }
+        let distance = pull_threshold_px();
+        // Scrolling away from the stretch consumes it 1:1 (`ReconcileStretchAndScroll`).
+        if down < 0.0 && self.stretch > 0.0 && self.spring.is_none() {
+            self.stretch = (self.stretch + down).max(0.0);
+            self.accumulated = accumulated_from_stretch(self.stretch, distance);
+        }
+        if momentum {
+            if self.spring.is_none() {
+                if self.stretch > 0.0 {
+                    self.start_return(now);
+                } else if phase == WheelPhase::End {
+                    self.movement = ScrollMovement::None;
+                } else {
+                    self.movement = ScrollMovement::Momentum;
+                }
+            }
+            // Inertia that reaches the edge gives tdesktop a short plain bounce, never a pull;
+            // that bounce is not drawn here.
+            return;
+        }
+        if down <= 0.0 {
+            return;
+        }
+        if !allowed {
+            self.accumulated = 0.0;
+            self.stretch = 0.0;
+            return;
+        }
+        self.accumulated += if touch {
+            down * TOUCH_OVERSCROLL_MULTIPLIER
+        } else {
+            down
+        };
+        self.stretch = stretch_from_accumulated(self.accumulated, distance);
+    }
+
+    /// `ElasticScroll::trackWheelVelocity`.
+    fn track_velocity(&mut self, phase: WheelPhase, down: f32, now: f64) {
+        let momentum = phase == WheelPhase::Momentum;
+        if phase != WheelPhase::Update && !momentum {
+            if phase == WheelPhase::Begin {
+                self.velocity = 0.0;
+                self.velocity_time = None;
+                self.last_event_time = Some(now);
+            }
+            self.last_was_momentum = false;
+            return;
+        }
+        // Events of one frame share its time; they keep the velocity of the frame before.
+        let elapsed = self.last_event_time.map_or(0.0, |last| now - last);
+        if elapsed > 0.0 && elapsed < VELOCITY_ZEROING_SECS {
+            self.velocity =
+                (down / elapsed as f32).clamp(-MAX_TRACKED_VELOCITY, MAX_TRACKED_VELOCITY);
+            self.velocity_time = Some(now);
+        } else if elapsed > 0.0 && (!momentum || self.last_was_momentum) {
+            self.velocity = 0.0;
+            self.velocity_time = Some(now);
+        }
+        self.last_event_time = Some(now);
+        self.last_was_momentum = momentum;
+    }
+
+    /// `ElasticScroll::overscrollReturn` and `overscrollSpringStart`.
+    fn start_return(&mut self, now: f64) {
+        self.ignore_momentum = true;
+        if self.stretch <= 0.0 {
+            self.finish_return();
+            return;
+        }
+        self.movement = ScrollMovement::Returning;
+        let x0 = self.stretch;
+        let v0 = match self.velocity_time {
+            Some(at) if now - at <= VELOCITY_ZEROING_SECS => self.velocity,
+            _ => 0.0,
+        };
+        let push = v0 * RUBBER_BAND_AMPLITUDE;
+        let decay = RUBBER_BAND_STIFFNESS / RUBBER_BAND_PERIOD;
+        let peak_time = if push > 0.0 {
+            f64::from((1.0 / decay - x0 / push).max(0.0))
+        } else {
+            0.0
+        };
+        self.spring = Some(ReturnSpring {
+            start: now,
+            x0,
+            v0,
+            peak_time,
+        });
+    }
+
+    /// `ElasticScroll::overscrollReturnCancel`.
+    fn cancel_return(&mut self) {
+        self.movement = ScrollMovement::Progress;
+        if self.spring.take().is_some() {
+            self.accumulated = accumulated_from_stretch(self.stretch, pull_threshold_px());
+        }
+    }
+
+    fn finish_return(&mut self) {
+        self.spring = None;
+        self.accumulated = 0.0;
+        self.stretch = 0.0;
+        self.movement = ScrollMovement::None;
+    }
+
+    /// `ElasticScroll::overscrollSpringUpdate`: a critically damped spring back to the edge.
+    fn tick(&mut self, now: f64) {
+        let Some(spring) = self.spring else {
+            return;
+        };
+        let time = now - spring.start;
+        let t = time as f32;
+        let decay = RUBBER_BAND_STIFFNESS / RUBBER_BAND_PERIOD;
+        let value = (spring.x0 + spring.v0 * RUBBER_BAND_AMPLITUDE * t) * (-decay * t).exp();
+        if time >= MAX_RETURN_SECS || value <= 0.0 || (value < 0.5 && time >= spring.peak_time) {
+            self.finish_return();
+        } else {
+            self.stretch = value;
+        }
+    }
+}
+
+/// One value animation (`Ui::Animations::Simple`).
+#[derive(Debug, Clone, Copy)]
+struct Anim {
+    start: f64,
+    from: f64,
+    to: f64,
+    duration: f64,
+    ease: Transition,
+}
+
+impl Anim {
+    fn value(anim: Option<Self>, now: f64, rest: f64) -> f64 {
+        let Some(a) = anim else {
+            return rest;
+        };
+        if a.duration <= 0.0 || now >= a.start + a.duration {
+            return a.to;
+        }
+        let dt = ((now - a.start) / a.duration).clamp(0.0, 1.0);
+        a.from + a.ease.eval(a.to - a.from, dt)
+    }
+
+    fn running(anim: Option<Self>, now: f64) -> bool {
+        anim.is_some_and(|a| now < a.start + a.duration)
+    }
+}
+
+fn flag(on: bool) -> f64 {
+    if on { 1.0 } else { 0.0 }
+}
+
+/// What the gesture needs to know about the open chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullContext {
+    /// `PullToNextChannel::active()`: the chat is a broadcast channel and the list shows the
+    /// end of a history loaded to its newest message.
+    pub active: bool,
+    /// Another channel has unread messages to switch to.
+    pub has_next: bool,
+}
+
+/// The pull-to-next-channel gesture and its two overlays (`HistoryView::PullToNextChannel`).
 #[derive(Debug, Default)]
 pub struct PullToNextChannelWidget {
-    /// Current overscroll pull distance in logical pixels (`0.0` when idle).
-    pull_px: f32,
-    /// True once `pull_px >= pull_threshold_px()`.
-    ready: bool,
-    /// Animation progress `0.0..=1.0` for transitioning from arrow capsule to ready avatar pill.
-    release_progress: f64,
-    release_anim_start: Option<(f64, f64, f64)>,
-    /// Bounce timer start timestamp when `ready` first flips true.
+    edge: BottomStretch,
+    /// The "pull at the bottom of a channel" setting is off (`Core::Settings::pullToNextChannel`).
+    disabled: bool,
+    /// A phased wheel gesture is between its begin and its end.
+    wheel_gesture: bool,
+    /// A finger that went down on the list is still down.
+    touch_gesture: bool,
+    pulling: bool,
+    holding: bool,
+    committed: bool,
+    reached: bool,
+    expand_to: bool,
+    pull: f32,
+    peak_pull: f32,
+    expand: Option<Anim>,
+    dwell_until: Option<f64>,
+    /// The `ready` state the indicator and the hint last animated to.
+    shown_ready: bool,
+    release: Option<Anim>,
     bounce_start: Option<f64>,
-    /// Hint panel visibility animation `0.0..=1.0`.
-    panel_progress: f64,
-    panel_anim_start: Option<(f64, f64, f64)>,
-    /// Last time overscroll wheel/drag input was received (for smooth spring decay on release).
-    last_pull_time: Option<f64>,
+    hint_visible: bool,
+    hint_panel: Option<Anim>,
+    reduced_motion: bool,
+    /// A fixed state set by [`Self::set_pull_preview`]; input is ignored while it is shown.
+    preview: bool,
 }
 
 impl PullToNextChannelWidget {
@@ -107,608 +414,679 @@ impl PullToNextChannelWidget {
         Self::default()
     }
 
-    /// Resets pull state immediately (e.g. when switching channels or scrolling away from bottom).
+    /// Drops the gesture and hides both overlays at once (`reset(anim::type::instant)`).
     pub fn reset(&mut self) {
-        self.pull_px = 0.0;
-        self.ready = false;
-        self.release_progress = 0.0;
-        self.release_anim_start = None;
-        self.bounce_start = None;
-        self.panel_progress = 0.0;
-        self.panel_anim_start = None;
-        self.last_pull_time = None;
+        *self = Self {
+            disabled: self.disabled,
+            ..Self::default()
+        };
     }
 
-    /// Sets a deterministic overscroll distance (used by tests & visual snapshots).
-    pub fn set_pull_preview(&mut self, pull_px: f32, now_secs: f64) {
-        self.pull_px = pull_px.max(0.0);
-        self.last_pull_time = Some(now_secs);
-        let ready = self.pull_px >= pull_threshold_px();
-        self.ready = ready;
-        self.release_progress = if ready { 1.0 } else { 0.0 };
-        self.release_anim_start = None;
-        self.panel_progress = if pull_px > 0.0 { 1.0 } else { 0.0 };
-        self.panel_anim_start = None;
-        self.bounce_start = None;
+    /// Follows the "pull at the bottom of a channel for the next unread one" setting.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.disabled = !enabled;
     }
 
-    /// Current pull offset in logical pixels.
+    /// Shows a held pull of `pull_px` (snapshots and tests); stays until [`Self::reset`].
+    pub fn set_pull_preview(&mut self, pull_px: f32, _now_secs: f64) {
+        self.reset();
+        let pull = pull_px.max(0.0);
+        let ready = pull >= pull_threshold_px();
+        self.preview = true;
+        self.pulling = pull > 0.0;
+        self.holding = pull > 0.0;
+        self.pull = pull;
+        self.peak_pull = pull;
+        self.reached = ready;
+        self.expand_to = ready;
+        self.shown_ready = ready;
+        self.hint_visible = pull > 0.0;
+    }
+
+    /// Current stretch past the bottom of the list, logical pixels.
     #[must_use]
     pub const fn pull_px(&self) -> f32 {
-        self.pull_px
+        self.pull
     }
 
-    /// Returns `true` if the user has pulled past the release threshold.
+    /// `true` once the stretch stayed past the threshold long enough: lifting the fingers now
+    /// switches the channel.
     #[must_use]
     pub const fn is_ready(&self) -> bool {
-        self.ready
+        self.reached
     }
 
-    /// Feeds downward overscroll wheel delta (`delta_y < 0.0` in egui means scrolling down past
-    /// bottom) while the broadcast channel is pinned at bottom.
-    pub fn feed_bottom_overscroll(
+    /// `true` while the hint over the bottom bar is shown or fading.
+    #[must_use]
+    pub fn hint_shown(&self, now_secs: f64) -> bool {
+        Anim::value(self.hint_panel, now_secs, flag(self.hint_visible)) > 0.0
+    }
+
+    fn duration(&self, secs: f64) -> f64 {
+        if self.reduced_motion { 0.0 } else { secs }
+    }
+
+    /// Feeds one scroll event that arrived while the list was at its bottom. `down_px` is the
+    /// travel towards newer messages. Returns `true` when the gesture switches the channel.
+    pub fn feed_scroll(
         &mut self,
-        downward_overscroll_px: f32,
+        phase: WheelPhase,
+        down_px: f32,
+        touch: bool,
         now_secs: f64,
-        reduced_motion: bool,
-    ) {
-        if downward_overscroll_px <= 0.0 {
+        cx: PullContext,
+    ) -> bool {
+        let allowed = cx.active && !self.disabled;
+        self.edge.feed(phase, down_px, touch, allowed, now_secs);
+        self.handle_overscroll(now_secs, cx)
+    }
+
+    /// Advances the return spring and the dwell timer. Returns `true` when the gesture switches
+    /// the channel.
+    pub fn advance(&mut self, now_secs: f64, cx: PullContext) -> bool {
+        self.edge.tick(now_secs);
+        if self.dwell_until.is_some_and(|at| now_secs >= at) {
+            self.dwell_until = None;
+            if self.pulling && self.pull >= pull_threshold_px() {
+                self.reached = true;
+                self.peak_pull = self.pull;
+                self.start_expand(true, now_secs);
+                self.sync_overlays(now_secs, cx);
+            }
+        }
+        self.handle_overscroll(now_secs, cx)
+    }
+
+    /// `PullToNextChannel::handleOverscroll`.
+    fn handle_overscroll(&mut self, now: f64, cx: PullContext) -> bool {
+        let active = cx.active && !self.disabled;
+        let pull = self.edge.stretch.max(0.0);
+        let movement = self.edge.movement;
+        let threshold = pull_threshold_px();
+        if !self.pulling {
+            if movement != ScrollMovement::Progress || pull <= 0.0 || !active {
+                return false;
+            }
+            self.pulling = true;
+            self.committed = false;
+        }
+        self.pull = pull;
+        self.holding = movement == ScrollMovement::Progress;
+        if self.reached {
+            // Collapse on a peak-relative reverse, not down to the threshold.
+            self.peak_pull = self.peak_pull.max(pull);
+            let floor = threshold * RESET_REACHED_ON;
+            let reset_at = self.peak_pull - (self.peak_pull - floor) / REVERSE_EASE;
+            if pull < reset_at {
+                self.reached = false;
+                self.peak_pull = 0.0;
+                self.start_expand(false, now);
+            }
+        } else if pull >= threshold {
+            // Arm the dwell with the fingers down; a flick lifts them before it fires.
+            if self.dwell_until.is_none() && movement == ScrollMovement::Progress {
+                self.dwell_until = Some(now + READY_DWELL_SECS);
+            }
+        } else if pull < threshold * RESET_REACHED_ON {
+            self.dwell_until = None;
+        }
+        self.sync_overlays(now, cx);
+        if movement == ScrollMovement::Progress {
+            return false;
+        }
+        self.dwell_until = None;
+        if !self.committed {
+            self.committed = true;
+            if self.reached && cx.has_next && active {
+                self.pulling = false;
+                return true;
+            }
+        }
+        if pull <= 0.0 {
+            self.finish(now);
+        }
+        false
+    }
+
+    /// `reset(anim::type::normal)`: the indicator goes at once, the hint fades out.
+    fn finish(&mut self, now: f64) {
+        self.dwell_until = None;
+        self.pulling = false;
+        self.holding = false;
+        self.committed = false;
+        self.reached = false;
+        self.peak_pull = 0.0;
+        self.pull = 0.0;
+        self.expand_to = false;
+        self.expand = None;
+        self.bounce_start = None;
+        self.toggle_hint(false, now);
+    }
+
+    /// `PullToNextChannel::startExpand`.
+    fn start_expand(&mut self, ready: bool, now: f64) {
+        let from = Anim::value(self.expand, now, flag(self.expand_to));
+        self.expand_to = ready;
+        self.expand = Some(Anim {
+            start: now,
+            from,
+            to: flag(ready),
+            duration: self.duration(EXPAND_DURATION_SECS),
+            ease: if ready {
+                Transition::EaseOutQuint
+            } else {
+                Transition::SineInOut
+            },
+        });
+    }
+
+    /// `PullToNextChannel::pushIndicator`: `Indicator::setProgress` and `HintOverlay::setData`.
+    fn sync_overlays(&mut self, now: f64, cx: PullContext) {
+        if self.shown_ready != self.reached {
+            let from = Anim::value(self.release, now, flag(self.shown_ready));
+            self.shown_ready = self.reached;
+            self.release = Some(Anim {
+                start: now,
+                from,
+                to: flag(self.reached),
+                duration: self.duration(RELEASE_DURATION_SECS),
+                ease: if self.reached {
+                    Transition::EaseOutQuint
+                } else {
+                    Transition::SineInOut
+                },
+            });
+            if self.reached && !self.reduced_motion {
+                self.bounce_start = Some(now);
+            }
+        }
+        self.toggle_hint(self.holding && self.pull > 0.0 && cx.has_next, now);
+    }
+
+    /// `HintOverlay::toggle`.
+    fn toggle_hint(&mut self, visible: bool, now: f64) {
+        if self.hint_visible == visible {
             return;
         }
-        let max_pull = (st::history_pull_next_expand.0 as f32).max(120.0) * 1.35;
-        self.pull_px = (self.pull_px + downward_overscroll_px * 0.65).min(max_pull);
-        self.last_pull_time = Some(now_secs);
-        self.sync_ready(now_secs, reduced_motion);
+        let from = Anim::value(self.hint_panel, now, flag(self.hint_visible));
+        self.hint_visible = visible;
+        self.hint_panel = Some(Anim {
+            start: now,
+            from,
+            to: flag(visible),
+            duration: self.duration(PANEL_DURATION_SECS),
+            ease: Transition::EaseOutQuint,
+        });
     }
 
-    fn sync_ready(&mut self, now_secs: f64, reduced_motion: bool) {
-        let next_ready = self.pull_px >= pull_threshold_px();
-        if self.ready != next_ready {
-            self.ready = next_ready;
-            let to = if next_ready { 1.0 } else { 0.0 };
-            if reduced_motion {
-                self.release_progress = to;
-                self.release_anim_start = None;
-                self.bounce_start = None;
-            } else {
-                self.release_anim_start = Some((now_secs, self.release_progress, to));
-                if next_ready {
-                    self.bounce_start = Some(now_secs);
-                }
-            }
-        }
-        let target_panel = if self.pull_px > 2.0 { 1.0 } else { 0.0 };
-        let current_target = self
-            .panel_anim_start
-            .map_or(self.panel_progress, |(_, _, to)| to);
-        if (current_target - target_panel).abs() > 0.01 {
-            if reduced_motion {
-                self.panel_progress = target_panel;
-                self.panel_anim_start = None;
-            } else {
-                self.panel_anim_start = Some((now_secs, self.panel_progress, target_panel));
-            }
-        }
+    /// Height the indicator is drawn for (`_effective`): the stretch, plus the room the card
+    /// opens once the pull is armed.
+    fn effective(&self, now: f64) -> f32 {
+        let card = st::history_pull_next_expand.0 as f32;
+        let expand = Anim::value(self.expand, now, flag(self.expand_to)) as f32;
+        (self.pull + expand * (card - pull_threshold_px()))
+            .min(st::history_pull_next_max_height.0 as f32)
     }
 
-    fn step_animations(&mut self, now_secs: f64, reduced_motion: bool) -> (f64, f64, f64, bool) {
-        let mut animating = false;
-
-        if let Some((start, from, to)) = self.release_anim_start {
-            let dur = if to > from {
-                RELEASE_SHOW_DURATION_SECS
-            } else {
-                RELEASE_HIDE_DURATION_SECS
-            };
-            let t = ((now_secs - start) / dur).clamp(0.0, 1.0);
-            let eased = if to > from {
-                ease_out_quint(t)
-            } else {
-                sine_in_out(t)
-            };
-            self.release_progress = from + (to - from) * eased;
-            if t >= 1.0 {
-                self.release_progress = to;
-                self.release_anim_start = None;
-            } else {
-                animating = true;
-            }
-        }
-
-        if let Some((start, from, to)) = self.panel_anim_start {
-            let t = ((now_secs - start) / PANEL_DURATION_SECS).clamp(0.0, 1.0);
-            self.panel_progress = from + (to - from) * ease_out_quint(t);
-            if t >= 1.0 {
-                self.panel_progress = to;
-                self.panel_anim_start = None;
-            } else {
-                animating = true;
-            }
-        }
-
-        let bounce_offset = if reduced_motion {
-            0.0
-        } else if let Some(start) = self.bounce_start {
-            let t = ((now_secs - start) / BOUNCE_DURATION_SECS).clamp(0.0, 1.0);
-            if t >= 1.0 {
-                self.bounce_start = None;
-                0.0
-            } else {
-                animating = true;
-                -bounce_progress(t) * f64::from(st::history_pull_next_bounce.0.max(4))
-            }
+    /// How far the messages are lifted above the bottom of the list: the stretch plus the room
+    /// the armed card opens (`ElasticScroll` real overscroll + `setContentBottomInset`).
+    #[must_use]
+    pub fn content_shift(&self, now_secs: f64) -> f32 {
+        let offset = self.effective(now_secs);
+        if offset > st::line_width.0 as f32 {
+            offset
         } else {
             0.0
-        };
-
-        (
-            self.release_progress,
-            self.panel_progress,
-            bounce_offset,
-            animating,
-        )
+        }
     }
 
-    /// Paints the broadcast-channel Pull-to-Next-Unread-Channel indicator over the bottom of
-    /// `list_rect` AND the interactive footer bar inside `footer_rect`.
+    fn animating(&self, now: f64) -> bool {
+        self.edge.spring.is_some()
+            || Anim::running(self.expand, now)
+            || Anim::running(self.release, now)
+            || Anim::running(self.hint_panel, now)
+            || self
+                .bounce_start
+                .is_some_and(|at| now < at + BOUNCE_DURATION_SECS)
+    }
+
+    /// Reads this frame's scroll input over `list_rect` and feeds the gesture.
+    fn read_input(&mut self, ui: &Ui, list_rect: Rect, now: f64, cx: PullContext) -> bool {
+        let over_list = ui.ctx().input(|i| {
+            i.pointer
+                .latest_pos()
+                .is_some_and(|pos| list_rect.contains(pos))
+        });
+        let mut commit = false;
+        let wheel: Vec<(WheelPhase, f32)> = ui.ctx().input(|i| {
+            let mut gesture = self.wheel_gesture;
+            let out: Vec<(WheelPhase, f32)> = i
+                .events
+                .iter()
+                .filter_map(|event| {
+                    let Event::MouseWheel {
+                        unit,
+                        delta,
+                        phase,
+                        source,
+                        ..
+                    } = event
+                    else {
+                        return None;
+                    };
+                    let down = -delta.y
+                        * match unit {
+                            MouseWheelUnit::Point => 1.0,
+                            MouseWheelUnit::Line => WHEEL_LINE_POINTS,
+                            MouseWheelUnit::Page => list_rect.height(),
+                        };
+                    let ended = matches!(phase, TouchPhase::End | TouchPhase::Cancel);
+                    let wheel_phase = if *source == MouseWheelSource::Momentum {
+                        if ended {
+                            WheelPhase::End
+                        } else {
+                            WheelPhase::Momentum
+                        }
+                    } else if *phase == TouchPhase::Start {
+                        gesture = true;
+                        WheelPhase::Begin
+                    } else if ended {
+                        gesture = false;
+                        WheelPhase::End
+                    } else if gesture {
+                        WheelPhase::Update
+                    } else {
+                        WheelPhase::Unphased
+                    };
+                    Some((wheel_phase, down))
+                })
+                .collect();
+            self.wheel_gesture = gesture;
+            out
+        });
+        if over_list || self.pulling {
+            for (phase, down) in wheel {
+                commit |= self.feed_scroll(phase, down, false, now, cx);
+            }
+        }
+
+        // A finger on a touch screen drags the list; past the bottom it stretches it.
+        let (touching, drag_up) = ui.ctx().input(|i| {
+            (
+                i.any_touches() && i.pointer.primary_down(),
+                -i.pointer.delta().y,
+            )
+        });
+        if touching {
+            if !self.touch_gesture && over_list {
+                self.touch_gesture = true;
+                commit |= self.feed_scroll(WheelPhase::Begin, 0.0, true, now, cx);
+            } else if self.touch_gesture && drag_up != 0.0 {
+                commit |= self.feed_scroll(WheelPhase::Update, drag_up, true, now, cx);
+            }
+        } else if self.touch_gesture {
+            self.touch_gesture = false;
+            commit |= self.feed_scroll(WheelPhase::End, 0.0, true, now, cx);
+        }
+        commit
+    }
+
+    /// Runs the gesture for this frame and paints the indicator over the bottom of `list_rect`.
     ///
-    /// Returns `Some(next_peer_id)` when the user completes a pull-and-release gesture OR clicks
-    /// the footer button to jump to the next unread channel.
-    #[allow(clippy::too_many_arguments)]
+    /// Returns the channel to switch to when the user lifts the fingers from an armed pull.
     pub fn show(
         &mut self,
         ui: &mut Ui,
         list_rect: Rect,
-        footer_rect: Rect,
         at_bottom: bool,
         next_channel: Option<&NextUnreadChannelHint>,
         colors: &HistoryColors,
         reduced_motion: bool,
     ) -> Option<PeerId> {
-        let now_secs = ui.ctx().input(|i| i.time);
-        let mut jump_to = None;
-
-        if !at_bottom {
-            self.reset();
-            return None;
-        }
-
-        // Capture wheel overscroll while hovered over the channel history at bottom.
-        let pointer_in_list = ui
-            .ctx()
-            .input(|i| i.pointer.hover_pos().is_some_and(|p| list_rect.contains(p)));
-        if pointer_in_list {
-            let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-            if scroll_y < -0.5 {
-                self.feed_bottom_overscroll(-scroll_y, now_secs, reduced_motion);
-            } else if scroll_y > 0.5 && self.pull_px > 0.0 {
-                self.pull_px = (self.pull_px - scroll_y).max(0.0);
-                self.sync_ready(now_secs, reduced_motion);
-            }
-        }
-
-        // Release detection: once wheel/pull stops for 220ms, commit jump if ready, otherwise decay.
-        if self.pull_px > 0.0
-            && let Some(last) = self.last_pull_time
-            && now_secs - last > 0.22
-        {
-            if self.ready
-                && let Some(next) = next_channel
-            {
-                jump_to = Some(next.peer_id);
+        let now = ui.ctx().input(|i| i.time);
+        self.reduced_motion = reduced_motion;
+        let cx = PullContext {
+            active: at_bottom,
+            has_next: next_channel.is_some_and(|next| next.unread_count > 0),
+        };
+        if !self.preview {
+            let mut commit = self.read_input(ui, list_rect, now, cx);
+            commit |= self.advance(now, cx);
+            if commit {
                 self.reset();
-                return jump_to;
+                return next_channel.map(|next| next.peer_id);
             }
-            if reduced_motion {
-                self.pull_px = 0.0;
-            } else {
-                self.pull_px = (self.pull_px * 0.72 - 2.0).max(0.0);
-                ui.ctx().request_repaint();
-            }
-            self.sync_ready(now_secs, reduced_motion);
         }
-
-        let (release, _panel, bounce_offset, animating) =
-            self.step_animations(now_secs, reduced_motion);
-        if animating {
+        if self.animating(now) {
             ui.ctx().request_repaint();
+        } else if let Some(at) = self.dwell_until {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64((at - now).max(0.0)));
         }
-
-        // 1. Floating Pull Indicator capsule / avatar + title pill above the bottom edge of `list_rect`.
-        if self.pull_px > 1.0 {
-            self.paint_indicator(
-                ui,
-                list_rect,
-                next_channel,
-                release as f32,
-                bounce_offset as f32,
-                colors,
-            );
+        let offset = self.effective(now);
+        if offset > st::line_width.0 as f32 {
+            self.paint_indicator(ui, list_rect, offset, next_channel, colors, now);
         }
-
-        // 2. Interactive bottom footer strip inside `footer_rect` (accessible via click + keyboard
-        //    and displays the exact tdesktop pull/release hint strings).
-        if footer_rect.is_positive()
-            && self.paint_footer_hint(
-                ui,
-                footer_rect,
-                next_channel,
-                release as f32,
-                colors,
-                reduced_motion,
-            )
-            && let Some(next) = next_channel
-        {
-            jump_to = Some(next.peer_id);
-            self.reset();
-        }
-
-        jump_to
+        None
     }
 
+    /// `PullToNextChannel::Indicator::paintEvent`.
     fn paint_indicator(
         &self,
-        ui: &mut Ui,
+        ui: &Ui,
         list_rect: Rect,
+        offset: f32,
         next_channel: Option<&NextUnreadChannelHint>,
-        release: f32,
-        bounce_offset: f32,
         colors: &HistoryColors,
+        now: f64,
     ) {
-        let card = (st::history_pull_next_expand.0 as f32).max(108.0);
-        let skip = (st::history_pull_next_skip.0 as f32).max(8.0);
-        let padding = (st::history_pull_next_padding.0 as f32).max(4.0);
-        let avatar_dia = (st::history_pull_next_avatar.0 as f32).max(40.0);
-        let arrow_size = (st::history_pull_next_arrow_size.0 as f32).max(24.0);
-        let arrow_stroke = (st::history_pull_next_arrow_stroke.0 as f32).max(2.0);
-        let name_radius = (st::history_pull_next_name_radius.0 as f32).max(15.0);
-        let rise = (st::history_pull_next_rise.0 as f32).max(35.0);
+        let card = st::history_pull_next_expand.0 as f32;
+        let skip = st::history_pull_next_skip.0 as f32;
+        let padding = st::history_pull_next_padding.0 as f32;
+        let avatar = st::history_pull_next_avatar.0 as f32;
+        let inset = st::history_pull_next_inset.0 as f32;
+        let rise = st::history_pull_next_rise.0 as f32;
+        let arrow_size = st::history_pull_next_arrow_size.0 as f32;
+        let max_height = st::history_pull_next_max_height.0 as f32;
 
-        let offset = self.pull_px;
+        // The indicator widget covers the lowest `historyPullNextMaxHeight` of the list.
+        let h = list_rect.bottom();
+        let area = Rect::from_min_max(
+            Pos2::new(list_rect.left(), (h - max_height).max(list_rect.top())),
+            list_rect.right_bottom(),
+        );
+        let painter = ui.painter().with_clip_rect(area.intersect(ui.clip_rect()));
+        let center_width = list_rect.width() - HISTORY_SCROLL_WIDTH;
+        let cx = list_rect.left() + center_width / 2.0;
+
         let progress = (offset / card).clamp(0.0, 1.0);
         let alpha = progress;
-        let cx = list_rect.center().x;
-        let bottom = list_rect.bottom();
-        let bg = scale_alpha(colors.service_bg, alpha);
-        let fg = scale_alpha(colors.service_fg, alpha);
+        let release = Anim::value(self.release, now, flag(self.shown_ready)) as f32;
+        let bounce = self.bounce_start.map_or(1.0, |at| {
+            ((now - at) / BOUNCE_DURATION_SECS).clamp(0.0, 1.0)
+        });
+        let bounce_offset =
+            -(bounce_progress(bounce) as f32) * st::history_pull_next_bounce.0 as f32;
+        let circle_radius = avatar / 2.0;
+        let bg = colors.service_bg;
+        let fg = colors.service_fg;
 
-        let circle_r = avatar_dia * 0.5;
-        let width_r = (circle_r * (offset - skip) / (card - skip).max(1.0)).clamp(0.0, circle_r);
-        let width_r2 = (circle_r * progress)
-            .min(offset * 0.5 - skip * progress)
+        let width_radius =
+            (circle_radius * (offset - skip) / (card - skip)).clamp(0.0, circle_radius);
+        let width_radius2 = (circle_radius * progress)
+            .min(offset / 2.0 - skip * progress)
             .max(0.0);
-        let inset = (st::history_pull_next_inset.0 as f32).max(16.0);
-        let size = (width_r2 * 2.0 - inset).max(0.0) * (1.0 - release) + avatar_dia * release;
+        let size = (width_radius2 * 2.0 - inset) * (1.0 - release) + avatar * release;
 
-        // Stretching vertical capsule + upward pull arrow while `release < 1.0`.
-        if release < 0.99 && width_r > 1.0 {
-            let cap_top = bottom - offset;
-            let cap_bot = bottom + (-skip * (1.0 - release) + (-offset + avatar_dia) * release);
+        if release < 1.0 {
+            let capsule_top = h - offset;
+            let capsule_bottom = h - skip * (1.0 - release) + (avatar - offset) * release;
             let mut rect = Rect::from_min_max(
-                Pos2::new(cx - width_r, cap_top),
-                Pos2::new(cx + width_r, cap_bot),
+                Pos2::new(cx - width_radius, capsule_top),
+                Pos2::new(cx + width_radius, capsule_bottom),
             );
+            let mut bg_alpha = alpha;
             if release > 0.0 {
-                rect = rect.shrink(inset * release * 0.5);
+                rect = rect.shrink(inset * release);
+                bg_alpha = alpha * (1.0 - release);
             }
-            if rect.is_positive() {
-                let cr = CornerRadius::same((rect.width() * 0.5).min(255.0).round() as u8);
-                ui.painter().rect_filled(
+            if rect.width() > 0.0 && rect.height() > 0.0 {
+                let radius = width_radius
+                    .min(rect.width() / 2.0)
+                    .min(rect.height() / 2.0);
+                painter.rect_filled(
                     rect,
-                    cr,
-                    scale_alpha(colors.service_bg, alpha * (1.0 - release)),
+                    CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8),
+                    bg.gamma_multiply(bg_alpha),
                 );
-
-                let arrow_cy =
-                    bottom + (-offset + arrow_size + skip * (1.0 - progress) - rise * release);
-                paint_up_arrow(
-                    ui.painter(),
+                let arrow_cy = h - offset + arrow_size + skip * (1.0 - progress) - rise * release;
+                paint_arrow(
+                    &painter.with_clip_rect(rect.intersect(painter.clip_rect())),
                     Pos2::new(cx, arrow_cy),
-                    arrow_size * progress * 0.45,
-                    arrow_stroke * progress.max(0.5),
-                    scale_alpha(colors.service_fg, alpha * (1.0 - release)),
+                    progress,
+                    fg.gamma_multiply(alpha * (1.0 - release)),
                 );
             }
         }
 
-        // Next channel title pill (or "You have no unread channels") when `release > 0`.
-        let label = next_channel
-            .map(|c| c.title.clone())
-            .unwrap_or_else(tr::lng_pull_no_unread_channels);
-        if release > 0.01 && !label.is_empty() {
-            let avail = (list_rect.width() - 4.0 * skip - 24.0).max(80.0);
-            let galley = ui.painter().layout(
-                label,
-                FontId::new(13.0, family_semibold()),
-                scale_alpha(colors.service_fg, alpha * release),
-                avail,
+        let name = next_channel.map_or_else(tr::lng_pull_no_unread_channels, |c| c.title.clone());
+        if release > 0.0 && !name.is_empty() {
+            let avail = (center_width - 4.0 * skip).max(1.0);
+            let text_color = fg.gamma_multiply(alpha * release);
+            let mut job = egui::text::LayoutJob::single_section(
+                name,
+                egui::TextFormat {
+                    font_id: FontId::new(13.0, family_semibold()),
+                    color: text_color,
+                    ..Default::default()
+                },
             );
+            job.wrap = egui::text::TextWrapping {
+                max_width: avail,
+                max_rows: 1,
+                break_anywhere: true,
+                overflow_character: Some('…'),
+            };
+            let galley = painter.layout_job(job);
             let name_w = galley.size().x;
             let name_h = galley.size().y;
-            let name_top_offset = (st::history_pull_next_name_top.0 as f32).max(20.0);
-            let y = bottom + (name_top_offset * (1.0 - release) - rise * release) + bounce_offset;
+            let y = h + st::history_pull_next_name_top.0 as f32 * (1.0 - release) - rise * release
+                + bounce_offset;
+            let left = list_rect.left() + (center_width - name_w) / 2.0;
             let pill = Rect::from_min_size(
-                Pos2::new(cx - name_w * 0.5 - skip, y - padding),
-                Vec2::new(name_w + 2.0 * skip, name_h + padding * 2.0),
+                Pos2::new(left - skip, y - padding),
+                Vec2::new(name_w + 2.0 * skip, name_h + skip),
             );
-            ui.painter().rect_filled(
+            painter.rect_filled(
                 pill,
-                CornerRadius::same(name_radius.min(255.0).round() as u8),
-                scale_alpha(colors.service_bg, alpha * release),
+                CornerRadius::same(st::history_pull_next_name_radius.0.clamp(0, 255) as u8),
+                bg.gamma_multiply(alpha * release),
             );
-            ui.painter().galley(
-                Pos2::new(cx - name_w * 0.5, y),
-                galley,
-                scale_alpha(colors.service_fg, alpha * release),
-            );
+            painter.galley(Pos2::new(left, y), galley, text_color);
         }
 
-        // Channel avatar + unread badge (or checkmark circle when no unread channels remain).
-        if size >= 4.0 {
-            let top = bottom
-                + ((-skip - skip * progress - size) * (1.0 - release)
-                    + (-offset.min(card) + padding) * release)
+        if size >= 1.0 {
+            let top = h
+                + (-skip - skip * progress - size) * (1.0 - release)
+                + (-offset.min(card) + padding) * release
                 + bounce_offset;
-            let av_rect = Rect::from_min_size(Pos2::new(cx - size * 0.5, top), Vec2::splat(size));
+            let av_rect = Rect::from_min_size(Pos2::new(cx - size / 2.0, top), Vec2::splat(size));
             if let Some(next) = next_channel {
+                let mut faded = painter.clone();
+                faded.set_opacity(alpha);
                 let ui_colors = colors.ui_colors();
-                // Subtle surface halo ring so the floating avatar separates cleanly over message text.
-                ui.painter().circle_stroke(
-                    av_rect.center(),
-                    size * 0.5 + 1.5,
-                    Stroke::new(2.5, scale_alpha(colors.bar_bg, alpha)),
-                );
-                EmptyUserpic::for_color_index(next.color_index, &next.title, &ui_colors)
-                    .paint_circle(ui.painter(), av_rect);
-                if release > 0.05 && next.unread_count > 0 {
-                    let badge_h = (st::history_pull_next_badge.0 as f32).max(20.0) * release;
-                    let text = if next.unread_count > 999 {
-                        "999+".to_owned()
-                    } else {
-                        next.unread_count.to_string()
-                    };
-                    let badge_galley = ui.painter().layout_no_wrap(
-                        text,
-                        FontId::new(11.5 * release.max(0.7), family_semibold()),
-                        Color32::WHITE,
-                    );
-                    let badge_w = (badge_galley.size().x + 10.0).max(badge_h);
-                    let badge_rect = Rect::from_min_size(
-                        Pos2::new(
-                            av_rect.right() - badge_w + badge_h * 0.3,
-                            av_rect.top() - badge_h * 0.25,
-                        ),
-                        Vec2::new(badge_w, badge_h),
-                    );
-                    ui.painter().rect_filled(
-                        badge_rect,
-                        CornerRadius::same((badge_h * 0.5).round() as u8),
-                        colors.accent,
-                    );
-                    ui.painter().galley(
-                        Pos2::new(
-                            badge_rect.center().x - badge_galley.size().x * 0.5,
-                            badge_rect.center().y - badge_galley.size().y * 0.5,
-                        ),
-                        badge_galley,
-                        Color32::WHITE,
+                let userpic =
+                    EmptyUserpic::for_color_index(next.color_index, &next.title, &ui_colors);
+                if size >= MIN_SIZE_WITH_INITIALS {
+                    userpic.paint_circle_or_photo(&faded, av_rect, next.peer_id.0);
+                } else if !tg_ui::userpic_images::paint_userpic_image(
+                    &faded,
+                    av_rect,
+                    next.peer_id.0,
+                ) {
+                    // tdesktop scales the whole userpic; its initials are unreadable this small.
+                    let bg = userpic.bg_colors();
+                    tg_ui::userpic::paint_vertical_gradient_circle(
+                        &faded, av_rect, bg.color1, bg.color2,
                     );
                 }
+                if release > 0.05 && next.unread_count > 0 {
+                    paint_badge(&faded, av_rect, next.unread_count, release, colors);
+                }
             } else {
-                ui.painter().circle_filled(av_rect.center(), size * 0.5, bg);
-                paint_check_mark(ui.painter(), av_rect.center(), size * 0.26, fg);
+                painter.circle_filled(av_rect.center(), size / 2.0, bg.gamma_multiply(alpha));
+                paint_check(
+                    &painter,
+                    av_rect.center(),
+                    size / 2.0,
+                    fg.gamma_multiply(alpha),
+                );
             }
         }
     }
 
-    fn paint_footer_hint(
-        &self,
-        ui: &mut Ui,
-        rect: Rect,
-        next_channel: Option<&NextUnreadChannelHint>,
-        release: f32,
-        colors: &HistoryColors,
-        reduced_motion: bool,
-    ) -> bool {
-        let id = Id::unique("tg_hist_pull_next_channel_footer");
-        let sense = if next_channel.is_some() {
-            Sense::click()
-        } else {
-            Sense::hover()
-        };
-        let resp = ui.interact(rect, id, sense);
-
-        let bg = if next_channel.is_some() && resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            colors.bar_bg_over
-        } else {
-            colors.bar_bg
-        };
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
-        ui.painter().line_segment(
-            [
-                Pos2::new(rect.left(), rect.top()),
-                Pos2::new(rect.right(), rect.top()),
-            ],
-            Stroke::new(1.0, colors.divider),
-        );
-
-        let Some(next) = next_channel else {
-            let empty_text = tr::lng_pull_no_unread_channels();
-            resp.widget_info(|| WidgetInfo::labeled(Role::Label, true, empty_text.clone()));
-            ui.painter().text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                empty_text,
-                FontId::new(13.0, family_regular()),
-                colors.sub_text_fg,
-            );
-            return false;
-        };
-
-        let a11y = format!(
-            "{}: {} ({} unread)",
-            tr::lng_pull_next_channel(),
-            next.title,
-            next.unread_count
-        );
-        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, a11y.clone()));
-
-        if resp.has_focus() {
-            ui.painter().rect_stroke(
-                rect.shrink(2.0),
-                CornerRadius::same(6),
-                Stroke::new(2.0, colors.accent),
-                StrokeKind::Inside,
-            );
+    /// Paints the hint over the bottom bar (`PullToNextChannel::HintOverlay::paintEvent`):
+    /// "pull up" while the fingers hold the stretch, "release" once the pull is armed.
+    ///
+    /// `rect` is everything below the list (the area of the bottom bar). The hint takes no
+    /// clicks.
+    pub fn paint_hint(&self, ui: &mut Ui, rect: Rect, colors: &HistoryColors) {
+        let now = ui.ctx().input(|i| i.time);
+        let panel = Anim::value(self.hint_panel, now, flag(self.hint_visible)) as f32;
+        if panel <= 0.0 || !rect.is_positive() {
+            return;
         }
-
-        let slide = if reduced_motion {
-            0.0
-        } else {
-            (st::history_pull_next_hint_slide.0 as f32).max(10.0)
-        };
-        // Compact badge on the right when space permits (keep footer strictly single-line at 390px).
-        let compact = rect.width() < 460.0;
-        let show_arrow = release <= 0.5;
-        let hint_text = if release > 0.5 {
-            if compact {
-                tr::lng_release_next_channel()
-            } else {
-                format!("{} · {}", tr::lng_release_next_channel(), next.title)
-            }
-        } else if compact {
-            next.title.clone()
-        } else {
-            format!("{} · {}", tr::lng_pull_next_channel(), next.title)
-        };
-
-        let badge_text = if next.unread_count > 999 {
-            "999+".to_owned()
-        } else {
-            next.unread_count.to_string()
-        };
-        let badge_galley = ui.painter().layout_no_wrap(
-            badge_text,
-            FontId::new(11.5, family_semibold()),
-            Color32::WHITE,
-        );
-        let badge_w = (badge_galley.size().x + 12.0).max(22.0);
-        let badge_h = 20.0;
-        let arrow_slot = if show_arrow { 16.0 } else { 0.0 };
-        let max_text_w = (rect.width() - badge_w - arrow_slot - 44.0).max(100.0);
-
-        let text_col = if release > 0.5 {
-            colors.active_text_fg
-        } else {
-            colors.sub_text_fg
-        };
-        let mut job = egui::text::LayoutJob::single_section(
-            hint_text,
-            egui::TextFormat {
-                font_id: FontId::new(13.0, family_regular()),
-                color: text_col,
-                ..Default::default()
-            },
-        );
-        job.wrap = egui::text::TextWrapping {
-            max_width: max_text_w,
-            max_rows: 1,
-            break_anywhere: true,
-            overflow_character: Some('…'),
-        };
-        let galley = ui.painter().layout_job(job);
-        let total_w = arrow_slot + galley.size().x + 10.0 + badge_w;
-        let start_x = (rect.center().x - total_w * 0.5).max(rect.left() + 12.0);
-        let shift_y = if release > 0.5 {
-            slide * (1.0 - release)
-        } else {
-            -slide * release
-        };
-        if show_arrow {
-            tg_app_core::ui_icons::paint_arrow(
-                ui.painter(),
-                Pos2::new(start_x + 5.0, rect.center().y + shift_y),
-                11.0,
-                tg_app_core::ui_icons::ArrowDir::Up,
-                text_col,
-            );
+        if Anim::running(self.hint_panel, now) || Anim::running(self.release, now) {
+            ui.ctx().request_repaint();
         }
-        ui.painter().galley(
-            Pos2::new(
-                start_x + arrow_slot,
-                rect.center().y - galley.size().y * 0.5 + shift_y,
-            ),
-            galley,
-            text_col,
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        painter.rect_filled(
+            rect,
+            CornerRadius::ZERO,
+            colors.bar_bg.gamma_multiply(panel),
         );
 
-        let badge_rect = Rect::from_min_size(
-            Pos2::new(
-                (start_x + total_w - badge_w).min(rect.right() - badge_w - 12.0),
-                rect.center().y - badge_h * 0.5,
-            ),
-            Vec2::new(badge_w, badge_h),
-        );
-        ui.painter()
-            .rect_filled(badge_rect, CornerRadius::same(10), colors.accent);
-        ui.painter().galley(
-            Pos2::new(
-                badge_rect.center().x - badge_galley.size().x * 0.5,
-                badge_rect.center().y - badge_galley.size().y * 0.5,
-            ),
-            badge_galley,
-            Color32::WHITE,
-        );
+        let release = Anim::value(self.release, now, flag(self.shown_ready)) as f32;
+        let slide = st::history_pull_next_hint_slide.0 as f32;
+        let font = FontId::new(14.0, family_regular());
+        let pull_text = tr::lng_pull_next_channel();
+        let release_text = tr::lng_release_next_channel();
+        let label = if release > 0.5 {
+            release_text.clone()
+        } else {
+            pull_text.clone()
+        };
+        ui.interact(
+            rect,
+            Id::unique("tg_hist_pull_next_channel_hint"),
+            Sense::hover(),
+        )
+        .widget_info(|| WidgetInfo::labeled(Role::Label, true, label.clone()));
 
-        resp.clicked()
+        let line = |text: String, shift: f32, opacity: f32| {
+            let color = colors.sub_text_fg.gamma_multiply(opacity);
+            let galley = painter.layout_no_wrap(text, font.clone(), color);
+            let pos = Pos2::new(
+                rect.center().x - galley.size().x / 2.0,
+                rect.center().y - galley.size().y / 2.0 + shift,
+            );
+            painter.galley(pos, galley, color);
+        };
+        if release < 1.0 {
+            line(pull_text, -slide * release, panel * (1.0 - release));
+        }
+        if release > 0.0 {
+            line(release_text, slide * (1.0 - release), panel * release);
+        }
     }
 }
 
-fn paint_up_arrow(painter: &egui::Painter, center: Pos2, radius: f32, stroke_w: f32, fg: Color32) {
-    if radius <= 1.0 {
+/// `PaintArrow`: the up arrow in the capsule, scaled by `progress` around its anchor.
+fn paint_arrow(painter: &egui::Painter, center: Pos2, progress: f32, fg: Color32) {
+    if progress <= 0.0 {
         return;
     }
-    let stroke = Stroke::new(stroke_w, fg);
-    painter.line_segment(
-        [
-            Pos2::new(center.x, center.y - radius),
-            Pos2::new(center.x, center.y + radius),
-        ],
-        stroke,
-    );
+    let raise = st::history_pull_next_arrow_raise.0 as f32;
+    let map = |x: f32, y: f32| {
+        Pos2::new(
+            center.x + progress * (x - 12.0),
+            center.y - raise + progress * (y + 8.0),
+        )
+    };
+    let stroke = Stroke::new(st::history_pull_next_arrow_stroke.0 as f32 * progress, fg);
+    painter.line_segment([map(12.5, 4.0), map(12.5, 22.0)], stroke);
     painter.add(Shape::line(
-        vec![
-            Pos2::new(center.x - radius * 0.72, center.y - radius * 0.22),
-            Pos2::new(center.x, center.y - radius),
-            Pos2::new(center.x + radius * 0.72, center.y - radius * 0.22),
-        ],
+        vec![map(3.5, 12.0), map(12.5, 3.5), map(21.5, 12.0)],
         stroke,
     ));
 }
 
-fn paint_check_mark(painter: &egui::Painter, center: Pos2, s: f32, fg: Color32) {
-    if s <= 1.0 {
+/// `PaintCheck`: the check mark shown when no channel has unread messages.
+fn paint_check(painter: &egui::Painter, center: Pos2, size: f32, fg: Color32) {
+    if size <= 0.0 {
         return;
     }
+    let s = size / 2.4;
     painter.add(Shape::line(
         vec![
             Pos2::new(center.x - s, center.y),
             Pos2::new(center.x - s / 3.0, center.y + s * 0.7),
             Pos2::new(center.x + s, center.y - s * 0.7),
         ],
-        Stroke::new(2.0, fg),
+        Stroke::new(st::history_pull_next_arrow_stroke.0 as f32, fg),
     ));
 }
 
-fn scale_alpha(color: Color32, factor: f32) -> Color32 {
-    let a = (f32::from(color.a()) * factor.clamp(0.0, 1.0)).round() as u8;
-    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
+/// The unread badge at the top right of the next channel's userpic; it grows with `release`.
+fn paint_badge(
+    painter: &egui::Painter,
+    av_rect: Rect,
+    count: u32,
+    release: f32,
+    colors: &HistoryColors,
+) {
+    let height = st::history_pull_next_badge.0 as f32;
+    let text = if count > 999 {
+        "999+".to_owned()
+    } else {
+        count.to_string()
+    };
+    let galley = painter.layout_no_wrap(
+        text,
+        FontId::new(12.0 * release, family_semibold()),
+        Color32::WHITE,
+    );
+    let text_size = galley.size() / release.max(0.01);
+    let width = (text_size.x + height - text_size.y).max(height);
+    let full = Rect::from_min_size(
+        Pos2::new(
+            av_rect.right() - width + height / 3.0,
+            av_rect.top() - height / 4.0,
+        ),
+        Vec2::new(width, height),
+    );
+    let badge = Rect::from_center_size(full.center(), full.size() * release);
+    painter.rect_filled(
+        badge,
+        CornerRadius::same((badge.height() / 2.0).round().clamp(0.0, 255.0) as u8),
+        colors.accent,
+    );
+    painter.galley(badge.center() - galley.size() / 2.0, galley, Color32::WHITE);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LIVE: PullContext = PullContext {
+        active: true,
+        has_next: true,
+    };
+    const FRAME: f64 = 1.0 / 60.0;
+
+    /// A phased gesture at the bottom of the list: `travel` px of input in 10 px steps, one
+    /// step per frame. Returns the time after the last step.
+    fn drag(pull: &mut PullToNextChannelWidget, travel: f32, start: f64) -> f64 {
+        let mut now = start;
+        assert!(!pull.feed_scroll(WheelPhase::Begin, 0.0, false, now, LIVE));
+        let mut sent = 0.0;
+        while sent < travel {
+            now += FRAME;
+            assert!(!pull.feed_scroll(WheelPhase::Update, 10.0, false, now, LIVE));
+            assert!(!pull.advance(now, LIVE));
+            sent += 10.0;
+        }
+        now
+    }
+
+    fn hold(pull: &mut PullToNextChannelWidget, from: f64, secs: f64) -> f64 {
+        let mut now = from;
+        while now < from + secs {
+            now += FRAME;
+            assert!(!pull.advance(now, LIVE));
+        }
+        now
+    }
 
     #[test]
     fn bounce_progress_matches_tdesktop_endpoints_and_overshoot() {
@@ -719,14 +1097,154 @@ mod tests {
     }
 
     #[test]
-    fn pull_reaches_ready_past_threshold() {
+    fn the_threshold_is_96_px_of_stretch_which_takes_240_px_of_travel() {
+        assert_eq!(pull_threshold_px(), 96.0);
         let mut pull = PullToNextChannelWidget::new();
+        let now = drag(&mut pull, 230.0, 1.0);
+        assert!((pull.pull_px() - 92.0).abs() < 0.01, "{}", pull.pull_px());
+        pull.feed_scroll(WheelPhase::Update, 10.0, false, now + FRAME, LIVE);
+        assert!((pull.pull_px() - 96.0).abs() < 0.01, "{}", pull.pull_px());
+        // Past the pull distance the edge is twenty times stiffer.
+        pull.feed_scroll(WheelPhase::Update, 100.0, false, now + 2.0 * FRAME, LIVE);
+        assert!((pull.pull_px() - 101.0).abs() < 0.01, "{}", pull.pull_px());
+    }
+
+    #[test]
+    fn a_classic_mouse_wheel_never_pulls_however_far_it_scrolls() {
+        let mut pull = PullToNextChannelWidget::new();
+        let mut now = 1.0;
+        for _ in 0..400 {
+            now += FRAME;
+            assert!(!pull.feed_scroll(WheelPhase::Unphased, 120.0, false, now, LIVE));
+            assert!(!pull.advance(now, LIVE));
+            assert_eq!(pull.pull_px(), 0.0);
+        }
         assert!(!pull.is_ready());
-        let thresh = pull_threshold_px();
-        pull.feed_bottom_overscroll(thresh * 2.0, 1.0, false);
+    }
+
+    #[test]
+    fn inertia_that_reaches_the_bottom_never_pulls() {
+        let mut pull = PullToNextChannelWidget::new();
+        let mut now = 1.0;
+        // The fingers lifted while the list was still scrolling; the inertia arrives at the
+        // bottom and keeps coming.
+        for _ in 0..200 {
+            now += FRAME;
+            assert!(!pull.feed_scroll(WheelPhase::Momentum, 60.0, false, now, LIVE));
+            assert!(!pull.advance(now, LIVE));
+            assert_eq!(pull.pull_px(), 0.0);
+        }
+        assert!(!pull.feed_scroll(WheelPhase::End, 0.0, false, now + FRAME, LIVE));
+        assert!(!pull.is_ready());
+    }
+
+    #[test]
+    fn a_pull_past_the_threshold_held_and_released_switches() {
+        let mut pull = PullToNextChannelWidget::new();
+        let now = drag(&mut pull, 300.0, 1.0);
+        assert!(pull.pull_px() >= pull_threshold_px());
+        assert!(!pull.is_ready(), "the pull arms only after the dwell");
+        let now = hold(&mut pull, now, READY_DWELL_SECS + 2.0 * FRAME);
         assert!(pull.is_ready());
-        pull.reset();
-        assert!(!pull.is_ready());
+        assert!(
+            pull.feed_scroll(WheelPhase::End, 0.0, false, now + FRAME, LIVE),
+            "lifting the fingers from an armed pull switches the channel"
+        );
+    }
+
+    #[test]
+    fn a_flick_past_the_threshold_does_not_switch() {
+        let mut pull = PullToNextChannelWidget::new();
+        let mut now = 1.0;
+        pull.feed_scroll(WheelPhase::Begin, 0.0, false, now, LIVE);
+        // 300 px of travel in three frames, then the fingers lift 50 ms later.
+        for _ in 0..3 {
+            now += FRAME;
+            assert!(!pull.feed_scroll(WheelPhase::Update, 100.0, false, now, LIVE));
+        }
+        assert!(pull.pull_px() >= pull_threshold_px());
+        now += 0.050;
+        assert!(!pull.advance(now, LIVE));
+        assert!(!pull.feed_scroll(WheelPhase::End, 0.0, false, now, LIVE));
+        // The stretch springs back to rest and nothing switches on the way.
+        let end = now + MAX_RETURN_SECS + 0.1;
+        while now < end {
+            now += FRAME;
+            assert!(!pull.advance(now, LIVE));
+        }
         assert_eq!(pull.pull_px(), 0.0);
+        assert!(!pull.is_ready());
+    }
+
+    #[test]
+    fn a_pull_short_of_the_threshold_does_not_switch_however_long_it_is_held() {
+        let mut pull = PullToNextChannelWidget::new();
+        let now = drag(&mut pull, 200.0, 1.0);
+        assert!(pull.pull_px() < pull_threshold_px());
+        let now = hold(&mut pull, now, 2.0);
+        assert!(!pull.is_ready());
+        assert!(!pull.feed_scroll(WheelPhase::End, 0.0, false, now + FRAME, LIVE));
+    }
+
+    #[test]
+    fn pulling_back_before_the_release_disarms_the_pull() {
+        let mut pull = PullToNextChannelWidget::new();
+        let now = drag(&mut pull, 300.0, 1.0);
+        let mut now = hold(&mut pull, now, READY_DWELL_SECS + 2.0 * FRAME);
+        assert!(pull.is_ready());
+        // Scrolling back consumes the stretch 1:1.
+        for _ in 0..4 {
+            now += FRAME;
+            assert!(!pull.feed_scroll(WheelPhase::Update, -10.0, false, now, LIVE));
+        }
+        assert!(!pull.is_ready(), "stretch {}", pull.pull_px());
+        assert!(!pull.feed_scroll(WheelPhase::End, 0.0, false, now + FRAME, LIVE));
+    }
+
+    #[test]
+    fn an_armed_pull_with_no_unread_channel_left_does_not_switch() {
+        let none = PullContext {
+            active: true,
+            has_next: false,
+        };
+        let mut pull = PullToNextChannelWidget::new();
+        let mut now = 1.0;
+        pull.feed_scroll(WheelPhase::Begin, 0.0, false, now, none);
+        for _ in 0..30 {
+            now += FRAME;
+            pull.feed_scroll(WheelPhase::Update, 10.0, false, now, none);
+        }
+        for _ in 0..12 {
+            now += FRAME;
+            assert!(!pull.advance(now, none));
+        }
+        assert!(pull.is_ready());
+        assert!(!pull.feed_scroll(WheelPhase::End, 0.0, false, now + FRAME, none));
+    }
+
+    #[test]
+    fn nothing_pulls_away_from_the_bottom_or_with_the_setting_off() {
+        let away = PullContext {
+            active: false,
+            has_next: true,
+        };
+        let mut pull = PullToNextChannelWidget::new();
+        pull.feed_scroll(WheelPhase::Begin, 0.0, false, 1.0, away);
+        pull.feed_scroll(WheelPhase::Update, 300.0, false, 1.1, away);
+        assert_eq!(pull.pull_px(), 0.0);
+
+        let mut off = PullToNextChannelWidget::new();
+        off.set_enabled(false);
+        off.feed_scroll(WheelPhase::Begin, 0.0, false, 1.0, LIVE);
+        off.feed_scroll(WheelPhase::Update, 300.0, false, 1.1, LIVE);
+        assert_eq!(off.pull_px(), 0.0);
+    }
+
+    #[test]
+    fn a_finger_on_a_touch_screen_travels_half_as_far() {
+        let mut pull = PullToNextChannelWidget::new();
+        pull.feed_scroll(WheelPhase::Begin, 0.0, true, 1.0, LIVE);
+        pull.feed_scroll(WheelPhase::Update, 120.0, true, 1.0 + FRAME, LIVE);
+        assert!((pull.pull_px() - 96.0).abs() < 0.01, "{}", pull.pull_px());
     }
 }

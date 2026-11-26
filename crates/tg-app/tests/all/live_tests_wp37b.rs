@@ -1000,7 +1000,8 @@ fn wp37b_settings_chat_emoji_sets_triggers_fake_downloader_and_handles_failure()
             .state()
             .1
             .as_deref()
-            .is_some_and(|t| t.contains("Failed to download Twemoji"))
+            // tdesktop marks the set "Failed" (`storage/storage_cloud_blob.cpp:96-97`, TGB-2957).
+            .is_some_and(|t| t == tg_lang::tr::lng_attach_failed())
     );
 }
 

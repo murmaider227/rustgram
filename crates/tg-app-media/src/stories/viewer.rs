@@ -2115,7 +2115,10 @@ impl StoryViewerOverlay {
     }
 
     fn show_toast(&mut self, message: impl Into<String>, now_ms: i64) {
-        self.toast_text = Some((message.into(), now_ms + 3_200));
+        let Some(message) = tg_app_core::user_error::visible_toast_text(message.into()) else {
+            return;
+        };
+        self.toast_text = Some((message, now_ms + 3_200));
     }
 }
 

@@ -1062,7 +1062,9 @@ impl ChooseChatThemeState {
             && let Some(be) = backend
             && let Err(err) = self.hydrate_unique_gift_themes(be, true)
         {
-            out.toast = Some(format!("Load gift themes failed: {err}"));
+            out.toast =
+                tg_app_core::user_error::theme_sync("account.getUniqueGiftChatThemes", &err)
+                    .into_text();
         }
 
         if let Some(choice) = newly_selected {

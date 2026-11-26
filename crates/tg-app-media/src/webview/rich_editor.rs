@@ -468,7 +468,10 @@ impl RichEditorWindow {
     }
 
     fn show_toast(&mut self, msg: impl Into<String>, now_secs: f64) {
-        self.toast = Some((msg.into(), now_secs + 3.5));
+        let Some(msg) = tg_app_core::user_error::visible_toast_text(msg.into()) else {
+            return;
+        };
+        self.toast = Some((msg, now_secs + 3.5));
     }
 
     fn check_limit_error(&mut self, res: ApplyResult, now_secs: f64) {

@@ -1,0 +1,79 @@
+# Reviewed `format!` calls that put a LOCAL error (file, OS, parse, media engine) into visible
+# text. Read by tests/no_raw_error_text.rs (TGB-2957). One line per call:
+#   <path under crates/>|<format string exactly as in the source>
+# A request (RPC) failure never belongs here: map it with tg_app_core::user_error instead.
+
+# Startup / account storage (local tdata and runtime start, shown on the bootstrap error screen).
+tg-app/src/live_host/host.rs|Failed to persist signed-in session to tdata: {err}
+tg-app/src/live_host/host.rs|Failed to start live SessionRuntime: {err}
+tg-app/src/live_host/host.rs|Failed to start live SessionRuntime for slot {slot}: {err}
+
+# Local files.
+tg-app-history/src/history/compose_boxes.rs|Failed to read file: {e}
+tg-app-history/src/history/edit_caption.rs|Failed to read file: {err}
+tg-app-info/src/payments/passport.rs|Failed to read scan file: {err}
+tg-app-info/src/payments/passport.rs|Failed to read translation file: {err}
+tg-app-info/src/statistics/mod.rs|Failed to save XLSX: {err}
+tg-app-media/src/media/overlay.rs|Failed to open file: {err}
+tg-app-media/src/media/overlay.rs|{}: {err}
+tg-app-settings/src/settings/information.rs|Could not read file: {e}
+tg-app-settings/src/settings/notifications.rs|Failed to read ringtone file: {err}
+tg-app-settings/src/themes/background_picker.rs|Could not load background ({err}). Check the file path and try again.
+tg-app-settings/src/themes/editor.rs|Export failed: {e}
+tg-app-settings/src/themes/editor.rs|Import failed: {e}
+tg-app-settings/src/themes/editor.rs|Failed to save color: {e}
+
+# Local editors and parsers.
+tg-app-history/src/history/video_editor.rs|Split failed: {err}
+tg-app-history/src/history/video_editor.rs|Overlay timing: {err}
+tg-app-history/src/history/video_editor.rs|Export warning: {err}
+tg-app-history/src/history/video_editor.rs|Draft save error: {err}
+tg-app-history/src/history/video_editor.rs|Draft restore error: {err}
+tg-app-media/src/webview/rich_editor.rs|Formula error: {err}
+tg-app-media/src/webview/rich_editor.rs|Invalid formula: {err}
+tg-app-media/src/webview/rich_editor.rs|Markdown import error: {err}
+
+# Local webviews and OS integration.
+tg-app-history/src/history/mod.rs|Widget sandbox: {err}
+tg-app-info/src/payments/checkout.rs|Could not open 3-D Secure verification: {err}
+tg-app-info/src/payments/checkout.rs|3-D Secure verification failed: {err}
+tg-app-settings/src/settings/advanced.rs|Couldn't open Startup Apps settings: {err}
+tg-app-settings/src/settings/advanced.rs|Preference saved (SendTo shortcut: {err})
+tg-app-settings/src/settings/advanced.rs|Failed to apply proxy settings: {err}
+tg-app-settings/src/settings/passkeys.rs|! {} ({err})
+tg-app-window/src/window/lock_widgets.rs|Windows Hello failed: {err}
+
+# TON wallet (local key storage and TonConnect parsing, not Telegram requests).
+tg-app-settings/src/wallet/backup.rs|! {err}
+tg-app-settings/src/wallet/backup.rs|Invalid · {err}
+tg-app-settings/src/wallet/card_editor.rs|{} ({err})
+tg-app-settings/src/wallet/ton_connect_ui.rs|! {err}
+
+# Group-call media engine, e2e blocks and session starts (local; tdesktop hangs up or logs).
+tg-app-live/src/calls.rs|Failed to start group call engine: {err}
+tg-app-live/src/calls.rs|Failed to create group call: {err}
+tg-app-live/src/calls.rs|VoIP media engine failed to start: {err}
+tg-app-live/src/calls.rs|Could not generate conference join block: {err}
+tg-app-live/src/calls.rs|Failed to update conference participants: {err}
+tg-app-live/src/calls.rs|Failed to build group join payload: {err}
+tg-app-live/src/calls.rs|Failed to build screen join payload: {err}
+tg-app-live/src/calls.rs|Group media engine error: {err}
+tg-app-live/src/calls.rs|Group media engine start failed: {err}
+tg-app-live/src/calls.rs|Group broadcast stream start failed: {err}
+tg-app-live/src/calls.rs|Could not generate conference zero block: {err}
+tg-app-live/src/calls.rs|Failed to join group call: {err}
+tg-app-live/src/calls.rs|Failed to create conference call: {err}
+tg-app-live/src/calls.rs|Failed to join conference call: {err}
+tg-app-live/src/calls.rs|Failed to switch join-as identity: {err}
+tg-app-media/src/calls/live_backend.rs|VoIP media engine failed to start: {err}
+tg-app-media/src/calls/live_backend.rs|Failed to build group join payload: {err}
+tg-app-media/src/calls/live_backend.rs|Group media engine error: {err}
+tg-app-media/src/calls/live_backend.rs|Group media engine start failed: {err}
+tg-app-media/src/calls/live_backend.rs|Failed to start group call engine: {err}
+
+# Backend-internal error texts (returned to callers, which map them; never a toast by itself).
+tg-app-live/src/media.rs|invalid upload.getCdnFile params: {err}
+tg-app-live/src/media.rs|CDN AES-256-CTR decryption failed: {err}
+tg-app-live/src/media.rs|upload.getCdnFileHashes failed: {err}
+tg-app-live/src/media.rs|upload.reuploadCdnFile failed: {err}
+tg-app-live/src/media.rs|upload.getCdnFile failed: {err}

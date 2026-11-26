@@ -329,6 +329,8 @@ fn wp52_dialog_quick_actions_dispatch_expected_tl_rpcs() {
         ),
     );
     live.mark_dialog_read(peer);
+    // `messages.readHistory` goes out from the background queue.
+    assert!(live.flush_background_rpcs(std::time::Duration::from_secs(10)));
 
     // 4. Mark unread -> messages.markDialogUnread
     rpc.enqueue_ok(tl_fns::messages::MarkDialogUnread::CONSTRUCTOR_ID, &true);

@@ -15,12 +15,11 @@ use tg_history::consts::{
     HISTORY_REPLY_PADDING, HISTORY_UNREAD_BAR_HEIGHT, MSG_PADDING, MSG_SERVICE_PADDING,
 };
 use tg_history::{
-    BubbleCornerRounding, BubbleRounding, InfoDisplayType, MessageLayout, ServiceLayout,
-    TextSelection,
+    BubbleCornerRounding, BubbleRounding, MessageLayout, ServiceLayout, TextSelection,
 };
 use tg_ui::text::{
-    RichTextOptions, SyntaxHighlightPalette, build_layout_job, render_rich_text,
-    render_text_with_entities,
+    RichTextOptions, SyntaxHighlightPalette, render_prepared_rich_text,
+    render_prepared_text_with_entities,
 };
 use tg_ui::userpic::{EmptyUserpic, peer_name_color};
 
@@ -35,10 +34,10 @@ use crate::history::media::{
     MediaAssetCache, MediaInteraction, VoicePlaybackState, bubble_rounding_to_egui,
     paint_history_media, paint_history_media_with_runtime,
 };
+use crate::history::paint_cache::{MessagePaintCache, PreparedBody};
+use crate::history::reply_preview::{paint_reply_thumb, reply_preview_skip, reply_text_galley};
 use crate::history::sections_model::LinkPreviewData;
-use crate::history::text_bridge::{
-    char_range_rects, entities_to_rich_text, message_text_style, pointer_to_char_index,
-};
+use crate::history::text_bridge::{char_range_rects, message_text_style, pointer_to_char_index};
 use crate::history::theme::HistoryColors;
 use tg_app_core::stand_in::theme::Palette;
 use tg_app_core::stand_in::types::{FullMsgId, MsgId, PeerId};
@@ -165,14 +164,66 @@ pub fn parse_paid_media_stars(lp: &LinkPreviewData) -> Option<i64> {
     None
 }
 
+/// Vertical layout of a web page preview block's text lines, in logical pixels from the block
+/// top. A line the page does not have is `None` and takes no room, as in
+/// `HistoryView::WebPage::resizeGetHeight` (`_siteNameLines` / `_titleLines` are 0 when empty).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkPreviewRows {
+    /// Top of the site-name line.
+    pub site_name: Option<i32>,
+    /// Top of the title line.
+    pub title: Option<i32>,
+    /// Top of the description line.
+    pub description: Option<i32>,
+    /// Total block height.
+    pub height: i32,
+}
+
+const LINK_PREVIEW_PAD_TOP: i32 = 5;
+const LINK_PREVIEW_PAD_BOTTOM: i32 = 5;
+const LINK_PREVIEW_SITE_NAME_H: i32 = 15;
+const LINK_PREVIEW_TITLE_H: i32 = 17;
+const LINK_PREVIEW_DESCRIPTION_H: i32 = 16;
+
+/// Lays out the text lines of `lp`'s preview block (see [`LinkPreviewRows`]).
+///
+/// Invoice and Paid Media cards keep their fixed layout: they always carry a site name and a
+/// button row.
+#[must_use]
+pub fn link_preview_card_rows(lp: &LinkPreviewData) -> LinkPreviewRows {
+    if is_invoice_link_preview(lp) || parse_paid_media_stars(lp).is_some() {
+        return LinkPreviewRows {
+            site_name: Some(LINK_PREVIEW_PAD_TOP),
+            title: Some(LINK_PREVIEW_PAD_TOP + LINK_PREVIEW_SITE_NAME_H),
+            description: Some(
+                LINK_PREVIEW_PAD_TOP + LINK_PREVIEW_SITE_NAME_H + LINK_PREVIEW_TITLE_H,
+            ),
+            height: 84,
+        };
+    }
+    let mut y = LINK_PREVIEW_PAD_TOP;
+    let mut line = |present: bool, h: i32| {
+        present.then(|| {
+            let top = y;
+            y += h;
+            top
+        })
+    };
+    let site_name = line(!lp.site_name.is_empty(), LINK_PREVIEW_SITE_NAME_H);
+    let title = line(!lp.title.is_empty(), LINK_PREVIEW_TITLE_H);
+    let description = line(!lp.description.is_empty(), LINK_PREVIEW_DESCRIPTION_H);
+    LinkPreviewRows {
+        site_name,
+        title,
+        description,
+        height: y + LINK_PREVIEW_PAD_BOTTOM,
+    }
+}
+
 /// Returns the layout height in logical pixels reserved for a bubble's `link_preview` card.
 #[must_use]
 pub fn link_preview_card_height(lp: &LinkPreviewData) -> i32 {
-    if is_invoice_link_preview(lp) || parse_paid_media_stars(lp).is_some() {
-        84
-    } else {
-        58
-    }
+    link_preview_card_rows(lp).height
 }
 
 /// Optional bot inline-keyboard rendering context passed into [`paint_message_element_with_bots`].
@@ -512,6 +563,7 @@ pub fn paint_message_element(
         None,
         false,
         None,
+        &mut MessagePaintCache::default(),
     )
 }
 
@@ -548,6 +600,7 @@ pub fn paint_message_element_with_runtime(
         None,
         false,
         None,
+        &mut MessagePaintCache::default(),
     )
 }
 
@@ -585,11 +638,15 @@ pub fn paint_message_element_with_bots(
         None,
         false,
         None,
+        &mut MessagePaintCache::default(),
     )
 }
 
 /// Paints a complete regular chat message element wired to [`HistoryMediaRuntime`], inline bot
 /// keyboards, and optional AI message summary state (`messages.summarizeText`).
+///
+/// `paint_cache` is the message's [`MessagePaintCache`]: the body text prepared on an earlier
+/// frame is painted again without being rebuilt.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_message_element_full(
     ui: &mut Ui,
@@ -608,6 +665,7 @@ pub fn paint_message_element_full(
     summary: Option<&MessageSummaryEntry>,
     paused_chat_effects: bool,
     reaction_userpics: Option<&ReactionUserpics>,
+    paint_cache: &mut MessagePaintCache,
 ) -> Vec<MessagePaintEvent> {
     paint_message_element_internal(
         ui,
@@ -626,6 +684,7 @@ pub fn paint_message_element_full(
         summary,
         paused_chat_effects,
         reaction_userpics,
+        paint_cache,
     )
 }
 
@@ -647,6 +706,7 @@ fn paint_message_element_internal(
     summary: Option<&MessageSummaryEntry>,
     paused_chat_effects: bool,
     reaction_userpics: Option<&ReactionUserpics>,
+    paint_cache: &mut MessagePaintCache,
 ) -> Vec<MessagePaintEvent> {
     let mut events = Vec::new();
     let is_selected = selection.is_full();
@@ -689,16 +749,32 @@ fn paint_message_element_internal(
     let inner_w = (bubble_rect.width() - MSG_PADDING.horizontal() as f32).max(40.0);
     let mut header_y = bubble_rect.top() + MSG_PADDING.top as f32;
 
-    if layout.has_bubble && show_sender_name && layout.header_heights.from_name_or_via > 0 {
-        let color_idx = tg_ui::userpic::decide_color_index(msg.from_id.bare());
-        let name_fg = peer_name_color(color_idx, &ui_colors);
-        ui.painter().text(
+    if layout.has_bubble && layout.header_heights.from_name_or_via > 0 {
+        let line = Rect::from_min_size(
             Pos2::new(inner_left, header_y),
-            Align2::LEFT_TOP,
-            &msg.sender_name,
-            FontId::new(13.0, tg_ui::fonts::family_semibold()),
-            name_fg,
+            Vec2::new(inner_w, layout.header_heights.from_name_or_via as f32),
         );
+        // `!displayForwardedFrom()`: a forwarded message names its inline bot in the forward
+        // header.
+        let via_fg = msg
+            .forward
+            .is_none()
+            .then(|| crate::history::name_line::via_fg(colors, layout.has_out_layout));
+        if show_sender_name {
+            let color_idx = tg_ui::userpic::decide_color_index(msg.from_id.bare());
+            let name_fg = peer_name_color(color_idx, &ui_colors);
+            crate::history::name_line::paint_from_name(
+                ui.painter(),
+                msg,
+                line,
+                name_fg,
+                via_fg,
+                colors,
+                ui.ctx().input(|i| i.time),
+            );
+        } else if let Some(fg) = via_fg {
+            crate::history::name_line::paint_via_line(ui.painter(), msg, line, fg);
+        }
         header_y += layout.header_heights.from_name_or_via as f32;
     }
 
@@ -711,7 +787,7 @@ fn paint_message_element_internal(
         } else {
             colors.msg_in_reply_bar
         };
-        let label = format!("Forwarded from {}", fwd.from_name);
+        let label = crate::history::name_line::forwarded_header_text(msg, fwd);
         ui.painter().text(
             Pos2::new(inner_left, header_y),
             Align2::LEFT_TOP,
@@ -748,15 +824,11 @@ fn paint_message_element_internal(
         ui.painter()
             .rect_filled(accent_bar, CornerRadius::same(2), bar_color);
 
+        // `Reply::paint`: the 32x32 media preview, then name and text `previewSkip` further
+        // right.
         let mut text_x = reply_rect.left() + HISTORY_REPLY_PADDING.left as f32;
-        if let Some([r, g, b]) = reply.preview_thumb_rgb {
-            let thumb = Rect::from_min_size(
-                Pos2::new(reply_rect.left() + 7.0, reply_rect.top() + 3.0),
-                Vec2::splat((reply_h - 6.0).min(30.0)),
-            );
-            ui.painter()
-                .rect_filled(thumb, CornerRadius::same(3), Color32::from_rgb(r, g, b));
-            text_x = thumb.right() + 6.0;
+        if paint_reply_thumb(ui, assets, peer_id, msg.id, reply, reply_rect).is_some() {
+            text_x += reply_preview_skip() as f32;
         }
 
         let name_col = if layout.has_out_layout {
@@ -772,33 +844,47 @@ fn paint_message_element_internal(
         let text_max_w =
             (reply_rect.right() - text_x - HISTORY_REPLY_PADDING.right as f32).max(40.0);
         let name_top = reply_rect.top() + HISTORY_REPLY_PADDING.top as f32;
-        let name = elided_line(
-            ui,
-            &reply.author_name,
-            FontId::new(13.0, tg_ui::fonts::family_semibold()),
-            name_col,
-            text_max_w,
-        );
-        let name_h = name.size().y.max(18.0);
-        ui.painter()
-            .galley(Pos2::new(text_x, name_top), name, name_col);
-        let snippet_text = if let Some(ref quote) = reply.quote_text {
-            format!("“{quote}”")
+        if reply.author_name.is_empty() {
+            // `Reply::paint` without `_displaying`: the "Loading..." / "Deleted message" state in
+            // `msgDateFont` and the reply bar colour, half a line below the top padding.
+            let state_font = FontId::proportional(13.0);
+            let state = elided_line(ui, &reply.preview_text, state_font, bar_color, text_max_w);
+            let state_top = name_top + state.size().y / 2.0;
+            ui.painter()
+                .galley(Pos2::new(text_x, state_top), state, bar_color);
         } else {
-            reply.preview_text.clone()
-        };
-        let snippet = elided_line(
-            ui,
-            &snippet_text,
-            FontId::proportional(13.0),
-            colors.text_fg,
-            text_max_w,
-        );
-        ui.painter().galley(
-            Pos2::new(text_x, name_top + name_h),
-            snippet,
-            colors.text_fg,
-        );
+            let name = elided_line(
+                ui,
+                &reply.author_name,
+                FontId::new(13.0, tg_ui::fonts::family_semibold()),
+                name_col,
+                text_max_w,
+            );
+            let name_h = name.size().y.max(18.0);
+            ui.painter()
+                .galley(Pos2::new(text_x, name_top), name, name_col);
+            // The media part of the text ("Photo") takes the name colour
+            // (`replyTextPalette.linkFg`), the rest the bubble's text colour.
+            let (snippet_text, colored_len) = if let Some(ref quote) = reply.quote_text {
+                (format!("“{quote}”"), 0)
+            } else {
+                (reply.preview_text.clone(), reply.preview_colored_len)
+            };
+            let snippet = reply_text_galley(
+                ui,
+                &snippet_text,
+                colored_len,
+                FontId::proportional(13.0),
+                name_col,
+                colors.text_fg,
+                text_max_w,
+            );
+            ui.painter().galley(
+                Pos2::new(text_x, name_top + name_h),
+                snippet,
+                colors.text_fg,
+            );
+        }
 
         let reply_resp = ui.interact(
             reply_rect,
@@ -808,7 +894,8 @@ fn paint_message_element_internal(
         if reply_resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        if reply_resp.clicked() {
+        // A reply to a story has no message to jump to.
+        if reply_resp.clicked() && reply.reply_to_msg_id.0 != 0 {
             events.push(MessagePaintEvent::JumpToMessage(reply.reply_to_msg_id));
         }
     }
@@ -818,6 +905,9 @@ fn paint_message_element_internal(
         && !layout.media_rect.is_empty()
     {
         let media_rect = hist_rect_to_egui(layout.media_rect, origin.x, origin.y);
+        if matches!(media, HistoryMedia::RoundVideo(_)) && !layout.has_bubble {
+            place_round_transcribe_button(ui, msg, layout, origin, colors);
+        }
         let media_rounding = if layout.has_bubble {
             let mut r = layout.message_rounding;
             if layout.header_heights.total() > 0 {
@@ -1064,131 +1154,115 @@ fn paint_message_element_internal(
 
         let style = message_text_style();
         let text_pal = colors.text_palette(layout.has_out_layout);
-        let uses_rich_entity_renderer = active_text.entities.iter().any(|e| {
-            matches!(
-                e.entity_type(),
-                tg_text::EntityType::Pre
-                    | tg_text::EntityType::Blockquote
-                    | tg_text::EntityType::CustomEmoji
-                    | tg_text::EntityType::Colorized
-            )
-        });
-
-        if uses_rich_entity_renderer {
-            let mut opts = RichTextOptions::new(colors.text_fg, text_rect.width().max(40.0))
-                .selectable(true)
-                .selection(tg_text::TextSelection::new(selection.from, selection.to));
-            opts.syntax_palette = Some(if colors.is_night {
-                SyntaxHighlightPalette::night()
-            } else {
-                SyntaxHighlightPalette::day()
-            });
-            let mut clicked_link: Option<(String, bool)> = None;
-            ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
-                let resp = render_text_with_entities(
-                    ui,
-                    Id::unique(("tg_msg_entity_text", msg.id.0)),
-                    active_text,
-                    &style,
-                    &text_pal,
-                    &opts,
-                );
-                if let Some(link) = resp.clicked_link {
-                    let is_hidden = link.kind == tg_text::EntityType::CustomUrl;
-                    clicked_link = Some((link.target, is_hidden));
-                }
-            });
-            if let Some((url, is_hidden)) = clicked_link {
-                if is_hidden {
-                    events.push(MessagePaintEvent::OpenHiddenLink(url));
+        // The body is prepared once per message text (`MessagePaintCache::body`) and painted
+        // from that on later frames.
+        let body_wrap = text_rect.width().max(40.0);
+        match paint_cache.body(active_text) {
+            PreparedBody::Blocks(prepared) => {
+                let mut opts = RichTextOptions::new(colors.text_fg, text_rect.width().max(40.0))
+                    .selectable(true)
+                    .selection(tg_text::TextSelection::new(selection.from, selection.to));
+                opts.syntax_palette = Some(if colors.is_night {
+                    SyntaxHighlightPalette::night()
                 } else {
-                    events.push(MessagePaintEvent::OpenLink(url));
-                }
-            }
-        } else {
-            let rich = entities_to_rich_text(active_text);
-
-            // Paint partial text-selection background rectangles before drawing the text galley.
-            if !selection.is_empty() && !selection.is_full() {
-                let job = build_layout_job(
-                    &rich,
-                    &style,
-                    &text_pal,
-                    colors.text_fg,
-                    text_rect.width().max(40.0),
-                    None,
-                    true,
-                );
-                let sel_galley = ui.painter().layout_job(job);
-                for sr in char_range_rects(
-                    &sel_galley,
-                    text_rect.min,
-                    usize::from(selection.from),
-                    usize::from(selection.to),
-                ) {
-                    ui.painter()
-                        .rect_filled(sr, CornerRadius::same(2), colors.text_select_bg);
-                }
-            }
-
-            // Render interactive rich text (links, bold, italic, mono, underline, strike, spoiler).
-            let mut clicked_link = None;
-            ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
-                let resp = render_rich_text(
-                    ui,
-                    Id::unique(("tg_msg_text", msg.id.0)),
-                    &rich,
-                    &style,
-                    &text_pal,
-                    colors.text_fg,
-                    text_rect.width().max(40.0),
-                );
-                clicked_link = resp.clicked_link;
-            });
-            if let Some(url) = clicked_link {
-                let is_hidden = active_text
-                    .entities
-                    .iter()
-                    .any(|e| e.entity_type() == tg_text::EntityType::CustomUrl && e.data() == url);
-                if is_hidden {
-                    events.push(MessagePaintEvent::OpenHiddenLink(url));
-                } else {
-                    events.push(MessagePaintEvent::OpenLink(url));
-                }
-            }
-
-            // Drag-select text sensing over the text rect.
-            let drag_resp = ui.interact(
-                text_rect,
-                Id::unique(("tg_msg_text_drag", msg.id.0)),
-                Sense::drag(),
-            );
-            if drag_resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::Text);
-            }
-            if drag_resp.drag_started() || drag_resp.dragged() {
-                let job = build_layout_job(
-                    &rich,
-                    &style,
-                    &text_pal,
-                    colors.text_fg,
-                    text_rect.width().max(40.0),
-                    None,
-                    true,
-                );
-                let drag_galley = ui.painter().layout_job(job);
-                if let Some(ptr) = ui.ctx().pointer_interact_pos() {
-                    let (char_index, _) = pointer_to_char_index(&drag_galley, text_rect.min, ptr);
-                    if drag_resp.drag_started() {
-                        events.push(MessagePaintEvent::TextDragStart {
-                            msg_id: msg.id,
-                            char_index,
-                        });
+                    SyntaxHighlightPalette::day()
+                });
+                let mut clicked_link: Option<(String, bool)> = None;
+                ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+                    let resp = render_prepared_text_with_entities(
+                        ui,
+                        Id::unique(("tg_msg_entity_text", msg.id.0)),
+                        prepared,
+                        &style,
+                        &text_pal,
+                        &opts,
+                        None,
+                    );
+                    if let Some(link) = resp.clicked_link {
+                        let is_hidden = link.kind == tg_text::EntityType::CustomUrl;
+                        clicked_link = Some((link.target, is_hidden));
+                    }
+                });
+                if let Some((url, is_hidden)) = clicked_link {
+                    if is_hidden {
+                        events.push(MessagePaintEvent::OpenHiddenLink(url));
                     } else {
-                        events.push(MessagePaintEvent::TextDragUpdate {
-                            msg_id: msg.id,
-                            char_index,
-                        });
+                        events.push(MessagePaintEvent::OpenLink(url));
+                    }
+                }
+            }
+            PreparedBody::Spans { text: prepared, .. } => {
+                // Paint partial text-selection background rectangles before drawing the text galley.
+                if !selection.is_empty() && !selection.is_full() {
+                    let sel_galley =
+                        prepared.plain_galley(ui, &style, &text_pal, colors.text_fg, body_wrap);
+                    for sr in char_range_rects(
+                        &sel_galley,
+                        text_rect.min,
+                        usize::from(selection.from),
+                        usize::from(selection.to),
+                    ) {
+                        ui.painter()
+                            .rect_filled(sr, CornerRadius::same(2), colors.text_select_bg);
+                    }
+                }
+
+                // Drag-select sensing over the text rect. It is registered below the text: a
+                // drag-only widget on top would take the press from the links under it (egui's
+                // hit test gives the click to nobody), so no link in the text was clickable.
+                let drag_resp = ui.interact(
+                    text_rect,
+                    Id::unique(("tg_msg_text_drag", msg.id.0)),
+                    Sense::drag(),
+                );
+
+                // Render interactive rich text (links, bold, italic, mono, underline, strike, spoiler).
+                let mut clicked_link = None;
+                ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+                    let resp = render_prepared_rich_text(
+                        ui,
+                        Id::unique(("tg_msg_text", msg.id.0)),
+                        prepared,
+                        &style,
+                        &text_pal,
+                        colors.text_fg,
+                        body_wrap,
+                    );
+                    clicked_link = resp.clicked_link;
+                });
+                if let Some(url) = clicked_link {
+                    let is_hidden = active_text.entities.iter().any(|e| {
+                        e.entity_type() == tg_text::EntityType::CustomUrl && e.data() == url
+                    });
+                    if is_hidden {
+                        events.push(MessagePaintEvent::OpenHiddenLink(url));
+                    } else {
+                        events.push(MessagePaintEvent::OpenLink(url));
+                    }
+                }
+
+                // The text sets the hand cursor over a link; elsewhere the I-beam.
+                if drag_resp.hovered() && ui.ctx().output(|o| o.cursor_icon) == CursorIcon::Default
+                {
+                    ui.ctx().set_cursor_icon(CursorIcon::Text);
+                }
+                if drag_resp.drag_started() || drag_resp.dragged() {
+                    let drag_galley =
+                        prepared.plain_galley(ui, &style, &text_pal, colors.text_fg, body_wrap);
+                    if let Some(ptr) = ui.ctx().pointer_interact_pos() {
+                        let (char_index, _) =
+                            pointer_to_char_index(&drag_galley, text_rect.min, ptr);
+                        if drag_resp.drag_started() {
+                            events.push(MessagePaintEvent::TextDragStart {
+                                msg_id: msg.id,
+                                char_index,
+                            });
+                        } else {
+                            events.push(MessagePaintEvent::TextDragUpdate {
+                                msg_id: msg.id,
+                                char_index,
+                            });
+                        }
                     }
                 }
             }
@@ -1227,12 +1301,21 @@ fn paint_message_element_internal(
     // 5. Reactions row (`Reactions::InlineList`: emoji + count, or reactor userpics in
     // private chats). The full picker opens from the context menu reaction strip.
     if !msg.reactions.is_empty() && !layout.reactions_rect.is_empty() {
-        let react_rect = hist_rect_to_egui(layout.reactions_rect, origin.x, origin.y);
+        let chips: Vec<Rect> = if layout.reaction_buttons.len() == msg.reactions.len() {
+            layout
+                .reaction_buttons
+                .iter()
+                .map(|r| hist_rect_to_egui(*r, origin.x, origin.y))
+                .collect()
+        } else {
+            let react_rect = hist_rect_to_egui(layout.reactions_rect, origin.x, origin.y);
+            single_row_chip_rects(ui, &msg.reactions, react_rect, reaction_userpics.is_some())
+        };
         if let Some(ReactionRowAction::Toggle(emoji)) = paint_reactions_row(
             ui,
             msg.id,
             &msg.reactions,
-            react_rect,
+            &chips,
             layout.has_out_layout,
             colors,
             reaction_userpics,
@@ -1362,7 +1445,7 @@ fn paint_message_element_internal(
     // 6. Bottom info bar (views, edited, time, outgoing sent/read ticks).
     if !layout.bottom_info_rect.is_empty() {
         let info_rect = hist_rect_to_egui(layout.bottom_info_rect, origin.x, origin.y);
-        paint_bottom_info(
+        crate::history::bubble_info::paint_bottom_info(
             ui.painter(),
             msg,
             info_rect,
@@ -1433,53 +1516,39 @@ fn paint_link_preview_card(
 
     let text_x = rect.left() + 10.0;
     let clip_w = (rect.width() - 18.0).max(40.0);
-    let site_label = if lp.site_name.is_empty() {
-        "Link".to_owned()
-    } else {
-        lp.site_name.clone()
-    };
-    ui.painter().text(
-        Pos2::new(text_x, rect.top() + 5.0),
-        Align2::LEFT_TOP,
-        &site_label,
-        FontId::proportional(11.5),
-        accent,
-    );
+    let rows = link_preview_card_rows(lp);
+    if let Some(top) = rows.site_name {
+        ui.painter().text(
+            Pos2::new(text_x, rect.top() + top as f32),
+            Align2::LEFT_TOP,
+            &lp.site_name,
+            FontId::proportional(11.5),
+            accent,
+        );
+    }
 
-    if !lp.title.is_empty() {
+    if let Some(top) = rows.title.filter(|_| !lp.title.is_empty()) {
         let title_galley = ui.painter().layout_no_wrap(
             lp.title.clone(),
             FontId::proportional(12.5),
             colors.bold_fg,
         );
+        let pos = Pos2::new(text_x, rect.top() + top as f32);
         ui.painter()
-            .with_clip_rect(Rect::from_min_size(
-                Pos2::new(text_x, rect.top() + 20.0),
-                Vec2::new(clip_w, 18.0),
-            ))
-            .galley(
-                Pos2::new(text_x, rect.top() + 20.0),
-                title_galley,
-                colors.bold_fg,
-            );
+            .with_clip_rect(Rect::from_min_size(pos, Vec2::new(clip_w, 18.0)))
+            .galley(pos, title_galley, colors.bold_fg);
     }
 
-    if !lp.description.is_empty() {
+    if let Some(top) = rows.description.filter(|_| !lp.description.is_empty()) {
         let desc_galley = ui.painter().layout_no_wrap(
             lp.description.clone(),
             FontId::proportional(11.5),
             colors.sub_text_fg,
         );
+        let pos = Pos2::new(text_x, rect.top() + top as f32);
         ui.painter()
-            .with_clip_rect(Rect::from_min_size(
-                Pos2::new(text_x, rect.top() + 37.0),
-                Vec2::new(clip_w, 16.0),
-            ))
-            .galley(
-                Pos2::new(text_x, rect.top() + 37.0),
-                desc_galley,
-                colors.sub_text_fg,
-            );
+            .with_clip_rect(Rect::from_min_size(pos, Vec2::new(clip_w, 16.0)))
+            .galley(pos, desc_galley, colors.sub_text_fg);
     }
 
     if is_invoice {
@@ -1661,7 +1730,43 @@ fn reaction_userpic_count(r: &ReactionCounter) -> usize {
 }
 
 fn reaction_count_text(r: &ReactionCounter) -> String {
-    r.count.to_string()
+    crate::history::bubble_info::reaction_count_text(r)
+}
+
+/// Chip rects in one row from `rect`'s top-left, for layouts computed without chip widths.
+fn single_row_chip_rects(
+    ui: &Ui,
+    reactions: &[ReactionCounter],
+    rect: Rect,
+    private_chat: bool,
+) -> Vec<Rect> {
+    let pill_h = REACTION_PAD_V * 2.0 + REACTION_SIZE;
+    let mut x = rect.left();
+    reactions
+        .iter()
+        .map(|r| {
+            let count_w = ui
+                .painter()
+                .layout_no_wrap(
+                    reaction_count_text(r),
+                    FontId::new(12.0, tg_ui::fonts::family_semibold()),
+                    Color32::WHITE,
+                )
+                .size()
+                .x;
+            let w = reaction_button_width(r, private_chat, count_w);
+            let chip = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(w, pill_h));
+            x += w + REACTION_BETWEEN;
+            chip
+        })
+        .collect()
+}
+
+/// Width of a private-chat chip with reactor userpics (`InlineList::countOptimalSize`,
+/// `widthBaseUserpics + userpicsWidth`).
+#[must_use]
+pub fn reaction_userpics_chip_width(r: &ReactionCounter) -> i32 {
+    reaction_button_width(r, true, 0.0).ceil() as i32
 }
 
 fn reaction_button_width(r: &ReactionCounter, private_chat: bool, count_w: f32) -> f32 {
@@ -1682,19 +1787,17 @@ fn paint_reactions_row(
     ui: &mut Ui,
     msg_id: MsgId,
     reactions: &[ReactionCounter],
-    rect: Rect,
+    chips: &[Rect],
     outgoing: bool,
     colors: &HistoryColors,
     userpics: Option<&ReactionUserpics>,
     assets: &mut MediaAssetCache,
 ) -> Option<ReactionRowAction> {
     let mut toggled = None;
-    let mut x = rect.left();
-    let y = rect.top();
-    let pill_h = REACTION_PAD_V * 2.0 + REACTION_SIZE;
     let ui_colors = colors.ui_colors();
 
-    for (idx, r) in reactions.iter().enumerate() {
+    for (idx, (r, chip)) in reactions.iter().zip(chips).enumerate() {
+        let (x, y) = (chip.left(), chip.top());
         let fg = if r.chosen {
             colors.reaction_chosen_fg
         } else if outgoing {
@@ -1714,8 +1817,8 @@ fn paint_reactions_row(
             FontId::new(12.0, tg_ui::fonts::family_semibold()),
             fg,
         );
-        let pill_w = reaction_button_width(r, userpics.is_some(), count_galley.size().x);
-        let pill_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(pill_w, pill_h));
+        let pill_rect = *chip;
+        let pill_h = pill_rect.height();
 
         let resp = ui.interact(
             pill_rect,
@@ -1763,8 +1866,10 @@ fn paint_reactions_row(
                 );
                 ui.painter()
                     .circle_filled(pic.center(), REACTION_USERPIC * 0.5 + 1.0, bg);
-                EmptyUserpic::for_peer(peer.bare(), name, &ui_colors)
-                    .paint_circle(ui.painter(), pic);
+                if !tg_ui::userpic_images::paint_userpic_image(ui.painter(), pic, peer.0) {
+                    EmptyUserpic::for_peer(peer.bare(), name, &ui_colors)
+                        .paint_circle(ui.painter(), pic);
+                }
                 px += REACTION_USERPIC - REACTION_USERPIC_SHIFT;
             }
         } else {
@@ -1781,153 +1886,50 @@ fn paint_reactions_row(
         if resp.clicked() {
             toggled = Some(ReactionRowAction::Toggle(r.emoji.clone()));
         }
-        x += pill_w + REACTION_BETWEEN;
     }
     toggled
 }
 
-fn paint_bottom_info(
-    painter: &Painter,
+/// Places a bubble-less round video's transcribe button like `Gif::paintTranscribe`: right of
+/// the circle and its info pill, stacked above the right action; left of the circle for
+/// outgoing messages.
+fn place_round_transcribe_button(
+    ui: &Ui,
     msg: &HistoryMessage,
-    rect: Rect,
-    display: InfoDisplayType,
-    outgoing: bool,
+    layout: &MessageLayout,
+    origin: Pos2,
     colors: &HistoryColors,
 ) {
-    let pill = matches!(
-        display,
-        InfoDisplayType::Image | InfoDisplayType::ImageLeftToRight | InfoDisplayType::Background
-    );
-    let fg = if pill {
-        colors.date_img_fg
-    } else if outgoing {
-        colors.msg_out_date_fg
-    } else {
-        colors.msg_in_date_fg
+    use crate::history::inner::{
+        HISTORY_FAST_SHARE_BOTTOM_F, HISTORY_FAST_SHARE_LEFT_F, HISTORY_FAST_SHARE_SIZE_F,
     };
-
-    if pill {
-        let r = (rect.height() * 0.5).ceil() as u8;
-        painter.rect_filled(rect, CornerRadius::same(r), colors.date_img_bg);
-    }
-
-    let mut parts = Vec::new();
-    if let Some(ref bot) = msg.extra.via_bot {
-        parts.push(format!("via @{bot}"));
-    }
-    if let Some(views) = msg.views {
-        parts.push(format_compact_views(views));
-    }
-    if msg.edited {
-        parts.push("edited".to_owned());
-    }
-    parts.push(crate::history::inner::message_time_text(msg));
-    let text = parts.join("  ");
-
-    let reserve_ticks = if outgoing { 16.0 } else { 0.0 };
-    let pad_x = if pill { 7.0 } else { 0.0 };
-    let text_right = rect.right() - pad_x - reserve_ticks;
-
-    let galley = painter.layout_no_wrap(text, FontId::proportional(11.0), fg);
-    let mut cursor_x = text_right - galley.size().x;
-    painter.galley(
-        Pos2::new(cursor_x, rect.center().y - galley.size().y * 0.5),
-        galley,
-        fg,
-    );
-    if msg.views.is_some() {
-        cursor_x -= 14.0;
-        tg_app_core::ui_icons::paint_eye(
-            painter,
-            Pos2::new(cursor_x + 5.0, rect.center().y),
-            11.0,
-            fg,
-        );
-    }
-    if msg.is_pinned {
-        cursor_x -= 14.0;
-        tg_app_core::ui_icons::paint_style_tinted(
-            painter,
-            Rect::from_center_size(
-                Pos2::new(cursor_x + 5.0, rect.center().y),
-                Vec2::splat(11.0),
+    let size = HISTORY_FAST_SHARE_SIZE_F;
+    let delta = 4.0; // st::msgDateImgDelta
+    let media = hist_rect_to_egui(layout.media_rect, origin.x, origin.y);
+    let rect = if layout.has_right_layout {
+        Rect::from_min_size(
+            Pos2::new(media.left() - size, media.bottom() - size - delta),
+            Vec2::splat(size),
+        )
+    } else {
+        let anchor = crate::history::inner::unwrapped_right_action_anchor(layout, origin);
+        let action_h = crate::history::inner::unwrapped_right_action_height(ui, msg, colors);
+        let top = anchor.bottom() - HISTORY_FAST_SHARE_BOTTOM_F - action_h;
+        Rect::from_min_size(
+            Pos2::new(
+                anchor.right() + HISTORY_FAST_SHARE_LEFT_F,
+                top - size - delta,
             ),
-            tg_ui::tg_style::st::menu_icon_pin,
-            fg,
-        );
-    }
-    if msg.extra.silent {
-        cursor_x -= 14.0;
-        tg_app_core::ui_icons::paint_style_tinted(
-            painter,
-            Rect::from_center_size(
-                Pos2::new(cursor_x + 5.0, rect.center().y),
-                Vec2::splat(11.0),
-            ),
-            tg_ui::tg_style::st::menu_icon_mute,
-            fg,
-        );
-    }
-    if msg.extra.effect_id.is_some() {
-        cursor_x -= 13.0;
-        tg_app_core::ui_icons::paint_sparkle(
-            painter,
-            Pos2::new(cursor_x + 5.0, rect.center().y),
-            10.0,
-            fg,
-        );
-    }
-
-    // Outgoing send / read ticks painted as crisp vector strokes.
-    if outgoing {
-        let tx = rect.right() - pad_x - 12.0;
-        let ty = rect.center().y;
-        let stroke = Stroke::new(1.4, fg);
-        if msg.is_sending {
-            painter.circle_stroke(Pos2::new(tx + 5.0, ty), 4.2, stroke);
-            painter.line_segment(
-                [Pos2::new(tx + 5.0, ty - 2.2), Pos2::new(tx + 5.0, ty)],
-                stroke,
-            );
-            painter.line_segment(
-                [Pos2::new(tx + 5.0, ty), Pos2::new(tx + 7.2, ty + 1.0)],
-                stroke,
-            );
-        } else {
-            // First check
-            painter.add(Shape::line(
-                vec![
-                    Pos2::new(tx, ty + 0.5),
-                    Pos2::new(tx + 2.8, ty + 3.2),
-                    Pos2::new(tx + 7.8, ty - 3.0),
-                ],
-                stroke,
-            ));
-            // Second check when read
-            if msg.is_read {
-                painter.add(Shape::line(
-                    vec![
-                        Pos2::new(tx + 4.0, ty + 0.8),
-                        Pos2::new(tx + 6.4, ty + 3.2),
-                        Pos2::new(tx + 11.4, ty - 3.0),
-                    ],
-                    stroke,
-                ));
-            }
-        }
-    }
+            Vec2::splat(size),
+        )
+    };
+    crate::history::media::set_round_transcribe_rect(ui.ctx(), msg.id, rect);
 }
 
-/// Formats channel view counts compactly (`1.2K`, `4.8M`).
+/// Formats view and reply counts like `Lang::FormatCountToShort` (`9999`, `14.5K`, `1.6M`).
 #[must_use]
 pub fn format_compact_views(views: u32) -> String {
-    if views >= 1_000_000 {
-        format!("{:.1}M", f64::from(views) / 1_000_000.0)
-    } else if views >= 1_000 {
-        format!("{:.1}K", f64::from(views) / 1_000.0)
-    } else {
-        views.to_string()
-    }
+    tg_history::format_count_to_short(i64::from(views))
 }
 
 /// Computes the exact size of a message's reactions row for `MessageInput::reactions_size`

@@ -1036,8 +1036,11 @@ impl MediaOverlayWidget {
     }
 
     fn show_toast(&mut self, text: impl Into<String>, now_ms: i64) {
+        let Some(text) = tg_app_core::user_error::visible_toast_text(text.into()) else {
+            return;
+        };
         self.toast = Some(ToastBanner {
-            text: text.into(),
+            text,
             shown_at_ms: now_ms,
         });
     }

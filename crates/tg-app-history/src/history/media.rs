@@ -14,15 +14,13 @@ use egui::{
 };
 use tg_history::consts::{
     HISTORY_POLL_ANSWERS_SKIP, HISTORY_POLL_QUESTION_TOP, HISTORY_POLL_SUBTITLE_SKIP,
-    HISTORY_POLL_TOTAL_VOTES_SKIP, MSG_FILE_LAYOUT, MSG_FILE_THUMB_LAYOUT, MSG_PADDING,
-    MSG_WAVEFORM_BAR, MSG_WAVEFORM_MAX, MSG_WAVEFORM_MIN, MSG_WAVEFORM_SKIP,
+    HISTORY_POLL_TOTAL_VOTES_SKIP, HISTORY_TRANSCRIBE_SIZE, HISTORY_TRANSCRIBE_SKIP,
+    MSG_FILE_LAYOUT, MSG_FILE_THUMB_LAYOUT, MSG_PADDING, MSG_WAVEFORM_MAX, MSG_WAVEFORM_MIN,
 };
 use tg_history::{
     BubbleCornerRounding, BubbleRounding, GroupedMediaLayout, MediaLayout, apply_rounding_sides,
-    waveform_bar_count,
 };
 use tg_lottie::{Composition, Size as LottieSize, render_composition};
-use tg_media::audio::{resample_waveform, waveform_decode_5bit};
 use tg_media::image::inline::from_inline_bytes;
 use tg_ui::painter::image_prepare;
 
@@ -33,9 +31,16 @@ use crate::history::backend::{
     VoiceAttachment, WidgetAttachment,
 };
 use crate::history::inline_media::{
-    HistoryMediaRuntime, is_music_document, paint_music_document_bubble, paint_round_video_inline,
+    HistoryMediaRuntime, LottieFrameState, MSG_FILE_OVER_DURATION_SECS, MediaDownloadAction,
+    PhotoLink, is_music_document, paint_music_document_bubble, paint_round_video_inline,
 };
+use crate::history::photo_frame::{PhotoFit, cover_uv};
 use crate::history::theme::HistoryColors;
+use crate::history::voice_view::{
+    MEDIA_UNREAD_SIZE, MEDIA_UNREAD_SKIP, MEDIA_UNREAD_TOP, VoiceStatus, WaveformBarsCache,
+    locale_decimal_point, paint_waveform_bars, voice_status_text, waveform_available_width,
+    waveform_progress,
+};
 use tg_app_core::stand_in::types::{MsgId, PeerId};
 use tg_app_media::media::inline::InlinePlaybackKind;
 
@@ -160,6 +165,8 @@ pub struct VoicePlaybackState {
     pub transcriptions: HashMap<MsgId, TranscribeUiEntry>,
     /// Current Premium / free-trial transcription limits synced from `HistoryBackend`.
     pub transcribe_limits: TranscribeLimitsView,
+    /// Waveform bars per message, recomputed only when the waveform or the width changes.
+    pub wave_bars: WaveformBarsCache,
 }
 
 impl VoicePlaybackState {
@@ -193,13 +200,23 @@ impl VoicePlaybackState {
     }
 }
 
+/// Stripped-thumbnail textures kept (tiny blurred placeholders, rebuilt on demand).
+const STRIPPED_TEXTURES_CAP: usize = 1024;
+/// Lottie compositions / frames kept by the runtime-less fallback renderer.
+const FALLBACK_LOTTIE_COMPS_CAP: usize = 128;
+const FALLBACK_LOTTIE_FRAMES_CAP: usize = 512;
+
 /// Cached GPU textures and decoded Lottie compositions for smooth 60fps painting.
 #[derive(Default)]
 pub struct MediaAssetCache {
     stripped_textures: HashMap<u64, Option<TextureHandle>>,
     lottie_comps: HashMap<u64, Option<Composition>>,
     lottie_frames: HashMap<(u64, u32), TextureHandle>,
+    /// The badge shown for a sticker whose Lottie JSON does not parse (same for every sticker).
+    sticker_fallback: Option<TextureHandle>,
     emoji: tg_emoji::egui_ext::EmojiTextureCache,
+    /// Downloaded reply header thumbnails (`history::reply_preview`).
+    pub(crate) reply_previews: crate::history::reply_preview::ReplyPreviewTextures,
 }
 
 impl fmt::Debug for MediaAssetCache {
@@ -235,6 +252,9 @@ impl MediaAssetCache {
         if let Some(cached) = self.stripped_textures.get(&cache_key) {
             return cached.clone();
         }
+        if self.stripped_textures.len() >= STRIPPED_TEXTURES_CAP {
+            self.stripped_textures.clear();
+        }
         let decoded = from_inline_bytes(bytes).ok().map(|rgba| {
             let rgba = blur_small_rgba(&rgba);
             let (w, h) = rgba.dimensions();
@@ -258,6 +278,11 @@ impl MediaAssetCache {
         time_secs: f64,
         render_px: u32,
     ) -> Option<(TextureHandle, bool)> {
+        if self.lottie_comps.len() >= FALLBACK_LOTTIE_COMPS_CAP
+            && !self.lottie_comps.contains_key(&sticker.sticker_id)
+        {
+            self.lottie_comps.clear();
+        }
         self.lottie_comps
             .entry(sticker.sticker_id)
             .or_insert_with(|| Composition::from_json(&sticker.lottie_json).ok());
@@ -277,6 +302,9 @@ impl MediaAssetCache {
             return Some((tex.clone(), total_steps > 1));
         }
 
+        if self.lottie_frames.len() >= FALLBACK_LOTTIE_FRAMES_CAP {
+            self.lottie_frames.clear();
+        }
         let side = render_px.clamp(64, 224);
         let fb = render_composition(comp, sample_frame, LottieSize::new(side, side));
         let img =
@@ -288,6 +316,18 @@ impl MediaAssetCache {
         );
         self.lottie_frames.insert(key, tex.clone());
         Some((tex, total_steps > 1))
+    }
+
+    /// Texture of the badge painted for a sticker whose Lottie JSON does not parse.
+    fn sticker_fallback(&mut self, ctx: &egui::Context) -> &TextureHandle {
+        self.sticker_fallback.get_or_insert_with(|| {
+            let circle = image_prepare::vertical_gradient_circle(
+                64,
+                Color32::from_rgb(0x40, 0xA7, 0xE3),
+                Color32::from_rgb(0x2A, 0x7A, 0xB8),
+            );
+            ctx.load_texture("tg_sticker_fallback", circle, TextureOptions::LINEAR)
+        })
     }
 }
 
@@ -487,6 +527,10 @@ fn paint_history_media_internal(
     }
 }
 
+/// `FillBlurredBackground` (`media_streaming_utility.cpp`): `QColor(0, 0, 0, 48)` over the
+/// blurred thumbnail of a single photo.
+const BLURRED_BACKGROUND_DIM: u8 = 48;
+
 #[allow(clippy::too_many_arguments)]
 fn paint_photo_surface(
     ctx: &egui::Context,
@@ -531,16 +575,14 @@ fn paint_photo_surface(
         Color32::from_rgba_unmultiplied(bot.r(), bot.g(), bot.b(), 195),
     );
 
-    // Decoded Telegram stripped thumbnail, drawn opaque and blurred
-    // (`Photo::paintUserpicFrame` / `validateImageCache` with `Images::Option::Blur`).
+    // Decoded Telegram stripped thumbnail, drawn opaque and blurred, cropped to the box's
+    // aspect ratio (`PrepareBlurredBackground` / `Images::Prepare` with `Images::Option::Blur`).
     if let Some(bytes) = stripped_thumb
         && let Some(tex) = assets.get_stripped_texture(ctx, cache_key, bytes)
     {
         painter.add(
-            egui::epaint::RectShape::filled(rect, cr, Color32::WHITE).with_texture(
-                tex.id(),
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            ),
+            egui::epaint::RectShape::filled(rect, cr, Color32::WHITE)
+                .with_texture(tex.id(), cover_uv(rect.size(), tex.size_vec2())),
         );
         return;
     }
@@ -583,7 +625,7 @@ fn paint_photo_surface(
 }
 
 /// Two passes of a 3x3 box blur over a small decoded thumbnail (stripped sizes are ~40px).
-fn blur_small_rgba(src: &image::RgbaImage) -> image::RgbaImage {
+pub(crate) fn blur_small_rgba(src: &image::RgbaImage) -> image::RgbaImage {
     let (w, h) = src.dimensions();
     if w < 3 || h < 3 {
         return src.clone();
@@ -634,15 +676,36 @@ fn paint_photo(
         photo.fallback_rgb,
         assets,
     );
+    if photo.stripped_thumb.is_some() {
+        // `FillBlurredBackground`: the blurred thumbnail is dimmed; the full picture covers it
+        // or sits centered over it.
+        ui.painter()
+            .rect_filled(rect, cr, Color32::from_black_alpha(BLURRED_BACKGROUND_DIM));
+    }
+
+    // `Photo::textState`: the whole photo is one link, open / cancel / download by its state.
+    let resp = ui.interact(rect, Id::unique(("tg_photo", msg_id.0)), Sense::click());
+    let link = runtime
+        .as_deref()
+        .map_or(PhotoLink::Open, |rt| rt.photo_link(msg_id));
+    let over = photo_link_over(ui.ctx(), msg_id, link, resp.hovered());
 
     let mut spoiler_hidden = false;
     if let Some(rt) = runtime.as_deref_mut() {
-        rt.paint_photo_load_and_blur_up(ui.ctx(), ui.painter(), msg_id, rect, now_secs);
+        rt.paint_photo_load_and_blur_up(
+            ui.ctx(),
+            ui.painter(),
+            msg_id,
+            rect,
+            cr,
+            PhotoFit::Single,
+            now_secs,
+            over,
+        );
         spoiler_hidden =
             rt.paint_spoiler_overlay(ui.ctx(), ui.painter(), msg_id, rect, cr, now_secs);
     }
 
-    let resp = ui.interact(rect, Id::unique(("tg_photo", msg_id.0)), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
@@ -653,12 +716,44 @@ fn paint_photo(
             }
             return None;
         }
-        return Some(MediaInteraction::OpenMedia {
+        return photo_link_clicked(runtime, msg_id, link).then_some(MediaInteraction::OpenMedia {
             msg_id,
             album_index: None,
         });
     }
     None
+}
+
+/// How far the circle of a loading / not loaded photo is towards `msgDateImgBgOver`
+/// (`Photo::_animation->a_thumbOver`, `st::msgFileOverDuration`): the pointer is over the
+/// cancel or download link.
+fn photo_link_over(ctx: &egui::Context, msg_id: MsgId, link: PhotoLink, hovered: bool) -> f32 {
+    if link == PhotoLink::Open {
+        return 0.0;
+    }
+    ctx.animate_bool_with_time(
+        Id::unique(("tg_photo_over", msg_id.0)),
+        hovered,
+        MSG_FILE_OVER_DURATION_SECS,
+    )
+}
+
+/// Handles a click on a photo's link. Returns `true` when the click opens the media viewer;
+/// a cancel or download click is queued for the backend instead.
+fn photo_link_clicked(
+    runtime: Option<&mut HistoryMediaRuntime>,
+    msg_id: MsgId,
+    link: PhotoLink,
+) -> bool {
+    let action = match link {
+        PhotoLink::Open => return true,
+        PhotoLink::Cancel => MediaDownloadAction::Cancel,
+        PhotoLink::Save => MediaDownloadAction::Start,
+    };
+    if let Some(rt) = runtime {
+        rt.queue_download(msg_id, action);
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -703,6 +798,16 @@ fn paint_album(
                 paint_play_circle(ui.painter(), tile_rect.center(), 18.0);
             }
 
+            let resp = ui.interact(
+                tile_rect,
+                Id::unique(("tg_album_tile", msg_id.0, idx)),
+                Sense::click(),
+            );
+            let link = runtime
+                .as_deref()
+                .map_or(PhotoLink::Open, |rt| rt.photo_link(item.msg_id));
+            let over = photo_link_over(ui.ctx(), item.msg_id, link, resp.hovered());
+
             let mut spoiler_hidden = false;
             if let Some(rt) = runtime.as_deref_mut() {
                 rt.paint_photo_load_and_blur_up(
@@ -710,7 +815,10 @@ fn paint_album(
                     ui.painter(),
                     item.msg_id,
                     tile_rect,
+                    cr,
+                    PhotoFit::Cover,
                     now_secs,
+                    over,
                 );
                 spoiler_hidden = rt.paint_spoiler_overlay(
                     ui.ctx(),
@@ -722,11 +830,6 @@ fn paint_album(
                 );
             }
 
-            let resp = ui.interact(
-                tile_rect,
-                Id::unique(("tg_album_tile", msg_id.0, idx)),
-                Sense::click(),
-            );
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 ui.painter().rect_filled(
@@ -740,7 +843,7 @@ fn paint_album(
                     if let Some(rt) = runtime.as_deref_mut() {
                         rt.reveal_spoiler(item.msg_id, now_secs);
                     }
-                } else {
+                } else if photo_link_clicked(runtime.as_deref_mut(), item.msg_id, link) {
                     interaction = Some(MediaInteraction::OpenMedia {
                         msg_id,
                         album_index: Some(idx),
@@ -1020,6 +1123,19 @@ fn paint_document(
     None
 }
 
+/// Whether the status line of a voice message leaves the file size out
+/// (`Ui::FileStatusSizeLoaded`, `Document::dataLoaded`): the file is in the media cache. Data
+/// without a cache (demo) counts as loaded once the message was started.
+fn voice_file_loaded(
+    runtime: Option<&HistoryMediaRuntime>,
+    voice_state: &VoicePlaybackState,
+    msg_id: MsgId,
+) -> bool {
+    runtime
+        .and_then(|rt| rt.voice_loaded(msg_id))
+        .unwrap_or_else(|| voice_state.progress.contains_key(&msg_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_voice(
     ui: &mut Ui,
@@ -1057,7 +1173,13 @@ fn paint_voice(
     let (is_active_audio, is_playing, progress, speed) = if let Some(rt) = runtime.as_deref() {
         let (active, playing, prog, spd, _) =
             rt.audio_item_state(msg_id, tg_audio::AudioType::Voice);
-        if active {
+        if rt.voice_play_pending(msg_id) {
+            // Started, its file is still downloading: shown like a playing message at 00:00
+            // (tdesktop's streamed voice while it buffers).
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(40));
+            (true, true, 0.0, spd)
+        } else if active {
             voice_state.progress.insert(msg_id, prog);
             if playing {
                 voice_state.playing_msg_id = Some(msg_id);
@@ -1136,47 +1258,35 @@ fn paint_voice(
         });
     }
 
-    // Waveform decoded via `tg_media::audio::waveform_decode_5bit` + resampled to visible bars.
+    // Waveform (`PaintWaveform`): bars resampled to the name column, scaled by the loudest
+    // sample and centred on one line; the bars come from `voice_state.wave_bars`.
     let wave_left = btn_rect.right() + st.thumb_skip as f32;
-    let transcribe_w = 38.0;
-    let wave_avail_w =
-        (rect.right() - wave_left - st.padding.right as f32 - transcribe_w).max(48.0);
-    let wave_top = rect.top() + st.name_top as f32;
-    let wave_h = MSG_WAVEFORM_MAX as f32;
+    let status_width = (rect.right() - wave_left - st.padding.right as f32).floor() as i32;
+    let name_width =
+        (status_width - HISTORY_TRANSCRIBE_SKIP - HISTORY_TRANSCRIBE_SIZE.width).max(0);
+    let wave_avail = waveform_available_width(name_width);
+    let wave_top = btn_rect.top();
     let wave_rect = Rect::from_min_size(
         Pos2::new(wave_left, wave_top),
-        Vec2::new(wave_avail_w, wave_h),
+        Vec2::new(
+            name_width as f32,
+            (MSG_WAVEFORM_MAX + MSG_WAVEFORM_MIN) as f32,
+        ),
     );
-
-    let decoded = waveform_decode_5bit(&voice.waveform_5bit);
-    let bar_count =
-        waveform_bar_count(wave_avail_w as i32, decoded.len().max(1) as i32).max(1) as usize;
-    let resampled = if decoded.is_empty() {
-        vec![8u8; bar_count]
-    } else {
-        resample_waveform(&decoded, bar_count)
-    };
-
-    let bar_w = MSG_WAVEFORM_BAR as f32;
-    let bar_step = (MSG_WAVEFORM_BAR + MSG_WAVEFORM_SKIP) as f32;
-    let min_h = MSG_WAVEFORM_MIN as f32;
-    let max_h = MSG_WAVEFORM_MAX as f32;
-    let active_bars = (progress * resampled.len() as f32).round() as usize;
-
-    for (i, &amp) in resampled.iter().enumerate() {
-        let norm = f32::from(amp.min(31)) / 31.0;
-        let h = (min_h + norm * (max_h - min_h)).round();
-        let x = wave_left + i as f32 * bar_step;
-        let bar_rect =
-            Rect::from_min_size(Pos2::new(x, wave_top + (max_h - h)), Vec2::new(bar_w, h));
-        let col = if i < active_bars {
-            active_color
-        } else {
-            inactive_color
-        };
-        ui.painter()
-            .rect_filled(bar_rect, CornerRadius::same(1), col);
-    }
+    // `voice->playback`: the player has this message (playing or paused).
+    let has_playback = is_active_audio || (runtime.is_none() && progress > 0.0);
+    let bars = voice_state
+        .wave_bars
+        .bars(msg_id, &voice.waveform_5bit, wave_avail);
+    paint_waveform_bars(
+        ui.painter(),
+        Pos2::new(wave_left, wave_top),
+        &bars,
+        wave_avail,
+        waveform_progress(outgoing, has_playback, voice.is_unread, progress),
+        active_color,
+        inactive_color,
+    );
 
     let wave_resp = ui.interact(
         wave_rect,
@@ -1207,31 +1317,50 @@ fn paint_voice(
         });
     }
 
-    // Duration + unread dot + inline playback speed button (`1x`/`1.5x`/`2x`)
-    let elapsed_secs = if is_playing || progress > 0.0 {
-        (progress * voice.duration_secs as f32).round() as u32
+    // Status line (`File::setStatusSize`): "00:04, 15.9 KB" until the voice message was
+    // started, "00:01 / 00:04" while the player has it, "00:04" afterwards; then the unread
+    // dot and the inline playback speed button (`1x`/`1.5x`/`2x`).
+    let status = if has_playback {
+        VoiceStatus::Played {
+            position_secs: (progress * voice.duration_secs as f32).floor() as u32,
+        }
+    } else if voice_file_loaded(runtime.as_deref(), voice_state, msg_id) {
+        VoiceStatus::Loaded
     } else {
-        voice.duration_secs
+        VoiceStatus::Ready
     };
+    // `stm->mediaFg`.
     let status_fg = if outgoing {
         colors.msg_out_date_fg
     } else {
-        colors.sub_text_fg
+        colors.msg_in_date_fg
     };
     let dur_galley = ui.painter().layout_no_wrap(
-        format_duration(elapsed_secs),
-        FontId::proportional(12.0),
+        voice_status_text(
+            status,
+            voice.duration_secs,
+            voice.size_bytes,
+            locale_decimal_point(),
+        ),
+        FontId::proportional(13.0),
         status_fg,
     );
-    let dur_pos = Pos2::new(wave_left, rect.top() + st.status_top as f32);
-    let dur_w = dur_galley.size().x;
+    let dur_pos = Pos2::new(
+        wave_left,
+        btn_rect.top() + (st.status_top - st.padding.top) as f32,
+    );
+    let mut dur_w = dur_galley.size().x;
     ui.painter().galley(dur_pos, dur_galley, status_fg);
-    if voice.is_unread && !is_playing && progress == 0.0 {
+    if voice.is_unread && dur_w + MEDIA_UNREAD_SKIP + MEDIA_UNREAD_SIZE <= status_width as f32 {
         ui.painter().circle_filled(
-            Pos2::new(dur_pos.x + dur_w + 8.0, dur_pos.y + 7.5),
-            3.5,
+            Pos2::new(
+                dur_pos.x + dur_w + MEDIA_UNREAD_SKIP + MEDIA_UNREAD_SIZE / 2.0,
+                dur_pos.y + MEDIA_UNREAD_TOP + MEDIA_UNREAD_SIZE / 2.0,
+            ),
+            MEDIA_UNREAD_SIZE / 2.0,
             active_color,
         );
+        dur_w += MEDIA_UNREAD_SKIP + MEDIA_UNREAD_SIZE;
     }
 
     if is_active_audio {
@@ -1292,17 +1421,21 @@ fn paint_voice(
             .copied()
             .unwrap_or(false)
     };
+    // `voice->transcribe->paint(p, nameleft + namewidth + st::historyTranscribeSkip, top)`.
     let chip_rect = Rect::from_min_size(
         Pos2::new(
-            rect.right() - st.padding.right as f32 - 32.0,
-            wave_top - 1.0,
+            wave_left + (name_width + HISTORY_TRANSCRIBE_SKIP) as f32,
+            wave_top,
         ),
-        Vec2::new(32.0, 22.0),
+        Vec2::new(
+            HISTORY_TRANSCRIBE_SIZE.width as f32,
+            HISTORY_TRANSCRIBE_SIZE.height as f32,
+        ),
     );
     let has_lock = limits.locked && live_entry.is_none() && voice.transcription.is_none();
     ui.painter().rect_filled(
         chip_rect,
-        CornerRadius::same(6),
+        CornerRadius::same(4),
         if expanded {
             active_color
         } else {
@@ -1431,7 +1564,7 @@ fn paint_transcribe_pending_ring(ui: &Ui, rect: Rect, color: Color32, circular: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_expanded_transcript(
+pub(crate) fn paint_expanded_transcript(
     ui: &mut Ui,
     msg_id: MsgId,
     pos: Pos2,
@@ -1449,10 +1582,12 @@ fn paint_expanded_transcript(
         _ => "...",
     };
     let (display_text, is_error, can_rate) = if let Some(entry) = live_entry {
-        if entry.too_long {
-            ("Audio is too long to transcribe.".to_owned(), true, false)
-        } else if entry.failed {
-            ("Transcription unavailable.".to_owned(), true, false)
+        if entry.failed || entry.too_long {
+            (
+                tg_app_core::user_error::transcribe_bubble_text(entry.too_long),
+                true,
+                false,
+            )
         } else if entry.pending {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(120));
@@ -1469,14 +1604,12 @@ fn paint_expanded_transcript(
         (fallback_text?.to_owned(), false, false)
     };
 
-    let text_col = if is_error {
-        colors.sub_text_fg
-    } else {
-        colors.text_fg
-    };
+    // A failure is italic in the message text colour (`tr::italic`,
+    // `history_view_document.cpp:533-538`).
+    let text_col = colors.text_fg;
     let galley = ui
         .painter()
-        .layout(display_text, FontId::proportional(12.5), text_col, max_w);
+        .layout_job(transcript_job(display_text, is_error, text_col, max_w));
     let text_h = galley.size().y;
     ui.painter().galley(pos, galley, text_col);
 
@@ -1518,6 +1651,45 @@ fn paint_expanded_transcript(
     None
 }
 
+/// The layout of a transcript: italic for a failure text.
+pub(crate) fn transcript_job(
+    text: String,
+    italic: bool,
+    color: Color32,
+    max_w: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::single_section(
+        text,
+        egui::TextFormat {
+            font_id: FontId::proportional(12.5),
+            color,
+            italics: italic,
+            ..egui::TextFormat::default()
+        },
+    );
+    job.wrap.max_width = max_w;
+    job
+}
+
+fn round_transcribe_key(msg_id: MsgId) -> Id {
+    Id::unique(("tg_round_transcribe_rect", msg_id.0))
+}
+
+/// Records where the message painter placed a round video's transcribe button for this frame
+/// (it sits outside the media rect, next to the info pill and right action).
+pub(crate) fn set_round_transcribe_rect(ctx: &egui::Context, msg_id: MsgId, rect: Rect) {
+    ctx.data_mut(|d| d.insert_temp(round_transcribe_key(msg_id), rect));
+}
+
+fn round_transcribe_rect(ctx: &egui::Context, msg_id: MsgId) -> Option<Rect> {
+    let key = round_transcribe_key(msg_id);
+    ctx.data_mut(|d| {
+        let rect = d.get_temp::<Rect>(key);
+        d.remove::<Rect>(key);
+        rect
+    })
+}
+
 fn paint_round_video_transcribe_overlay(
     ui: &mut Ui,
     msg_id: MsgId,
@@ -1532,15 +1704,20 @@ fn paint_round_video_transcribe_overlay(
     let expanded = entry.as_ref().is_some_and(|e| e.shown);
     let has_lock = limits.locked && entry.is_none();
 
-    let diameter = rect.width().min(rect.height()).max(80.0);
-    let radius = diameter * 0.48;
-    let circle_center = Pos2::new(rect.center().x, rect.top() + diameter * 0.5);
-    let btn_size = 30.0;
-    let btn_center = Pos2::new(
-        (circle_center.x + radius - 14.0).min(rect.right() - 16.0),
-        circle_center.y + radius - 14.0,
-    );
-    let btn_rect = Rect::from_center_size(btn_center, Vec2::splat(btn_size));
+    let diameter = rect.width().min(rect.height()).max(1.0);
+    let radius = diameter * 0.5;
+    let circle_center = rect.min + Vec2::splat(radius);
+    let btn_size = 31.0;
+    let btn_rect = round_transcribe_rect(ui.ctx(), msg_id).unwrap_or_else(|| {
+        Rect::from_center_size(
+            Pos2::new(
+                (circle_center.x + radius - 14.0).min(rect.right() - 16.0),
+                circle_center.y + radius - 14.0,
+            ),
+            Vec2::splat(btn_size),
+        )
+    });
+    let btn_center = btn_rect.center();
 
     ui.painter()
         .circle_filled(btn_center, btn_size * 0.5, colors.service_bg);
@@ -1672,29 +1849,35 @@ fn paint_sticker(
         painted = true;
     }
 
-    // 2. Animated Lottie sticker cached per size via `HistoryMediaRuntime` (`tg-lottie`).
-    if !painted
-        && let Some(rt) = runtime.as_deref_mut()
-        && let Some((tex, animated)) = rt.get_lottie_frame_per_size(
+    // 2. Animated Lottie sticker cached per size via `HistoryMediaRuntime` (`tg-lottie`),
+    //    parsed and rasterised on the decode workers.
+    if !painted && let Some(rt) = runtime.as_deref_mut() {
+        match rt.lottie_frame_per_size(
             ui.ctx(),
             msg_id,
             sticker.sticker_id,
             &sticker.lottie_json,
             time,
             render_px,
-        )
-    {
-        ui.painter().image(
-            tex.id(),
-            rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        if animated {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(33));
+        ) {
+            LottieFrameState::Ready { texture, animated } => {
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                if animated {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(33));
+                }
+                painted = true;
+            }
+            // The first frame is still being rendered in the background; it appears on the
+            // frame it lands (the worker requests the repaint).
+            LottieFrameState::Pending => painted = true,
+            LottieFrameState::Unavailable => {}
         }
-        painted = true;
     }
 
     if !painted {
@@ -1711,16 +1894,7 @@ fn paint_sticker(
             }
         } else {
             // Fallback crisp vector badge if Lottie JSON fails.
-            let circle = image_prepare::vertical_gradient_circle(
-                64,
-                Color32::from_rgb(0x40, 0xA7, 0xE3),
-                Color32::from_rgb(0x2A, 0x7A, 0xB8),
-            );
-            let tex = ui.ctx().load_texture(
-                format!("tg_sticker_fallback_{}", sticker.sticker_id),
-                circle,
-                TextureOptions::LINEAR,
-            );
+            let tex = assets.sticker_fallback(ui.ctx()).clone();
             ui.painter().image(
                 tex.id(),
                 rect,
@@ -3072,3 +3246,6 @@ fn paint_video_stream_card(
     }
     None
 }
+
+#[cfg(test)]
+mod tests_wave4_downloads;

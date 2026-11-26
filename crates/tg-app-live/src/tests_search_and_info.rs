@@ -2373,3 +2373,79 @@ fn top_peers_disabled_and_report_nested_choose_option_flow() {
 
     h.shutdown();
 }
+
+/// The history search bar's backend call (`HistoryBackend::search_chat_messages`, used by
+/// `ComposeSearch`) sends `messages.search` for the open chat with the typed query, maps the
+/// server's total and ids newest first, and pages older results from the oldest id.
+#[test]
+fn history_search_bar_issues_messages_search_for_the_chat_and_pages_older() {
+    let h = Harness::start();
+    let peer_tl = tl_enums::Peer::User(tl_types::PeerUser {
+        user_id: h.uid_alpha,
+    });
+    let slice = |ids: &[i32], count: i32| {
+        tl_enums::messages::Messages::Slice(tl_types::messages::MessagesSlice {
+            inexact: false,
+            count,
+            next_rate: None,
+            offset_id_offset: None,
+            search_flood: None,
+            messages: ids
+                .iter()
+                .map(|&id| {
+                    syn_message(
+                        id,
+                        peer_tl.clone(),
+                        h.uid_alpha,
+                        1_750_000_000 + id,
+                        "meet at the lighthouse",
+                        false,
+                        None,
+                    )
+                })
+                .collect(),
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: vec![tl_enums::User::User(h.user_alpha.clone())],
+        })
+    };
+    h.fake.enqueue_ok(
+        tl_fns::messages::Search::CONSTRUCTOR_ID,
+        &slice(&[70, 95], 3),
+    );
+    h.fake
+        .enqueue_ok(tl_fns::messages::Search::CONSTRUCTOR_ID, &slice(&[40], 3));
+
+    let first = h
+        .live
+        .search_chat_messages(h.peer_alpha, " lighthouse ", None, MsgId(0), 2)
+        .expect("first page");
+    assert_eq!(first.total, 3);
+    assert_eq!(first.ids, vec![MsgId(95), MsgId(70)]);
+    assert_eq!(first.next_offset, Some(MsgId(70)));
+
+    let older = h
+        .live
+        .search_chat_messages(h.peer_alpha, "lighthouse", None, MsgId(70), 2)
+        .expect("older page");
+    assert_eq!(older.ids, vec![MsgId(40)]);
+
+    let reqs = h.fake.recorded_requests::<tl_fns::messages::Search>();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].q, "lighthouse");
+    assert!(
+        matches!(&reqs[0].peer, tl_enums::InputPeer::User(u) if u.user_id == h.uid_alpha),
+        "searches inside the open chat"
+    );
+    assert_eq!(
+        (reqs[0].offset_id, reqs[0].add_offset, reqs[0].limit),
+        (0, 0, 2)
+    );
+    assert_eq!(reqs[1].offset_id, 70);
+    assert!(matches!(
+        reqs[0].filter,
+        tl_enums::MessagesFilter::InputMessagesFilterEmpty
+    ));
+
+    h.shutdown();
+}
