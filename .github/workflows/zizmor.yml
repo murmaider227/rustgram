@@ -1,0 +1,28 @@
+# zizmor: security lint for the GitHub Actions workflows themselves; findings go to the Security tab.
+name: zizmor
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: [".github/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: Workflow security (zizmor)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@1b4550e929643b8b26a62303c6bd64814271a4f1 # v0.9.2

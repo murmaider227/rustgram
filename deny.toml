@@ -1,0 +1,63 @@
+# cargo-deny: checked in CI on every push (`cargo deny check`).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+
+[advisories]
+# RustSec advisory database: known vulnerabilities, unmaintained and yanked crates fail the check.
+version = 2
+yanked = "deny"
+ignore = [
+    # Known and tracked in TGB-3019 (zip 2.x -> >= 9.0.5). Remove each entry when fixed.
+    { id = "RUSTSEC-2026-0367", reason = "zip 2.x, upgrade tracked in TGB-3019" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 2.x, upgrade tracked in TGB-3019" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 2.x, upgrade tracked in TGB-3019" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 2.x, upgrade tracked in TGB-3019" },
+    { id = "RUSTSEC-2026-0545", reason = "zip 2.x, upgrade tracked in TGB-3019" },
+    { id = "RUSTSEC-2026-0548", reason = "zip 2.x, upgrade tracked in TGB-3019" },
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite via rusqlite 0.32, upgrade tracked in TGB-3019" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, replacement tracked in TGB-3019" },
+]
+
+[licenses]
+# Every dependency must be usable in a GPL-3.0-or-later program. GPL-2.0-only is not in the list:
+# a crate offering it must also offer one of these (self_cell is Apache-2.0 OR GPL-2.0-only).
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # Rustgram's own crates (same license as Telegram Desktop).
+    "GPL-3.0-or-later WITH openvpn-openssl-exception",
+]
+
+[[licenses.exceptions]]
+# egui's bundled default fonts (font data, not code).
+crate = "epaint_default_fonts"
+allow = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+[bans]
+# Several crates are pulled in at two major versions by the GUI and TLS stacks; report, do not fail.
+multiple-versions = "warn"
+# Workspace crates depend on each other by path and are never published to crates.io.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

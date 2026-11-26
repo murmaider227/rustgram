@@ -1,0 +1,73 @@
+# Scans the published release files on VirusTotal and appends the report links to the release notes.
+name: VirusTotal
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to scan (e.g. v0.1.0-alpha.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scan-release:
+    name: Scan release files
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: VirusTotal scan
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          github_token: ${{ github.token }}
+          update_release_body: true
+          request_rate: 4
+          files: |
+            .exe$
+            .zip$
+
+  scan-tag:
+    name: Scan files of an existing release
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir dist
+          gh release download "$TAG" -R "$REPO" -D dist -p '*.exe' -p '*.zip'
+          ls -la dist
+
+      - name: VirusTotal scan
+        id: vt
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          request_rate: 4
+          files: |
+            ./dist/*
+
+      - name: Append report links to the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          ANALYSIS: ${{ steps.vt.outputs.analysis }}
+        run: |
+          body="$(gh release view "$TAG" -R "$REPO" --json body --jq .body)"
+          if printf '%s' "$body" | grep -q 'VirusTotal'; then echo "already has links"; exit 0; fi
+          links="$(printf '%s' "$ANALYSIS" | tr ',' '\n' | sed 's/^ *//' | awk 'i=index($0,"=") {n=substr($0,1,i-1); u=substr($0,i+1); sub(/^.*\//,"",n); print "* [" n "](" u ")"}')"
+          printf '%s\n\n### VirusTotal\n%s\n' "$body" "$links" > notes.md
+          gh release edit "$TAG" -R "$REPO" --notes-file notes.md

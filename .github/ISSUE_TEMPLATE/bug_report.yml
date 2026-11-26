@@ -1,0 +1,65 @@
+name: Bug report
+description: Something in Rustgram does not work or looks different from Telegram Desktop.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Rustgram. Before you attach screenshots or logs, hide phone numbers, names, chats
+        and anything else private. Security problems go to a private report instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Rustgram version
+      description: Settings > About, or the release file name.
+      placeholder: 0.1.0-alpha.2
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build
+      options:
+        - Portable zip
+        - Installer
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a channel with custom emoji reactions
+        2. Scroll to an older post
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected (what Telegram Desktop does)
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Ideally Telegram Desktop and Rustgram side by side, with private data hidden.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: Only the relevant lines, with private data removed.
+      render: text

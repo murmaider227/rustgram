@@ -1,0 +1,68 @@
+# Test coverage of the platform-independent crates (the same set the Ubuntu CI job tests).
+# The summary is written to the run page; the report is uploaded to Codecov when the repository is enabled there.
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Coverage (platform-independent crates)
+    runs-on: ubuntu-latest
+    env:
+      EXCLUDE_CRATES: >-
+        --exclude tg-app --exclude tg-app-core --exclude tg-app-history --exclude tg-app-info
+        --exclude tg-app-live --exclude tg-app-media --exclude tg-app-settings --exclude tg-app-window
+        --exclude tg-platform --exclude tg-audio --exclude tg-voip --exclude tg-video --exclude tg-editor
+        --exclude tg-ui
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Run tests with coverage
+        run: cargo llvm-cov --workspace $EXCLUDE_CRATES --lcov --output-path lcov.info
+
+      - name: Write summary
+        run: |
+          {
+            echo '### Test coverage (platform-independent crates)'
+            echo '```'
+            cargo llvm-cov report --summary-only | tail -n 1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

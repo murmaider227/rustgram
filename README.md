@@ -13,6 +13,8 @@ From the MTProto protocol and its encryption up to every screen of the interface
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-orange)
 ![API layer](https://img.shields.io/badge/Telegram%20API-layer%20233-2CA5E0)
 ![Status](https://img.shields.io/badge/status-pre--release-yellow)
+[![CI](https://github.com/murmaider227/rustgram/actions/workflows/ci.yml/badge.svg)](https://github.com/murmaider227/rustgram/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/murmaider227/rustgram/badge)](https://scorecard.dev/viewer/?uri=github.com/murmaider227/rustgram)
 
 <img src="assets/screenshots/main.png" alt="Rustgram main window" width="860">
 
@@ -182,6 +184,16 @@ lists the SHA-256 of every file in `SHA256SUMS.txt`. Pre-releases are not Authen
 SmartScreen may warn when you run the installer. Update packages (`.tupdate`) are signed with the project's
 Ed25519 update key, and Rustgram installs an update only after verifying that signature. Details:
 [CODE_SIGNING.md](CODE_SIGNING.md).
+
+Every release file also carries a GitHub build provenance attestation, which proves it was built by this
+repository's release workflow from the tagged commit. Check a download with the GitHub CLI:
+
+```sh
+gh attestation verify rustgram-<version>-win-x64-portable.zip -R murmaider227/rustgram
+```
+
+The `.exe` and `.zip` files of each published release are scanned on VirusTotal; the report links are added to the
+release notes.
 
 ## Privacy
 

@@ -13,6 +13,9 @@ on:
 
 permissions:
   contents: write
+  # Build provenance attestations for the release files (`gh attestation verify <file> -R murmaider227/rustgram`).
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,13 +27,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Cache Cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        # Only release runs save this key, and tag refs cannot read pull-request caches (pinned v2).
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # zizmor: ignore[cache-poisoning]
         with:
           # Stable key plus saving on failure: a re-run after a failed release reuses the compiled
           # dependencies instead of rebuilding them (~20 min).
@@ -56,14 +62,18 @@ jobs:
       - name: Resolve release metadata
         id: meta
         shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $version = "${{ inputs.version }}" -replace '^v', ''
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+            $version = $env:INPUT_VERSION -replace '^v', ''
             $tag = "v$version"
           } else {
             $tag = $env:GITHUB_REF_NAME
             $version = $tag -replace '^v', ''
           }
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$') { throw "Bad version: $version" }
           $isPrerelease = if ($version -match '-') { "true" } else { "false" }
           $channel = if ($isPrerelease -eq "true") { "beta" } else { "stable" }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
@@ -73,8 +83,10 @@ jobs:
 
       - name: Require the updater public key
         shell: pwsh
+        env:
+          RUSTGRAM_UPDATE_PUBKEY: ${{ vars.RUSTGRAM_UPDATE_PUBKEY }}
         run: |
-          if (-not '${{ vars.RUSTGRAM_UPDATE_PUBKEY }}') { throw 'Repository variable RUSTGRAM_UPDATE_PUBKEY is not set' }
+          if (-not $env:RUSTGRAM_UPDATE_PUBKEY) { throw 'Repository variable RUSTGRAM_UPDATE_PUBKEY is not set' }
 
       - name: Build distribution artifacts (portable zip, installer, update package)
         shell: pwsh
@@ -83,18 +95,22 @@ jobs:
           RUSTGRAM_API_HASH: ${{ secrets.RUSTGRAM_API_HASH }}
           RUSTGRAM_UPDATER_SIGNING_KEY: ${{ secrets.RUSTGRAM_UPDATER_SIGNING_KEY }}
           RUSTGRAM_UPDATE_PUBKEY: ${{ vars.RUSTGRAM_UPDATE_PUBKEY }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_CHANNEL: ${{ steps.meta.outputs.channel }}
         run: |
           cargo run --release -p tg-xtask -- dist `
-            --version "${{ steps.meta.outputs.version }}" `
-            --channel "${{ steps.meta.outputs.channel }}" `
+            --version "$env:RELEASE_VERSION" `
+            --channel "$env:RELEASE_CHANNEL" `
             --out-dir dist `
             --require-iscc `
             --require-api-credentials
 
       - name: Verify expected release artifacts exist
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          $v = "${{ steps.meta.outputs.version }}"
+          $v = $env:RELEASE_VERSION
           $required = @(
             "dist/Rustgram-Setup-$v-win-x64.exe",
             "dist/rustgram-$v-win-x64-portable.zip",
@@ -108,8 +124,16 @@ jobs:
           }
           Get-ChildItem dist
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/Rustgram-Setup-${{ steps.meta.outputs.version }}-win-x64.exe
+            dist/rustgram-${{ steps.meta.outputs.version }}-win-x64-portable.zip
+            dist/rustgram-${{ steps.meta.outputs.version }}-win-x64.tupdate
+
       - name: Create Draft GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: Rustgram ${{ steps.meta.outputs.tag }}

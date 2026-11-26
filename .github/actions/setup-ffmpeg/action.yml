@@ -8,7 +8,8 @@ runs:
   steps:
     - name: Download, verify and extract FFmpeg
       shell: pwsh
-      run: |
+      # Writes only FFMPEG_DIR and the DLL folder of the archive verified above, never untrusted input.
+      run: | # zizmor: ignore[github-env]
         $ffmpegArchive = "ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
         $baseUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
         $workDir = Join-Path $env:RUNNER_TEMP "ffmpeg-download"
