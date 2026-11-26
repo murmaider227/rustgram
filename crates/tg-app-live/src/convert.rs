@@ -29,8 +29,8 @@ use tg_app_core::dialogs::backend::{
 use tg_app_core::history::backend::{
     AlbumItem, ContactStatusBanner, DocumentAttachment, DraftMessage, ForwardHeader,
     GameAttachment, GiveawayAttachment, GiveawayResultsAttachment, HistoryMedia, HistoryMessage,
-    HistoryPeerInfo, MessageExtra, PhotoAttachment, PollAttachment, PollOption, ReactionCounter,
-    ReplyHeader, ServiceAction as UiServiceAction, StickerAttachment, StoryAttachment,
+    HistoryPeerInfo, MessageExtra, PhotoAttachment, PollAttachment, PollOption, ReplyHeader,
+    ServiceAction as UiServiceAction, StickerAttachment, StoryAttachment,
     TypingAction as HistoryTypingAction, VideoAttachment, VideoStreamAttachment, VoiceAttachment,
     WidgetAttachment,
 };
@@ -1513,24 +1513,7 @@ pub fn message_to_history_message_with_resolvers(
     let reactions = msg
         .reactions
         .as_ref()
-        .map(|summary| {
-            summary
-                .results
-                .iter()
-                .map(|r| {
-                    let emoji = match &r.id {
-                        tg_data::ReactionId::Emoji(e) => e.clone(),
-                        tg_data::ReactionId::Custom(doc) => format!("custom:{}", doc.0),
-                        tg_data::ReactionId::Paid => "⭐".to_owned(),
-                    };
-                    ReactionCounter {
-                        emoji,
-                        count: r.count.max(0) as u32,
-                        chosen: r.is_chosen(),
-                    }
-                })
-                .collect()
-        })
+        .map(crate::inline_reactions::reaction_counters)
         .unwrap_or_default();
 
     let is_read = session

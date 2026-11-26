@@ -542,7 +542,10 @@ fn voice_recorder_hold_lock_cancel_waveform_and_round_video() {
     rec.toggle_pause(23.0);
     assert!(!rec.is_paused());
 
-    let attachment = rec.finish(24.0).expect("voice attachment produced");
+    let attachment = rec
+        .finish(24.0)
+        .expect("voice attachment produced")
+        .attachment;
     assert!(attachment.duration_secs >= 1);
     let bars = waveform_decode_5bit(&attachment.waveform_5bit);
     assert!(!bars.is_empty());

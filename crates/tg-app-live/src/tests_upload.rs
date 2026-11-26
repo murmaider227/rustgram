@@ -1771,3 +1771,84 @@ fn story_upload_sends_photo_and_video_with_all_fields_and_tracks_pending_uploads
 
     h.shutdown();
 }
+
+// =============================================================================
+// TGB-3015: a recorded voice message carries its own OGG bytes to the upload
+// =============================================================================
+
+#[test]
+fn recorded_voice_bytes_are_uploaded_and_sent_with_the_voice_attribute_only() {
+    let h = UploadTestHarness::start();
+    let self_uid = h.self_uid;
+    let bob_uid = h.bob_uid;
+    h.fake.set_dynamic_handler(Arc::new(move |ctor, _raw| {
+        if ctor == tl_fns::upload::SaveFilePart::CONSTRUCTOR_ID {
+            return Some(Ok(true.to_bytes()));
+        }
+        if ctor == tl_fns::messages::SendMedia::CONSTRUCTOR_ID {
+            let upd = make_updates_with_messages(vec![synthetic_tl_message(
+                512, bob_uid, self_uid, true, "",
+            )]);
+            return Some(Ok(upd.to_bytes()));
+        }
+        None
+    }));
+
+    // What the recorder hands over: nothing is staged under "voice.ogg" and no such file
+    // exists, so the old code failed with "no file bytes available" before any request.
+    let mut ogg = b"OggS".to_vec();
+    ogg.extend(synth_bytes(3_000, 0x21));
+    let mut live = h.live.clone();
+    HistoryBackend::send_message_extended(
+        &mut live,
+        h.bob_peer,
+        SendMessageExtended {
+            media: Some(HistoryMedia::Voice(
+                tg_app_core::history::backend::VoiceAttachment {
+                    duration_secs: 4,
+                    waveform_5bit: vec![0x11, 0x22, 0x33],
+                    size_bytes: ogg.len() as u64,
+                    is_unread: false,
+                    transcription: None,
+                },
+            )),
+            voice_ogg: Some(ogg.clone()),
+            ..SendMessageExtended::default()
+        },
+    )
+    .expect("the recorded voice message is sent");
+
+    let parts: Vec<tl_fns::upload::SaveFilePart> = h
+        .fake
+        .recorded_calls_of(tl_fns::upload::SaveFilePart::CONSTRUCTOR_ID)
+        .iter()
+        .map(|raw| tl_fns::upload::SaveFilePart::from_bytes(raw).expect("SaveFilePart"))
+        .collect();
+    let uploaded: Vec<u8> = parts.iter().flat_map(|p| p.bytes.clone()).collect();
+    assert_eq!(uploaded, ogg, "the recorder's bytes are the uploaded file");
+
+    let sends = h
+        .fake
+        .recorded_calls_of(tl_fns::messages::SendMedia::CONSTRUCTOR_ID);
+    assert_eq!(sends.len(), 1);
+    let send = tl_fns::messages::SendMedia::from_bytes(&sends[0]).expect("SendMedia");
+    let tl_enums::InputMedia::UploadedDocument(doc) = send.media else {
+        panic!("expected an uploaded document");
+    };
+    assert_eq!(doc.mime_type, "audio/ogg");
+    // `FileLoadTask::process`: a voice note keeps only `documentAttributeAudio`.
+    assert_eq!(
+        doc.attributes,
+        vec![tl_enums::DocumentAttribute::Audio(
+            tl_types::DocumentAttributeAudio {
+                voice: true,
+                duration: 4,
+                title: None,
+                performer: None,
+                waveform: Some(vec![0x11, 0x22, 0x33]),
+            }
+        )]
+    );
+
+    h.shutdown();
+}

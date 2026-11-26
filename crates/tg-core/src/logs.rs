@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use chrono::{Datelike, Local, Timelike};
+use jiff::ZonedDateTime;
 use thiserror::Error;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -177,10 +177,10 @@ impl Drop for WritingScope {
 
 /// Formats `[HH:MM:SS.mmm TT-NNNNNNN]` matching `_logsEntryStart()` in `logs.cpp:64-71`.
 fn format_debug_entry_start() -> String {
-    let now = Local::now();
+    let now = ZonedDateTime::now();
     let tid = THREAD_LOG_ID.with(|&id| id);
     let idx = ENTRY_INDEX.fetch_add(1, Ordering::Relaxed) + 1;
-    let millis = now.timestamp_subsec_millis();
+    let millis = now.millisecond();
     format!(
         "[{:02}:{:02}:{:02}.{:03} {:02}-{:07}]",
         now.hour(),
@@ -194,7 +194,7 @@ fn format_debug_entry_start() -> String {
 
 /// Formats `[YYYY.MM.DD HH:MM:SS] msg\n` matching `Logs::writeMain()` in `logs.cpp:501-508`.
 fn format_main_line(msg: &str) -> String {
-    let now = Local::now();
+    let now = ZonedDateTime::now();
     format!(
         "[{:04}.{:02}.{:02} {:02}:{:02}:{:02}] {}\n",
         now.year(),
@@ -205,6 +205,15 @@ fn format_main_line(msg: &str) -> String {
         now.second(),
         msg
     )
+}
+
+/// `(day_index, part)` of the debug/MTP log file for `now`: `YYYYMMDD` and the 15-minute slot of
+/// the day (`Logs::writeDebug` in `logs.cpp:250-262`).
+fn debug_rotation_bucket(now: &ZonedDateTime) -> (i32, i32) {
+    let day_index =
+        i32::from(now.year()) * 10_000 + i32::from(now.month()) * 100 + i32::from(now.day());
+    let minute_of_day = i32::from(now.hour()) * 60 + i32::from(now.minute());
+    (day_index, minute_of_day / DEBUG_ROTATE_MINUTES as i32)
 }
 
 #[derive(Debug)]
@@ -638,9 +647,8 @@ impl LogManager {
 
     fn write_raw_debug(&self, category: LogCategory, line: &str) {
         let _scope = WritingScope::enter();
-        let now = Local::now();
-        let day_index = now.year() * 10_000 + (now.month() as i32) * 100 + (now.day() as i32);
-        let part = ((now.hour() * 60 + now.minute()) / DEBUG_ROTATE_MINUTES) as i32;
+        let now = ZonedDateTime::now();
+        let (day_index, part) = debug_rotation_bucket(&now);
         self.write_raw_debug_at(category, line, day_index, part);
     }
 
@@ -882,6 +890,25 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tracing_subscriber::layer::SubscriberExt;
+
+    /// TGB-3019: the debug/MTP file bucket (`YYYYMMDD`, 15-minute slot) is computed from local
+    /// calendar fields as before the chrono -> jiff switch.
+    #[test]
+    fn debug_rotation_bucket_uses_local_day_and_quarter_hour() {
+        let at = |s: &str| -> ZonedDateTime { s.parse().expect("fixed zoned literal") };
+        assert_eq!(
+            debug_rotation_bucket(&at("2026-11-27T00:00:00+02:00[+02:00]")),
+            (20_261_127, 0)
+        );
+        assert_eq!(
+            debug_rotation_bucket(&at("2026-11-27T13:47:12+02:00[+02:00]")),
+            (20_261_127, 55)
+        );
+        assert_eq!(
+            debug_rotation_bucket(&at("2026-12-31T23:59:59-05:00[-05:00]")),
+            (20_261_231, 95)
+        );
+    }
 
     /// TGB-2908: the `saved_side` diagnostics are INFO events with a custom target; they must
     /// land in the main `log.txt` (not the debug-only logs) together with their fields.

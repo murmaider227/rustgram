@@ -203,8 +203,9 @@ fn dist_stages_portable_folder_with_ffmpeg_and_licenses_zip_update_and_checksums
     let mut names = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).unwrap();
-        names.push(entry.name().to_string());
-        if entry.name() == DEFAULT_EXE_NAME {
+        let name = entry.name().unwrap().into_owned();
+        names.push(name.clone());
+        if name == DEFAULT_EXE_NAME {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).unwrap();
             assert_eq!(buf, b"dummy-rustgram-exe");
@@ -418,7 +419,7 @@ fn dist_file_list_and_installers_include_all_three_executables() {
     let zip_file = File::open(&output.portable_zip).unwrap();
     let mut archive = ZipArchive::new(zip_file).unwrap();
     let zip_names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_owned())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .collect();
     for exe in DIST_EXE_NAMES {
         assert!(
@@ -440,7 +441,7 @@ fn dist_file_list_and_installers_include_all_three_executables() {
     .unwrap();
     let mut inner_zip = ZipArchive::new(std::io::Cursor::new(&verified.envelope.payload)).unwrap();
     let update_names: Vec<String> = (0..inner_zip.len())
-        .map(|i| inner_zip.by_index(i).unwrap().name().to_owned())
+        .map(|i| inner_zip.by_index(i).unwrap().name().unwrap().into_owned())
         .collect();
     for exe in DIST_EXE_NAMES {
         assert!(

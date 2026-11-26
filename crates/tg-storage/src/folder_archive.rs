@@ -1007,7 +1007,10 @@ where
         let mut entry = archive
             .by_index(idx)
             .map_err(|err| FolderArchiveError::Archive(err.to_string()))?;
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(|err| FolderArchiveError::Archive(err.to_string()))?
+            .into_owned();
 
         if is_zip_entry_symlink(&entry) {
             return Err(FolderArchiveError::SymlinkRejected(raw_name));

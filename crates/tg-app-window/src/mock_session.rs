@@ -8,6 +8,9 @@
 //! synthetic placeholders (no real people's names or real Telegram accounts).
 
 mod bench_data;
+mod demo_photos;
+#[cfg(test)]
+mod tests_demo_photos;
 mod versioned_state;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -29,6 +32,7 @@ use tg_stats::{
 use tg_text::{EntityInText, EntityType, TextWithEntities, utf8_to_utf16_offset};
 use tg_video::RangeLoader;
 
+use tg_app_core::core_types::dto::inline_media::InlineMediaDescriptor;
 use tg_app_core::stand_in::backend::Backend;
 use tg_app_core::stand_in::types::{
     AuthUser, CodeSentInfo, CodeVerifyOutcome, ConnectionStatus, DialogEntry, FilterId,
@@ -1532,6 +1536,8 @@ impl MockSessionState {
 pub struct SharedSessionHandle {
     state: Arc<versioned_state::VersionedState<MockSessionState>>,
     media_base: Arc<MockMediaBackend>,
+    /// Encoded full pictures of the demo chat photos.
+    demo_photos: Arc<demo_photos::DemoPhotoBytes>,
     /// Chat rows converted by the chat-list reads so far (TGB-2949 frame-cost checks).
     dialog_items_built: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -2010,6 +2016,7 @@ impl MockSession {
             handle: SharedSessionHandle {
                 state: Arc::new(versioned_state::VersionedState::new(state)),
                 media_base: Arc::new(MockMediaBackend::new()),
+                demo_photos: Arc::default(),
                 dialog_items_built: Arc::default(),
             },
             cached_user,
@@ -3371,6 +3378,25 @@ impl HistoryBackend for SharedSessionHandle {
             can_delete: true,
             link_base,
         })
+    }
+
+    fn inline_media_descriptor(
+        &self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+    ) -> Option<InlineMediaDescriptor> {
+        let media_id = {
+            let st = self.state.lock().ok()?;
+            let album_message = st.histories.get(&peer_id).is_some_and(|all| {
+                all.iter()
+                    .any(|m| m.id == msg_id && matches!(m.media, Some(HistoryMedia::Album(_))))
+            });
+            if album_message {
+                return None;
+            }
+            *st.msg_media_map.get(&(peer_id, msg_id))?
+        };
+        self.demo_photos.descriptor(media_id, &self.media_base)
     }
 
     fn load_slice_around(
@@ -5046,6 +5072,13 @@ impl HistoryBackend for MockSession {
     }
     fn peer_info(&self, peer_id: PeerId) -> Option<HistoryPeerInfo> {
         HistoryBackend::peer_info(&self.handle, peer_id)
+    }
+    fn inline_media_descriptor(
+        &self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+    ) -> Option<InlineMediaDescriptor> {
+        self.handle.inline_media_descriptor(peer_id, msg_id)
     }
     fn load_slice_around(
         &self,

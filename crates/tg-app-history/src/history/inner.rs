@@ -40,16 +40,17 @@ use crate::history::bubble::{
     paint_date_separator, paint_message_element_full, paint_service_message_interactive,
     paint_unread_bar, parse_paid_media_stars,
 };
+use crate::history::copy_selection::{self, SelectionCopy, UponSelected};
 use crate::history::inline_media::HistoryMediaRuntime;
 use crate::history::media::{
     MediaAssetCache, MediaInteraction, VoicePlaybackState, format_duration, format_file_size,
 };
+use crate::history::message_text_state::{MessageTextState, ends_with_quote, measure_message_text};
 use crate::history::paint_cache::MessagePaintCache;
 use crate::history::read_gate::{BackendReadGate, Gated};
 use crate::history::sections_model::{CopiedRichText, ReplyQuote, slice_text_with_entities};
 use crate::history::text_bridge::{
-    entities_to_rich_text, estimate_text_metrics, measure_rich_text, message_text_style,
-    slice_by_char_range,
+    entities_to_rich_text, estimate_text_metrics, message_text_style,
 };
 use crate::history::theme::HistoryColors;
 use tg_app_core::stand_in::theme::{Palette, ThemeMode};
@@ -266,7 +267,7 @@ pub enum InnerEvent {
     OpenComments(MsgId),
     /// Copied text with preserved `tg-text` entities.
     CopiedRich {
-        /// Toast summary.
+        /// Toast summary; empty for no toast (tdesktop shows none for text copies).
         summary: String,
         /// Preserved rich text payload.
         rich: CopiedRichText,
@@ -537,7 +538,15 @@ pub struct HistoryInnerWidget {
     paint_cache_order: VecDeque<MsgId>,
     /// The painted messages `paint_cache_order` was last updated for.
     paint_cache_painted: Vec<MsgId>,
+    /// Revealed spoilers and expanded quotes of the open chat's messages (TGB-3009).
+    text_states: HashMap<MsgId, MessageTextState>,
 }
+
+/// The text state of a message nobody clicked.
+static UNTOUCHED_TEXT: MessageTextState = MessageTextState {
+    spoilers_revealed_at: None,
+    expanded_quotes: Vec::new(),
+};
 
 impl Default for HistoryInnerWidget {
     fn default() -> Self {
@@ -609,6 +618,7 @@ impl HistoryInnerWidget {
             reaction_userpics: None,
             paint_cache_order: VecDeque::new(),
             paint_cache_painted: Vec::new(),
+            text_states: HashMap::new(),
         }
     }
 
@@ -925,73 +935,88 @@ impl HistoryInnerWidget {
         }
     }
 
-    /// Extracts selected text preserving all `tg-text` UTF-16 entities (for copy with entities).
+    /// Selected text with its `tg-text` UTF-16 entities (for a formatted paste).
     #[must_use]
     pub fn extract_selected_rich_text(&self) -> CopiedRichText {
-        let mut combined = tg_text::TextWithEntities::default();
-        if self.list.selection.has_selected_items() {
-            for m in &self.messages {
-                let full = to_hist_full(FullMsgId {
-                    peer: self.peer_id,
-                    msg: m.id,
-                });
-                if self.list.selection.selected_items.contains(&full) {
-                    if !combined.text.is_empty() {
-                        combined.text.push('\n');
-                    }
-                    let base_u16 = combined.utf16_len() as i32;
-                    let src = if m.text.is_empty() {
-                        tg_text::TextWithEntities::simple(m.preview_snippet())
-                    } else {
-                        m.text.clone()
-                    };
-                    combined.text.push_str(&src.text);
-                    for e in src.entities {
-                        combined.entities.push(tg_text::EntityInText::with_data(
-                            e.entity_type(),
-                            e.offset() + base_u16,
-                            e.length(),
-                            e.data(),
-                        ));
-                    }
-                }
-            }
-            combined.sort_entities();
-            return CopiedRichText { content: combined };
+        self.selection_copy()
+            .map(|copy| copy.rich)
+            .unwrap_or_default()
+    }
+
+    /// What copying the current selection puts on the clipboard (`HistoryInner::
+    /// getSelectedTextParts`): the selected piece of one message's text, or whole messages
+    /// (selected items, or a drag that crossed into other messages) wrapped with their time
+    /// and author when there are several.
+    #[must_use]
+    pub fn selection_copy(&self) -> Option<SelectionCopy> {
+        let selection = &self.list.selection;
+        if selection.has_selected_items() {
+            let items: Vec<&HistoryMessage> = self
+                .messages
+                .iter()
+                .filter(|m| {
+                    selection.selected_items.contains(&to_hist_full(FullMsgId {
+                        peer: self.peer_id,
+                        msg: m.id,
+                    }))
+                })
+                .collect();
+            return copy_selection::items_copy(&items);
         }
-        for (idx, m) in self.messages.iter().enumerate() {
-            let full = to_hist_full(FullMsgId {
-                peer: self.peer_id,
-                msg: m.id,
-            });
-            let sel = self.list.selection.selection_for_item(idx, full);
-            if sel.is_empty() {
-                continue;
-            }
-            let piece = if sel.is_full() {
-                m.text.clone()
-            } else {
-                slice_text_with_entities(&m.text, usize::from(sel.from), usize::from(sel.to))
-            };
-            if piece.text.is_empty() {
-                continue;
-            }
-            if !combined.text.is_empty() {
-                combined.text.push('\n');
-            }
-            let base_u16 = combined.utf16_len() as i32;
-            combined.text.push_str(&piece.text);
-            for e in piece.entities {
-                combined.entities.push(tg_text::EntityInText::with_data(
-                    e.entity_type(),
-                    e.offset() + base_u16,
-                    e.length(),
-                    e.data(),
-                ));
-            }
+        let (Some(from), Some(to)) = (selection.from, selection.to) else {
+            return None;
+        };
+        if from.item_index != to.item_index {
+            let lo = from.item_index.min(to.item_index);
+            let hi = from.item_index.max(to.item_index);
+            let items: Vec<&HistoryMessage> = self
+                .messages
+                .get(lo..=hi.min(self.messages.len().saturating_sub(1)))
+                .unwrap_or_default()
+                .iter()
+                .collect();
+            return copy_selection::items_copy(&items);
         }
-        combined.sort_entities();
-        CopiedRichText { content: combined }
+        let msg = self.messages.get(from.item_index)?;
+        let full = to_hist_full(FullMsgId {
+            peer: self.peer_id,
+            msg: msg.id,
+        });
+        let sel = selection.selection_for_item(from.item_index, full);
+        if sel.is_empty() {
+            return None;
+        }
+        let piece = if sel.is_full() {
+            msg.text.clone()
+        } else {
+            slice_text_with_entities(&msg.text, usize::from(sel.from), usize::from(sel.to))
+        };
+        copy_selection::text_selection_copy(piece)
+    }
+
+    /// Where the context menu for `msg_id` opened relative to the selection (`isUponSelected`).
+    fn upon_selected(&self, msg_id: MsgId) -> UponSelected {
+        let Some(index) = self.index_of(msg_id) else {
+            return UponSelected::No;
+        };
+        let selection = &self.list.selection;
+        let full = to_hist_full(FullMsgId {
+            peer: self.peer_id,
+            msg: msg_id,
+        });
+        let sel = selection.selection_for_item(index, full);
+        if sel.is_empty() {
+            UponSelected::No
+        } else if selection.has_selected_items()
+            || selection
+                .from
+                .zip(selection.to)
+                .is_some_and(|(a, b)| a.item_index != b.item_index)
+        {
+            UponSelected::Items
+        } else {
+            UponSelected::Text
+        }
     }
 
     /// Returns a [`ReplyQuote`] if `msg_id` currently has a partial drag-selected text range.
@@ -1140,7 +1165,19 @@ impl HistoryInnerWidget {
         let loading: Vec<MsgId> = self
             .messages
             .iter()
-            .map(|m| m.id)
+            .flat_map(|m| {
+                let tiles = match &m.media {
+                    Some(HistoryMedia::Album(items)) => items.as_slice(),
+                    _ => &[],
+                };
+                let own = m.id;
+                std::iter::once(own).chain(
+                    tiles
+                        .iter()
+                        .map(|item| item.msg_id)
+                        .filter(move |&id| id != own),
+                )
+            })
             .filter(|id| {
                 match self
                     .media_runtime
@@ -1406,6 +1443,25 @@ impl HistoryInnerWidget {
             self.media_runtime.register_descriptor(msg_id, desc);
             self.media_watch.dirty = true;
         }
+        // Each tile of an album is painted under its own id (`GroupedMedia` parts), so each
+        // asks for its own picture.
+        let tile_ids: Vec<MsgId> = match self
+            .index_of(msg_id)
+            .and_then(|i| self.messages[i].media.as_ref())
+        {
+            Some(HistoryMedia::Album(items)) => items
+                .iter()
+                .map(|item| item.msg_id)
+                .filter(|&id| id != msg_id)
+                .collect(),
+            _ => return,
+        };
+        for id in tile_ids {
+            if let Some(desc) = backend.inline_media_descriptor(peer_id, id) {
+                self.media_runtime.register_descriptor(id, desc);
+                self.media_watch.dirty = true;
+            }
+        }
     }
 
     /// Asks `backend` for the inline media of `messages`, for the slices that enter the list
@@ -1524,6 +1580,8 @@ impl HistoryInnerWidget {
         self.media_backlog.clear();
         self.media_watch.dirty = true;
         if switching_peer {
+            // `Data::Session::hideShownSpoilers`: another chat hides revealed spoilers again.
+            self.text_states.clear();
             self.list.selection.clear();
             self.highlighter.clear();
             self.context_menu.close();
@@ -2095,44 +2153,13 @@ impl HistoryInnerWidget {
         self.update_date_and_unread_heights();
     }
 
-    /// Extracts concatenated selected text (from either partial drag selection or multi-selected items).
+    /// The plain clipboard text a copy of the current selection produces (empty when nothing is
+    /// selected): see [`Self::selection_copy`].
     #[must_use]
     pub fn extract_selected_text(&self) -> String {
-        if self.list.selection.has_selected_items() {
-            let mut out = Vec::new();
-            for m in &self.messages {
-                let full = to_hist_full(FullMsgId {
-                    peer: self.peer_id,
-                    msg: m.id,
-                });
-                if self.list.selection.selected_items.contains(&full) {
-                    let body = if m.text.is_empty() {
-                        m.preview_snippet()
-                    } else {
-                        m.text.text.clone()
-                    };
-                    out.push(format!("{}: {}", m.sender_name, body));
-                }
-            }
-            return out.join("\n");
-        }
-        let mut parts = Vec::new();
-        for (idx, m) in self.messages.iter().enumerate() {
-            let full = to_hist_full(FullMsgId {
-                peer: self.peer_id,
-                msg: m.id,
-            });
-            let sel = self.list.selection.selection_for_item(idx, full);
-            if sel.is_empty() {
-                continue;
-            }
-            if sel.is_full() {
-                parts.push(m.text.text.clone());
-            } else {
-                parts.push(slice_by_char_range(&m.text.text, sel.from, sel.to));
-            }
-        }
-        parts.join("\n")
+        self.selection_copy()
+            .map(|copy| copy.clipboard)
+            .unwrap_or_default()
     }
 
     /// Headless visible-range layout helper (also used by unit tests to verify 5,000+ message
@@ -2253,27 +2280,19 @@ impl HistoryInnerWidget {
             ui.ctx().request_repaint();
         }
 
-        // Handle Ctrl+C copy shortcut for text/multi selection, Escape to clear selection.
+        // Copy shortcut for the text/multi selection (the backend sends `Event::Copy`, not a
+        // `C` key, TGB-3016), Escape to clear selection.
         if !self.list.selection.is_empty() {
             if ui.ctx().input(|i| i.key_pressed(Key::Escape)) {
                 self.list.selection.clear();
-            } else if ui
-                .ctx()
-                .input(|i| i.modifiers.command && i.key_pressed(Key::C))
+            } else if ui.ctx().input(tg_ui::clipboard::copy_requested)
+                && let Some(copy) = self.selection_copy()
             {
-                let rich = self.extract_selected_rich_text();
-                let text = if !rich.content.text.is_empty() {
-                    rich.to_markdown()
-                } else {
-                    self.extract_selected_text()
-                };
-                if !text.is_empty() {
-                    ui.ctx().copy_text(text);
-                    events.push(InnerEvent::CopiedRich {
-                        summary: "Copied selection (with formatting)".to_owned(),
-                        rich,
-                    });
-                }
+                ui.ctx().copy_text(copy.clipboard);
+                events.push(InnerEvent::CopiedRich {
+                    summary: String::new(),
+                    rich: copy.rich,
+                });
             }
         }
 
@@ -2709,11 +2728,18 @@ impl HistoryInnerWidget {
                     });
                     let sel = self.list.selection.selection_for_item(v.index, full_id);
                     if sel.is_full() {
-                        ui.painter().rect_filled(
-                            row_rect,
-                            CornerRadius::ZERO,
-                            colors.select_overlay,
-                        );
+                        // The date badge and the unread bar above the message stay untinted
+                        // (`Message::draw` fills from below them).
+                        let skip = item.displayed_date_height
+                            + if item.has_unread_bar {
+                                unread_bar_height()
+                            } else {
+                                0
+                            };
+                        let mut tint = row_rect;
+                        tint.min.y = (tint.min.y + skip as f32).min(tint.max.y);
+                        ui.painter()
+                            .rect_filled(tint, CornerRadius::ZERO, colors.select_overlay);
                     }
 
                     // Jump-to-message full-row highlight overlay (`ElementHighlighter`).
@@ -2962,6 +2988,11 @@ impl HistoryInnerWidget {
                                     paused_chat_effects,
                                     reaction_userpics,
                                     paint_cache,
+                                    Some(
+                                        self.text_states
+                                            .get(&msg.id)
+                                            .unwrap_or(&UNTOUCHED_TEXT),
+                                    ),
                                 );
                                 if msg.is_post
                                     && matches!(peer.summary.kind, PeerKind::Channel)
@@ -3157,15 +3188,37 @@ impl HistoryInnerWidget {
                                             msg_id: _,
                                             char_index,
                                         } => {
-                                            self.list.selection.update_drag(
-                                                ListSelectionEndpoint {
+                                            // egui keeps the drag on the message it began in;
+                                            // the message under the pointer says whether it
+                                            // crossed into others (whole messages then).
+                                            let endpoint = ui
+                                                .ctx()
+                                                .pointer_interact_pos()
+                                                .and_then(|p| {
+                                                    self.list.find_item_index_by_y(
+                                                        (p.y - paint_top).floor() as i32,
+                                                    )
+                                                })
+                                                .filter(|&i| i != v.index)
+                                                .and_then(|i| {
+                                                    let m = self.messages.get(i)?;
+                                                    Some(ListSelectionEndpoint {
+                                                        item_id: to_hist_full(FullMsgId {
+                                                            peer: self.peer_id,
+                                                            msg: m.id,
+                                                        }),
+                                                        item_index: i,
+                                                        text: FlatSelectionEndpoint::new(0, false),
+                                                    })
+                                                })
+                                                .unwrap_or(ListSelectionEndpoint {
                                                     item_id: full_id,
                                                     item_index: v.index,
                                                     text: FlatSelectionEndpoint::new(
                                                         char_index, false,
                                                     ),
-                                                },
-                                            );
+                                                });
+                                            self.list.selection.update_drag(endpoint);
                                         }
                                         MessagePaintEvent::OpenComments(mid) => {
                                             events.push(InnerEvent::OpenComments(mid));
@@ -3221,6 +3274,22 @@ impl HistoryInnerWidget {
                                         }
                                         MessagePaintEvent::AboutAiSummary(mid) => {
                                             events.push(InnerEvent::AboutAiSummary(mid));
+                                        }
+                                        MessagePaintEvent::RevealSpoilers(mid) => {
+                                            let now = ui.input(|i| i.time);
+                                            self.text_states
+                                                .entry(mid)
+                                                .or_default()
+                                                .spoilers_revealed_at
+                                                .get_or_insert(now);
+                                        }
+                                        MessagePaintEvent::ToggleQuote { msg_id, block } => {
+                                            self.text_states
+                                                .entry(msg_id)
+                                                .or_default()
+                                                .toggle_quote(block);
+                                            // The bubble is measured with the quote's lines.
+                                            invalidated.push(msg_id);
                                         }
                                     }
                                 }
@@ -3504,6 +3573,12 @@ impl HistoryInnerWidget {
         // layer or overlay, not minimized, not idle; set by the window each frame).
         let window_focused = ui.ctx().input(|i| i.focused) && self.is_marking_as_read();
 
+        // `HistoryInner::paintEvent` -> `Reactions::poll(item, now)`: the shown messages'
+        // reactions are refreshed every `kPollEach` (the backend skips those not due).
+        if !self.painted_msg_ids.is_empty() {
+            backend.poll_painted_reactions(self.peer_id, &self.painted_msg_ids);
+        }
+
         // `HistoryInner::paintEvent` marks shown messages with unread reactions as read
         // (`readContents`), which clears the floating "♥ N" button and the chat-row badge.
         // Only while the window is active (`markingAsViewed`), and only when the set changed.
@@ -3585,6 +3660,7 @@ impl HistoryInnerWidget {
             let has_quote_sel = self.selected_quote_for_msg(target_id).is_some();
             let ref_now_unix = now_unix_secs.max(i64::from(target_msg.date_unix) + 60);
             let mut items = build_context_menu_items(&target_msg, peer, has_quote_sel);
+            copy_selection::apply_upon_selected(&mut items, self.upon_selected(target_id));
             if let Some(ref eng) = self.context_menu_engagement
                 && eng.peer_id == self.peer_id
                 && eng.msg_id == target_id
@@ -3669,26 +3745,25 @@ impl HistoryInnerWidget {
                     }
                     "open_comments" => events.push(InnerEvent::OpenComments(target_id)),
                     "edit" => events.push(InnerEvent::Edit(target_id)),
-                    "copy_text" => {
-                        let rich = if !self.list.selection.is_empty() {
-                            self.extract_selected_rich_text()
-                        } else if !target_msg.text.is_empty() {
-                            CopiedRichText {
-                                content: target_msg.text.clone(),
-                            }
+                    // `copyContextText`: the whole message; `copySelectedText`: the selection,
+                    // and a copy of selected messages ends the selection.
+                    "copy_text" | copy_selection::MENU_ID_COPY_SELECTED => {
+                        let selected = triggered == copy_selection::MENU_ID_COPY_SELECTED;
+                        let copy = if selected {
+                            self.selection_copy()
                         } else {
-                            CopiedRichText {
-                                content: tg_text::TextWithEntities::simple(
-                                    target_msg.preview_snippet(),
-                                ),
-                            }
+                            copy_selection::items_copy(&[&target_msg])
                         };
-                        let copy_str = rich.to_markdown();
-                        ui.ctx().copy_text(copy_str);
-                        events.push(InnerEvent::CopiedRich {
-                            summary: "Copied text with formatting".to_owned(),
-                            rich,
-                        });
+                        if let Some(copy) = copy {
+                            ui.ctx().copy_text(copy.clipboard);
+                            events.push(InnerEvent::CopiedRich {
+                                summary: String::new(),
+                                rich: copy.rich,
+                            });
+                        }
+                        if selected && self.list.selection.has_selected_items() {
+                            self.clear_selection();
+                        }
                     }
                     "copy_link" => {
                         events.push(InnerEvent::CopyMessageLink(target_id));
@@ -3820,7 +3895,11 @@ impl HistoryInnerWidget {
         let item = &self.list.items()[index];
         let show_sender_in_chat = matches!(peer.summary.kind, PeerKind::Group);
         let transcribe_h = expanded_transcribe_height(msg, &self.voice_state);
-        let cached = compute_item_layout_egui(
+        let expanded_quotes = self
+            .text_states
+            .get(&msg.id)
+            .map_or(&[][..], |state| &state.expanded_quotes);
+        let cached = compute_item_layout_egui_with_quotes(
             ui,
             msg,
             item,
@@ -3832,6 +3911,7 @@ impl HistoryInnerWidget {
             factcheck_extra_h,
             transcribe_h,
             summary_entry,
+            expanded_quotes,
         );
         let new_h = cached_layout_height(&cached);
         let changed = self.list.items()[index].height != new_h;
@@ -4369,6 +4449,7 @@ fn build_bottom_info_input(msg: &HistoryMessage) -> BottomInfoInput {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn compute_item_layout_egui(
     ui: &Ui,
     msg: &HistoryMessage,
@@ -4381,6 +4462,38 @@ fn compute_item_layout_egui(
     factcheck_extra_h: i32,
     transcribe_text_height: i32,
     summary_entry: Option<&MessageSummaryEntry>,
+) -> CachedItemLayout {
+    compute_item_layout_egui_with_quotes(
+        ui,
+        msg,
+        item,
+        viewport_w,
+        is_chat_wide,
+        show_sender_in_chat,
+        colors,
+        fonts,
+        factcheck_extra_h,
+        transcribe_text_height,
+        summary_entry,
+        &[],
+    )
+}
+
+/// The layout of one item; `expanded_quotes` are the message's expanded collapsible quotes.
+#[allow(clippy::too_many_arguments)]
+fn compute_item_layout_egui_with_quotes(
+    ui: &Ui,
+    msg: &HistoryMessage,
+    item: &HistoryListItem,
+    viewport_w: i32,
+    is_chat_wide: bool,
+    show_sender_in_chat: bool,
+    colors: &HistoryColors,
+    fonts: &FontMetrics,
+    factcheck_extra_h: i32,
+    transcribe_text_height: i32,
+    summary_entry: Option<&MessageSummaryEntry>,
+    expanded_quotes: &[usize],
 ) -> CachedItemLayout {
     let chat_mode = if is_chat_wide {
         ElementChatMode::Wide
@@ -4514,12 +4627,13 @@ fn compute_item_layout_egui(
         } else if active_text.is_empty() {
             (0, 0, 0)
         } else {
-            measure_rich_text(
+            measure_message_text(
                 ui,
                 active_text,
                 &text_pal,
                 colors.text_fg,
                 max_text_wrap as f32,
+                expanded_quotes,
             )
         };
     if summary_h > 0 {
@@ -4603,6 +4717,9 @@ fn compute_item_layout_egui(
     // `updateSkipBlock`): the time drops to its own line only when that line is full.
     let needs_date_line_room = has_body_text && msg.reactions.is_empty();
     let time_fits_last_line = || {
+        if ends_with_quote(active_text) {
+            return false;
+        }
         let line_h = message_text_style().line_height.round() as i32;
         let (last_w, row_w) = if text_wrapped_h <= line_h + 1 {
             (text_max_w, max_text_wrap)
@@ -4714,24 +4831,26 @@ fn compute_item_layout_egui(
     let painted_wrap = layout.text_rect.width;
     if !has_rich_body && !active_text.is_empty() && painted_wrap > 0 && painted_wrap < max_text_wrap
     {
-        let (_, wrapped_h, _) = measure_rich_text(
+        let (_, wrapped_h, _) = measure_message_text(
             ui,
             active_text,
             &text_pal,
             colors.text_fg,
             painted_wrap as f32,
+            expanded_quotes,
         );
         let time_fits = !needs_date_line_room
-            || last_line_fits_time(
-                ui,
-                active_text,
-                &text_pal,
-                colors.text_fg,
-                painted_wrap,
-                wrapped_h,
-                text_max_w,
-                info_skip_w,
-            );
+            || !ends_with_quote(active_text)
+                && last_line_fits_time(
+                    ui,
+                    active_text,
+                    &text_pal,
+                    colors.text_fg,
+                    painted_wrap,
+                    wrapped_h,
+                    text_max_w,
+                    info_skip_w,
+                );
         let painted_h = text_block_h(wrapped_h, time_fits);
         if painted_h != input.text_wrapped_height {
             let input = MessageInput {
@@ -5065,7 +5184,7 @@ fn context_menu_icon(id: &str, fallback: Option<IconKind>) -> Option<tg_ui::tg_s
         "reply" | "reply_quote" => st::menu_icon_reply,
         "edit" => st::menu_icon_edit,
         "pin" => st::menu_icon_pin,
-        "copy_text" => st::menu_icon_copy,
+        "copy_text" | copy_selection::MENU_ID_COPY_SELECTED => st::menu_icon_copy,
         "copy_link" => st::menu_icon_link,
         "translate" => st::menu_icon_translate,
         "forward" => st::menu_icon_forward,
@@ -5203,13 +5322,19 @@ fn paint_reaction_strip(
                 menu_st.item_bg_over,
             );
         }
-        let _ = assets.emoji().paint_emoji_str(
-            &painter,
+        let image = Rect::from_center_size(cell.center(), Vec2::splat(CONTEXT_STRIP_IMAGE));
+        if !crate::history::reaction_buttons::paint_special_reaction(
             &ctx,
+            &painter,
             emoji,
-            Rect::from_center_size(cell.center(), Vec2::splat(CONTEXT_STRIP_IMAGE)),
-            Color32::WHITE,
-        );
+            image,
+            Rect::from_center_size(cell.center(), image.size() * 0.5),
+            menu_st.item_fg,
+        ) {
+            let _ = assets
+                .emoji()
+                .paint_emoji_str(&painter, &ctx, emoji, image, Color32::WHITE);
+        }
         if resp.clicked() {
             triggered = Some(format!("{CONTEXT_STRIP_REACTION_PREFIX}{emoji}"));
         }

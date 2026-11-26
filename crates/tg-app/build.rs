@@ -18,6 +18,15 @@ fn main() {
     println!("cargo:rerun-if-changed=../../assets/icon.svg");
     println!("cargo::rustc-check-cfg=cfg(rustgram_window_icon_rgba)");
 
+    // Version printed by `rustgram --version` (same source as the VERSIONINFO resource).
+    let version = ["RUSTGRAM_VERSION", "TGFORK_VERSION"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|v| v.trim().to_owned())
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    println!("cargo:rustc-env=RUSTGRAM_BUILD_VERSION={version}");
+
     // 16 MB main-thread stack for rustgram.exe: the dev profile builds tg-app unoptimized, and the default 1 MB
     // Windows stack is too small for deep egui layouts without inlining.
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {

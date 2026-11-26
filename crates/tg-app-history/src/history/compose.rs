@@ -25,13 +25,13 @@ use tg_ui::widgets::rich_input::{
 use crate::bots::menus::{BotMenuButtonAction, paint_bot_menu_button};
 use crate::bots::reply_keyboard::paint_reply_keyboard_toggle_button;
 use crate::history::backend::{
-    DraftMessage, HistoryBackend, SendMessageExtended, ThreadDraft, TypingAction, VoiceAttachment,
+    DraftMessage, HistoryBackend, SendMessageExtended, ThreadDraft, TypingAction,
 };
 use crate::history::compose_extras::{
     ComposeSpellchecker, InlineBotPanelState, InlineBotQueryHook, LINK_PREVIEW_BAR_HEIGHT,
-    LinkPreviewEditorState, MessageEffectsPickerState, RecordButtonMode, RoundVideoRecorderState,
-    SendAsChooserState, VoiceBarAction, VoiceRecorderController, paint_slow_mode_badge,
-    paint_voice_recording_bar,
+    LinkPreviewEditorState, MessageEffectsPickerState, RecordButtonMode, RecordedVoice,
+    RoundVideoRecorderState, SendAsChooserState, VoiceBarAction, VoiceRecorderController,
+    paint_slow_mode_badge, paint_voice_recording_bar,
 };
 use crate::history::rich_compose::{
     ComposeHistoryShortcut, FormatStripAction, MentionAutocompleteState,
@@ -303,8 +303,8 @@ pub enum ComposeEvent {
         /// Duration in seconds.
         duration_secs: u32,
     },
-    /// Voice recording finalized via `tg-audio` with real 5-bit waveform.
-    VoiceCaptured(VoiceAttachment),
+    /// Voice recording finalized via `tg-audio`: the OGG/Opus file, duration and 5-bit waveform.
+    VoiceCaptured(RecordedVoice),
     /// Round video recording placeholder finalized.
     RoundVideoCaptured(RoundVideoAttachment),
     /// User picked a Telegram Business quick-reply shortcut via `/` autocomplete in a private chat.
@@ -691,6 +691,7 @@ impl ComposeControls {
             ttl_seconds: None,
             round_video_path: None,
             video_cover_jpeg: None,
+            voice_ogg: None,
         }
     }
 
@@ -1370,7 +1371,10 @@ impl ComposeControls {
                         if let Event::Paste(ref pasted_str) = i.events[idx] {
                             if let Some(ref copied) = self.copied_rich_buffer
                                 && (copied.to_markdown() == *pasted_str
-                                    || copied.content.text == *pasted_str)
+                                    || copied.content.text == *pasted_str
+                                    || crate::history::copy_selection::clipboard_text(
+                                        &copied.content,
+                                    ) == *pasted_str)
                                 && !copied.content.entities.is_empty()
                             {
                                 intercepted_paste = Some(copied.content.clone());

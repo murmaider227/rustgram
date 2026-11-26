@@ -228,10 +228,12 @@ impl HistoryColors {
     /// Builds a [`tg_ui::stand_in::TextPalette`] for incoming or outgoing message text.
     #[must_use]
     pub fn text_palette(&self, outgoing: bool) -> TextPalette {
-        let spoiler_fg = if self.is_night {
-            Color32::from_rgb(0x8D, 0xA1, 0xB5)
+        // `inTextPalette.spoilerFg: msgInDateFg`, `outTextPalette.spoilerFg: msgOutDateFg`:
+        // the spoiler particles take the colour of the message's time.
+        let spoiler_fg = if outgoing {
+            self.msg_out_date_fg
         } else {
-            Color32::from_rgb(0x6D, 0x7C, 0x8A)
+            self.msg_in_date_fg
         };
         TextPalette {
             link_fg: if outgoing {

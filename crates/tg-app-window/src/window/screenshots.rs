@@ -53,6 +53,8 @@ struct AppScreenshotRunner {
     docs_dir: PathBuf,
     index: usize,
     frames_in_step: u32,
+    // Media is decoded on worker threads; give each shot time to show real thumbnails, not placeholders.
+    step_started: std::time::Instant,
     requested: bool,
     done: Arc<AtomicBool>,
     controller: WindowController,
@@ -76,6 +78,7 @@ impl AppScreenshotRunner {
             docs_dir,
             index: 0,
             frames_in_step: 0,
+            step_started: std::time::Instant::now(),
             requested: false,
             done: Arc::new(AtomicBool::new(false)),
             controller,
@@ -157,12 +160,47 @@ impl AppScreenshotRunner {
         }
 
         self.frames_in_step = 0;
+        self.step_started = std::time::Instant::now();
         self.requested = false;
         self.done.store(false, Ordering::Release);
     }
 }
 
+/// Keeps the real mouse out of the shots: whatever the pointer does over the window (it may
+/// rest anywhere on the desktop), the app sees no pointer, so no bubble shows its hover
+/// buttons (reply / react circles) or hover highlight.
+fn hide_pointer(raw_input: &mut egui::RawInput) {
+    raw_input.events.retain(|event| {
+        !matches!(
+            event,
+            egui::Event::PointerMoved(_)
+                | egui::Event::MouseMoved(_)
+                | egui::Event::PointerButton { .. }
+                | egui::Event::MouseWheel { .. }
+                | egui::Event::Touch { .. }
+        )
+    });
+    raw_input.events.push(egui::Event::PointerGone);
+}
+
+/// The media viewer turns a windowed viewport fullscreen (it covers the monitor in the app);
+/// reporting the window as fullscreen already keeps the shot at the runner's 1440x900.
+fn keep_window_size(raw_input: &mut egui::RawInput) {
+    raw_input
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(true);
+}
+
 impl eframe::App for AppScreenshotRunner {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        hide_pointer(raw_input);
+        if matches!(AppShot::ALL.get(self.index), Some(AppShot::MediaViewer)) {
+            keep_window_size(raw_input);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
@@ -181,7 +219,10 @@ impl eframe::App for AppScreenshotRunner {
         }
 
         self.frames_in_step += 1;
-        if !self.requested && self.frames_in_step >= 10 {
+        if !self.requested
+            && self.frames_in_step >= 10
+            && self.step_started.elapsed() >= std::time::Duration::from_secs(3)
+        {
             self.requested = true;
             let path = self.docs_dir.join(AppShot::ALL[self.index].file_name());
             let done = Arc::clone(&self.done);
@@ -239,4 +280,33 @@ fn capture_app_screenshots() {
         Box::new(move |cc| Ok(Box::new(AppScreenshotRunner::new(cc, docs_dir)))),
     )
     .expect("eframe app screenshot runner succeeded");
+}
+
+#[test]
+fn screenshot_runner_hides_the_pointer() {
+    let mut raw = egui::RawInput {
+        events: vec![
+            egui::Event::PointerMoved(egui::pos2(700.0, 400.0)),
+            egui::Event::MouseMoved(Vec2::new(3.0, 1.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(700.0, 400.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::WindowFocused(true),
+        ],
+        ..egui::RawInput::default()
+    };
+    hide_pointer(&mut raw);
+    assert_eq!(
+        raw.events,
+        vec![egui::Event::WindowFocused(true), egui::Event::PointerGone]
+    );
+
+    // A bubble under the real mouse would show its hover buttons; the app sees no pointer.
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(raw, |_| {});
+    out.textures_delta.clear();
+    assert!(ctx.pointer_hover_pos().is_none());
 }

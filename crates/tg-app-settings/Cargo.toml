@@ -37,7 +37,7 @@ tg-updater = { path = "../tg-updater" }
 tg-wallet = { path = "../tg-wallet" }
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.44"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }

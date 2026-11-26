@@ -15,6 +15,7 @@ use tg_platform::app_id::{DEFAULT_APP_USER_MODEL_ID, build_app_user_model_id};
 use tg_platform::single_instance::{InstanceActivation, single_instance_name};
 use tg_platform::widget_sandbox::resolve_widget_helper_path_with_fallback;
 
+use super::cli_guard::{CliRequest, classify_cli};
 use super::ipc::build_activation_from_args;
 
 /// High-level action chosen from parsed CLI arguments.
@@ -22,6 +23,10 @@ use super::ipc::build_activation_from_args;
 pub enum StartupAction {
     /// Print CLI help and exit without starting the GUI or touching working dir.
     ShowHelp,
+    /// Print the version (`--version`, `-v`) and exit without touching the working dir.
+    ShowVersion,
+    /// An unknown option was passed: print an error and exit without touching the working dir.
+    RejectArguments,
     /// Stop running instance, remove OS integration (`-cleanup`), and exit.
     Cleanup,
     /// Proceed with single-instance handshake, crash check, and GUI launch.
@@ -77,7 +82,6 @@ pub const fn select_live_mode(
 /// Extra `tg-app` developer switches extracted before handing argv to `tg-core`'s parser.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DevSwitches {
-    show_help: bool,
     start_signed_in: bool,
     live_mode: bool,
     demo_mode: bool,
@@ -187,12 +191,14 @@ impl StartupPlan {
             DEFAULT_APP_USER_MODEL_ID.to_owned()
         };
 
-        let action = if dev.show_help {
-            StartupAction::ShowHelp
-        } else if parsed_args.launch_mode == LaunchMode::Cleanup {
-            StartupAction::Cleanup
-        } else {
-            StartupAction::RunApp
+        let action = match classify_cli(&raw_args) {
+            CliRequest::Version => StartupAction::ShowVersion,
+            CliRequest::Help => StartupAction::ShowHelp,
+            CliRequest::UnknownOption(_) => StartupAction::RejectArguments,
+            CliRequest::Run if parsed_args.launch_mode == LaunchMode::Cleanup => {
+                StartupAction::Cleanup
+            }
+            CliRequest::Run => StartupAction::RunApp,
         };
 
         let is_run = action == StartupAction::RunApp;
@@ -278,9 +284,8 @@ fn extract_dev_switches(raw: &[String]) -> (DevSwitches, Vec<String>) {
                 after_double_dash = true;
                 out.push(arg.clone());
             }
-            "-h" | "--help" => {
-                dev.show_help = true;
-            }
+            // Classified by `classify_cli`; never forwarded as trailing file paths.
+            "-h" | "--help" => {}
             "--start-main" => {
                 dev.start_signed_in = true;
             }
@@ -339,5 +344,6 @@ pub fn help_text() -> &'static str {
        --live               Force live mode (default when API credentials are available)\n  \
        --start-main         Skip Intro and open straight into the signed-in workspace\n  \
        --settings <PATH>    Use a custom shell settings JSON file\n  \
-       -h, --help           Show this help message"
+       -h, --help           Show this help message
+         -v, --version        Print the version and exit"
 }

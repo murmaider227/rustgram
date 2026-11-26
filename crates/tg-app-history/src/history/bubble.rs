@@ -19,7 +19,7 @@ use tg_history::{
 };
 use tg_ui::text::{
     RichTextOptions, SyntaxHighlightPalette, render_prepared_rich_text,
-    render_prepared_text_with_entities,
+    render_prepared_rich_text_with_reveal, render_prepared_text_with_entities,
 };
 use tg_ui::userpic::{EmptyUserpic, peer_name_color};
 
@@ -34,6 +34,7 @@ use crate::history::media::{
     MediaAssetCache, MediaInteraction, VoicePlaybackState, bubble_rounding_to_egui,
     paint_history_media, paint_history_media_with_runtime,
 };
+use crate::history::message_text_state::MessageTextState;
 use crate::history::paint_cache::{MessagePaintCache, PreparedBody};
 use crate::history::reply_preview::{paint_reply_thumb, reply_preview_skip, reply_text_galley};
 use crate::history::sections_model::LinkPreviewData;
@@ -119,6 +120,15 @@ pub enum MessagePaintEvent {
     ToggleSummary(MsgId),
     /// User clicked the info icon on the expanded AI summary header.
     AboutAiSummary(MsgId),
+    /// User clicked a hidden spoiler in the message text: reveal all of its spoilers.
+    RevealSpoilers(MsgId),
+    /// User clicked the expand / collapse toggle of a collapsible quote in the message text.
+    ToggleQuote {
+        /// Message id.
+        msg_id: MsgId,
+        /// Block index of the quote in the text.
+        block: usize,
+    },
 }
 
 /// Interactive action emitted by a centered service action card.
@@ -564,6 +574,7 @@ pub fn paint_message_element(
         false,
         None,
         &mut MessagePaintCache::default(),
+        None,
     )
 }
 
@@ -601,6 +612,7 @@ pub fn paint_message_element_with_runtime(
         false,
         None,
         &mut MessagePaintCache::default(),
+        None,
     )
 }
 
@@ -639,6 +651,7 @@ pub fn paint_message_element_with_bots(
         false,
         None,
         &mut MessagePaintCache::default(),
+        None,
     )
 }
 
@@ -646,7 +659,9 @@ pub fn paint_message_element_with_bots(
 /// keyboards, and optional AI message summary state (`messages.summarizeText`).
 ///
 /// `paint_cache` is the message's [`MessagePaintCache`]: the body text prepared on an earlier
-/// frame is painted again without being rebuilt.
+/// frame is painted again without being rebuilt. `text_state` is what the reader changed in the
+/// text (revealed spoilers, expanded quotes); clicks that change it come back as
+/// [`MessagePaintEvent::RevealSpoilers`] and [`MessagePaintEvent::ToggleQuote`].
 #[allow(clippy::too_many_arguments)]
 pub fn paint_message_element_full(
     ui: &mut Ui,
@@ -666,6 +681,7 @@ pub fn paint_message_element_full(
     paused_chat_effects: bool,
     reaction_userpics: Option<&ReactionUserpics>,
     paint_cache: &mut MessagePaintCache,
+    text_state: Option<&MessageTextState>,
 ) -> Vec<MessagePaintEvent> {
     paint_message_element_internal(
         ui,
@@ -685,6 +701,7 @@ pub fn paint_message_element_full(
         paused_chat_effects,
         reaction_userpics,
         paint_cache,
+        text_state,
     )
 }
 
@@ -707,6 +724,7 @@ fn paint_message_element_internal(
     paused_chat_effects: bool,
     reaction_userpics: Option<&ReactionUserpics>,
     paint_cache: &mut MessagePaintCache,
+    text_state: Option<&MessageTextState>,
 ) -> Vec<MessagePaintEvent> {
     let mut events = Vec::new();
     let is_selected = selection.is_full();
@@ -1157,6 +1175,8 @@ fn paint_message_element_internal(
         // The body is prepared once per message text (`MessagePaintCache::body`) and painted
         // from that on later frames.
         let body_wrap = text_rect.width().max(40.0);
+        let spoiler_reveal = text_state.map(|s| s.spoiler_reveal(ui.input(|i| i.time)));
+        let mut spoilers_clicked = false;
         match paint_cache.body(active_text) {
             PreparedBody::Blocks(prepared) => {
                 let mut opts = RichTextOptions::new(colors.text_fg, text_rect.width().max(40.0))
@@ -1167,7 +1187,10 @@ fn paint_message_element_internal(
                 } else {
                     SyntaxHighlightPalette::day()
                 });
+                opts.spoiler_reveal = spoiler_reveal;
+                opts.expanded_blockquotes = text_state.map(|s| s.expanded_quotes.clone());
                 let mut clicked_link: Option<(String, bool)> = None;
+                let mut toggled_quote = None;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
                     let resp = render_prepared_text_with_entities(
                         ui,
@@ -1182,7 +1205,15 @@ fn paint_message_element_internal(
                         let is_hidden = link.kind == tg_text::EntityType::CustomUrl;
                         clicked_link = Some((link.target, is_hidden));
                     }
+                    spoilers_clicked = resp.spoiler_toggled;
+                    toggled_quote = resp.blockquote_toggled;
                 });
+                if let Some(block) = toggled_quote {
+                    events.push(MessagePaintEvent::ToggleQuote {
+                        msg_id: msg.id,
+                        block,
+                    });
+                }
                 if let Some((url, is_hidden)) = clicked_link {
                     if is_hidden {
                         events.push(MessagePaintEvent::OpenHiddenLink(url));
@@ -1219,16 +1250,30 @@ fn paint_message_element_internal(
                 // Render interactive rich text (links, bold, italic, mono, underline, strike, spoiler).
                 let mut clicked_link = None;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
-                    let resp = render_prepared_rich_text(
-                        ui,
-                        Id::unique(("tg_msg_text", msg.id.0)),
-                        prepared,
-                        &style,
-                        &text_pal,
-                        colors.text_fg,
-                        body_wrap,
-                    );
+                    let id = Id::unique(("tg_msg_text", msg.id.0));
+                    let resp = match spoiler_reveal {
+                        Some(reveal) => render_prepared_rich_text_with_reveal(
+                            ui,
+                            id,
+                            prepared,
+                            &style,
+                            &text_pal,
+                            colors.text_fg,
+                            body_wrap,
+                            reveal,
+                        ),
+                        None => render_prepared_rich_text(
+                            ui,
+                            id,
+                            prepared,
+                            &style,
+                            &text_pal,
+                            colors.text_fg,
+                            body_wrap,
+                        ),
+                    };
                     clicked_link = resp.clicked_link;
+                    spoilers_clicked = resp.spoiler_toggled;
                 });
                 if let Some(url) = clicked_link {
                     let is_hidden = active_text.entities.iter().any(|e| {
@@ -1246,13 +1291,16 @@ fn paint_message_element_internal(
                 {
                     ui.ctx().set_cursor_icon(CursorIcon::Text);
                 }
-                if drag_resp.drag_started() || drag_resp.dragged() {
+                // Only the left button selects: a right press on the selection opens the
+                // context menu over it (`HistoryInner::mousePressEvent`), TGB-3016.
+                let started = drag_resp.drag_started_by(egui::PointerButton::Primary);
+                if started || drag_resp.dragged_by(egui::PointerButton::Primary) {
                     let drag_galley =
                         prepared.plain_galley(ui, &style, &text_pal, colors.text_fg, body_wrap);
                     if let Some(ptr) = ui.ctx().pointer_interact_pos() {
                         let (char_index, _) =
                             pointer_to_char_index(&drag_galley, text_rect.min, ptr);
-                        if drag_resp.drag_started() {
+                        if started {
                             events.push(MessagePaintEvent::TextDragStart {
                                 msg_id: msg.id,
                                 char_index,
@@ -1266,6 +1314,9 @@ fn paint_message_element_internal(
                     }
                 }
             }
+        }
+        if spoilers_clicked {
+            events.push(MessagePaintEvent::RevealSpoilers(msg.id));
         }
     }
 
@@ -1798,20 +1849,13 @@ fn paint_reactions_row(
 
     for (idx, (r, chip)) in reactions.iter().zip(chips).enumerate() {
         let (x, y) = (chip.left(), chip.top());
-        let fg = if r.chosen {
-            colors.reaction_chosen_fg
-        } else if outgoing {
-            colors.msg_out_date_fg
-        } else {
-            colors.active_text_fg
-        };
-        let bg = if r.chosen {
-            colors.reaction_chosen_bg
-        } else if outgoing {
-            colors.reaction_out_bg
-        } else {
-            colors.reaction_in_bg
-        };
+        let paid = matches!(
+            crate::history::reaction_buttons::reaction_image(&r.emoji),
+            crate::history::reaction_buttons::ReactionImage::Paid
+        );
+        let (bg, fg) = crate::history::reaction_buttons::reaction_button_colors(
+            colors, r.chosen, outgoing, paid,
+        );
         let count_galley = ui.painter().layout_no_wrap(
             reaction_count_text(r),
             FontId::new(12.0, tg_ui::fonts::family_semibold()),
@@ -1842,14 +1886,21 @@ fn paint_reactions_row(
             Pos2::new(x + REACTION_PAD_LEFT, y + REACTION_PAD_V),
             Vec2::splat(REACTION_SIZE),
         );
-        let ctx = ui.ctx().clone();
-        let _ = assets.emoji().paint_emoji_str(
-            ui.painter(),
-            &ctx,
+        if !crate::history::reaction_buttons::paint_special_reaction_image(
+            ui,
             &r.emoji,
-            emoji_rect,
-            Color32::WHITE,
-        );
+            emoji_rect.min,
+            fg,
+        ) {
+            let ctx = ui.ctx().clone();
+            let _ = assets.emoji().paint_emoji_str(
+                ui.painter(),
+                &ctx,
+                &r.emoji,
+                emoji_rect,
+                Color32::WHITE,
+            );
+        }
         if let Some(pics) = userpics {
             let mut list: Vec<&(PeerId, String)> = Vec::with_capacity(2);
             if !r.chosen || r.count > 1 {

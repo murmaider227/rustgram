@@ -40,7 +40,7 @@ tg-wallet = { path = "../tg-wallet" }
 tg-webview = { path = "../tg-webview" }
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.44"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

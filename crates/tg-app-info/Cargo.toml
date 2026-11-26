@@ -34,7 +34,7 @@ tg-transport = { path = "../tg-transport" }
 tg-ui = { path = "../tg-ui" }
 tg-wallet = { path = "../tg-wallet" }
 tracing = "0.1.44"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 eframe = { workspace = true }

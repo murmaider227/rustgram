@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jiff = "1.0"
 parking_lot = "0.12.5"
 tg-api = { path = "../tg-api" }
 tg-core = { path = "../tg-core" }

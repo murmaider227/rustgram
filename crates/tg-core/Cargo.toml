@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jiff = "1.0"
 md-5 = "0.10"
 rand = "0.8"
 tg-storage = { path = "../tg-storage" }

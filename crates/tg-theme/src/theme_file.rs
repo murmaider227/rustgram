@@ -503,7 +503,8 @@ fn read_zip_entry_case_insensitive(
         let entry = archive
             .by_index(i)
             .map_err(|e| ThemeError::Zip(e.to_string()))?;
-        if entry.name().to_ascii_lowercase() == target_lower {
+        let name = entry.name().map_err(|e| ThemeError::Zip(e.to_string()))?;
+        if name.to_ascii_lowercase() == target_lower {
             matched_index = Some(i);
             break;
         }

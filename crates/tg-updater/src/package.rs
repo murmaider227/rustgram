@@ -638,8 +638,13 @@ pub fn unpack_verified_package(
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
-        if !is_safe_archive_path(&name)
+        let name = entry
+            .name()
+            .map_err(|e| UpdateError::Archive(e.to_string()))?
+            .into_owned();
+        // `pack_update` never writes symlinks; one in a package is malformed or hostile.
+        if entry.is_symlink()
+            || !is_safe_archive_path(&name)
             || !register_unique_path(&name, &mut seen_files, &mut seen_dirs)
         {
             let _ = fs::remove_dir_all(&temp_dir);

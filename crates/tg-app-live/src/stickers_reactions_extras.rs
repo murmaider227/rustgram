@@ -1075,41 +1075,68 @@ impl LiveSession {
         peer_id: PeerId,
         msg_ids: &[MsgId],
     ) -> Result<Vec<MsgId>, String> {
-        let data_peer = to_data_peer(peer_id);
-        if data_peer.is_user() || msg_ids.is_empty() {
-            return Ok(Vec::new());
+        let due = self.due_reaction_polls(peer_id, msg_ids, false);
+        self.poll_reactions_of_live(peer_id, &due)
+    }
+
+    /// The ids of `msg_ids` whose reactions were not polled during the last `kPollEach` (none
+    /// in a 1:1 chat). With `mark`, they count as polled now: the history calls this for its
+    /// painted messages every frame (`HistoryInner::paintEvent` -> `Reactions::poll`), so a
+    /// visible message costs one map lookup until it is due again.
+    pub(crate) fn due_reaction_polls(
+        &self,
+        peer_id: PeerId,
+        msg_ids: &[MsgId],
+        mark: bool,
+    ) -> Vec<MsgId> {
+        if to_data_peer(peer_id).is_user() || msg_ids.is_empty() {
+            return Vec::new();
         }
         let now_ms = now_ms_u64(self);
         let state = state_for_live(self);
-        let due_candidates: Vec<MsgId> = {
-            let g = state.lock().unwrap_or_else(|e| e.into_inner());
-            let mut seen = Vec::with_capacity(msg_ids.len());
-            for &mid in msg_ids {
-                if mid.0 <= 0 || seen.contains(&mid) {
-                    continue;
-                }
-                let due = g
-                    .reactions_last_polled_ms
-                    .get(&(peer_id, mid))
-                    .is_none_or(|&last| now_ms.saturating_sub(last) >= REACTIONS_POLL_INTERVAL_MS);
-                if due {
-                    seen.push(mid);
-                }
+        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut due = Vec::with_capacity(msg_ids.len());
+        for &mid in msg_ids {
+            if mid.0 <= 0 || due.contains(&mid) {
+                continue;
             }
-            seen
-        };
-        if due_candidates.is_empty() {
+            let is_due = g
+                .reactions_last_polled_ms
+                .get(&(peer_id, mid))
+                .is_none_or(|&last| now_ms.saturating_sub(last) >= REACTIONS_POLL_INTERVAL_MS);
+            if is_due {
+                due.push(mid);
+            }
+        }
+        if mark {
+            for &mid in &due {
+                g.reactions_last_polled_ms.insert((peer_id, mid), now_ms);
+            }
+        }
+        due
+    }
+
+    /// Sends `messages.getMessagesReactions` for the messages of `candidates` that ever carried
+    /// a reactions object (`HistoryItem::lastReactionsRefreshTime() != 0`: an empty list counts,
+    /// a channel post with no reactions yet gets them this way). Returns the polled ids.
+    pub(crate) fn poll_reactions_of_live(
+        &self,
+        peer_id: PeerId,
+        candidates: &[MsgId],
+    ) -> Result<Vec<MsgId>, String> {
+        let data_peer = to_data_peer(peer_id);
+        if data_peer.is_user() || candidates.is_empty() {
             return Ok(Vec::new());
         }
         let with_reactions: Vec<MsgId> = read_session(self, |session| {
-            due_candidates
-                .into_iter()
+            candidates
+                .iter()
+                .copied()
                 .filter(|&mid| {
                     let full_id = DataFullMsgId::new(data_peer, to_data_msg(mid));
                     session
                         .message(full_id)
-                        .and_then(|m| m.reactions.as_ref())
-                        .is_some_and(|r| !r.is_empty())
+                        .is_some_and(|m| m.reactions.is_some())
                 })
                 .collect()
         });
@@ -1119,6 +1146,8 @@ impl LiveSession {
         // Record poll attempt timestamp before invoking so transient errors also respect
         // `kPollEach` instead of re-polling on every frame.
         {
+            let now_ms = now_ms_u64(self);
+            let state = state_for_live(self);
             let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
             for &mid in &with_reactions {
                 g.reactions_last_polled_ms.insert((peer_id, mid), now_ms);

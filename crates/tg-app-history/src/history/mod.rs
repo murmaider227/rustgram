@@ -17,6 +17,7 @@ pub mod compose_boxes;
 pub mod compose_extras;
 pub mod compose_search;
 pub mod compose_stash;
+pub mod copy_selection;
 pub mod edit_caption;
 pub mod emoji_interactions;
 mod entity_clicks;
@@ -25,6 +26,7 @@ pub mod inline_media;
 pub mod inner;
 pub mod marking_read;
 pub mod media;
+pub mod message_text_state;
 pub mod mock;
 pub mod mock_ext;
 pub mod monoforum;
@@ -34,6 +36,7 @@ pub mod paint_cache;
 pub mod photo_frame;
 pub mod pull_to_next_channel;
 pub mod quick_action;
+pub mod reaction_buttons;
 mod read_gate;
 pub mod read_receipts;
 pub mod reply_preview;
@@ -52,6 +55,7 @@ pub mod user_errors;
 pub mod video_cover;
 pub mod video_editor;
 pub mod video_message_seek;
+mod voice_send;
 pub mod voice_view;
 pub use tg_app_info::boxes::welcome_messages;
 
@@ -65,6 +69,8 @@ mod sections_screenshot;
 mod sections_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_album_tile_media;
 #[cfg(test)]
 mod tests_alpha2_bubble_media;
 #[cfg(test)]
@@ -94,6 +100,8 @@ mod tests_photo_layout;
 #[cfg(test)]
 mod tests_photo_snap;
 #[cfg(test)]
+mod tests_reactions_row_snap;
+#[cfg(test)]
 mod tests_round_video;
 #[cfg(test)]
 mod tests_round_video_snap;
@@ -104,6 +112,10 @@ mod tests_scroll_paging;
 #[cfg(test)]
 mod tests_sec3a;
 #[cfg(test)]
+mod tests_spoiler_snap;
+#[cfg(test)]
+mod tests_spoiler_state;
+#[cfg(test)]
 mod tests_tgb2971_pull;
 #[cfg(test)]
 mod tests_transcribe_failure_snap;
@@ -112,9 +124,15 @@ mod tests_user_errors;
 #[cfg(test)]
 mod tests_video_editor_wire2;
 #[cfg(test)]
+mod tests_voice_send;
+#[cfg(test)]
 mod tests_w4_text;
 #[cfg(test)]
 mod tests_w4_text_snap;
+#[cfg(test)]
+mod tests_w5_copy;
+#[cfg(test)]
+mod tests_w5_copy_snap;
 #[cfg(test)]
 mod tests_wave4_media;
 #[cfg(test)]
@@ -3751,13 +3769,14 @@ impl HistoryWidget {
                     }
                 }
                 ComposeEvent::VoiceCaptured(voice) => {
-                    let req = SendMessageExtended {
-                        media: Some(HistoryMedia::Voice(voice)),
-                        silent: self.compose.silent_mode,
-                        ..SendMessageExtended::default()
-                    };
-                    if let Ok(sent) = backend.send_message_extended(peer_id, req) {
-                        self.inner.append_message(sent, peer_info.summary.kind);
+                    if self.send_recorded_voice(
+                        peer_id,
+                        peer_info.summary.kind,
+                        voice,
+                        backend,
+                        now_secs,
+                    ) {
+                        backend.record_slow_mode_send(peer_id, now_unix_i64);
                     }
                 }
                 ComposeEvent::RoundVideoCaptured(rv) => {
@@ -5394,7 +5413,9 @@ impl HistoryWidget {
                 }
                 InnerEvent::CopiedRich { summary, rich } => {
                     self.compose.copied_rich_buffer = Some(rich);
-                    self.show_toast(summary, now_secs);
+                    if !summary.is_empty() {
+                        self.show_toast(summary, now_secs);
+                    }
                 }
                 InnerEvent::OpenMedia {
                     msg_id,

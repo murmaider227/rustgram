@@ -638,7 +638,10 @@ fn parse_import_zip(archive_name: &str, bytes: &[u8]) -> Result<ParsedImportArch
         if entry.is_dir() {
             continue;
         }
-        let raw_name = entry.name().replace('\\', "/");
+        let raw_name = entry
+            .name()
+            .map_err(|e| format!("Failed reading ZIP entry #{idx} name: {e}"))?
+            .replace('\\', "/");
         if raw_name.contains("..") || raw_name.starts_with('/') || raw_name.starts_with("__MACOSX/")
         {
             continue;

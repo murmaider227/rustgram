@@ -31,6 +31,7 @@ pub mod geo_map;
 mod gift_stickers;
 pub mod history_sections;
 pub mod inline_bot_query;
+pub mod inline_reactions;
 pub mod langpack;
 pub mod layer233_extras;
 pub mod live_extras;
@@ -140,6 +141,8 @@ mod tests_profile_info_extras;
 #[cfg(test)]
 mod tests_pts_feed_remaining;
 #[cfg(test)]
+mod tests_react_older;
+#[cfg(test)]
 mod tests_reply_preview;
 #[cfg(test)]
 mod tests_reply_preview_wave4;
@@ -161,6 +164,8 @@ mod tests_search_topics_conformance;
 mod tests_seca;
 #[cfg(test)]
 mod tests_settings_extra;
+#[cfg(test)]
+mod tests_spoiler_entities;
 #[cfg(test)]
 mod tests_sticker_owner;
 #[cfg(test)]

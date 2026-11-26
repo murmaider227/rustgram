@@ -15,6 +15,7 @@ pub use tg_text;
 pub use tg_theme;
 
 pub mod anim;
+pub mod clipboard;
 pub mod custom_emoji;
 pub mod effects;
 pub mod entity_link;

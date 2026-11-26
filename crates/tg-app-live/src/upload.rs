@@ -1247,18 +1247,17 @@ where
                 |p| track_upload(&mut prev, p),
             )
             .await?;
-            let attributes = vec![
-                tl_enums::DocumentAttribute::Filename(tl_types::DocumentAttributeFilename {
-                    file_name: effective_name,
-                }),
-                tl_enums::DocumentAttribute::Audio(tl_types::DocumentAttributeAudio {
+            // `FileLoadTask::process` for a voice note keeps only the audio attribute
+            // (`attributes.resize(1)`): no file name.
+            let attributes = vec![tl_enums::DocumentAttribute::Audio(
+                tl_types::DocumentAttributeAudio {
                     voice: true,
                     duration: duration_secs.max(0),
                     title: None,
                     performer: None,
                     waveform: (!waveform_5bit.is_empty()).then_some(waveform_5bit),
-                }),
-            ];
+                },
+            )];
             let input_media =
                 tl_enums::InputMedia::UploadedDocument(tl_types::InputMediaUploadedDocument {
                     nosound_video: false,
@@ -2398,6 +2397,7 @@ pub(super) fn send_history_media_extended(
     let req_ttl_seconds = request.ttl_seconds;
     let req_round_video_path = request.round_video_path.clone();
     let req_video_cover_jpeg = request.video_cover_jpeg;
+    let req_voice_ogg = request.voice_ogg.filter(|bytes| !bytes.is_empty());
 
     match media {
         HistoryMedia::Photo(photo) => {
@@ -2475,7 +2475,12 @@ pub(super) fn send_history_media_extended(
             live.send_uploaded_media(peer_id, outgoing, opts)
         }
         HistoryMedia::Voice(voice) => {
-            let bytes = resolve_bytes_for_attachment(live, "voice.ogg", None)?;
+            // The recorder hands over the encoded file (`sendVoiceMessage(result.bytes, ..)`);
+            // bytes staged under "voice.ogg" remain the fallback for programmatic sends.
+            let bytes = match req_voice_ogg {
+                Some(bytes) => bytes,
+                None => resolve_bytes_for_attachment(live, "voice.ogg", None)?,
+            };
             live.send_uploaded_media(
                 peer_id,
                 OutgoingMedia::Voice {

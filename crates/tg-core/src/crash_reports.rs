@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use chrono::Local;
+use jiff::ZonedDateTime;
 use thiserror::Error;
 
 use crate::globals::{GlobalConfig, Platform};
@@ -172,7 +172,7 @@ impl CrashReportManager {
     /// Populates standard process annotations (`CrashReports::StartCatching`).
     pub fn init_default_annotations(&self, config: &GlobalConfig, installation_tag: u64) {
         let version_str = default_version_string(config.alpha_version);
-        let launched = Local::now().format("%d.%m.%Y %H:%M:%S").to_string();
+        let launched = report_timestamp(&ZonedDateTime::now());
 
         self.set_annotation("Binary", &config.exe_name);
         self.set_annotation("Version", &version_str);
@@ -329,7 +329,7 @@ impl CrashReportManager {
 
         // Archive a timestamped copy under `tdata/dumps/`.
         if fs::create_dir_all(&self.dumps_dir).is_ok() {
-            let ts = Local::now().format("%Y%m%d_%H%M%S_%3f");
+            let ts = dump_file_timestamp(&ZonedDateTime::now());
             let seq = DUMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let archive_path = self.dumps_dir.join(format!("crash_{ts}_{seq}.txt"));
             if fs::write(&archive_path, report.as_bytes()).is_ok() {
@@ -378,7 +378,7 @@ impl CrashReportManager {
         report.push_str("Thread: ");
         report.push_str(&current_thread_description());
         report.push_str("\nCrashedAt: ");
-        report.push_str(&Local::now().format("%d.%m.%Y %H:%M:%S").to_string());
+        report.push_str(&report_timestamp(&ZonedDateTime::now()));
         report.push_str("\nWorkingDir: ");
         report.push_str(&self.working_dir.to_string_lossy());
 
@@ -410,6 +410,16 @@ impl CrashReportManager {
         }
         report
     }
+}
+
+/// `dd.MM.yyyy hh:mm:ss` local time for the `Launched` / `CrashedAt` report fields.
+fn report_timestamp(now: &ZonedDateTime) -> String {
+    now.strftime("%d.%m.%Y %H:%M:%S").to_string()
+}
+
+/// `yyyyMMdd_hhmmss_zzz` local time in archived dump file names.
+fn dump_file_timestamp(now: &ZonedDateTime) -> String {
+    now.strftime("%Y%m%d_%H%M%S_%3f").to_string()
 }
 
 fn default_version_string(alpha_version: u64) -> String {
@@ -657,6 +667,20 @@ mod win_exception {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// TGB-3019: the chrono -> jiff switch keeps the report and dump-name formats byte for byte.
+    #[test]
+    fn report_and_dump_timestamps_keep_their_format() {
+        let at: ZonedDateTime = "2026-03-07T04:05:06.789123456+02:00[+02:00]"
+            .parse()
+            .expect("fixed zoned literal");
+        assert_eq!(report_timestamp(&at), "07.03.2026 04:05:06");
+        assert_eq!(dump_file_timestamp(&at), "20260307_040506_789");
+        let whole: ZonedDateTime = "2026-12-31T23:59:59+00:00[UTC]"
+            .parse()
+            .expect("fixed zoned literal");
+        assert_eq!(dump_file_timestamp(&whole), "20261231_235959_000");
+    }
 
     #[test]
     fn clean_exit_vs_crash_detection_lifecycle() {

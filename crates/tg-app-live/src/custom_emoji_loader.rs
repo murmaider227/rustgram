@@ -85,8 +85,8 @@ fn state_for(live: &LiveSession) -> Arc<Mutex<LoaderState>> {
     created
 }
 
-/// Custom emoji document ids `messages` paint: emoji statuses on name lines and custom emoji
-/// entities in the text.
+/// Custom emoji document ids `messages` paint: emoji statuses on name lines, custom emoji
+/// entities in the text and custom emoji reactions (TGB-3017).
 pub(crate) fn wanted_ids(messages: &[HistoryMessage]) -> Vec<u64> {
     let mut out = Vec::new();
     for msg in messages {
@@ -100,6 +100,7 @@ pub(crate) fn wanted_ids(messages: &[HistoryMessage]) -> Vec<u64> {
                 out.push(id);
             }
         }
+        out.extend(crate::inline_reactions::custom_emoji_ids(&msg.reactions));
     }
     out
 }

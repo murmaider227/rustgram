@@ -690,7 +690,10 @@ where
         let mut entry = archive
             .by_index(idx)
             .map_err(|err| CloudBlobError::Archive(err.to_string()))?;
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(|err| CloudBlobError::Archive(err.to_string()))?
+            .into_owned();
 
         // Reject symlinks unconditionally, even before checking name filters.
         if is_zip_entry_symlink(&entry) {

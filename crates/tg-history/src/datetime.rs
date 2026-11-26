@@ -8,7 +8,8 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::{Local, Offset, TimeZone};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 /// Sentinel stored in [`UTC_OFFSET_OVERRIDE`] when no override is active.
 const NO_OVERRIDE: i64 = i64::MIN;
@@ -53,13 +54,10 @@ thread_local! {
     };
 }
 
-/// Asks the system time zone (a Windows time-zone query per call, which is why the result is
-/// cached).
+/// Asks the system time zone (a zone handle lookup plus a search of its transitions per call,
+/// which is why the result is cached).
 fn system_utc_offset_secs(unix_secs: i64) -> i32 {
-    Local
-        .timestamp_opt(unix_secs, 0)
-        .single()
-        .map_or(0, |dt| dt.offset().fix().local_minus_utc())
+    Timestamp::from_second(unix_secs).map_or(0, |ts| TimeZone::system().to_offset(ts).seconds())
 }
 
 /// UTC offset (seconds east of UTC) of the system local time zone at `unix_secs`, including

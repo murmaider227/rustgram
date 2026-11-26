@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Local};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use tg_api::{ApiError, LoadDirection, LoginErrorKind, LoginStep, RpcClient, SendOptions};
@@ -216,13 +217,13 @@ fn render_qr_terminal(url: &str) -> Result<String, String> {
 }
 
 fn format_timestamp(ts: TimeId) -> String {
-    DateTime::from_timestamp(i64::from(ts), 0)
-        .map(|dt| {
-            dt.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M")
+    Timestamp::from_second(i64::from(ts))
+        .map(|t| {
+            t.to_zoned_datetime(TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M")
                 .to_string()
         })
-        .unwrap_or_else(|| ts.to_string())
+        .unwrap_or_else(|_| ts.to_string())
 }
 
 async fn run_phone_login(flow: &mut LoginFlow) -> Result<tg_tl::types::User, SessionError> {

@@ -14,7 +14,7 @@ sha2 = "0.10.9"
 tg-updater = { path = "../tg-updater" }
 thiserror = "2.0.21"
 tiny-skia = "0.11.4"
-zip = { version = "2.6.1", default-features = false, features = ["deflate"] }
+zip = { version = "9.8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

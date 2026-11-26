@@ -2824,16 +2824,26 @@ impl LiveSession {
     /// open history as edits, like tdesktop's periodic `Data::Reactions` poll. The slice shows the
     /// reactions it was loaded with until then.
     fn poll_slice_reactions_in_background(&self, peer_id: PeerId, messages: &[HistoryMessage]) {
-        let data_peer = to_data_peer(peer_id);
-        if data_peer.is_user() {
-            return;
-        }
-        let reacted_ids: Vec<MsgId> = messages
+        let ids: Vec<MsgId> = messages
             .iter()
-            .filter(|m| m.id.0 > 0 && !m.reactions.is_empty())
+            .filter(|m| m.id.0 > 0)
             .map(|m| m.id)
             .collect();
-        if reacted_ids.is_empty() {
+        self.poll_reactions_in_background(peer_id, ids, false);
+    }
+
+    /// Polls the reactions of `ids` on a worker thread, one poll per chat at a time; the
+    /// messages whose reactions changed reach the open history as edits. With `mark_due` the
+    /// ids are first narrowed to those due ([`Self::due_reaction_polls`]) and marked polled, so
+    /// the history can pass its painted messages every frame (TGB-3013).
+    pub(crate) fn poll_reactions_in_background(
+        &self,
+        peer_id: PeerId,
+        ids: Vec<MsgId>,
+        mark_due: bool,
+    ) {
+        let data_peer = to_data_peer(peer_id);
+        if data_peer.is_user() || ids.is_empty() {
             return;
         }
         let first = self
@@ -2843,27 +2853,58 @@ impl LiveSession {
         if !first {
             return;
         }
+        let release = move |live: &Self| {
+            if let Ok(mut c) = live.cache.lock() {
+                c.reaction_polls.remove(&data_peer);
+            }
+        };
+        let ids = if mark_due {
+            self.due_reaction_polls(peer_id, &ids, true)
+        } else {
+            ids
+        };
+        if ids.is_empty() {
+            release(self);
+            return;
+        }
         let live = self.clone();
         let spawned = std::thread::Builder::new()
             .name("reactions-poll".to_owned())
             .spawn(move || {
-                if let Ok(polled) = live.poll_visible_messages_reactions_live(peer_id, &reacted_ids)
-                    && !polled.is_empty()
-                {
+                let snapshot = |live: &Self| {
+                    live.read_session(|s| {
+                        ids.iter()
+                            .map(|&id| {
+                                s.message(DataFullMsgId::new(data_peer, to_data_msg(id)))
+                                    .and_then(|m| m.reactions.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let before = snapshot(&live);
+                let polled = if mark_due {
+                    live.poll_reactions_of_live(peer_id, &ids)
+                } else {
+                    live.poll_visible_messages_reactions_live(peer_id, &ids)
+                };
+                if polled.is_ok_and(|p| !p.is_empty()) {
+                    let after = snapshot(&live);
                     let bridge = live.bridge.state();
-                    for id in polled {
-                        bridge.record_message_edited(data_peer, to_data_msg(id));
+                    let mut changed = false;
+                    for ((id, was), now) in ids.iter().zip(&before).zip(&after) {
+                        if was != now {
+                            bridge.record_message_edited(data_peer, to_data_msg(*id));
+                            changed = true;
+                        }
                     }
-                    bridge.notify_chat_changed(data_peer);
+                    if changed {
+                        bridge.notify_chat_changed(data_peer);
+                    }
                 }
-                if let Ok(mut c) = live.cache.lock() {
-                    c.reaction_polls.remove(&data_peer);
-                }
+                release(&live);
             });
-        if spawned.is_err()
-            && let Ok(mut c) = self.cache.lock()
-        {
-            c.reaction_polls.remove(&data_peer);
+        if spawned.is_err() {
+            release(self);
         }
     }
 
@@ -2873,7 +2914,7 @@ impl LiveSession {
         }
         let reacted_ids: Vec<MsgId> = messages
             .iter()
-            .filter(|m| m.id.0 > 0 && !m.reactions.is_empty())
+            .filter(|m| m.id.0 > 0)
             .map(|m| m.id)
             .collect();
         if reacted_ids.is_empty() {
@@ -4426,6 +4467,10 @@ impl HistoryBackend for LiveSession {
         msg_ids: &[MsgId],
     ) -> Result<Vec<MsgId>, String> {
         self.poll_visible_messages_reactions_live(peer_id, msg_ids)
+    }
+
+    fn poll_painted_reactions(&self, peer_id: PeerId, msg_ids: &[MsgId]) {
+        self.poll_reactions_in_background(peer_id, msg_ids.to_vec(), true);
     }
 
     fn load_unread_things_page(

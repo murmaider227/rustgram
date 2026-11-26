@@ -8,17 +8,7 @@ all-features = false
 # RustSec advisory database: known vulnerabilities, unmaintained and yanked crates fail the check.
 version = 2
 yanked = "deny"
-ignore = [
-    # Known and tracked in TGB-3019 (zip 2.x -> >= 9.0.5). Remove each entry when fixed.
-    { id = "RUSTSEC-2026-0367", reason = "zip 2.x, upgrade tracked in TGB-3019" },
-    { id = "RUSTSEC-2026-0368", reason = "zip 2.x, upgrade tracked in TGB-3019" },
-    { id = "RUSTSEC-2026-0369", reason = "zip 2.x, upgrade tracked in TGB-3019" },
-    { id = "RUSTSEC-2026-0429", reason = "zip 2.x, upgrade tracked in TGB-3019" },
-    { id = "RUSTSEC-2026-0545", reason = "zip 2.x, upgrade tracked in TGB-3019" },
-    { id = "RUSTSEC-2026-0548", reason = "zip 2.x, upgrade tracked in TGB-3019" },
-    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite via rusqlite 0.32, upgrade tracked in TGB-3019" },
-    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, replacement tracked in TGB-3019" },
-]
+ignore = []
 
 [licenses]
 # Every dependency must be usable in a GPL-3.0-or-later program. GPL-2.0-only is not in the list:

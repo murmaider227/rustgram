@@ -11,18 +11,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui::text::LayoutJob;
-use egui::{Color32, CursorIcon, FontId, Galley, Id, Pos2, Rect, Sense, Ui, Vec2};
+use egui::{Color32, CursorIcon, FontId, Galley, Id, Pos2, Rect, Sense, Ui};
 use tg_style::Icon as TgIcon;
 use tg_text::{EntityInText, EntityType, TextWithEntities};
 
 use super::{
     EntityTextResponse, LaidOutRichText, LegacySegment, RichText, RichTextOptions,
     RichTextResponse, byte_range_rects, layout_job_for_segments,
-    layout_text_with_entities_expanded, split_legacy_segments,
+    layout_text_with_entities_expanded, split_legacy_segments, spoiler_reveal_progress,
 };
-use crate::anim::with_alpha;
 use crate::custom_emoji::{CustomEmojiRenderer, has_registered_custom_emoji};
-use crate::effects::paint_spoiler_particles;
+use crate::effects::{merge_spoiler_rects, paint_text_spoiler};
 use crate::style::{QuoteStyle, TextPalette, TextStyle};
 
 thread_local! {
@@ -189,6 +188,10 @@ fn same_layout_options(a: &RichTextOptions, b: &RichTextOptions) -> bool {
         pre_style,
         syntax_palette,
         pause_custom_emoji: _,
+        // The caller's reveal progress and expanded quotes reach the layout as
+        // `spoilers_revealed` and the `expanded_blockquotes` argument.
+        spoiler_reveal: _,
+        expanded_blockquotes: _,
     } = a;
     *max_width == b.max_width
         && *max_lines == b.max_lines
@@ -373,6 +376,35 @@ pub fn render_prepared_rich_text(
         palette,
         base_color,
         max_width,
+        None,
+    )
+}
+
+/// [`render_prepared_rich_text`] for a caller that keeps the spoiler state itself (a chat
+/// message: tdesktop hides its spoilers again when the chat changes). `reveal` is how far the
+/// spoilers have faded in (`0` hidden, `1` revealed, see [`super::spoiler_reveal_progress`]);
+/// a click on a hidden spoiler only sets [`RichTextResponse::spoiler_toggled`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_prepared_rich_text_with_reveal(
+    ui: &mut Ui,
+    id: Id,
+    prepared: &mut PreparedRichText,
+    style: &TextStyle,
+    palette: &TextPalette,
+    base_color: Color32,
+    max_width: f32,
+    reveal: f32,
+) -> RichTextResponse {
+    render_rich_text_cached(
+        ui,
+        id,
+        &prepared.rich,
+        &mut prepared.cache,
+        style,
+        palette,
+        base_color,
+        max_width,
+        Some(reveal),
     )
 }
 
@@ -386,13 +418,24 @@ pub(super) fn render_rich_text_cached(
     palette: &TextPalette,
     base_color: Color32,
     max_width: f32,
+    external_reveal: Option<f32>,
 ) -> RichTextResponse {
-    let reveal_id = id.with("_tg_spoiler_revealed");
+    let reveal_id = id.with("_tg_spoiler_revealed_at");
     let hover_link_id = id.with("_tg_hover_link");
-    let mut revealed = ui
-        .ctx()
-        .data_mut(|d| d.get_temp::<bool>(reveal_id))
-        .unwrap_or(false);
+    let now = ui.input(|i| i.time);
+    let reveal = match external_reveal {
+        Some(progress) => progress.clamp(0.0, 1.0),
+        None => ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<f64>(reveal_id))
+            .map_or(0.0, |at| spoiler_reveal_progress(now - at)),
+    };
+    let revealed = reveal >= 1.0;
+    // A spoiler takes the click only while it is fully hidden.
+    let spoilers_clickable = reveal <= 0.0;
+    if !revealed && !spoilers_clickable {
+        ui.ctx().request_repaint();
+    }
     let prev_hovered = ui
         .ctx()
         .data_mut(|d| d.get_temp::<Option<String>>(hover_link_id))
@@ -401,7 +444,10 @@ pub(super) fn render_rich_text_cached(
     let wrap_w = max_width.max(1.0);
     cache.validate(ui.ctx(), style, palette, base_color, wrap_w);
     let RichTextCache {
-        segments, shown, ..
+        segments,
+        shown,
+        plain,
+        ..
     } = cache;
     let segments: &[LegacySegment] = segments.get_or_insert_with(|| split_legacy_segments(rich));
 
@@ -455,7 +501,7 @@ pub(super) fn render_rich_text_cached(
         shown.hits = Some(HitRects {
             origin: rect.min,
             links,
-            spoilers,
+            spoilers: merge_spoiler_rects(&spoilers),
         });
     }
     let (link_hits, spoiler_rects): (&[(Rect, usize)], &[Rect]) = match &shown.hits {
@@ -476,7 +522,7 @@ pub(super) fn render_rich_text_cached(
     if let Some(pos) = pointer
         && rect.contains(pos)
     {
-        if !revealed && spoiler_rects.iter().any(|r| r.contains(pos)) {
+        if spoilers_clickable && spoiler_rects.iter().any(|r| r.contains(pos)) {
             hovering_spoiler = true;
         } else {
             new_hovered_link = link_at(pos);
@@ -502,10 +548,11 @@ pub(super) fn render_rich_text_cached(
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
     {
-        if !revealed && spoiler_rects.iter().any(|r| r.contains(pos)) {
-            revealed = true;
+        if spoilers_clickable && spoiler_rects.iter().any(|r| r.contains(pos)) {
             out.spoiler_toggled = true;
-            ui.ctx().data_mut(|d| d.insert_temp(reveal_id, revealed));
+            if external_reveal.is_none() {
+                ui.ctx().data_mut(|d| d.insert_temp(reveal_id, now));
+            }
             ui.ctx().request_repaint();
         } else {
             out.clicked_link = link_at(pos).map(str::to_owned);
@@ -515,18 +562,31 @@ pub(super) fn render_rich_text_cached(
     if ui.is_rect_visible(rect) {
         ui.painter().galley(rect.min, galley, base_color);
 
-        if !revealed {
-            let bg = with_alpha(palette.spoiler_fg, 0.16);
-            for (i, srect) in spoiler_rects.iter().enumerate() {
-                paint_spoiler_particles(
-                    ui.ctx(),
-                    ui.painter(),
-                    srect.expand2(Vec2::new(1.0, 0.0)),
-                    palette.spoiler_fg,
-                    bg,
-                    (i as u64).wrapping_add(1),
-                );
+        if !revealed && !spoiler_rects.is_empty() {
+            if !spoilers_clickable {
+                // The spoilers fade in: the revealed text over them (`_spoilerOpacity`).
+                let revealed_galley = Arc::clone(plain.get_or_insert_with(|| {
+                    let job = layout_job_for_segments(
+                        &rich.text, segments, style, palette, base_color, wrap_w, None, true,
+                    );
+                    ui.painter().layout_job(job)
+                }));
+                for srect in spoiler_rects {
+                    let mut fade = ui
+                        .painter()
+                        .with_clip_rect(ui.painter().clip_rect().intersect(*srect));
+                    fade.multiply_opacity(reveal);
+                    fade.galley(rect.min, Arc::clone(&revealed_galley), base_color);
+                }
             }
+            paint_text_spoiler(
+                ui.ctx(),
+                ui.painter(),
+                spoiler_rects,
+                rect.min,
+                palette.spoiler_fg,
+                1.0 - reveal,
+            );
         }
     }
 
@@ -553,13 +613,84 @@ struct EntityLayoutEntry {
     laid: LaidOutRichText,
 }
 
+impl EntityLayoutEntry {
+    fn is_for(
+        &self,
+        epoch: u64,
+        emoji_registered: &[bool],
+        style: &TextStyle,
+        palette: &TextPalette,
+        options: &RichTextOptions,
+        expanded_blockquotes: &[usize],
+    ) -> bool {
+        self.epoch == epoch
+            && self.expanded_blockquotes == expanded_blockquotes
+            && self.emoji_registered == emoji_registered
+            && same_style(&self.style, style)
+            && same_palette(&self.palette, palette)
+            && same_layout_options(&self.options, options)
+    }
+}
+
 /// The last [`LaidOutRichText`] of one text, reused while its inputs stay the same.
 #[derive(Default)]
 pub(super) struct EntityLayoutCache {
     entry: Option<EntityLayoutEntry>,
+    /// The revealed layout painted over the spoilers while they fade in; it becomes `entry`
+    /// when the fade ends.
+    fade: Option<EntityLayoutEntry>,
 }
 
 impl EntityLayoutCache {
+    /// The revealed layout for the spoiler fade, kept in its own slot so the hidden layout in
+    /// `entry` stays too: neither is laid out again on the frames of the fade.
+    pub(super) fn fade_layout(
+        &mut self,
+        ctx: &egui::Context,
+        source: &TextWithEntities,
+        style: &TextStyle,
+        palette: &TextPalette,
+        options: &RichTextOptions,
+        expanded_blockquotes: &[usize],
+    ) -> &LaidOutRichText {
+        let epoch = fonts_epoch(ctx);
+        let emoji_registered = custom_emoji_registered(&source.entities);
+        if !self.fade.as_ref().is_some_and(|e| {
+            e.is_for(
+                epoch,
+                &emoji_registered,
+                style,
+                palette,
+                options,
+                expanded_blockquotes,
+            )
+        }) {
+            self.fade = None;
+        }
+        let entry = self.fade.get_or_insert_with(|| EntityLayoutEntry {
+            style: *style,
+            palette: *palette,
+            options: options.clone(),
+            expanded_blockquotes: expanded_blockquotes.to_vec(),
+            emoji_registered,
+            epoch,
+            laid: layout_text_with_entities_expanded(
+                ctx,
+                source,
+                style,
+                palette,
+                options,
+                expanded_blockquotes,
+            ),
+        });
+        &entry.laid
+    }
+
+    /// Drops the fade layout once no fade is running.
+    pub(super) fn clear_fade(&mut self) {
+        self.fade = None;
+    }
+
     /// The layout of `source` for these parameters: the kept one, or a new one.
     ///
     /// The caller guarantees `source` is the text this cache belongs to.
@@ -574,16 +705,19 @@ impl EntityLayoutCache {
     ) -> &LaidOutRichText {
         let epoch = fonts_epoch(ctx);
         let emoji_registered = custom_emoji_registered(&source.entities);
-        let reuse = self.entry.as_ref().is_some_and(|e| {
-            e.epoch == epoch
-                && e.expanded_blockquotes == expanded_blockquotes
-                && e.emoji_registered == emoji_registered
-                && same_style(&e.style, style)
-                && same_palette(&e.palette, palette)
-                && same_layout_options(&e.options, options)
-        });
-        if !reuse {
-            self.entry = None;
+        let fits = |e: &EntityLayoutEntry| {
+            e.is_for(
+                epoch,
+                &emoji_registered,
+                style,
+                palette,
+                options,
+                expanded_blockquotes,
+            )
+        };
+        if !self.entry.as_ref().is_some_and(fits) {
+            // The fade's revealed layout is the one wanted when the fade ends.
+            self.entry = self.fade.take().filter(fits);
         }
         let entry = self.entry.get_or_insert_with(|| EntityLayoutEntry {
             style: *style,
@@ -793,8 +927,8 @@ mod tests {
         frames
     }
 
-    /// `render_rich_text` as it was before texts were prepared (copied unchanged): what the
-    /// prepared path has to paint.
+    /// `render_rich_text` as it was before texts were prepared, with the spoiler cover and
+    /// reveal fade of TGB-3009: what the prepared path has to paint.
     #[allow(clippy::too_many_arguments)]
     fn reference_render_rich_text(
         ui: &mut Ui,
@@ -805,12 +939,15 @@ mod tests {
         base_color: Color32,
         max_width: f32,
     ) -> RichTextResponse {
-        let reveal_id = id.with("_tg_spoiler_revealed");
+        let reveal_id = id.with("_tg_spoiler_revealed_at");
         let hover_link_id = id.with("_tg_hover_link");
-        let mut revealed = ui
+        let now = ui.input(|i| i.time);
+        let reveal = ui
             .ctx()
-            .data_mut(|d| d.get_temp::<bool>(reveal_id))
-            .unwrap_or(false);
+            .data_mut(|d| d.get_temp::<f64>(reveal_id))
+            .map_or(0.0, |at| spoiler_reveal_progress(now - at));
+        let revealed = reveal >= 1.0;
+        let clickable = reveal <= 0.0;
         let prev_hovered = ui
             .ctx()
             .data_mut(|d| d.get_temp::<Option<String>>(hover_link_id))
@@ -848,6 +985,7 @@ mod tests {
                 spoiler_rects.extend(rects.iter().copied());
             }
         }
+        let spoiler_rects = merge_spoiler_rects(&spoiler_rects);
 
         let pointer = ui.ctx().pointer_hover_pos();
         let mut new_hovered_link: Option<String> = None;
@@ -855,7 +993,7 @@ mod tests {
         if let Some(pos) = pointer
             && rect.contains(pos)
         {
-            if !revealed && spoiler_rects.iter().any(|r| r.contains(pos)) {
+            if clickable && spoiler_rects.iter().any(|r| r.contains(pos)) {
                 hovering_spoiler = true;
             } else {
                 for (r, url) in &link_hits {
@@ -886,10 +1024,9 @@ mod tests {
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            if !revealed && spoiler_rects.iter().any(|r| r.contains(pos)) {
-                revealed = true;
+            if clickable && spoiler_rects.iter().any(|r| r.contains(pos)) {
                 out.spoiler_toggled = true;
-                ui.ctx().data_mut(|d| d.insert_temp(reveal_id, revealed));
+                ui.ctx().data_mut(|d| d.insert_temp(reveal_id, now));
                 ui.ctx().request_repaint();
             } else {
                 for (r, url) in &link_hits {
@@ -904,18 +1041,27 @@ mod tests {
         if ui.is_rect_visible(rect) {
             ui.painter().galley(rect.min, galley, base_color);
 
-            if !revealed {
-                let bg = with_alpha(palette.spoiler_fg, 0.16);
-                for (i, srect) in spoiler_rects.iter().enumerate() {
-                    paint_spoiler_particles(
-                        ui.ctx(),
-                        ui.painter(),
-                        srect.expand2(Vec2::new(1.0, 0.0)),
-                        palette.spoiler_fg,
-                        bg,
-                        (i as u64).wrapping_add(1),
-                    );
+            if !revealed && !spoiler_rects.is_empty() {
+                if !clickable {
+                    let job =
+                        build_layout_job(rich, style, palette, base_color, wrap_w, None, true);
+                    let revealed_galley = ui.painter().layout_job(job);
+                    for srect in &spoiler_rects {
+                        let mut fade = ui
+                            .painter()
+                            .with_clip_rect(ui.painter().clip_rect().intersect(*srect));
+                        fade.multiply_opacity(reveal);
+                        fade.galley(rect.min, Arc::clone(&revealed_galley), base_color);
+                    }
                 }
+                paint_text_spoiler(
+                    ui.ctx(),
+                    ui.painter(),
+                    &spoiler_rects,
+                    rect.min,
+                    palette.spoiler_fg,
+                    1.0 - reveal,
+                );
             }
         }
 

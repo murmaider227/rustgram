@@ -5,6 +5,7 @@ pub mod fly;
 pub mod radial;
 pub mod ripple;
 pub mod spoiler;
+pub mod text_spoiler;
 pub mod thanos;
 
 pub use fly::{
@@ -18,6 +19,7 @@ pub use radial::{
 };
 pub use ripple::{RippleMask, RippleState, clamp_point_to_round_rect, update_and_paint_ripple};
 pub use spoiler::paint_spoiler_particles;
+pub use text_spoiler::{merge_spoiler_rects, paint_text_spoiler};
 pub use thanos::{
     ThanosEffect, ThanosItem, ThanosParticle, ThanosPolicy, animation_speed_multiplier,
     compute_particle_grid, disappear_progress,

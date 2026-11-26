@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Galley, Id, Key, Pos2, Rect, Sense, Shape,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Galley, Id, Pos2, Rect, Sense, Shape,
     Stroke, Ui, Vec2,
 };
 use tg_style::{FontFlags, font::SUB_SUPER_MULTIPLIER, st};
@@ -36,16 +36,19 @@ use crate::custom_emoji::{
     CustomEmojiPaintContext, CustomEmojiRenderer, has_registered_custom_emoji,
     paint_registered_custom_emoji,
 };
-use crate::effects::paint_spoiler_particles;
+use crate::effects::{merge_spoiler_rects, paint_text_spoiler};
 use crate::fonts::font_id_for_flags;
 use crate::icons::paint_style_icon;
 use crate::style::{LinkUnderline, QuoteStyle, TextPalette, TextStyle, px};
 
 mod prepared;
+#[cfg(test)]
+mod spoiler_tests;
 
 pub use prepared::{
     PreparedEntityText, PreparedRichText, fonts_epoch, note_text_preparation,
-    render_prepared_rich_text, render_prepared_text_with_entities, text_preparation_count,
+    render_prepared_rich_text, render_prepared_rich_text_with_reveal,
+    render_prepared_text_with_entities, text_preparation_count,
 };
 
 // ---------------------------------------------------------------------------
@@ -483,6 +486,7 @@ pub fn render_rich_text(
         palette,
         base_color,
         max_width,
+        None,
     )
 }
 
@@ -637,6 +641,28 @@ pub struct RichTextOptions {
     pub syntax_palette: Option<SyntaxHighlightPalette>,
     /// Pause inline animated custom emoji playback (power saving / offscreen).
     pub pause_custom_emoji: bool,
+    /// Reveal progress of the spoilers when the caller keeps that state (tdesktop's
+    /// `String::setSpoilerRevealed`, a [`SPOILER_REVEAL_SECS`] fade): `0` hidden, `1` revealed.
+    /// `None`: the widget keeps it itself and a click on a hidden spoiler reveals the text.
+    /// Either way a click on a hidden spoiler sets [`EntityTextResponse::spoiler_toggled`].
+    pub spoiler_reveal: Option<f32>,
+    /// Expanded collapsible quotes (block indices) when the caller keeps that state, so the
+    /// height it lays the text out with matches what is painted. `None`: the widget keeps it.
+    /// Either way a click on a quote's toggle sets [`EntityTextResponse::blockquote_toggled`].
+    pub expanded_blockquotes: Option<Vec<usize>>,
+}
+
+/// `fadeWrapDuration`: how long revealed spoiler text takes to fade in.
+pub const SPOILER_REVEAL_SECS: f64 = 0.2;
+
+/// How far the spoilers revealed `elapsed_secs` ago have faded in (`0..=1`, linear like
+/// tdesktop's `Animations::Simple`); `1` at once when animations are off.
+#[must_use]
+pub fn spoiler_reveal_progress(elapsed_secs: f64) -> f32 {
+    if crate::anim::disabled() {
+        return 1.0;
+    }
+    (elapsed_secs / SPOILER_REVEAL_SECS).clamp(0.0, 1.0) as f32
 }
 
 impl RichTextOptions {
@@ -660,6 +686,8 @@ impl RichTextOptions {
             pre_style: QuoteStyle::history_pre(),
             syntax_palette: None,
             pause_custom_emoji: false,
+            spoiler_reveal: None,
+            expanded_blockquotes: None,
         }
     }
 
@@ -977,6 +1005,8 @@ pub struct EntityTextResponse {
     pub spoiler_toggled: bool,
     /// Code text copied when the user clicked a `<pre>` block's copy button.
     pub copied_pre_code: Option<String>,
+    /// Block index of the collapsible quote whose expand / collapse toggle was clicked.
+    pub blockquote_toggled: Option<usize>,
     /// Current active UTF-16 text selection (when `selectable = true`).
     pub selection: TextSelection,
     /// Whether the text was elided due to `max_lines`.
@@ -992,6 +1022,7 @@ impl Default for EntityTextResponse {
             hovered_link: None,
             spoiler_toggled: false,
             copied_pre_code: None,
+            blockquote_toggled: None,
             selection: TextSelection::default(),
             elided: false,
             rect: Rect::NOTHING,
@@ -1402,16 +1433,16 @@ pub fn layout_text_with_entities_expanded(
             (None, None) => None,
         };
 
+        // A collapsed quote just stops after its lines (`Renderer::draw` skips the lines past
+        // `_quoteLinesLeft`); only a `max_lines` limit ends the text with an ellipsis.
+        let elide_rows = options.elide
+            && remaining_lines.is_some_and(|rem| collapsed_cap.is_none_or(|cap| rem <= cap));
         let mut job = LayoutJob {
             wrap: TextWrapping {
                 max_width: text_wrap_w,
                 max_rows: block_max_rows.unwrap_or(usize::MAX),
                 break_anywhere: block_max_rows == Some(1) && options.elide,
-                overflow_character: if options.elide && block_max_rows.is_some() {
-                    Some('…')
-                } else {
-                    None
-                },
+                overflow_character: if elide_rows { Some('…') } else { None },
             },
             ..Default::default()
         };
@@ -1612,7 +1643,7 @@ pub fn layout_text_with_entities_expanded(
         blocks: laid_blocks,
         links,
         link_regions,
-        spoiler_rects,
+        spoiler_rects: merge_spoiler_rects(&spoiler_rects),
         inline_code_rects,
         custom_emojis,
         size: Vec2::new(max_w, cursor_y),
@@ -1627,7 +1658,8 @@ fn galley_elided_flag(_existing: &[LaidOutBlock], _fallback: bool) -> bool {
 
 #[derive(Debug, Clone, Default)]
 struct EntityTextInteractiveState {
-    spoilers_revealed: bool,
+    /// When a click revealed the spoilers (`ui.input` time), if the widget keeps that state.
+    spoilers_revealed_at: Option<f64>,
     hovered_link_index: Option<usize>,
     selection: TextSelection,
     drag_anchor_utf16: Option<usize>,
@@ -1689,15 +1721,53 @@ fn render_entity_text_cached(
     let mut state = ui
         .ctx()
         .data_mut(|d| d.get_temp::<EntityTextInteractiveState>(state_key))
-        .unwrap_or_else(|| EntityTextInteractiveState {
-            spoilers_revealed: options.spoilers_revealed,
-            ..Default::default()
-        });
+        .unwrap_or_default();
 
-    let effective_revealed = options.spoilers_revealed || state.spoilers_revealed;
+    let now = ui.input(|i| i.time);
+    let reveal = match options.spoiler_reveal {
+        Some(progress) => progress.clamp(0.0, 1.0),
+        None if options.spoilers_revealed => 1.0,
+        None => state
+            .spoilers_revealed_at
+            .map_or(0.0, |at| spoiler_reveal_progress(now - at)),
+    };
+    let effective_revealed = reveal >= 1.0;
+    // A spoiler takes the click only while it is fully hidden.
+    let spoilers_clickable = reveal <= 0.0;
+    if !effective_revealed && !spoilers_clickable {
+        ui.ctx().request_repaint();
+    }
+    let expanded_quotes = options
+        .expanded_blockquotes
+        .clone()
+        .unwrap_or_else(|| state.expanded_blockquotes.clone());
     let mut layout_opts = options.clone();
     layout_opts.spoilers_revealed = effective_revealed;
+    layout_opts.spoiler_reveal = None;
+    layout_opts.expanded_blockquotes = None;
     layout_opts.hovered_link_index = state.hovered_link_index;
+
+    // While the spoilers fade in, the revealed text is painted over them (`_spoilerOpacity`).
+    let fading_in: Vec<(Pos2, Arc<Galley>)> = if effective_revealed || spoilers_clickable {
+        layout_cache.clear_fade();
+        Vec::new()
+    } else {
+        let mut revealed_opts = layout_opts.clone();
+        revealed_opts.spoilers_revealed = true;
+        layout_cache
+            .fade_layout(
+                ui.ctx(),
+                source,
+                style,
+                palette,
+                &revealed_opts,
+                &expanded_quotes,
+            )
+            .blocks
+            .iter()
+            .map(|b| (b.text_origin, Arc::clone(&b.galley)))
+            .collect()
+    };
 
     let laid = layout_cache.layout(
         ui.ctx(),
@@ -1705,7 +1775,7 @@ fn render_entity_text_cached(
         style,
         palette,
         &layout_opts,
-        &state.expanded_blockquotes,
+        &expanded_quotes,
     );
 
     let sense = if options.selectable {
@@ -1739,7 +1809,7 @@ fn render_entity_text_cached(
         && rect.contains(pointer)
     {
         let hit = laid.hit_test((pointer - origin).to_pos2());
-        if (!effective_revealed && hit.in_spoiler)
+        if (spoilers_clickable && hit.in_spoiler)
             || hit.pre_copy_block.is_some()
             || hit.blockquote_toggle_block.is_some()
         {
@@ -1790,8 +1860,7 @@ fn render_entity_text_cached(
             let hit = laid.hit_test((pos - origin).to_pos2());
             state.selection = word_selection_at(&laid.text, &laid.offset_mapper, hit.utf8_offset);
         }
-        if !state.selection.is_empty() && ui.input(|i| i.modifiers.command && i.key_pressed(Key::C))
-        {
+        if !state.selection.is_empty() && ui.input(crate::clipboard::copy_requested) {
             let copied = laid.selected_text(state.selection);
             if !copied.is_empty() {
                 ui.ctx().copy_text(copied);
@@ -1809,8 +1878,10 @@ fn render_entity_text_cached(
         && let Some(pos) = response.interact_pointer_pos()
     {
         let hit = laid.hit_test((pos - origin).to_pos2());
-        if !effective_revealed && hit.in_spoiler {
-            state.spoilers_revealed = true;
+        if spoilers_clickable && hit.in_spoiler {
+            if options.spoiler_reveal.is_none() {
+                state.spoilers_revealed_at = Some(now);
+            }
             out.spoiler_toggled = true;
             ui.ctx().request_repaint();
         } else if let Some(pre_idx) = hit.pre_copy_block {
@@ -1820,11 +1891,14 @@ fn render_entity_text_cached(
                 out.copied_pre_code = Some(code_owned);
             }
         } else if let Some(bq_idx) = hit.blockquote_toggle_block {
-            if let Some(p) = state.expanded_blockquotes.iter().position(|&x| x == bq_idx) {
-                state.expanded_blockquotes.remove(p);
-            } else {
-                state.expanded_blockquotes.push(bq_idx);
+            if options.expanded_blockquotes.is_none() {
+                if let Some(p) = state.expanded_blockquotes.iter().position(|&x| x == bq_idx) {
+                    state.expanded_blockquotes.remove(p);
+                } else {
+                    state.expanded_blockquotes.push(bq_idx);
+                }
             }
+            out.blockquote_toggled = Some(bq_idx);
             ui.ctx().request_repaint();
         } else if let Some(link) = hit.link {
             out.clicked_link = Some(link);
@@ -1970,7 +2044,7 @@ fn render_entity_text_cached(
                     // Expand/collapse chevron for collapsible blockquotes.
                     if *collapsed && let Some(tr) = block.toggle_rect {
                         let tr_s = tr.translate(offset);
-                        let expanded = state.expanded_blockquotes.contains(&idx);
+                        let expanded = expanded_quotes.contains(&idx);
                         let chevron = if expanded { q.collapse } else { q.expand };
                         let painted = paint_style_icon(
                             painter,
@@ -2066,19 +2140,38 @@ fn render_entity_text_cached(
             }
         }
 
-        // 6. Paint animated spoiler particles over unrevealed spoiler spans.
-        if !effective_revealed {
-            let bg = with_alpha(palette.spoiler_fg, 0.16);
-            for (i, sr) in laid.spoiler_rects.iter().enumerate() {
-                paint_spoiler_particles(
-                    ui.ctx(),
-                    painter,
-                    sr.translate(offset).expand2(Vec2::new(1.0, 0.0)),
-                    palette.spoiler_fg,
-                    bg,
-                    (i as u64).wrapping_add(1),
-                );
+        // 5c. Spoilers being revealed: their text fades in over the hidden layout.
+        if !fading_in.is_empty() {
+            for sr in &laid.spoiler_rects {
+                let mut fade =
+                    painter.with_clip_rect(painter.clip_rect().intersect(sr.translate(offset)));
+                fade.multiply_opacity(reveal);
+                for (text_origin, galley) in &fading_in {
+                    fade.galley(
+                        *text_origin + offset,
+                        Arc::clone(galley),
+                        options.base_color,
+                    );
+                }
             }
+        }
+
+        // 6. The particle cover over hidden spoilers (`paintSpoilerRects`), fading out while
+        //    they are revealed.
+        if !effective_revealed && !laid.spoiler_rects.is_empty() {
+            let rects: Vec<Rect> = laid
+                .spoiler_rects
+                .iter()
+                .map(|r| r.translate(offset))
+                .collect();
+            paint_text_spoiler(
+                ui.ctx(),
+                painter,
+                &rects,
+                origin,
+                palette.spoiler_fg,
+                1.0 - reveal,
+            );
         }
     }
 

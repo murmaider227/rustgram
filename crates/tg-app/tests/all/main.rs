@@ -40,6 +40,7 @@ mod e2e_tgb2948_reselect_open_chat;
 mod e2e_tgb2949_chatlist_frames;
 mod e2e_tgb2955_theme_switch;
 mod e2e_tgb2971_pull_next_channel;
+mod e2e_tgb3005_cli_guard;
 mod e2e_uip2_a;
 mod e2e_uip2_b;
 mod e2e_uip2_c;

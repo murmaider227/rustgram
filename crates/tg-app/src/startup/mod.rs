@@ -9,6 +9,7 @@
 //! `Telegram/SourceFiles/core/update_checker.cpp`, and
 //! `Telegram/SourceFiles/platform/win/specific_win.cpp`.
 
+pub mod cli_guard;
 pub mod crash_window;
 pub mod frame_trace;
 pub mod icon;
@@ -97,7 +98,9 @@ impl std::fmt::Debug for StartupContext {
 /// Executes tdesktop's startup pipeline in order:
 /// 1. Parse `LaunchArgs` (`-workdir`, `-many`, `-key`, `-autostart`, `-startintray`, `-noupdate`,
 ///    `-cleanup`, `-debug`, `-sendpath`, `-tosettings`, `-quit`, `tg://`, `tonsite://`, etc.).
-/// 2. Handle `--help` / `-h` and `-cleanup` (uninstaller integration) before GUI creation.
+/// 2. Handle `--version` / `--help` / unknown options and refuse agent runs without their own
+///    `-workdir` ([`cli_guard`]) before the working dir is touched, then `-cleanup` (uninstaller
+///    integration) before GUI creation.
 /// 3. Initialize `tg-core` file logger in the resolved working dir + tracing console layer.
 /// 4. Set Windows `AppUserModelID` (`"Rustgram"` or `"Rustgram.<hash>"`).
 /// 5. Acquire single-instance mutex + named pipe via `tg-platform`, forwarding arguments and
@@ -120,14 +123,28 @@ pub fn run_from_cli() -> anyhow::Result<()> {
         Some(&exe_path),
         &StartupPrefs::default(),
     );
+    // `--version` / `--help` / unknown options and agent runs without their own `-workdir` end
+    // here, before the working dir is read or written (TGB-3005).
+    let agent = cli_guard::detect_agent(std::env::vars_os());
+    if let Some(exit) = cli_guard::early_exit(
+        &raw_args,
+        &prelim.resolved_working_dir,
+        &work_env,
+        agent.as_ref(),
+    ) {
+        exit.emit();
+        if exit.code != 0 {
+            std::process::exit(exit.code);
+        }
+        return Ok(());
+    }
     let prefs = StartupPrefs::load_from(&prelim.resolved_working_dir.path);
     let plan = StartupPlan::build(&raw_args, &work_env, Some(&exe_path), &prefs);
     profiler::mark("cli_and_plan");
 
     match plan.action {
-        StartupAction::ShowHelp => {
-            attach_parent_console();
-            println!("{}", help_text());
+        // Handled by `cli_guard::early_exit` above.
+        StartupAction::ShowHelp | StartupAction::ShowVersion | StartupAction::RejectArguments => {
             return Ok(());
         }
         StartupAction::Cleanup => {
@@ -306,8 +323,8 @@ fn spawn_startup_integration(plan: StartupPlan, exe_path: PathBuf, mut prefs: St
     }
 }
 
-/// Release builds are GUI-subsystem binaries without a console of their own, so `--help`
-/// attaches to the console of the shell that started it (if any) before printing.
+/// Release builds are GUI-subsystem binaries without a console of their own, so `--help` /
+/// `--version` attach to the console of the shell that started it (if any) before printing.
 fn attach_parent_console() {
     #[cfg(windows)]
     {

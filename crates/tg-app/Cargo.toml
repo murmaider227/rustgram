@@ -72,7 +72,7 @@ tg-transport = { path = "../tg-transport" }
 tg-voip = { path = "../tg-voip" }
 tg-wallet = { path = "../tg-wallet" }
 tg-webview = { path = "../tg-webview" }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.8", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "rustgram"

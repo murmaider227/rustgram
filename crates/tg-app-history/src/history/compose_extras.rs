@@ -103,11 +103,34 @@ struct LiveLevelFeed {
     hardware_active: bool,
 }
 
+/// A finished voice recording: the bubble data plus the encoded file to upload
+/// (tdesktop's `VoiceToSend { bytes, waveform, duration }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedVoice {
+    /// Duration, 5-bit waveform and size for `documentAttributeAudio` and the pending bubble.
+    pub attachment: VoiceAttachment,
+    /// Telegram-compatible OGG/Opus file bytes (`audio/ogg`).
+    pub ogg: Vec<u8>,
+}
+
+/// Longest synthetic PCM span fed in one fallback step, in seconds: a stalled frame must not
+/// turn into a long silent gap or a huge allocation.
+const FALLBACK_MAX_STEP_SECS: f64 = 1.0;
+
+/// Whether voice recording may open the real microphone (`cpal`). Never in unit tests, and
+/// never when `RUSTGRAM_HEADLESS_AUDIO` / `TGFORK_HEADLESS_AUDIO` is set (agent and CI runs):
+/// then the synthetic capture source below records instead.
+#[must_use]
+pub fn hardware_voice_capture_enabled() -> bool {
+    crate::history::inline_media::default_hardware_audio_enabled()
+}
+
 /// Voice recorder controller wrapping `tg-audio`'s [`AudioRecorder`] and [`VoiceCapturePipeline`].
 ///
-/// Uses real microphone capture via `cpal` when a capture device is available, and falls back
-/// seamlessly to feeding synthetic PCM into `VoiceCapturePipeline` when headless / without a mic
-/// so the real Opus + 5-bit waveform pipeline always produces valid [`VoiceAttachment`] results.
+/// Uses real microphone capture via `cpal` when a capture device is available and hardware
+/// capture is allowed ([`hardware_voice_capture_enabled`]); otherwise it feeds synthetic PCM
+/// into `VoiceCapturePipeline`, so the real Opus + 5-bit waveform pipeline always produces a
+/// sendable [`RecordedVoice`].
 pub struct VoiceRecorderController {
     phase: VoiceRecordPhase,
     recorder: Option<AudioRecorder>,
@@ -216,9 +239,22 @@ impl VoiceRecorderController {
         }
         self.last_fallback_tick_secs = now_secs;
 
-        let devices = Arc::new(DeviceManager::new());
-        let cfg = CaptureConfig::default();
-        let rec = AudioRecorder::new(devices, cfg);
+        self.recorder = self.start_hardware_capture();
+        self.fallback_pipeline = if self.recorder.is_some() {
+            None
+        } else {
+            // Headless / no-mic source feeding the real `tg-audio` Opus + waveform pipeline.
+            VoiceCapturePipeline::telegram_default().ok()
+        };
+    }
+
+    /// Opens the microphone stream, or `None` when hardware capture is off or unavailable.
+    /// Nothing touches the audio devices while it is off (not even device enumeration).
+    fn start_hardware_capture(&self) -> Option<AudioRecorder> {
+        if !hardware_voice_capture_enabled() {
+            return None;
+        }
+        let rec = AudioRecorder::new(Arc::new(DeviceManager::new()), CaptureConfig::default());
         let feed_cb = Arc::clone(&self.feed);
         let cb = Arc::new(move |upd: CaptureUpdate| {
             let level_bar = ((u32::from(upd.level) * 31) / 32768).clamp(2, 31) as u8;
@@ -231,15 +267,7 @@ impl VoiceRecorderController {
                 }
             }
         });
-
-        if rec.available() && rec.start(Some(cb)).is_ok() {
-            self.recorder = Some(rec);
-            self.fallback_pipeline = None;
-        } else {
-            // Headless / no-mic fallback using the real `tg-audio` Opus + waveform pipeline.
-            self.recorder = None;
-            self.fallback_pipeline = VoiceCapturePipeline::telegram_default().ok();
-        }
+        (rec.available() && rec.start(Some(cb)).is_ok()).then_some(rec)
     }
 
     /// Updates pointer drag delta during hold-to-record.
@@ -284,6 +312,10 @@ impl VoiceRecorderController {
 
     /// Toggles pause/resume while in locked mode.
     pub fn toggle_pause(&mut self, now_secs: f64) {
+        if self.recorder.is_none() && self.is_locked() && !self.is_paused() {
+            // Record the synthetic source up to the pause.
+            self.feed_fallback_until(now_secs);
+        }
         if let VoiceRecordPhase::Locked {
             ref mut started_at,
             ref mut paused,
@@ -293,6 +325,8 @@ impl VoiceRecorderController {
             if *paused {
                 *started_at = now_secs - *paused_elapsed_secs;
                 *paused = false;
+                // The synthetic source must not fill the paused span on resume.
+                self.last_fallback_tick_secs = now_secs;
                 if let Some(ref rec) = self.recorder {
                     let _ = rec.pause(false);
                 }
@@ -324,10 +358,21 @@ impl VoiceRecorderController {
         if now_secs - self.last_fallback_tick_secs < 0.08 {
             return;
         }
-        self.last_fallback_tick_secs = now_secs;
+        self.feed_fallback_until(now_secs);
+    }
 
-        // Feed a 80ms synthetic speech-like tone burst into the real `VoiceCapturePipeline`.
-        let sample_count = 3_840usize; // 80ms at 48kHz
+    /// Feeds the synthetic source with PCM for the wall time since the last step, so the
+    /// recorded duration follows the clock even when frames are sparse (an idle window
+    /// repaints only a few times a second).
+    fn feed_fallback_until(&mut self, now_secs: f64) {
+        let span = (now_secs - self.last_fallback_tick_secs).clamp(0.0, FALLBACK_MAX_STEP_SECS);
+        self.last_fallback_tick_secs = now_secs;
+        let sample_count = (span * 48_000.0).round() as usize;
+        if sample_count == 0 {
+            return;
+        }
+
+        // A synthetic speech-like tone burst into the real `VoiceCapturePipeline`.
         let t0 = now_secs * 6.0;
         let amp = ((t0.sin() * 0.5 + 0.5) * 0.65 + ((t0 * 2.7).cos() * 0.5 + 0.5) * 0.35) * 22000.0;
         let mut pcm = Vec::with_capacity(sample_count);
@@ -370,13 +415,18 @@ impl VoiceRecorderController {
         self.phase = VoiceRecordPhase::Idle;
     }
 
-    /// Stops recording and finalizes into a [`VoiceAttachment`] with a 5-bit packed waveform.
-    pub fn finish(&mut self, now_secs: f64) -> Option<VoiceAttachment> {
+    /// Stops recording and finalizes the OGG/Opus file with its 5-bit packed waveform.
+    ///
+    /// Returns `None` when nothing is recorded or the recording is shorter than
+    /// `tg_audio`'s minimum (one second): tdesktop's `VoiceRecordBar::stopRecording`
+    /// discards an empty result instead of sending it.
+    pub fn finish(&mut self, now_secs: f64) -> Option<RecordedVoice> {
         if !self.is_active() {
             return None;
         }
-        let elapsed = self.elapsed_secs(now_secs);
-        let live_bars = self.live_bars();
+        if self.recorder.is_none() && !self.is_paused() {
+            self.feed_fallback_until(now_secs);
+        }
 
         let capture_result = if let Some(rec) = self.recorder.take() {
             rec.stop().ok()
@@ -387,36 +437,30 @@ impl VoiceRecorderController {
         };
         self.phase = VoiceRecordPhase::Idle;
 
-        let duration_secs = capture_result
-            .as_ref()
-            .filter(|r| r.duration_ms > 0)
-            .map_or_else(
-                || (elapsed.round() as u32).max(1),
-                |r| ((r.duration_ms + 500) / 1000).max(1) as u32,
-            );
-
-        let waveform_5bit = capture_result
-            .filter(|r| !r.waveform_5bit.is_empty())
-            .map(|r| r.waveform_5bit)
-            .unwrap_or_else(|| {
-                let mut padded = Vec::with_capacity(100);
-                if live_bars.is_empty() {
-                    padded.resize(100, 10);
-                } else {
-                    for i in 0..100 {
-                        padded.push(live_bars[i * live_bars.len() / 100]);
-                    }
-                }
-                encode_5bit(&padded)
-            });
-
-        Some(VoiceAttachment {
-            duration_secs,
-            waveform_5bit,
-            size_bytes: 0,
-            is_unread: false,
-            transcription: None,
+        let result = capture_result.filter(|r| !r.bytes.is_empty())?;
+        // `FileLoadTask::process`: `seconds = duration / 1000` (whole seconds, rounded down).
+        let duration_secs = u32::try_from(result.duration_ms.max(0) / 1000).unwrap_or(u32::MAX);
+        let waveform_5bit = if result.waveform_5bit.is_empty() {
+            encode_5bit(&[0; 100])
+        } else {
+            result.waveform_5bit
+        };
+        Some(RecordedVoice {
+            attachment: VoiceAttachment {
+                duration_secs,
+                waveform_5bit,
+                size_bytes: result.bytes.len() as u64,
+                is_unread: false,
+                transcription: None,
+            },
+            ogg: result.bytes,
         })
+    }
+
+    /// Returns `true` while the real microphone stream is recording (never in headless runs).
+    #[must_use]
+    pub const fn uses_hardware_capture(&self) -> bool {
+        self.recorder.is_some()
     }
 }
 

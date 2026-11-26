@@ -171,7 +171,7 @@ pub fn build_mtproto_client_config(
         Some(code) => language_id_or_default(code).to_owned(),
         None => with_current(|inst| language_id_or_default(inst.id()).to_owned()),
     };
-    let tz_offset_secs = chrono::Local::now().offset().local_minus_utc();
+    let tz_offset_secs = jiff::ZonedDateTime::now().offset().seconds();
 
     ClientConfig {
         api_id: credentials.api_id,

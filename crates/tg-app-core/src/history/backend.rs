@@ -1259,6 +1259,9 @@ pub struct SendMessageExtended {
     /// Optional custom JPEG cover image bytes for a video attachment
     /// (`InputMediaUploadedDocument::video_cover`).
     pub video_cover_jpeg: Option<Vec<u8>>,
+    /// Encoded OGG/Opus bytes of a just-recorded voice message (`HistoryMedia::Voice`),
+    /// the `result.bytes` tdesktop hands to `ApiWrap::sendVoiceMessage`.
+    pub voice_ogg: Option<Vec<u8>>,
 }
 
 /// Windowed slice returned by [`HistoryBackend::load_slice_around`], `before`, or `after`.
@@ -2874,6 +2877,11 @@ pub trait HistoryBackend: Send {
     ) -> Result<Vec<MsgId>, String> {
         Ok(Vec::new())
     }
+
+    /// `HistoryInner::paintEvent` -> `Data::Reactions::poll` for every painted message: refreshes
+    /// the reactions of painted group/channel messages that carry a reactions object, at most
+    /// once per `kPollEach` (20 s) each, without waiting (TGB-3013). Called every frame.
+    fn poll_painted_reactions(&self, _peer_id: PeerId, _msg_ids: &[MsgId]) {}
 
     /// Loads the next page of unread mentions, reactions, or poll votes for `scope` via
     /// `messages.getUnread{Mentions,Reactions,PollVotes}` (`Api::UnreadThings`).
