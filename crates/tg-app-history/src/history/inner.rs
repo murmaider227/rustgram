@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::history::delete_collapse::{CollapseScroll, Removal};
 use egui::{
     Color32, CornerRadius, FontId, Id, Key, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, Ui, Vec2,
 };
@@ -542,6 +543,8 @@ pub struct HistoryInnerWidget {
     paint_cache_painted: Vec<MsgId>,
     /// Revealed spoilers and expanded quotes of the open chat's messages (TGB-3009).
     text_states: HashMap<MsgId, MessageTextState>,
+    /// Holes of deleted messages closing (TGB-3011, `ThanosEffectController` collapse).
+    delete_collapse: crate::history::delete_collapse::CollapseAnimator,
 }
 
 /// The text state of a message nobody clicked.
@@ -622,6 +625,7 @@ impl HistoryInnerWidget {
             paint_cache_order: VecDeque::new(),
             paint_cache_painted: Vec::new(),
             text_states: HashMap::new(),
+            delete_collapse: Default::default(),
         }
     }
 
@@ -1593,6 +1597,7 @@ impl HistoryInnerWidget {
         self.peer_id = peer_id;
         self.messages = slice.messages;
         self.unread_count = slice.unread_count;
+        self.delete_collapse.clear();
         self.layout_cache.clear();
         // A backlog belongs to the slice `load_peer` applied; it sets its own after this call.
         self.media_backlog.clear();
@@ -1890,6 +1895,8 @@ impl HistoryInnerWidget {
         if drop_count == 0 {
             return;
         }
+        let dropped_height = self.list.items().get(drop_count).map_or(0, |item| item.y);
+        self.delete_collapse.shift(-dropped_height);
         let dropped: HashSet<MsgId> = self.messages.drain(..drop_count).map(|m| m.id).collect();
         for id in &dropped {
             self.layout_cache.remove(id);
@@ -2060,6 +2067,58 @@ impl HistoryInnerWidget {
         self.update_date_and_unread_heights();
     }
 
+    /// Removes deleted messages leaving holes that close smoothly (TGB-3011,
+    /// `ThanosEffectController::captureOnRemoval` and `flushRemovals`). Regular messages not
+    /// below the view leave a hole; local, service and lower ones go at once.
+    pub fn remove_messages_collapsing(
+        &mut self,
+        msg_ids: &[MsgId],
+        peer_kind: PeerKind,
+        now_ms: f64,
+    ) {
+        let view_top = self.effective_scroll_top();
+        let view_bottom = view_top + self.last_viewport_h;
+        let removals: Vec<Removal> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| msg_ids.contains(&m.id))
+            .filter_map(|(index, m)| {
+                let item = self.list.items().get(index)?;
+                let below = self.list.visual_item_top(index) as f32 >= view_bottom;
+                Some(Removal {
+                    top: item.y,
+                    height: item.height,
+                    animated: m.id.0 > 0 && !m.is_service() && !below,
+                })
+            })
+            .collect();
+        if removals.is_empty() {
+            return;
+        }
+        if removals.iter().any(|r| r.animated) {
+            self.delete_collapse
+                .note_scroll_baseline(view_top, self.is_at_history_bottom());
+        }
+        let before = self.list.items_height();
+        self.remove_messages(msg_ids, peer_kind);
+        let left = before - self.list.items_height();
+        self.delete_collapse.flush(&removals, left, now_ms);
+        self.list
+            .set_collapse_gaps(self.delete_collapse.render_gaps());
+    }
+
+    /// Corner radii of message `msg_id`'s bubble as laid out (square for media without one).
+    #[must_use]
+    pub fn bubble_corners(&self, msg_id: MsgId) -> CornerRadius {
+        match self.layout_cache.get(&msg_id).map(|cached| &cached.layout) {
+            Some(CachedItemLayout::Message(layout)) if layout.has_bubble => {
+                crate::history::media::bubble_rounding_to_egui(layout.bubble_rounding)
+            }
+            _ => CornerRadius::ZERO,
+        }
+    }
+
     /// Loads the slice before the first loaded message (`HistoryList::check_preload` top) and
     /// prepends it, starting the media of its messages.
     pub fn load_older_slice(&mut self, backend: &dyn HistoryBackend, peer_kind: PeerKind) {
@@ -2118,8 +2177,11 @@ impl HistoryInnerWidget {
         merged.append(&mut self.messages);
         self.messages = merged;
         self.list.loaded_at_top = older.loaded_at_top;
+        let added = older_items.len();
         self.list.prepend_older(older_items);
         self.update_date_and_unread_heights();
+        self.delete_collapse
+            .shift(self.list.items().get(added).map_or(0, |item| item.y));
 
         // A view at the newest message stays there while older messages fill in above
         // (`HistoryWidget::updateHistoryGeometry` keeps `wasAtBottom` at the new bottom); a chat
@@ -2333,7 +2395,18 @@ impl HistoryInnerWidget {
         // Active chat background (Classic wallpaper by default, flat Night background).
         self.paint_chat_wallpaper(ui, list_rect, colors);
 
-        let content_pad_bottom = 12;
+        // Holes of deleted messages closing (TGB-3011). They count in the list's height, so a
+        // short chat stays bottom-aligned while they close.
+        if let Some(scroll) = self.delete_collapse.tick(now_ms as f64) {
+            match scroll {
+                CollapseScroll::Bottom => self.pending_scroll_to_bottom = true,
+                CollapseScroll::Top(y) => self.pending_scroll_y = Some(y),
+            }
+            ui.ctx().request_repaint();
+        }
+        self.list
+            .set_collapse_gaps(self.delete_collapse.render_gaps());
+        let content_pad_bottom = 12 + self.list.collapse_gap_total();
         let mut laid_out_this_frame = 0usize;
 
         // When pinning to the bottom (initial load, peer switch, or newly appended messages),

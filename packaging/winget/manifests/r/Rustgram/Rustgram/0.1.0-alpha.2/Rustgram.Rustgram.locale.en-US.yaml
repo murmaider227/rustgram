@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+PackageIdentifier: Rustgram.Rustgram
+PackageVersion: 0.1.0-alpha.2
+PackageLocale: en-US
+Publisher: Rustgram Authors
+PublisherUrl: https://github.com/murmaider227/rustgram
+PublisherSupportUrl: https://github.com/murmaider227/rustgram/issues
+PrivacyUrl: https://github.com/murmaider227/rustgram/blob/main/PRIVACY.md
+PackageName: Rustgram
+PackageUrl: https://github.com/murmaider227/rustgram
+License: GPL-3.0-or-later with the OpenSSL exception
+LicenseUrl: https://github.com/murmaider227/rustgram/blob/main/LICENSE
+ShortDescription: An unofficial Telegram desktop client written in Rust, ported from Telegram Desktop.
+Description: |-
+  Rustgram is an unofficial Telegram client for Windows written entirely in Rust: MTProto, encryption,
+  sync, local storage and the user interface. It is a port of Telegram Desktop and keeps its behaviour and
+  its local data format. It is pre-release software in testing.
+Moniker: rustgram
+Tags:
+  - chat
+  - messenger
+  - mtproto
+  - rust
+  - telegram
+ReleaseNotesUrl: https://github.com/murmaider227/rustgram/releases/tag/v0.1.0-alpha.2
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

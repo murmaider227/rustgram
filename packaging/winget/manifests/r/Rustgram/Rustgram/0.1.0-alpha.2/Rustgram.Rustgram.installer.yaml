@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+PackageIdentifier: Rustgram.Rustgram
+PackageVersion: 0.1.0-alpha.2
+InstallerType: inno
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+Protocols:
+  - tg
+ProductCode: '{46C2F7F5-7D28-455F-8E02-5102E303855E}_is1'
+ReleaseDate: 2026-11-26
+AppsAndFeaturesEntries:
+  - DisplayName: Rustgram
+    Publisher: Rustgram Authors
+    ProductCode: '{46C2F7F5-7D28-455F-8E02-5102E303855E}_is1'
+InstallationMetadata:
+  DefaultInstallLocation: '%APPDATA%\Rustgram'
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/murmaider227/rustgram/releases/download/v0.1.0-alpha.2/Rustgram-Setup-0.1.0-alpha.2-win-x64.exe
+    InstallerSha256: 7681C19DDE3EFAF09808AD2F4E52650CFAF2C95F1DAB10AF65F09C5C54132903
+ManifestType: installer
+ManifestVersion: 1.10.0

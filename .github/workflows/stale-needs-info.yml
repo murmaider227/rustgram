@@ -1,0 +1,42 @@
+# Closes issues labelled "needs more info" when the reporter has not replied within 7 days.
+# Nothing is ever marked automatically: only a maintainer adds the label. Any update after the label
+# (a comment, an edit, another label) removes it again and puts the issue back into "needs triage",
+# so a maintainer posts the question first and adds the label last.
+name: Close "needs more info" issues
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: stale-needs-info
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    name: Close unanswered "needs more info" issues
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write # remove the label, comment and close issues
+    steps:
+      - name: Close issues without a reply
+        uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          only-issue-labels: "needs more info"
+          stale-issue-label: "needs more info"
+          # Never mark anything stale; close 7 days after a maintainer added the label.
+          days-before-issue-stale: -1
+          days-before-issue-close: 7
+          remove-issue-stale-when-updated: true
+          labels-to-add-when-unstale: "needs triage"
+          close-issue-reason: not_planned
+          close-issue-message: >-
+            Closing this because there was no reply within 7 days of our question. If you can add
+            the missing details, comment here and we will reopen it.
+          # Pull requests are never touched.
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          operations-per-run: 100

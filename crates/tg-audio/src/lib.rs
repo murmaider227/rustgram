@@ -9,6 +9,7 @@ pub mod decoder;
 pub mod device;
 pub mod dsp;
 pub mod error;
+pub mod external;
 pub mod float_controller;
 pub mod local_cache;
 pub mod mixer;
@@ -35,6 +36,7 @@ pub use device::{
 };
 pub use dsp::{Resampler, TimeStretcher};
 pub use error::{AudioError, AudioResult};
+pub use external::{EXTERNAL_FEED_MAX_MS, ExternalPcmFeed, ExternalPcmStream};
 pub use float_controller::{
     DragOutcome, FloatColumn, FloatController, FloatCorner, FloatItemState, FloatSide, Point, Rect,
     SectionArea, Size, compute_out_ratio,
@@ -43,7 +45,10 @@ pub use local_cache::{
     LOCAL_SOUND_MAX_DURATION_MS, LOCAL_SOUND_SAMPLE_RATE, LocalCache, LocalDiskCache, LocalSound,
     convert_and_cut_to_wav, encode_wav_pcm_s16le,
 };
-pub use mixer::{AudioStream, MemoryPcmStream, MixerCore, MixerEvent, PcmChunk, compute_volume};
+pub use mixer::{
+    AudioStream, ExternalSyncPoint, MemoryPcmStream, MixerCore, MixerEvent, PcmChunk,
+    compute_volume,
+};
 pub use opus_codec::{
     AudioEditResult, OPUS_VOICE_BITRATE_BPS, OPUS_VOICE_FRAME_SAMPLES, OggOpusStreamDecoder,
     concat_ogg_opus, decode_ogg_opus_to_f32, decode_ogg_opus_to_i16, encode_ogg_opus_i16,

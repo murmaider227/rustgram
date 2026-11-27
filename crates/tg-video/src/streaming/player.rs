@@ -3,15 +3,17 @@
 //! Port of `Telegram/SourceFiles/media/streaming/media_streaming_player.cpp`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::error::{Result, StreamingError, VideoError};
+use crate::streaming::audio_output::{AudioSink, PlayerAudio};
 use crate::streaming::clock::{
     DEFAULT_FRAME_QUEUE_CAPACITY, FramePopOutcome, FrameQueue, SyncClock, TimePoint,
 };
 use crate::streaming::decoder::{DecodedPacket, Decoder};
 use crate::types::{
-    AudioFrame, DURATION_UNAVAILABLE, PlaybackOptions, SPEED_MAX, SPEED_MIN, StreamInformation,
-    StreamingUpdate, TIME_UNKNOWN, VideoFrame,
+    AudioFrame, DURATION_UNAVAILABLE, PlaybackMode, PlaybackOptions, SPEED_MAX, SPEED_MIN,
+    StreamInformation, StreamingUpdate, TIME_UNKNOWN, VideoFrame,
 };
 
 /// Minimum buffered media duration required to resume from waiting-for-data (`kBufferFor` = 3 s).
@@ -66,6 +68,14 @@ pub struct StreamingPlayer<D: Decoder> {
     /// `paused_by_waiting` was set because the decoder ran dry (see [`STARVE_GRACE_MS`]).
     waiting_starved: bool,
     last_video_duration_ms: i64,
+    /// Sound output (tdesktop's `AudioTrack`); its played position drives the clock.
+    audio: Option<Box<dyn PlayerAudio>>,
+    /// The attached output's sink ([`Self::fill_buffers`] forwards to it unless the decoder
+    /// feeds it itself).
+    audio_sink: Option<Arc<dyn AudioSink>>,
+    /// The decoder hands audio to the output itself (see [`Decoder::set_audio_sink`]).
+    decoder_feeds_audio: bool,
+    audio_playing: bool,
 }
 
 impl<D: Decoder> StreamingPlayer<D> {
@@ -132,7 +142,61 @@ impl<D: Decoder> StreamingPlayer<D> {
             decoder_pending: false,
             waiting_starved: false,
             last_video_duration_ms: 0,
+            audio: None,
+            audio_sink: None,
+            decoder_feeds_audio: false,
+            audio_playing: false,
         })
+    }
+
+    /// Plays the decoded sound through `audio` and makes the video follow its clock, like
+    /// tdesktop's `Player` with an `AudioTrack` and `syncVideoByAudio`. Audio decoded before
+    /// this call is handed over first. Returns `false` (dropping `audio`) when the stream has
+    /// no sound, the player decodes video only, or an output is already attached.
+    pub fn attach_audio(&mut self, mut audio: Box<dyn PlayerAudio>) -> bool {
+        if !self.wants_audio_output() {
+            return false;
+        }
+        let sink = audio.sink();
+        for frame in self.audio_queue.drain(..) {
+            sink.push(frame);
+        }
+        self.decoder_feeds_audio = self.decoder.set_audio_sink(Arc::clone(&sink));
+        self.audio_sink = Some(sink);
+        audio.set_speed(self.options.speed);
+        audio.set_volume(self.options.volume);
+        self.audio = Some(audio);
+        self.audio_playing = false;
+        self.sync_audio_playing();
+        true
+    }
+
+    /// `true` when the stream has sound that no output plays yet (see [`Self::attach_audio`]).
+    #[must_use]
+    pub fn wants_audio_output(&self) -> bool {
+        self.audio.is_none()
+            && self.decoder.info().audio.is_some()
+            && self.options.mode != PlaybackMode::Video
+    }
+
+    /// `true` when decoded sound goes to an output attached with [`Self::attach_audio`].
+    #[must_use]
+    pub const fn has_audio_output(&self) -> bool {
+        self.audio.is_some()
+    }
+
+    /// Plays the sound exactly while the picture plays: not before start, not while paused by
+    /// the user or waiting for data, not after the end (tdesktop pauses the `AudioTrack`
+    /// together with the `VideoTrack`).
+    fn sync_audio_playing(&mut self) {
+        let playing =
+            self.stage == PlayerStage::Started && !self.paused_by_user && !self.paused_by_waiting;
+        if let Some(audio) = &mut self.audio
+            && playing != self.audio_playing
+        {
+            self.audio_playing = playing;
+            audio.set_playing(playing);
+        }
     }
 
     /// Returns stream metadata.
@@ -207,12 +271,14 @@ impl<D: Decoder> StreamingPlayer<D> {
         if !self.paused_by_waiting {
             self.clock.resume(world_now_ms);
         }
+        self.sync_audio_playing();
     }
 
     /// Pauses playback at `world_now_ms`.
     pub fn pause(&mut self, world_now_ms: i64) {
         self.paused_by_user = true;
         self.clock.pause(world_now_ms);
+        self.sync_audio_playing();
     }
 
     /// Resumes playback at `world_now_ms`.
@@ -227,11 +293,29 @@ impl<D: Decoder> StreamingPlayer<D> {
         self.audio_queue.clear();
         self.current_video_frame = None;
         self.eof_reached = false;
+        self.sync_audio_playing();
+        if let Some(audio) = &mut self.audio {
+            audio.reset();
+        }
+        if let Some(sink) = &self.audio_sink {
+            sink.clear();
+        }
     }
 
     /// Seeks to `position_ms` and resets frame queues and A/V clock.
     pub fn seek(&mut self, position_ms: i64, world_now_ms: Option<i64>) -> Result<()> {
+        // Stop the sound first, then seek: a decoder thread drops the queued sound atomically
+        // with its seek (`AudioSink::clear`), so the frames it decodes right after the seek are
+        // kept. Clearing after the seek raced with them and could wipe the restarted sound.
+        if let Some(audio) = &mut self.audio {
+            audio.reset();
+        }
         self.decoder.seek(position_ms)?;
+        if !self.decoder_feeds_audio
+            && let Some(sink) = &self.audio_sink
+        {
+            sink.clear();
+        }
         self.video_queue.clear();
         self.audio_queue.clear();
         self.eof_reached = false;
@@ -253,6 +337,7 @@ impl<D: Decoder> StreamingPlayer<D> {
             self.waiting_starved = true;
             self.set_waiting_for_data(true, now);
         }
+        self.sync_audio_playing();
         Ok(())
     }
 
@@ -271,6 +356,9 @@ impl<D: Decoder> StreamingPlayer<D> {
         }
         self.options.speed = speed;
         self.clock.set_speed(speed, world_now_ms);
+        if let Some(audio) = &mut self.audio {
+            audio.set_speed(speed);
+        }
         Ok(())
     }
 
@@ -288,6 +376,9 @@ impl<D: Decoder> StreamingPlayer<D> {
             )));
         }
         self.options.volume = volume;
+        if let Some(audio) = &mut self.audio {
+            audio.set_volume(volume);
+        }
         Ok(())
     }
 
@@ -410,7 +501,10 @@ impl<D: Decoder> StreamingPlayer<D> {
                         self.updates
                             .push_back(StreamingUpdate::PreloadedAudio(frame.pts_ms));
                     }
-                    self.audio_queue.push_back(frame);
+                    match &self.audio_sink {
+                        Some(sink) if !self.decoder_feeds_audio => sink.push(frame),
+                        _ => self.audio_queue.push_back(frame),
+                    }
                 }
                 Ok(DecodedPacket::EndOfStream) => {
                     self.eof_reached = true;
@@ -442,6 +536,15 @@ impl<D: Decoder> StreamingPlayer<D> {
         }
         self.fill_buffers()?;
         self.update_starvation(world_now_ms);
+        self.sync_audio_playing();
+        // Audio-master sync (`VideoTrackObject::trackTime` with `syncVideoByAudio`): the clock
+        // takes the position the listener hears now from the sound output.
+        if self.audio_playing
+            && let Some(audio) = &mut self.audio
+            && let Some(point) = audio.sync_point(world_now_ms)
+        {
+            self.clock.sync_to_audio(point);
+        }
         let track_now = self.clock.track_time(world_now_ms).track_time_ms;
         let outcome = self.video_queue.pop_ready(track_now, self.options.speed);
         match &outcome {
@@ -465,6 +568,7 @@ impl<D: Decoder> StreamingPlayer<D> {
             FramePopOutcome::Empty if self.eof_reached && self.stage != PlayerStage::Finished => {
                 self.stage = PlayerStage::Finished;
                 self.updates.push_back(StreamingUpdate::Finished);
+                self.sync_audio_playing();
             }
             _ => {}
         }
@@ -548,6 +652,7 @@ impl<D: Decoder> StreamingPlayer<D> {
         }
         self.updates
             .push_back(StreamingUpdate::WaitingForData(waiting));
+        self.sync_audio_playing();
     }
 
     /// Returns `true` when buffered video/audio exceeds `BUFFER_FOR_MS` (or reached EOF).
@@ -559,6 +664,7 @@ impl<D: Decoder> StreamingPlayer<D> {
         let v_ok = self.decoder.info().video.is_none()
             || self.video_received_till_ms >= self.video_position_ms + BUFFER_FOR_MS;
         let a_ok = self.decoder.info().audio.is_none()
+            || self.decoder_feeds_audio
             || self.audio_received_till_ms >= self.audio_position_ms + BUFFER_FOR_MS;
         v_ok && a_ok
     }

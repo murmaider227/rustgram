@@ -1,7 +1,10 @@
-name: Feature request
-description: Something Telegram Desktop has that Rustgram is missing, or an idea.
-labels: ["enhancement"]
+title: "[Idea] "
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas and feature requests live here. Something that is broken or looks different from Telegram Desktop
+        is a bug: please use the [bug report form](https://github.com/murmaider227/rustgram/issues/new/choose) instead.
   - type: textarea
     id: what
     attributes:

@@ -13,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use crate::error::{Result, VideoError};
+use crate::streaming::audio_output::AudioSink;
 use crate::streaming::decoder::{DecodedPacket, Decoder};
 use crate::types::{FrameData, StreamInformation, VideoFrame};
 
@@ -43,6 +44,8 @@ struct State {
     generation: u64,
     finished: bool,
     stop: bool,
+    /// Decoded audio goes here directly instead of into `packets`.
+    audio_sink: Option<Arc<dyn AudioSink>>,
 }
 
 impl State {
@@ -110,6 +113,7 @@ impl ThreadedDecoder {
             generation: 0,
             finished: false,
             stop: false,
+            audio_sink: None,
         };
         if info.video.is_some() {
             state.accept(decoder.next_frame());
@@ -142,6 +146,11 @@ impl ThreadedDecoder {
             st.queued_video = 0;
             st.queued_video_bytes = 0;
             st.finished = false;
+            // Under the same lock as the generation bump: the worker pushes only under it, so
+            // the sink holds nothing from before the seek and loses nothing after it.
+            if let Some(sink) = &st.audio_sink {
+                sink.clear();
+            }
         }
         st.commands.push_back(command);
         drop(st);
@@ -215,7 +224,12 @@ fn run_worker<D: Decoder>(mut decoder: D, shared: &Shared) {
         if st.generation != generation {
             continue;
         }
-        st.accept(packet);
+        // Pushed under the lock: a seek bumps the generation under it too, so no frame decoded
+        // before a seek reaches the sink after the seek returned.
+        match (packet, &st.audio_sink) {
+            (Ok(DecodedPacket::Audio(frame)), Some(sink)) => sink.push(frame),
+            (packet, _) => st.accept(packet),
+        }
         drop(st);
         shared.wake.notify_all();
     }
@@ -270,6 +284,19 @@ impl Decoder for ThreadedDecoder {
 
     fn io_wait_flag(&self) -> Option<&Arc<AtomicBool>> {
         self.io_waiting.as_ref()
+    }
+
+    fn set_audio_sink(&mut self, sink: Arc<dyn AudioSink>) -> bool {
+        let mut st = self.shared.lock();
+        let packets = std::mem::take(&mut st.packets);
+        for packet in packets {
+            match packet {
+                Ok(DecodedPacket::Audio(frame)) => sink.push(frame),
+                other => st.packets.push_back(other),
+            }
+        }
+        st.audio_sink = Some(sink);
+        true
     }
 }
 

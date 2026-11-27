@@ -30,14 +30,14 @@ pub use ffmpeg::{
     ffmpeg_versions,
 };
 pub use streaming::{
-    BUFFER_FOR_MS, BinlogSliceCache, CacheKey, DEFAULT_FRAME_QUEUE_CAPACITY,
+    AudioSink, BUFFER_FOR_MS, BinlogSliceCache, CacheKey, DEFAULT_FRAME_QUEUE_CAPACITY,
     DEFAULT_PARTS_IN_SLICE, DEFAULT_SLICE_SIZE, DecodedPacket, Decoder, FfmpegStreamDecoder,
     FramePopOutcome, FrameQueue, HeaderMode, InstanceId, LOAD_FROM_REMOTE_MAX,
     LOAD_IN_ADVANCE_LOCAL_MS, LOAD_IN_ADVANCE_REMOTE_MS, LoadedPart, LocalFileLoader,
     MAX_FILE_SIZE, MAX_ONLY_IN_HEADER, MAX_PARTS_IN_HEADER, MAX_SINGLE_READ_AMOUNT,
     MediaCacheSliceCache, MemoryRangeLoader, MemorySliceCache, PART_SIZE, PRELOAD_PARTS_AHEAD,
-    PartsMap, PlayerStage, PriorityQueue, RangeLoader, ReaderStats, SLICES_IN_MEMORY, SliceCache,
-    SliceConfig, SpeedEstimator, StreamingDocument, StreamingInstance, StreamingPlayer,
+    PartsMap, PlayerAudio, PlayerStage, PriorityQueue, RangeLoader, ReaderStats, SLICES_IN_MEMORY,
+    SliceCache, SliceConfig, SpeedEstimator, StreamingDocument, StreamingInstance, StreamingPlayer,
     StreamingReader, SyncClock, TDESKTOP_PARTS_IN_SLICE, THREADED_VIDEO_AHEAD, ThreadedDecoder,
     TimePoint, slice_cache_key,
 };

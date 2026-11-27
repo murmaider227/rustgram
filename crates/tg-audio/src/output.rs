@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 
@@ -166,25 +167,25 @@ impl AudioOutputEngine {
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_output_stream(
                 stream_cfg,
-                move |data: &mut [f32], _| {
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     if !running.load(Ordering::Acquire) {
                         data.fill(0.0);
                         return;
                     }
-                    renderer.fill_f32(&mixer, &cb_slot, data);
+                    renderer.fill_f32(&mixer, &cb_slot, data, output_latency(info));
                 },
                 err_fn,
                 None,
             ),
             cpal::SampleFormat::I16 => device.build_output_stream(
                 stream_cfg,
-                move |data: &mut [i16], _| {
+                move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
                     if !running.load(Ordering::Acquire) {
                         data.fill(0);
                         return;
                     }
                     let mut tmp = vec![0.0f32; data.len()];
-                    renderer.fill_f32(&mixer, &cb_slot, &mut tmp);
+                    renderer.fill_f32(&mixer, &cb_slot, &mut tmp, output_latency(info));
                     for (dst, &src) in data.iter_mut().zip(tmp.iter()) {
                         *dst = (src.clamp(-1.0, 1.0) * 32767.0).round() as i16;
                     }
@@ -194,13 +195,13 @@ impl AudioOutputEngine {
             ),
             cpal::SampleFormat::U16 => device.build_output_stream(
                 stream_cfg,
-                move |data: &mut [u16], _| {
+                move |data: &mut [u16], info: &cpal::OutputCallbackInfo| {
                     if !running.load(Ordering::Acquire) {
                         data.fill(u16::MAX / 2);
                         return;
                     }
                     let mut tmp = vec![0.0f32; data.len()];
-                    renderer.fill_f32(&mixer, &cb_slot, &mut tmp);
+                    renderer.fill_f32(&mixer, &cb_slot, &mut tmp, output_latency(info));
                     for (dst, &src) in data.iter_mut().zip(tmp.iter()) {
                         *dst = ((src.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u16;
                     }
@@ -231,6 +232,14 @@ impl AudioOutputEngine {
         }
         Ok(())
     }
+}
+
+/// How long after this callback the first sample it writes is heard (the device's buffer).
+fn output_latency(info: &cpal::OutputCallbackInfo) -> Duration {
+    let ts = info.timestamp();
+    ts.playback
+        .duration_since(ts.callback)
+        .min(Duration::from_secs(1))
 }
 
 struct StreamRenderer {
@@ -264,18 +273,22 @@ impl StreamRenderer {
         mixer: &Arc<Mutex<MixerCore>>,
         cb: &Option<MixerEventCallback>,
         out: &mut [f32],
+        latency: Duration,
     ) {
         let out_frames = out.len() / self.out_channels;
         if out_frames == 0 {
             return;
         }
+        // The first sample written into `out` is heard at `heard_at`; the video clock follows
+        // the mixer's position at that instant (tdesktop reads it back from OpenAL instead).
+        let heard_at = Instant::now() + latency;
 
         let mut all_events = Vec::new();
 
         if self.out_rate == DEFAULT_FREQUENCY {
             self.mixer_buf.resize(out_frames * 2, 0.0);
             if let Ok(mut m) = mixer.lock() {
-                all_events = m.render_stereo_48k(&mut self.mixer_buf);
+                all_events = m.render_stereo_48k_at(&mut self.mixer_buf, heard_at);
             } else {
                 self.mixer_buf.fill(0.0);
             }
@@ -290,8 +303,11 @@ impl StreamRenderer {
                 }
                 let pull_frames = 512usize;
                 self.mixer_buf.resize(pull_frames * 2, 0.0);
+                // Samples already resampled play first, before this mixer buffer.
+                let ahead_frames = (self.resampled_buf.len() - self.resampled_offset) / 2;
+                let ahead = Duration::from_secs_f64(ahead_frames as f64 / f64::from(self.out_rate));
                 if let Ok(mut m) = mixer.lock() {
-                    let ev = m.render_stereo_48k(&mut self.mixer_buf);
+                    let ev = m.render_stereo_48k_at(&mut self.mixer_buf, heard_at + ahead);
                     all_events.extend(ev);
                 } else {
                     self.mixer_buf.fill(0.0);

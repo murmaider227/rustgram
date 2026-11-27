@@ -114,6 +114,16 @@ impl AudioPlayerBar {
         }
     }
 
+    /// Where viewer and Picture-in-Picture videos play their sound: this bar's mixer and output
+    /// device (tdesktop has one global mixer for music, voice and video).
+    #[must_use]
+    pub fn video_sound_output(&self) -> crate::media::video_sound::VideoSoundOutput {
+        crate::media::video_sound::VideoSoundOutput::new(
+            Arc::clone(&self.mixer),
+            self.player.output().cloned(),
+        )
+    }
+
     /// Attaches an explicit [`SystemMediaControls`] handle (e.g. for custom wiring).
     pub fn attach_smtc(&mut self, smtc: SystemMediaControls) {
         self.smtc = Some(smtc);

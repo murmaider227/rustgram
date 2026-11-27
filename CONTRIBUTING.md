@@ -3,6 +3,51 @@
 Thanks for your interest in Rustgram. This guide explains how the project works and what a good
 contribution looks like.
 
+## The most useful help: bug reports
+
+Rustgram is in testing, and a precise bug report helps more than anything else.
+
+- **Bugs** go to [issues](https://github.com/murmaider227/rustgram/issues/new/choose). Search open
+  and closed issues first; if yours exists, add your version and steps there instead of opening a
+  second one. One problem per issue, with the exact version and the shortest steps that show it.
+- **Your coding agent can write the report.** [docs/REPORTING_BUGS.md](docs/REPORTING_BUGS.md)
+  shows how to point Claude Code, Codex or a similar agent at the
+  [triage playbook](docs/TRIAGE_PLAYBOOK.md). The agent reads only logs and crash reports, removes
+  private details, and posts nothing until you approve the exact text.
+- **Ideas and feature requests** go to
+  [Discussions > Ideas](https://github.com/murmaider227/rustgram/discussions/categories/ideas);
+  questions go to [Q&A](https://github.com/murmaider227/rustgram/discussions/categories/q-a).
+- **Security problems** go to a private report, never a public issue (see [SECURITY.md](SECURITY.md)).
+
+When we need more details we add the `needs more info` label. If there is no reply within 7 days the
+issue closes; reply any time with the details and we reopen it.
+
+## Pull requests
+
+This public repository is an export of the private repository where development happens (each
+change passes a local merge gate there, and live checks against Telegram's test servers use test
+accounts that exist only there). Because of that, **pull requests are not merged here.** They are still welcome, and this is what happens to
+one:
+
+1. A maintainer reads it and checks the change against the bug and against Telegram Desktop.
+2. If we take it, we re-apply the change in the private repository, adjusted if needed, with you as
+   co-author: the commit carries a `Co-authored-by:` line with your GitHub noreply address, and so
+   does the commit that brings it into this repository, so GitHub credits you.
+3. We close the PR with the `re-applied` label and a note on where the change landed. It ships in
+   the next release.
+
+If we do not take it, we say why in the PR before closing it.
+
+Small, focused fixes for a bug have the best chance. A good PR:
+
+- fixes one problem, ideally one that has an issue; new features start as a discussion in Ideas;
+- follows Telegram Desktop's behaviour (see "How the code is written" below);
+- fills in the [pull request template](.github/pull_request_template.md): **Problem**, **Change**,
+  **Verification** (what you ran and saw; before/after screenshots for UI changes) and **AI use**
+  (the model and harness, if an AI agent wrote or changed any of it). AI-assisted PRs are fine; we
+  only ask you to say so and to have checked the result yourself;
+- contains nothing private: no API credentials, phone numbers, session files or chat screenshots.
+
 ## How the code is written
 
 Rustgram is a port of [Telegram Desktop](https://github.com/telegramdesktop/tdesktop). For every

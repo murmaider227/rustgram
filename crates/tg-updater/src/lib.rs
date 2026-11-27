@@ -165,6 +165,16 @@ pub enum UpdateError {
         package: String,
     },
 
+    /// The signed package declares a different version than the release it was listed under
+    /// (a wrong or mislabelled file was attached to the release).
+    #[error("package version {package} does not match release {release}")]
+    ReleaseVersionMismatch {
+        /// Version parsed from the release tag.
+        release: String,
+        /// Version declared inside the signed package.
+        package: String,
+    },
+
     /// Archive entry path failed safety checks (traversal, Windows device names, collisions).
     #[error("unsafe or conflicting archive path: {0}")]
     UnsafePath(String),

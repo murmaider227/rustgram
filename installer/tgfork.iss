@@ -12,7 +12,7 @@
 #define MyAppShortName "Rustgram"
 #define MyAppName "Rustgram"
 #define MyAppPublisher "Rustgram Authors"
-#define MyAppURL "https://github.com/rustgram/rustgram"
+#define MyAppURL "https://github.com/murmaider227/rustgram"
 #define MyAppExeName "rustgram.exe"
 #define MyUpdaterExeName "rustgram-updater.exe"
 #define MyWidgetHelperExeName "rustgram-widget-helper.exe"
@@ -102,7 +102,7 @@ Name: "ua";      MessagesFile: "compiler:Languages\Ukrainian.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "autoupdate"; Description: "Check for updates automatically"; GroupDescription: "Updates:"; Flags: checkedonce
-Name: "registertg"; Description: "Register tg:// protocol handler"; GroupDescription: "Protocol associations:"; Flags: checkedonce
+Name: "registertg"; Description: "Register tg:// protocol handler"; GroupDescription: "Protocol associations:"; Flags: unchecked
 
 [Files]
 Source: "{#DistDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion

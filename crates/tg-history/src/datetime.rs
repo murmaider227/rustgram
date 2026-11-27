@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_offset_is_cheaper_than_the_system_query() {
+    fn cached_offset_measurement() {
         const CALLS: i64 = 20_000;
         // A history page: timestamps a few minutes apart.
         let base = 1_795_557_720_i64;
@@ -350,6 +350,8 @@ mod tests {
             direct_time.as_secs_f64() * 1e6 / CALLS as f64,
             cached_time.as_secs_f64() * 1e6 / CALLS as f64
         );
-        assert!(cached_time < direct_time);
+        // No speed assertion: jiff already caches the zone on Linux, so the direct query can be as
+        // fast as the cache there and a timing comparison fails at random (coverage run, 2026-11-27).
+        // Correctness is checked by the test above; this one only prints the measurement.
     }
 }

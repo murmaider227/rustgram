@@ -1,65 +1,116 @@
 name: Bug report
-description: Something in Rustgram does not work or looks different from Telegram Desktop.
-labels: ["bug"]
+description: Something in Rustgram does not work, crashes, or looks different from Telegram Desktop.
+labels: ["bug", "needs triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for testing Rustgram. Before you attach screenshots or logs, hide phone numbers, names, chats
-        and anything else private. Security problems go to a private report instead (see SECURITY.md).
+        Thanks for testing Rustgram. Use this form for one problem: broken behaviour, a crash, a freeze, or a
+        difference from Telegram Desktop. Ideas and feature requests go to
+        [Discussions > Ideas](https://github.com/murmaider227/rustgram/discussions/categories/ideas).
+        Security problems go to a [private report](https://github.com/murmaider227/rustgram/security/advisories/new),
+        never here.
+
+        Your coding agent can investigate and draft this report for you: see
+        [docs/REPORTING_BUGS.md](https://github.com/murmaider227/rustgram/blob/main/docs/REPORTING_BUGS.md).
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched open and closed issues and did not find this bug.
+          required: true
+        - label: I use the latest release, or I say below why I cannot.
+          required: false
+
   - type: input
     id: version
     attributes:
       label: Rustgram version
-      description: Settings > About, or the release file name.
+      description: Shown at the bottom of the main menu (☰), or in rustgram.exe > Properties > Details.
       placeholder: 0.1.0-alpha.2
     validations:
       required: true
+
   - type: dropdown
     id: build
     attributes:
       label: Build
       options:
-        - Portable zip
         - Installer
+        - Portable zip
         - Built from source
     validations:
       required: true
+
   - type: input
     id: windows
     attributes:
       label: Windows version
       placeholder: Windows 11 24H2
+
   - type: textarea
     id: steps
     attributes:
       label: Steps to reproduce
+      description: The shortest sequence that shows the problem. Say how often it happens if it is not every time.
       placeholder: |
         1. Open a channel with custom emoji reactions
         2. Scroll to an older post
         3. ...
     validations:
       required: true
+
   - type: textarea
     id: expected
     attributes:
       label: What you expected (what Telegram Desktop does)
     validations:
       required: true
+
   - type: textarea
     id: actual
     attributes:
       label: What happened instead
     validations:
       required: true
-  - type: textarea
-    id: screenshots
+
+  - type: dropdown
+    id: impact
     attributes:
-      label: Screenshots
-      description: Ideally Telegram Desktop and Rustgram side by side, with private data hidden.
+      label: Impact
+      description: How much does this get in your way?
+      options:
+        - I cannot use Rustgram (crash, cannot log in, data lost)
+        - A feature I need does not work
+        - Annoying, but I can work around it
+        - Cosmetic (looks different from Telegram Desktop)
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround
+      description: Anything that avoids the problem for now, if you found one.
+
   - type: textarea
     id: logs
     attributes:
       label: Log excerpt
-      description: Only the relevant lines, with private data removed.
+      description: |
+        Only the lines around the problem, with private data removed. The log is `log.txt` in `%APPDATA%\Rustgram`
+        (portable copies: next to rustgram.exe); crash reports are `tdata\dumps\crash_*.txt` there. Never attach
+        anything else from the `tdata` folder: it holds your session keys.
       render: text
+
+  - type: upload
+    id: attachments
+    attributes:
+      label: Screenshots or recordings
+      description: |
+        Ideally Telegram Desktop and Rustgram side by side. Uploads are public: hide phone numbers, names,
+        chats and message text before you upload.
+    validations:
+      required: false

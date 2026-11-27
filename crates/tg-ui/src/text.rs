@@ -1528,6 +1528,9 @@ pub fn layout_text_with_entities_expanded(
             job.append(slice, 0.0, format);
         }
 
+        // Emoji glyphs are sized in physical pixels (`tg_emoji::text_glyphs`), and this layout
+        // may run outside a pass.
+        tg_emoji::set_text_pixels_per_point(ctx.pixels_per_point());
         let galley = ctx.fonts_mut(|f| f.layout_job(job));
         let galley_rows = galley.rows.len().max(1);
         total_lines += galley_rows;
@@ -2274,7 +2277,18 @@ fn hit_test_galley(galley: &Galley, slice: &str, rel_pos: Pos2) -> (usize, bool,
         if local_x >= g_left && local_x <= g_right {
             let mid = (g_left + g_right) * 0.5;
             let after = local_x >= mid;
-            let ch_idx = row_char_start + gi + usize::from(after);
+            // An emoji is one glyph followed by zero-width glyphs for the rest of its chars
+            // (joiners, selectors, the second flag letter): past its middle, the cursor goes
+            // after the whole sequence, like tdesktop's emoji block.
+            let cluster_tail = if after {
+                placed.row.glyphs[gi + 1..]
+                    .iter()
+                    .take_while(|next| next.advance_width == 0.0)
+                    .count()
+            } else {
+                0
+            };
+            let ch_idx = row_char_start + gi + usize::from(after) + cluster_tail;
             let byte_off = char_bytes.get(ch_idx).copied().unwrap_or(slice.len());
             return (byte_off, after, row_y_ok);
         }

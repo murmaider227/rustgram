@@ -1,0 +1,28 @@
+{
+  "accent_rgb": null,
+  "columns": {
+    "dialogs_no_chat_width_ratio": 0.3,
+    "dialogs_with_chat_width_ratio": 0.3,
+    "tabbed_selector_section_enabled": false,
+    "third_column_width": 350,
+    "third_section_extended_by": -1,
+    "third_section_info_enabled": false
+  },
+  "day_theme": null,
+  "embedded_theme": "Night",
+  "folders_sidebar_enabled": true,
+  "local_passcode": null,
+  "native_window_frame": false,
+  "night_theme": {
+    "accent_rgb": null,
+    "embedded_theme": "Night"
+  },
+  "theme_mode": "Night",
+  "window_position": {
+    "height": 760.0,
+    "maximized": false,
+    "width": 1180.0,
+    "x": 120.0,
+    "y": 80.0
+  }
+}

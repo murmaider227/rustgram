@@ -5,6 +5,7 @@
 //! (`Mixer`, `Mixer::Track`, `Fader`, `ComputeVolume`).
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::dsp::{Resampler, TimeStretcher, soft_clip, to_stereo_f32};
 use crate::error::AudioResult;
@@ -47,6 +48,13 @@ pub trait AudioStream: Send {
     /// Reads the next chunk of interleaved `f32` samples.
     /// Returns `Ok(None)` on end-of-stream.
     fn read_chunk(&mut self) -> AudioResult<Option<PcmChunk>>;
+
+    /// `true` while the stream has no samples yet but is not finished (a streamed video whose
+    /// decoder has not delivered the next audio frame). The mixer then plays silence and keeps
+    /// the track position where it is, like tdesktop's `waitingForData` track state.
+    fn waiting_for_data(&self) -> bool {
+        false
+    }
 }
 
 /// In-memory PCM [`AudioStream`] backed by a `Vec<f32>` (useful for tests and
@@ -234,6 +242,9 @@ impl MixerTrack {
                 self.eof_reached = true;
                 continue;
             };
+            if stream.waiting_for_data() {
+                break;
+            }
             match stream.read_chunk() {
                 Ok(Some(chunk)) => {
                     if chunk.samples.is_empty() {
@@ -386,6 +397,18 @@ impl SuppressionState {
     }
 }
 
+/// The position the video track's sound reaches the listener at a given instant
+/// (`Mixer::getExternalSyncTimePoint`: tdesktop's `lastUpdatePosition` / `lastUpdateWhen`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalSyncPoint {
+    /// The video sound this point belongs to.
+    pub audio: AudioMsgId,
+    /// Media position (speed independent) of the first sample of the rendered buffer, in ms.
+    pub position_ms: i64,
+    /// When that sample is heard: the output callback's playback instant.
+    pub at: Instant,
+}
+
 /// Real-time 48 kHz stereo software audio mixer.
 ///
 /// Faithfully implements tdesktop's `Media::Player::Mixer` + `Fader` +
@@ -403,6 +426,9 @@ pub struct MixerCore {
     notifications_volume_pct: u8,
     suppression: SuppressionState,
     idle_samples: i64,
+    /// Video track position at the start of the last rendered buffer, if it played any samples.
+    last_video_render: Option<(AudioMsgId, i64)>,
+    video_sync: Option<ExternalSyncPoint>,
 }
 
 impl Default for MixerCore {
@@ -427,6 +453,8 @@ impl MixerCore {
             notifications_volume_pct: 100,
             suppression: SuppressionState::default(),
             idle_samples: 0,
+            last_video_render: None,
+            video_sync: None,
         }
     }
 
@@ -539,6 +567,9 @@ impl MixerCore {
 
         if audio_type == AudioType::Voice && !start_paused {
             self.suppression.suppress_song();
+        }
+        if audio_type == AudioType::Video {
+            self.video_sync = None;
         }
         self.idle_samples = 0;
 
@@ -741,7 +772,37 @@ impl MixerCore {
         track.with_speed_position = pos_speed;
         track.fade_start_position = pos_speed;
         track.last_emitted_position = pos_speed;
+        if audio.audio_type == AudioType::Video {
+            self.video_sync = None;
+        }
         Ok(true)
+    }
+
+    /// Renders like [`Self::render_stereo_48k`] and records that the buffer's first sample is
+    /// heard at `heard_at`, the time point the video clock follows
+    /// ([`Self::external_sync_point`]).
+    pub fn render_stereo_48k_at(
+        &mut self,
+        out_stereo: &mut [f32],
+        heard_at: Instant,
+    ) -> Vec<MixerEvent> {
+        let events = self.render_stereo_48k(out_stereo);
+        if let Some((audio, position_ms)) = self.last_video_render.take() {
+            self.video_sync = Some(ExternalSyncPoint {
+                audio,
+                position_ms,
+                at: heard_at,
+            });
+        }
+        events
+    }
+
+    /// The latest played position of the video sound `audio`
+    /// (`Mixer::getExternalSyncTimePoint`); `None` before it played any sample.
+    #[must_use]
+    pub fn external_sync_point(&self, audio: AudioMsgId) -> Option<ExternalSyncPoint> {
+        self.video_sync
+            .filter(|p| p.audio == audio && self.video_track.state.id == audio)
     }
 
     /// Plays a short UI or notification sound (`Media::Audio::Track::playOnce/playInLoop`).
@@ -832,6 +893,12 @@ impl MixerCore {
         let mut events = Vec::new();
         let mut any_active = false;
         let mut unsuppress_song_after = false;
+        let video_start = (
+            self.video_track.state.id,
+            self.video_track.with_speed_position,
+            self.video_track.speed,
+        );
+        self.last_video_render = None;
 
         for (idx, track) in self.voice_tracks.iter_mut().enumerate() {
             let is_current = idx == self.voice_current;
@@ -856,6 +923,15 @@ impl MixerCore {
                 &mut events,
             );
             any_active |= active;
+        }
+        if self.video_track.state.id == video_start.0
+            && self.video_track.with_speed_position > video_start.1
+        {
+            let normal = speed_independent_position(video_start.1, video_start.2);
+            self.last_video_render = Some((
+                video_start.0,
+                (normal * 1000) / i64::from(DEFAULT_FREQUENCY),
+            ));
         }
 
         if unsuppress_song_after {

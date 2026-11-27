@@ -14,6 +14,7 @@ use crate::ffmpeg::{
     CustomIoSource, DecodedMediaFrame, FfmpegMedia, FfmpegOpenOptions, HwAccelKind,
     correct_by_aspect,
 };
+use crate::streaming::audio_output::AudioSink;
 use crate::streaming::cache::{CacheKey, SliceCache};
 use crate::streaming::loader::{LocalFileLoader, MemoryRangeLoader, RangeLoader};
 use crate::streaming::reader::{SliceConfig, StreamingReader};
@@ -77,6 +78,14 @@ pub trait Decoder: Send {
     fn io_wait_flag(&self) -> Option<&Arc<AtomicBool>> {
         None
     }
+
+    /// Asks the decoder to hand decoded audio straight to `sink` from its own thread, like
+    /// tdesktop's `AudioTrack` feeding the mixer from the streaming thread. Returns `false`
+    /// when it cannot (a synchronous decoder): the caller then forwards the
+    /// [`DecodedPacket::Audio`] frames itself.
+    fn set_audio_sink(&mut self, _sink: Arc<dyn AudioSink>) -> bool {
+        false
+    }
 }
 
 impl<D: Decoder + ?Sized> Decoder for Box<D> {
@@ -118,6 +127,10 @@ impl<D: Decoder + ?Sized> Decoder for Box<D> {
 
     fn io_wait_flag(&self) -> Option<&Arc<AtomicBool>> {
         (**self).io_wait_flag()
+    }
+
+    fn set_audio_sink(&mut self, sink: Arc<dyn AudioSink>) -> bool {
+        (**self).set_audio_sink(sink)
     }
 }
 

@@ -129,6 +129,14 @@ impl<C: HttpClient> UpdateChecker<C> {
             self.config.allow_beta,
             self.config.target,
         )?;
+        // The release tag picked this candidate; the signed package must be that exact version, so
+        // a wrong file attached to a release is never installed under another release's name.
+        if verified.envelope.version != available.version {
+            return Err(UpdateError::ReleaseVersionMismatch {
+                release: available.version.to_string(),
+                package: verified.envelope.version.to_string(),
+            });
+        }
 
         let staging_dir = unpack_verified_package(&verified, &self.config.working_dir)?;
         let updater_promoted =

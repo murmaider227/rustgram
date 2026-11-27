@@ -1,0 +1,57 @@
+# Issue and pull request labels, kept in sync by .github/workflows/labels.yml.
+# Edit labels here, not in the GitHub UI: the sync overwrites color and description of every label
+# listed below. Labels missing from this file are left alone (never deleted). Renaming a label here
+# creates a new one; rename it in the GitHub UI first, then here.
+# color: 6 hex digits without '#'.
+
+- name: bug
+  color: "d73a4a"
+  description: Something does not work, crashes, or differs from Telegram Desktop.
+- name: enhancement
+  color: "a2eeef"
+  description: A tracked improvement. Requests start in Discussions > Ideas.
+- name: needs triage
+  color: "fbca04"
+  description: New report a maintainer has not looked at yet.
+- name: needs more info
+  color: "fef2c0"
+  description: Waiting for the reporter. Closes 7 days after this label if there is no reply.
+- name: via-triage
+  color: "5319e7"
+  description: Drafted by the reporter's coding agent following docs/TRIAGE_PLAYBOOK.md.
+- name: crash
+  color: "b60205"
+  description: Rustgram closed, froze, or wrote a crash report.
+- name: re-applied
+  color: "0e8a16"
+  description: The fix from this pull request was re-applied by a maintainer with credit to the author.
+- name: duplicate
+  color: "cfd3d7"
+  description: This issue or pull request already exists.
+- name: wontfix
+  color: "ffffff"
+  description: This will not be worked on.
+- name: invalid
+  color: "e4e669"
+  description: Not a Rustgram bug, or not actionable.
+- name: question
+  color: "d876e3"
+  description: Further information is requested.
+- name: documentation
+  color: "0075ca"
+  description: Improvements or additions to documentation.
+- name: accessibility
+  color: "f143ab"
+  description: Barrier affecting people with disabilities.
+- name: good first issue
+  color: "7057ff"
+  description: Good for newcomers.
+- name: help wanted
+  color: "008672"
+  description: Extra attention is needed.
+- name: dependencies
+  color: "0366d6"
+  description: Pull requests that update a dependency file.
+- name: github_actions
+  color: "000000"
+  description: Pull requests that update GitHub Actions code.

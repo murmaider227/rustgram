@@ -63,6 +63,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--start-main",
     "--live",
     "--demo",
+    "--smoke-test",
 ];
 
 /// Switches that consume the next argument as their value.
@@ -82,14 +83,19 @@ pub enum CliRequest {
     Help,
     /// An option Rustgram does not know: print an error and exit with code 2.
     UnknownOption(String),
+    /// `--smoke-test`: open the local storage of a scratch `-workdir`, report and exit
+    /// ([`super::smoke_test`]).
+    SmokeTest,
 }
 
-/// Classifies `argv` (including `argv[0]`). Version and help flags win over unknown options;
-/// values of one-value options and everything after `--` are never read as options.
+/// Classifies `argv` (including `argv[0]`). Version and help flags win over unknown options,
+/// unknown options over `--smoke-test`; values of one-value options and everything after `--`
+/// are never read as options.
 #[must_use]
 pub fn classify_cli<S: AsRef<str>>(argv: &[S]) -> CliRequest {
     let mut info = None;
     let mut unknown = None;
+    let mut smoke_test = false;
     let mut args = argv.iter().skip(1).map(AsRef::as_ref);
     while let Some(arg) = args.next() {
         if arg == "--" {
@@ -109,11 +115,18 @@ pub fn classify_cli<S: AsRef<str>>(argv: &[S]) -> CliRequest {
                 continue;
             }
         }
+        if arg == super::smoke_test::SMOKE_TEST_FLAG {
+            smoke_test = true;
+        }
         if unknown.is_none() && is_unknown_option(arg) {
             unknown = Some(CliRequest::UnknownOption(arg.to_owned()));
         }
     }
-    info.or(unknown).unwrap_or(CliRequest::Run)
+    info.or(unknown).unwrap_or(if smoke_test {
+        CliRequest::SmokeTest
+    } else {
+        CliRequest::Run
+    })
 }
 
 fn is_unknown_option(arg: &str) -> bool {
@@ -203,6 +216,27 @@ pub fn agent_profile_refusal(
     ))
 }
 
+/// `--smoke-test` only runs on a scratch `-workdir` outside the default profile, for every
+/// caller (agent or not): it writes into the working dir it opens.
+#[must_use]
+pub fn smoke_test_refusal(resolved: &ResolvedWorkingDir, env: &WorkDirEnv) -> Option<String> {
+    let inside_default = default_profile_dirs(env)
+        .iter()
+        .any(|dir| path_is_within(&resolved.path, dir));
+    if resolved.is_custom && !inside_default {
+        return None;
+    }
+    let reason = if resolved.is_custom {
+        "-workdir points into the default profile"
+    } else {
+        "no -workdir was given"
+    };
+    Some(format!(
+        "Rustgram: refusing --smoke-test because {reason}. The smoke test writes into the          working dir it opens, so it only runs on a scratch copy.
+         Usage: rustgram --smoke-test -workdir <scratch dir>"
+    ))
+}
+
 fn default_profile_dirs(env: &WorkDirEnv) -> Vec<PathBuf> {
     let mut dirs = vec![resolve_working_dir(&ParsedArgs::default(), env).path];
     if let Some(app_data) = &env.app_data_dir {
@@ -245,7 +279,8 @@ impl EarlyExit {
 }
 
 /// Decides whether this launch ends before any profile, lock or window work: info flags,
-/// unknown options, and agent runs without their own `-workdir`. `resolved` is the working dir
+/// unknown options, `--smoke-test` without a scratch `-workdir`, and agent runs without their
+/// own `-workdir`. `resolved` is the working dir
 /// the launch would use; `agent` comes from [`detect_agent`].
 #[must_use]
 pub fn early_exit<S: AsRef<str>>(
@@ -271,6 +306,11 @@ pub fn early_exit<S: AsRef<str>>(
                 "Rustgram: unknown option '{option}'. Nothing was started.\n\
                  Run 'rustgram --help' for the list of options."
             ),
+            to_stderr: true,
+        }),
+        CliRequest::SmokeTest => smoke_test_refusal(resolved, env).map(|message| EarlyExit {
+            code: 2,
+            message,
             to_stderr: true,
         }),
         CliRequest::Run => agent_profile_refusal(agent, resolved, env).map(|message| EarlyExit {
@@ -450,6 +490,60 @@ mod tests {
             assert!(!resolved.is_custom);
             assert_eq!(early_exit(argv, &resolved, &env, None), None, "{argv:?}");
         }
+    }
+
+    #[test]
+    fn smoke_test_runs_only_on_a_scratch_workdir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = env(dir.path());
+        assert_eq!(
+            classify_cli(&["rustgram.exe", "--smoke-test"]),
+            CliRequest::SmokeTest
+        );
+        // Info flags and unknown options still win; `--` ends option parsing.
+        assert_eq!(
+            classify_cli(&["rustgram.exe", "--smoke-test", "--version"]),
+            CliRequest::Version
+        );
+        assert_eq!(
+            classify_cli(&["rustgram.exe", "--smoke-test", "--bogus"]),
+            CliRequest::UnknownOption("--bogus".to_owned())
+        );
+        assert_eq!(
+            classify_cli(&["rustgram.exe", "--", "--smoke-test"]),
+            CliRequest::Run
+        );
+
+        // Without -workdir, or with one inside the default profile, it is refused for everyone.
+        let default_dir = env.app_data_dir.clone().unwrap().join(APP_NAME);
+        let default_str = default_dir.to_string_lossy().into_owned();
+        for argv in [
+            &["rustgram.exe", "--smoke-test"][..],
+            &[
+                "rustgram.exe",
+                "--smoke-test",
+                "-workdir",
+                default_str.as_str(),
+            ],
+        ] {
+            let resolved = resolved_for(argv, &env);
+            for agent_signal in [None, Some(agent("RUSTGRAM_AGENT"))] {
+                let exit = early_exit(argv, &resolved, &env, agent_signal.as_ref())
+                    .unwrap_or_else(|| panic!("{argv:?} was not refused"));
+                assert_eq!(exit.code, 2, "{argv:?}");
+                assert!(exit.to_stderr);
+                assert!(exit.message.contains("--smoke-test"), "{}", exit.message);
+            }
+        }
+
+        let scratch = dir.path().join("scratch").to_string_lossy().into_owned();
+        let argv = ["rustgram.exe", "--smoke-test", "-workdir", scratch.as_str()];
+        let resolved = resolved_for(&argv, &env);
+        assert_eq!(early_exit(&argv, &resolved, &env, None), None);
+        assert_eq!(
+            early_exit(&argv, &resolved, &env, Some(&agent("CLAUDECODE"))),
+            None
+        );
     }
 
     #[test]

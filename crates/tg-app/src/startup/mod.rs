@@ -18,6 +18,7 @@ pub mod plan;
 pub mod platform;
 pub mod profile_paths;
 pub mod profiler;
+pub mod smoke_test;
 pub use crate::core_types::restore_windows;
 pub mod updater;
 
@@ -138,13 +139,31 @@ pub fn run_from_cli() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // `--smoke-test -workdir <scratch>` (release workflow): storage only, no window, network,
+    // lock, updater or system integration.
+    if prelim.action == StartupAction::SmokeTest {
+        let data_name = if prelim.parsed_args.key.is_empty() {
+            "data"
+        } else {
+            prelim.parsed_args.key.as_str()
+        };
+        let code = smoke_test::run_and_report(
+            &prelim.resolved_working_dir.path,
+            data_name,
+            &prelim.settings_path,
+        );
+        std::process::exit(code);
+    }
     let prefs = StartupPrefs::load_from(&prelim.resolved_working_dir.path);
     let plan = StartupPlan::build(&raw_args, &work_env, Some(&exe_path), &prefs);
     profiler::mark("cli_and_plan");
 
     match plan.action {
-        // Handled by `cli_guard::early_exit` above.
-        StartupAction::ShowHelp | StartupAction::ShowVersion | StartupAction::RejectArguments => {
+        // Handled by `cli_guard::early_exit` and the smoke test above.
+        StartupAction::ShowHelp
+        | StartupAction::ShowVersion
+        | StartupAction::RejectArguments
+        | StartupAction::SmokeTest => {
             return Ok(());
         }
         StartupAction::Cleanup => {

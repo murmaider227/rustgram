@@ -24,8 +24,8 @@ pub fn viewer_decoder(decoder: FfmpegStreamDecoder) -> tg_video::Result<Box<dyn 
     }
 }
 
-/// Drops decoded audio the viewer has no output for, so the queue does not grow for the whole
-/// video (about 11 MB per minute of 48 kHz stereo).
+/// Drops decoded audio when no sound output is attached (see `StreamingPlayer::attach_audio`),
+/// so the queue does not grow for the whole video (about 11 MB per minute of 48 kHz stereo).
 pub fn drop_unplayed_audio(player: &mut ViewerPlayer) {
     while player.pop_audio_frame().is_some() {}
 }

@@ -1,8 +1,11 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Questions and ideas
-    url: https://github.com/murmaider227/rustgram/discussions
-    about: Ask questions and discuss ideas in Discussions.
+  - name: Feature request or idea
+    url: https://github.com/murmaider227/rustgram/discussions/categories/ideas
+    about: Suggest something Rustgram should do in Discussions > Ideas. Issues are for bugs.
+  - name: Question
+    url: https://github.com/murmaider227/rustgram/discussions/categories/q-a
+    about: Ask how something works in Discussions > Q&A.
   - name: Report a security vulnerability
     url: https://github.com/murmaider227/rustgram/security/advisories/new
     about: Please report security problems privately, not as a public issue.

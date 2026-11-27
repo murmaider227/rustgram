@@ -362,6 +362,7 @@ pub fn apply_tdesktop_text_rendering(visuals: &mut egui::Visuals) {
 /// Register Telegram Desktop's fonts and default `egui::TextStyle` sizes on `ctx`.
 pub fn register_tdesktop_fonts(ctx: &egui::Context) {
     ctx.set_fonts(build_tdesktop_font_definitions());
+    tg_emoji::install_text_emoji(ctx, Arc::new(text_emoji_metrics));
     apply_tdesktop_text_styles(ctx);
     ctx.data_mut(|d| d.insert_temp(fonts_registered_id(), current_scale().percent()));
 }
@@ -408,10 +409,21 @@ pub fn ensure_tdesktop_fonts(ctx: &egui::Context) {
         None => register_tdesktop_fonts(ctx),
         Some(prev) if prev != cur => {
             apply_tdesktop_text_styles(ctx);
+            tg_emoji::reset_text_emoji(ctx, Arc::new(text_emoji_metrics));
             ctx.data_mut(|d| d.insert_temp(key, cur));
         }
         Some(_) => {}
     }
+}
+
+/// `(st::emojiSize, st::emojiPadding)` at the current interface scale: the size and side
+/// padding of every emoji drawn inside text (TGB-3048, `tg_emoji::text_glyphs`).
+#[must_use]
+pub fn text_emoji_metrics() -> (f32, f32) {
+    (
+        st::emoji_size.scaled() as f32,
+        st::emoji_padding.scaled() as f32,
+    )
 }
 
 fn fonts_registered_id() -> Id {

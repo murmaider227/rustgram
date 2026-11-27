@@ -29,6 +29,8 @@ pub enum StartupAction {
     RejectArguments,
     /// Stop running instance, remove OS integration (`-cleanup`), and exit.
     Cleanup,
+    /// Open the local storage of a scratch `-workdir`, report and exit (`--smoke-test`).
+    SmokeTest,
     /// Proceed with single-instance handshake, crash check, and GUI launch.
     RunApp,
 }
@@ -195,6 +197,7 @@ impl StartupPlan {
             CliRequest::Version => StartupAction::ShowVersion,
             CliRequest::Help => StartupAction::ShowHelp,
             CliRequest::UnknownOption(_) => StartupAction::RejectArguments,
+            CliRequest::SmokeTest => StartupAction::SmokeTest,
             CliRequest::Run if parsed_args.launch_mode == LaunchMode::Cleanup => {
                 StartupAction::Cleanup
             }
@@ -295,6 +298,8 @@ fn extract_dev_switches(raw: &[String]) -> (DevSwitches, Vec<String>) {
             "--demo" => {
                 dev.demo_mode = true;
             }
+            // Selected through `classify_cli`; never forwarded as a trailing file path.
+            "--smoke-test" => {}
             "--settings" => {
                 if let Some(next) = raw.get(i + 1) {
                     dev.settings_path = Some(PathBuf::from(next));
@@ -344,6 +349,7 @@ pub fn help_text() -> &'static str {
        --live               Force live mode (default when API credentials are available)\n  \
        --start-main         Skip Intro and open straight into the signed-in workspace\n  \
        --settings <PATH>    Use a custom shell settings JSON file\n  \
+       --smoke-test         Open the storage of -workdir <DIR>, report and exit\n  \
        -h, --help           Show this help message
          -v, --version        Print the version and exit"
 }

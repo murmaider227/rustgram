@@ -1,0 +1,9 @@
+{
+  "auto_update": true,
+  "install_beta": true,
+  "last_update_check_unix": 1764170000,
+  "register_url_schemes": true,
+  "start_minimized_on_autostart": true,
+  "take_url_schemes": false,
+  "url_schemes_registered": false
+}

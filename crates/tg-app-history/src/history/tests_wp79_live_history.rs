@@ -534,6 +534,18 @@ fn wp79_open_chat_appends_live_short_and_new_messages_edits_deletes_and_marks_re
     }));
     wait_for_generation_above(&live, gen_before);
     render_frame(&ctx, &mut widget, &mut live, peer_a, 5.0, true);
+    // A deleted message leaves the list once its frame is captured for the delete effect
+    // (TGB-3011); without a screenshot backend that takes a few frames.
+    for frame in 1..=5 {
+        render_frame(
+            &ctx,
+            &mut widget,
+            &mut live,
+            peer_a,
+            5.0 + f64::from(frame) / 60.0,
+            true,
+        );
+    }
 
     let remaining_ids: Vec<MsgId> = widget.inner_mut().messages().iter().map(|m| m.id).collect();
     assert_eq!(
@@ -710,6 +722,18 @@ fn wp79_open_channel_appends_new_channel_message_edit_and_delete() {
     }));
     wait_for_generation_above(&live, gen_before);
     render_frame(&ctx, &mut widget, &mut live, channel_c, 4.0, true);
+    // A deleted message leaves the list once its frame is captured for the delete effect
+    // (TGB-3011); without a screenshot backend that takes a few frames.
+    for frame in 1..=5 {
+        render_frame(
+            &ctx,
+            &mut widget,
+            &mut live,
+            channel_c,
+            4.0 + f64::from(frame) / 60.0,
+            true,
+        );
+    }
     let ids: Vec<MsgId> = widget.inner_mut().messages().iter().map(|m| m.id).collect();
     assert_eq!(ids, vec![MsgId(21)]);
 }

@@ -22,5 +22,5 @@ pub use spoiler::paint_spoiler_particles;
 pub use text_spoiler::{merge_spoiler_rects, paint_text_spoiler};
 pub use thanos::{
     ThanosEffect, ThanosItem, ThanosParticle, ThanosPolicy, animation_speed_multiplier,
-    compute_particle_grid, disappear_progress,
+    compute_particle_grid, disappear_progress, particle_budget, snapshot_region,
 };

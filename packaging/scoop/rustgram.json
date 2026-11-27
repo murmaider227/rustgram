@@ -1,0 +1,42 @@
+{
+    "version": "0.1.0-alpha.2",
+    "description": "An unofficial Telegram desktop client written in Rust, ported from Telegram Desktop (pre-release).",
+    "homepage": "https://github.com/murmaider227/rustgram",
+    "license": {
+        "identifier": "GPL-3.0-or-later",
+        "url": "https://github.com/murmaider227/rustgram/blob/main/LICENSE"
+    },
+    "notes": [
+        "Rustgram keeps its profile in %APPDATA%\\Rustgram, outside the Scoop folder, so it survives updates and is not removed by 'scoop uninstall'.",
+        "Rustgram also updates itself; 'scoop update rustgram' installs the latest release next to it."
+    ],
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/murmaider227/rustgram/releases/download/v0.1.0-alpha.2/rustgram-0.1.0-alpha.2-win-x64-portable.zip",
+            "hash": "1c21a82878ebba33799930001a898a6d9057e8c278616a139896229f1b19255e"
+        }
+    },
+    "bin": "rustgram.exe",
+    "shortcuts": [
+        [
+            "rustgram.exe",
+            "Rustgram"
+        ]
+    ],
+    "checkver": {
+        "url": "https://api.github.com/repos/murmaider227/rustgram/releases",
+        "jsonpath": "$[0].tag_name",
+        "regex": "v([\\w.-]+)"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/murmaider227/rustgram/releases/download/v$version/rustgram-$version-win-x64-portable.zip",
+                "hash": {
+                    "url": "$baseurl/SHA256SUMS.txt",
+                    "regex": "$sha256\\s+$basename"
+                }
+            }
+        }
+    }
+}

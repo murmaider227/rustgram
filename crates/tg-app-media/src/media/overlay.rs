@@ -25,6 +25,7 @@ use tg_video::{
 use crate::media::video_playback::{
     ViewerPlayer, drop_unplayed_audio, next_step_delay, viewer_decoder,
 };
+use crate::media::video_sound::VideoSoundOutput;
 
 use crate::media::backend::{MediaBackend, MediaItem, MediaItemId, MediaItemKind};
 use crate::media::controls::{PlaybackControlsAction, PlaybackControlsState, TimestampChapter};
@@ -394,6 +395,8 @@ pub struct MediaOverlayWidget {
     protection_reason: Option<ReasonId>,
     playback_sponsored: PlaybackSponsoredOverlay,
     controls_fade: ControlsFade,
+    /// Where videos play their sound (TGB-3041); `None` plays them silently.
+    video_sound: Option<VideoSoundOutput>,
 }
 
 impl Default for MediaOverlayWidget {
@@ -443,6 +446,41 @@ impl MediaOverlayWidget {
             protection_reason: None,
             playback_sponsored: PlaybackSponsoredOverlay::new(),
             controls_fade: ControlsFade::default(),
+            video_sound: None,
+        }
+    }
+
+    /// Sets where videos play their sound (the app's mixer and output device). A video that is
+    /// already open starts playing its sound through it.
+    pub fn set_video_sound_output(&mut self, output: Option<VideoSoundOutput>) {
+        let same = match (&self.video_sound, &output) {
+            (Some(a), Some(b)) => a.same_as(b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.video_sound = output;
+        }
+        self.attach_video_sound();
+    }
+
+    fn attach_video_sound(&mut self) {
+        if let (Some(output), ActiveContent::Video { player, .. }) =
+            (&self.video_sound, &mut self.content)
+            && player.wants_audio_output()
+        {
+            player.attach_audio(output.player_audio());
+        }
+    }
+
+    /// Presentation time of the video frame on screen, if a video is open.
+    #[must_use]
+    pub fn video_frame_pts_ms(&self) -> Option<i64> {
+        match &self.content {
+            ActiveContent::Video { player, .. } => {
+                player.current_video_frame().map(|frame| frame.pts_ms)
+            }
+            _ => None,
         }
     }
 
@@ -796,6 +834,7 @@ impl MediaOverlayWidget {
     /// Steps video decoding at `world_now_ms` without rendering UI (useful in tests & screenshots).
     pub fn step_video(&mut self, world_now_ms: i64) {
         self.last_world_ms = world_now_ms;
+        self.attach_video_sound();
         if let ActiveContent::Video { player, .. } = &mut self.content {
             let _ = player.step_video(world_now_ms);
             drop_unplayed_audio(player);
@@ -923,6 +962,11 @@ impl MediaOverlayWidget {
                         .and_then(|dec| StreamingPlayer::new(dec, opts))
                         {
                             Ok(mut player) => {
+                                if let Some(output) = &self.video_sound
+                                    && player.wants_audio_output()
+                                {
+                                    player.attach_audio(output.player_audio());
+                                }
                                 if let Some(vinfo) = &player.info().video {
                                     self.zoom.set_content(
                                         f64::from(vinfo.size.width.max(1)),
@@ -1575,6 +1619,7 @@ impl MediaOverlayWidget {
     }
 
     fn update_active_texture(&mut self, ctx: &egui::Context, world_now_ms: i64) {
+        self.attach_video_sound();
         let rot = self.zoom.rotation;
         let fh = self.zoom.flip_h;
         let fv = self.zoom.flip_v;

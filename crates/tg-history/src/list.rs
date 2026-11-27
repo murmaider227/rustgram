@@ -81,7 +81,9 @@ impl HistoryListItem {
 /// Optional vertical collapse gap injected at a logical Y offset (`ListWidget::collapseGaps`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CollapseGap {
-    /// Absolute logical Y threshold where the gap begins.
+    /// Where the gap begins, in item coordinates (`HistoryListItem::y`, without `items_top`, so
+    /// the gap stays put when a short list's top margin changes): items with `y >= abs_y` are
+    /// pushed down by `height`.
     pub abs_y: i32,
     /// Height of the gap in pixels.
     pub height: i32,
@@ -256,10 +258,11 @@ impl HistoryList {
     #[must_use]
     pub fn visual_item_top(&self, index: usize) -> i32 {
         let logical = self.item_top(index);
+        let item_y = self.items[index].y;
         let shift: i32 = self
             .collapse_gaps
             .iter()
-            .filter(|g| logical >= g.abs_y)
+            .filter(|g| item_y >= g.abs_y)
             .map(|g| g.height)
             .sum();
         logical + shift
@@ -366,7 +369,7 @@ impl HistoryList {
             let shift: i32 = self
                 .collapse_gaps
                 .iter()
-                .filter(|g| logical >= g.abs_y)
+                .filter(|g| item.y >= g.abs_y)
                 .map(|g| g.height)
                 .sum();
             logical + shift + item.height <= y
@@ -417,8 +420,8 @@ impl HistoryList {
         let gap_count = self.collapse_gaps.len();
         let mut next_gap_idx = 0usize;
         let mut collapse_shift = 0i32;
-        let first_top = self.item_top(from);
-        while next_gap_idx < gap_count && first_top >= self.collapse_gaps[next_gap_idx].abs_y {
+        let first_y = self.items[from].y;
+        while next_gap_idx < gap_count && first_y >= self.collapse_gaps[next_gap_idx].abs_y {
             collapse_shift += self.collapse_gaps[next_gap_idx].height;
             next_gap_idx += 1;
         }
@@ -426,7 +429,8 @@ impl HistoryList {
         let mut out = Vec::new();
         while from < self.items.len() {
             let logical_top = self.item_top(from);
-            while next_gap_idx < gap_count && logical_top >= self.collapse_gaps[next_gap_idx].abs_y
+            while next_gap_idx < gap_count
+                && self.items[from].y >= self.collapse_gaps[next_gap_idx].abs_y
             {
                 collapse_shift += self.collapse_gaps[next_gap_idx].height;
                 next_gap_idx += 1;

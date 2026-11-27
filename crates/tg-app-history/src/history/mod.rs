@@ -18,6 +18,8 @@ pub mod compose_extras;
 pub mod compose_search;
 pub mod compose_stash;
 pub mod copy_selection;
+mod delete_collapse;
+mod delete_dissolve;
 pub mod edit_caption;
 pub mod emoji_interactions;
 mod entity_clicks;
@@ -136,6 +138,8 @@ mod tests_w4_text_snap;
 mod tests_w5_copy;
 #[cfg(test)]
 mod tests_w5_copy_snap;
+#[cfg(test)]
+mod tests_w5_delete;
 #[cfg(test)]
 mod tests_wave4_media;
 #[cfg(test)]
@@ -544,6 +548,8 @@ pub struct HistoryWidget {
     widget_helper_path: Option<std::path::PathBuf>,
     // Decorative UI effects (`tg-ui::effects::{thanos, fly}`) & Draw-to-Reply (`tg-editor`)
     thanos_effect: tg_ui::effects::ThanosEffect,
+    /// Deleted messages waiting for the frame they dissolve from (TGB-3011).
+    pending_dissolve: Option<delete_dissolve::PendingDissolve>,
     fly_effects: tg_ui::effects::FlyEffectsManager,
     /// The text message flying from the field into the list (`MessageSendingTextFlight`).
     send_flight: Option<send_flight::SendFlight>,
@@ -714,6 +720,7 @@ impl HistoryWidget {
             active_widget_query_status: None,
             widget_helper_path: None,
             thanos_effect: tg_ui::effects::ThanosEffect::new(),
+            pending_dissolve: None,
             fly_effects: tg_ui::effects::FlyEffectsManager::new(),
             send_flight: None,
             effects_chat_enabled: true,
@@ -1448,7 +1455,7 @@ impl HistoryWidget {
                     reply_markup_dirty = true;
                 }
                 tg_app_core::history::backend::HistoryLiveUpdate::MessagesDeleted(ids) => {
-                    self.inner.remove_messages(&ids, peer_info.summary.kind);
+                    self.remove_messages_with_effect(ctx, peer_id, &ids, peer_info.summary.kind);
                     // Cancel active edit/reply targeting a deleted message (`HistoryWidget::itemRemoved`).
                     let target_deleted = match &self.compose.mode {
                         crate::history::compose::ComposeMode::Edit { msg_id, .. }
@@ -3026,6 +3033,7 @@ impl HistoryWidget {
                 .as_ref()
                 .and_then(|flight| flight.row(peer_id, now_secs)),
         );
+        self.finish_pending_dissolve(ui.ctx(), peer_id, peer_info.summary.kind, list_rect);
         let inner_events = self.inner.show_with_bots(
             ui,
             list_rect,
@@ -3038,6 +3046,7 @@ impl HistoryWidget {
             bot_snapshot.as_ref().is_some_and(|s| s.bot_verified),
             backend,
         );
+        self.request_dissolve_snapshot(ui.ctx());
         let flight_row = self.inner.take_send_flight_row();
         if let Some(flight) = self.send_flight.as_mut()
             && !flight.after_list(
@@ -6606,23 +6615,14 @@ impl HistoryWidget {
                     .delete_messages(peer_id, &msg_ids, revoke_for_everyone)
                     .is_ok()
             {
-                // Launch Thanos disintegration particle cloud for deleted bubbles (`thanos_effect.cpp`).
-                if self.last_list_rect.is_positive() {
-                    let policy = self.thanos_policy();
-                    let bubble_w = (self.last_list_rect.width() * 0.55).clamp(140.0, 320.0);
-                    for (idx, _) in msg_ids.iter().take(4).enumerate() {
-                        let y = (self.last_list_rect.center().y + idx as f32 * 52.0)
-                            .min(self.last_list_rect.bottom() - 56.0);
-                        let rect = Rect::from_min_size(
-                            Pos2::new(self.last_list_rect.center().x - bubble_w * 0.5, y),
-                            Vec2::new(bubble_w, 44.0),
-                        );
-                        self.thanos_effect
-                            .add_item(rect, colors.msg_out_bg, colors.accent, policy);
-                    }
-                }
-                self.inner.remove_messages(&msg_ids, peer_info.summary.kind);
+                // The messages turn to dust where they are painted (TGB-3011).
                 self.inner.clear_selection();
+                self.remove_messages_with_effect(
+                    ui.ctx(),
+                    peer_id,
+                    &msg_ids,
+                    peer_info.summary.kind,
+                );
                 let toast = if revoke_for_everyone {
                     format!("Deleted {} message(s) for everyone", msg_ids.len())
                 } else {
@@ -6699,8 +6699,12 @@ impl HistoryWidget {
                             } else {
                                 vec![req.msg_id]
                             };
-                            self.inner
-                                .remove_messages(&to_remove, peer_info.summary.kind);
+                            self.remove_messages_with_effect(
+                                ui.ctx(),
+                                peer_id,
+                                &to_remove,
+                                peer_info.summary.kind,
+                            );
                         }
                         self.show_toast(format!("Blocked {sender_name} from Replies"), now_secs);
                     }

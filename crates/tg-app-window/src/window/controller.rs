@@ -2115,6 +2115,9 @@ impl WindowController {
             self.close_content_windows();
         }
         if self.media_overlay.is_open() {
+            self.media_overlay.set_video_sound_output(Some(
+                self.main_widget.audio_player_bar().video_sound_output(),
+            ));
             let ov_events =
                 self.media_overlay
                     .show(&ctx, screen_rect, &*self.session_backend, now_ms);

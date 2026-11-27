@@ -29,6 +29,7 @@ mod tests_seca;
 #[cfg(test)]
 mod tests_wp14;
 pub mod video_playback;
+pub mod video_sound;
 pub mod video_stream;
 pub mod zoom;
 
@@ -60,6 +61,7 @@ pub use round_float::{
     single_section_layout_with_top_inset,
 };
 pub use style::{VolumeIconLevel, format_duration_secs, format_remaining_secs};
+pub use video_sound::VideoSoundOutput;
 pub use video_stream::{
     MAX_TOP_PAID_DONORS_SHOWN, PlaybackSponsoredEvent, PlaybackSponsoredOverlay,
     SPONSORED_DURATION_MIN_MS, SPONSORED_START_DELAY_MIN_MS, SponsoredForVideo,

@@ -2,6 +2,7 @@
 //!
 //! Port of `Telegram/SourceFiles/media/streaming/`.
 
+pub mod audio_output;
 pub mod cache;
 pub mod clock;
 pub mod decoder;
@@ -11,6 +12,7 @@ pub mod player;
 pub mod reader;
 pub mod threaded;
 
+pub use audio_output::{AudioSink, PlayerAudio};
 pub use cache::{
     BinlogSliceCache, CacheKey, MediaCacheSliceCache, MemorySliceCache, SliceCache, slice_cache_key,
 };

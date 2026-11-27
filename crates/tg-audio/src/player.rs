@@ -820,6 +820,12 @@ impl PlayerInstance {
         Ok(())
     }
 
+    /// The hardware output engine, if this player plays through a device.
+    #[must_use]
+    pub const fn output(&self) -> Option<&Arc<AudioOutputEngine>> {
+        self.output.as_ref()
+    }
+
     /// Pauses playback for `audio_type` (`Instance::pause(Type)`).
     pub fn pause(&mut self, audio_type: AudioType) {
         let current = self.current(audio_type);

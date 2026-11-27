@@ -9,16 +9,18 @@
 pub mod atlas;
 pub mod background;
 pub mod egui_ext;
-#[cfg(test)]
 mod resample;
 #[cfg(test)]
 mod tests_emoji_order;
 #[cfg(test)]
 mod tests_shared_textures;
 #[cfg(test)]
+mod tests_text_glyphs;
+#[cfg(test)]
 mod tests_tile_metrics;
 #[cfg(test)]
 mod tests_tile_pixels;
+pub mod text_glyphs;
 mod tile_worker;
 
 pub use atlas::{
@@ -27,6 +29,7 @@ pub use atlas::{
     TILE_COUNT, TILE_HEIGHT_PX, TILE_WIDTH_PX,
 };
 pub use egui_ext::{EmojiTextureCache, InlineEmojiSegment, split_inline_emoji};
+pub use text_glyphs::{install_text_emoji, reset_text_emoji, set_text_pixels_per_point};
 
 #[cfg(test)]
 mod tests {
