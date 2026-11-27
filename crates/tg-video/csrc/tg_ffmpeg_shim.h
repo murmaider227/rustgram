@@ -223,6 +223,9 @@ void tg_ffmpeg_versions(
     uint32_t *swscale_ver,
     uint32_t *swresample_ver);
 
+/* FFmpeg build identifier (`av_version_info()`, e.g. "N-129333-g7fdb4c2341-20261127"). */
+const char *tg_ffmpeg_build_id(void);
+
 /* Video editor export / transcode configuration (ports media_video_encode.cpp). */
 typedef struct TgVideoEncodeConfig {
     int64_t from_ms;        /* Trim start in milliseconds (>= 0). */

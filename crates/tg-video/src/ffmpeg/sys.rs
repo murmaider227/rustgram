@@ -267,6 +267,8 @@ unsafe extern "C" {
         swresample_ver: *mut u32,
     );
 
+    pub fn tg_ffmpeg_build_id() -> *const c_char;
+
     pub fn tg_video_transcode_file(
         input_path: *const c_char,
         output_path: *const c_char,

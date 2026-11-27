@@ -6,6 +6,9 @@
 //! with that coverage: a stepped (0 / 255) edge is off by about half a level.
 //!
 //! Writes `userpics_<scale>.png` into `$AVATAR_SNAP_DIR` when that variable is set.
+// These tests render on a GPU through egui_kittest's wgpu backend. The Linux CI runner has no adapter
+// (wgpu setup panics), so they run on Windows only; the Windows CI job and the merge gate cover them.
+#![cfg(windows)]
 
 use std::sync::Arc;
 

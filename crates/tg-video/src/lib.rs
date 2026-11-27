@@ -27,7 +27,7 @@ pub use error::{Result, StreamingError, VideoError};
 pub use ffmpeg::{
     CustomIoSource, DecodedMediaFrame, FfmpegMedia, FfmpegOpenOptions, FfmpegVersions,
     FileIoSource, FrameGenerator, GeneratedFrame, HwAccelKind, MediaStreamInfo, MemoryIoSource,
-    ffmpeg_versions,
+    ffmpeg_build_id, ffmpeg_versions,
 };
 pub use streaming::{
     AudioSink, BUFFER_FOR_MS, BinlogSliceCache, CacheKey, DEFAULT_FRAME_QUEUE_CAPACITY,

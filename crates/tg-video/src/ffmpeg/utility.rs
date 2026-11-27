@@ -72,6 +72,20 @@ pub fn ffmpeg_versions() -> FfmpegVersions {
     v
 }
 
+/// Build identifier of the linked FFmpeg (`av_version_info()`), e.g.
+/// `N-129333-g7fdb4c2341-20261127` for a BtbN master build. It names the exact FFmpeg commit,
+/// so release checks can tell whether the shipped libraries contain a given upstream fix.
+#[must_use]
+pub fn ffmpeg_build_id() -> String {
+    // SAFETY: `av_version_info()` returns a pointer to a static NUL-terminated string.
+    let ptr = unsafe { sys::tg_ffmpeg_build_id() };
+    if ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: checked for NULL above; the string is static and NUL-terminated.
+    unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+}
+
 /// Hardware decoding backend selected by FFmpeg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum HwAccelKind {

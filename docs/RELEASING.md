@@ -56,7 +56,9 @@ published releases.
    ids, no local paths, no account data. Delete the `RELEASE-NOTES-DRAFT` line once reviewed.
 3. Push the tag: `git tag v<version> <commit>` and `git push origin v<version>`.
 4. Watch the **Release** run. Check the "Smoke test the packaged app" step log: both cases end with
-   `result: PASS`.
+   `result: PASS`. Check the "Check FFmpeg and dav1d build ids" step log: it prints the FFmpeg and
+   dav1d build ids of the libraries that go into the package (pinned in
+   `.github/actions/setup-ffmpeg/action.yml`) and fails the run if they are not the pinned build.
 5. Open the draft and check:
    - four files: `Rustgram-Setup-<v>-win-x64.exe`, `rustgram-<v>-win-x64-portable.zip`,
      `rustgram-<v>-win-x64.tupdate`, `SHA256SUMS.txt`;

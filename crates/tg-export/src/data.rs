@@ -204,7 +204,6 @@ pub struct TextEntityInput {
 pub fn parse_text_entities(text: &str, entities: &[TextEntityInput]) -> Vec<TextPart> {
     let utf16: Vec<u16> = to_utf16(text);
     let utf16_len = utf16.len();
-    let byte_size = text.len() as i32;
     let slice_utf16 = |start: usize, len: usize| -> String {
         let end = (start + len).min(utf16_len);
         if start >= end {
@@ -219,11 +218,9 @@ pub fn parse_text_entities(text: &str, entities: &[TextEntityInput]) -> Vec<Text
     for entity in entities {
         let start = entity.offset;
         let length = entity.length;
-        // Matches tdesktop bounds check against UTF-8 size while slicing UTF-16 `QString::mid`.
+        // Bounds in UTF-16 units, like `QString::size()` (tdesktop 7.4.7 `3fc0789`).
         // i64: hostile server offsets would overflow `start + length` in i32.
-        if start < offset
-            || length <= 0
-            || i64::from(start) + i64::from(length) > i64::from(byte_size)
+        if start < offset || length <= 0 || i64::from(start) + i64::from(length) > utf16_len as i64
         {
             continue;
         }

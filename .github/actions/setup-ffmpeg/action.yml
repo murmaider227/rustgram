@@ -1,8 +1,17 @@
 name: Setup FFmpeg shared development build
 description: >
-  Downloads the pinned BtbN FFmpeg 8.1 GPL shared build for the runner (win64 or linux64), verifies
-  its SHA-256 against the release's checksums.sha256, and exports FFMPEG_DIR and the library
-  directory (PATH on Windows, LD_LIBRARY_PATH on Linux) for tg-video.
+  Downloads the pinned BtbN FFmpeg master GPL shared build for the runner (win64 or linux64),
+  verifies its SHA-256 against the value pinned here, checks the FFmpeg and dav1d build ids, and
+  exports FFMPEG_DIR and the library directory (PATH on Windows, LD_LIBRARY_PATH on Linux) for
+  tg-video.
+
+# Pinned build (TGB-3146): BtbN FFmpeg-Builds release autobuild-2026-11-27-12-42, FFmpeg master
+# N-129333-g7fdb4c2341 with dav1d 1.5.5 (6c7bee6). It contains the upstream fixes tdesktop 7.4.6
+# backports (desktop-app/patches ffmpeg/0019-0024 and dav1d.patch): FFmpeg 694934cc, 7442df24,
+# 1436f560, 0260f625, 5647739d, 5e8f97c4 and dav1d d7a83f6e. The release/8.1 branch has none of
+# the FFmpeg ones. BtbN deletes daily autobuilds after about two weeks and keeps the month-end
+# ones; move this pin to the month-end build (autobuild-2026-11-30-*) once it is published.
+# Updating the pin: change the tag, both archive names, both SHA-256 values and the expected ids.
 
 runs:
   using: composite
@@ -12,19 +21,14 @@ runs:
       shell: pwsh
       # Writes only FFMPEG_DIR and the DLL folder of the archive verified above, never untrusted input.
       run: | # zizmor: ignore[github-env]
-        $ffmpegArchive = "ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
-        $baseUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+        $releaseTag = "autobuild-2026-11-27-12-42"
+        $ffmpegArchive = "ffmpeg-N-129333-g7fdb4c2341-win64-gpl-shared.zip"
+        $expectedHash = "b0b227ae7345d8a9bb5ff3ba82d6527fbe0e30346cb86b2701de3f82b24fb8d7"
+        $baseUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$releaseTag"
         $workDir = Join-Path $env:RUNNER_TEMP "ffmpeg-download"
         New-Item -ItemType Directory -Force -Path $workDir | Out-Null
         $zipPath = Join-Path $workDir $ffmpegArchive
-        $sumsPath = Join-Path $workDir "checksums.sha256"
-        Invoke-WebRequest -Uri "$baseUrl/checksums.sha256" -OutFile $sumsPath
         Invoke-WebRequest -Uri "$baseUrl/$ffmpegArchive" -OutFile $zipPath
-        $expectedLine = Get-Content $sumsPath | Where-Object { $_ -match ([regex]::Escape($ffmpegArchive) + '$') } | Select-Object -First 1
-        if (-not $expectedLine) {
-          throw "Could not find $ffmpegArchive in BtbN checksums.sha256"
-        }
-        $expectedHash = ($expectedLine -split '\s+')[0].ToLowerInvariant()
         $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($actualHash -ne $expectedHash) {
           throw "FFmpeg SHA-256 mismatch: expected $expectedHash, got $actualHash"
@@ -39,24 +43,20 @@ runs:
         Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $ffmpegDir "bin")
 
     # Ubuntu ships FFmpeg 6.1; tg-video needs 7.0 or newer (libavformat 61+), so Linux uses the same
-    # BtbN 8.1 release as Windows.
+    # BtbN build as Windows.
     - name: Download, verify and extract FFmpeg (Linux)
       if: runner.os == 'Linux'
       shell: bash
       # Writes only FFMPEG_DIR, the library folder and the bin folder of the archive verified above.
       run: | # zizmor: ignore[github-env]
         set -euo pipefail
-        archive="ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
-        base_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+        release_tag="autobuild-2026-11-27-12-42"
+        archive="ffmpeg-N-129333-g7fdb4c2341-linux64-gpl-shared.tar.xz"
+        expected="a6e427082ac0e66135bd0c1907e3fa3365cdd97cbe83ad9d16dd2c45deec5534"
+        base_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/$release_tag"
         work_dir="$RUNNER_TEMP/ffmpeg-download"
         mkdir -p "$work_dir"
-        curl -fsSL --retry 3 -o "$work_dir/checksums.sha256" "$base_url/checksums.sha256"
         curl -fsSL --retry 3 -o "$work_dir/$archive" "$base_url/$archive"
-        expected="$(awk -v name="$archive" '$NF == name || $NF == "*" name { print tolower($1); exit }' "$work_dir/checksums.sha256")"
-        if [ -z "$expected" ]; then
-          echo "::error::Could not find $archive in BtbN checksums.sha256"
-          exit 1
-        fi
         actual="$(sha256sum "$work_dir/$archive" | cut -d ' ' -f 1)"
         if [ "$actual" != "$expected" ]; then
           echo "::error::FFmpeg SHA-256 mismatch: expected $expected, got $actual"
@@ -73,3 +73,32 @@ runs:
         echo "FFMPEG_DIR=$ffmpeg_dir" >> "$GITHUB_ENV"
         echo "LD_LIBRARY_PATH=$ffmpeg_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
         echo "$ffmpeg_dir/bin" >> "$GITHUB_PATH"
+
+    # Prints the build ids the release checklist asks for and fails if the libraries are not the
+    # pinned build. libdav1d is linked into libavcodec, so its id comes from decoding one AV1 frame.
+    - name: Check FFmpeg and dav1d build ids
+      shell: bash
+      run: |
+        set -euo pipefail
+        expected_ffmpeg="N-129333-g7fdb4c2341"
+        expected_dav1d="6c7bee6"
+        # The previous step put the pinned bin folder first on PATH (and LD_LIBRARY_PATH on Linux).
+        version_text="$(ffmpeg -hide_banner -version)"
+        ffmpeg_id="${version_text%%$'\n'*}"
+        decode_log="$( (ffmpeg -hide_banner -loglevel error -f lavfi -i color=s=64x64:r=5:d=0.2 \
+            -c:v libsvtav1 -f matroska - 2>/dev/null \
+          | ffmpeg -hide_banner -loglevel verbose -c:v libdav1d -f matroska -i - -f null - 2>&1) || true)"
+        dav1d_id=""
+        if [[ "$decode_log" =~ \]\ libdav1d\ ([0-9A-Za-z.+-]+) ]]; then
+          dav1d_id="${BASH_REMATCH[1]}"
+        fi
+        echo "FFmpeg build: $ffmpeg_id"
+        echo "dav1d build: ${dav1d_id:-unknown}"
+        case "$ffmpeg_id" in
+          *"$expected_ffmpeg"*) ;;
+          *) echo "::error::Expected FFmpeg $expected_ffmpeg, got: $ffmpeg_id"; exit 1 ;;
+        esac
+        if [ "$dav1d_id" != "$expected_dav1d" ]; then
+          echo "::error::Expected dav1d $expected_dav1d, got: ${dav1d_id:-unknown}"
+          exit 1
+        fi

@@ -2,13 +2,15 @@
 //! shared FFmpeg development build pointed to by `FFMPEG_DIR`.
 //!
 //! ## Expected FFmpeg version
-//! - **Supported series:** FFmpeg 7.x or 8.x (GPL shared build; tested with FFmpeg 8.1.x).
-//! - **Tested ABI major versions (FFmpeg 8.1.x):**
-//!   `libavformat 62.x`, `libavcodec 62.x`, `libavutil 60.x`, `libswscale 9.x`, `libswresample 6.x`.
+//! - **Supported series:** FFmpeg 7.x, 8.x or master (GPL shared build). Shipped and tested:
+//!   BtbN master build `N-129333-g7fdb4c2341` (pinned in `.github/actions/setup-ffmpeg`), which
+//!   has the October 2026 MOV and AAC-USAC memory-safety fixes that FFmpeg 8.1.x lacks.
+//! - **Tested ABI major versions:** `libavformat 63.x`, `libavcodec 63.x`, `libavutil 61.x`,
+//!   `libswscale 10.x`, `libswresample 7.x` (master); earlier also 62/62/60/9/6 (FFmpeg 8.1.x).
 //! - **Minimum supported ABI major versions (FFmpeg 7.0+):**
 //!   `libavformat >= 61`, `libavcodec >= 61`, `libavutil >= 59`, `libswscale >= 8`, `libswresample >= 5`.
-//! - **Security note:** Always ship a current patched FFmpeg 7.x/8.x build. Because general
-//!   shared builds enable hundreds of demuxers/decoders, `csrc/tg_ffmpeg_shim.c` and
+//! - **Security note:** Always ship a build that contains the latest upstream parser fixes.
+//!   Because general shared builds enable hundreds of demuxers/decoders, `csrc/tg_ffmpeg_shim.c` and
 //!   `csrc/tg_ffmpeg_encode.c` enforce `protocol_whitelist`, `format_whitelist`, and
 //!   `codec_whitelist` to match Telegram Desktop's minimal FFmpeg build surface.
 

@@ -94,6 +94,10 @@ void tg_ffmpeg_versions(
     if (swresample_ver) *swresample_ver = swresample_version();
 }
 
+const char *tg_ffmpeg_build_id(void) {
+    return av_version_info();
+}
+
 static int64_t max_pixels_for_area_limit(int64_t area) {
     return area + area / TG_MAX_PIXELS_PADDING_RATIO + TG_MAX_PIXELS_FIXED_PADDING;
 }

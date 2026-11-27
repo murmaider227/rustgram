@@ -6,7 +6,7 @@ Rust port of Telegram Desktop's video decoding, streaming reader/player, clip/st
 
 `tg-video` uses a thin bindgen-free C shim (`csrc/tg_ffmpeg_shim.c`) compiled with MSVC via `cc` and linked against a shared FFmpeg development build (FFmpeg 7.x or 8.x, GPL-3.0). No CMake or `libclang` installation is required.
 
-1. Download a Windows x64 shared GPL development release from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (for example `ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip`) and verify its SHA-256 against the release's `checksums.sha256`.
+1. Download the Windows x64 shared GPL build that CI and releases use, pinned in `.github/actions/setup-ffmpeg/action.yml`: BtbN [FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) release `autobuild-2026-11-27-12-42`, file `ffmpeg-N-129333-g7fdb4c2341-win64-gpl-shared.zip` (FFmpeg master `N-129333-g7fdb4c2341`, dav1d 1.5.5). Verify its SHA-256 against the value in that action. Release builds of FFmpeg 8.1 (`ffmpeg-n8.1-*`) still link, but they lack the October 2026 MOV and AAC-USAC memory-safety fixes (TGB-3146), so do not ship them.
 2. Extract it to a local directory (e.g. `C:\ffmpeg`) so it has `include/`, `lib/`, and `bin/`.
 3. Set `FFMPEG_DIR` before building, and add `<FFMPEG_DIR>\bin` to `PATH` when running binaries or tests:
 

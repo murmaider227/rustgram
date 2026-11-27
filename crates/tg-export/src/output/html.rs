@@ -4704,19 +4704,19 @@ impl HtmlWrap {
             ServiceAction::ScreenshotTaken => format!("{service_from} took a screenshot"),
             ServiceAction::CustomAction { message: text } => serialize_html_string(text),
             ServiceAction::BotAllowed {
+                app_id,
                 app,
                 domain,
                 attach_menu,
                 from_request,
-                ..
             } => {
                 if *attach_menu {
                     "You allowed this bot to message you when you added it in the attachment menu."
                         .to_string()
                 } else if *from_request {
                     "You allowed this bot to message you in his web-app.".to_string()
-                } else if app.is_empty() {
-                    // Matches exact condition in `export_output_html.cpp:4030`.
+                } else if *app_id != 0 {
+                    // `data.appId` (tdesktop 7.4.6 `57c122e`), like the JSON writer.
                     format!(
                         "You allowed this bot to message you when you opened {}",
                         serialize_html_string(app)
@@ -5786,15 +5786,19 @@ impl HtmlWriter {
         OutputResult::success()
     }
 
+    /// `last_ids` is non-decreasing: the first file whose running maximum reaches
+    /// `message_id` holds it (`ranges::lower_bound`).
     fn wrap_message_link(last_ids: &[i32], message_id: i32, text: &str) -> String {
-        match last_ids.iter().position(|&max_id| message_id <= max_id) {
-            None => format!(
+        let index = last_ids.partition_point(|&max_id| max_id < message_id);
+        if index == last_ids.len() {
+            format!(
                 "<a href=\"#go_to_message{message_id}\" onclick=\"return GoToMessage({message_id})\">{text}</a>"
-            ),
-            Some(index) => format!(
+            )
+        } else {
+            format!(
                 "<a href=\"{}#go_to_message{message_id}\">{text}</a>",
                 Self::messages_file(index)
-            ),
+            )
         }
     }
 
@@ -6349,7 +6353,11 @@ impl AbstractWriter for HtmlWriter {
                     return next_res;
                 }
                 if let Some(ref prev) = previous {
-                    self.last_message_ids_per_file.push(prev.id);
+                    // Running maximum, so `wrap_message_link` can binary-search it
+                    // (tdesktop 7.4.6 `57c122e`).
+                    let last = self.last_message_ids_per_file.last().copied();
+                    self.last_message_ids_per_file
+                        .push(last.map_or(prev.id, |last| last.max(prev.id)));
                 }
                 block.clear();
                 self.last_message_info = None;

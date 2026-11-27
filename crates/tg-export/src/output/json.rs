@@ -1548,7 +1548,7 @@ fn serialize_message(
         }
         ServiceAction::WebViewDataSent { text } => {
             push_str(&mut values, "action", "send_webview_data");
-            push_str(&mut values, "text", text);
+            push_str(&mut values, "button_text", text);
         }
         ServiceAction::GiftPremium { cost, days } => {
             push_from(&mut values, "actor");

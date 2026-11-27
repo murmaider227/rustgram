@@ -52,6 +52,7 @@ pub const DEFAULT_FOLDER_PINNED_LIMIT: usize = 100;
 
 mod indices;
 mod notify_defaults;
+mod service_changes;
 #[cfg(test)]
 mod tests_perf;
 mod unload;
@@ -827,8 +828,20 @@ impl Session {
     /// [`Self::insert_message`], but a newly added message is also flagged
     /// [`MessageUpdateFlags::NEW_UNREAD`] (`NewMessageType::Unread`) so the notifications
     /// layer may show it (`data/data_session.cpp:3629-3661`, `history/history.cpp:674`).
+    ///
+    /// A new service message that changes a loaded checklist or poll is applied to it
+    /// (`History::applyServiceChanges`).
     pub fn insert_new_unread_message(&mut self, message: Message) {
-        self.insert_message_typed(message, true);
+        self.insert_new_message_typed(message, true);
+    }
+
+    /// Inserts a message that arrived as a live update and applies its service changes
+    /// when it is new (`History::addNewMessage`, `history/history.cpp:674-705`).
+    fn insert_new_message_typed(&mut self, message: Message, unread_type: bool) {
+        if !self.messages.contains_key(&message.full_id()) {
+            self.apply_service_changes(&message);
+        }
+        self.insert_message_typed(message, unread_type);
     }
 
     /// Stores a message loaded as part of a page that is not the chat's own bottom:
@@ -952,7 +965,7 @@ impl Session {
             return;
         }
         let peer_id = message.peer_id;
-        self.insert_message_typed(message, unread_type);
+        self.insert_new_message_typed(message, unread_type);
         self.request_dialog_entry_if_folder_unknown(peer_id);
     }
 

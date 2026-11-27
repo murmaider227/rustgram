@@ -6,6 +6,9 @@
 //! compose field (egui `TextEdit`) on the GPU and look for the sheet's colours where the emoji are.
 //!
 //! Writes `emoji_text_<scale>.png` into `$EMOJI_SNAP_DIR` when that variable is set.
+// These tests render on a GPU through egui_kittest's wgpu backend. The Linux CI runner has no adapter
+// (wgpu setup panics), so they run on Windows only; the Windows CI job and the merge gate cover them.
+#![cfg(windows)]
 
 use egui::{Color32, Pos2, Rect, Vec2};
 use egui_kittest::Harness;

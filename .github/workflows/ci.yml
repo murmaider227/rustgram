@@ -73,7 +73,7 @@ jobs:
           retention-days: 14
 
   # Lints and tests every crate but the Windows desktop app (tg-app*, tg-platform), which the Windows job
-  # covers. The media crates need FFmpeg 8.1 (tg-video, tg-ui, tg-editor) and ALSA (tg-audio, tg-voip).
+  # covers. The media crates need FFmpeg (the pinned BtbN build; tg-video, tg-ui, tg-editor) and ALSA (tg-audio, tg-voip).
   ubuntu-core:
     name: Ubuntu (all crates but the Windows desktop app)
     runs-on: ubuntu-latest

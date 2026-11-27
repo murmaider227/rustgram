@@ -196,6 +196,8 @@ mod tests_storage_wiring;
 #[cfg(test)]
 mod tests_stories_channels_conformance;
 #[cfg(test)]
+mod tests_todo_service_updates;
+#[cfg(test)]
 mod tests_transcribe;
 #[cfg(test)]
 mod tests_ui_reads;
