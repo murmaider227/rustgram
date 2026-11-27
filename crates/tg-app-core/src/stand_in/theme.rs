@@ -117,7 +117,60 @@ pub struct Palette {
     pub sidebar_fg_active: Color32,
     /// Modal backdrop dimming scrim (`slideFadeOutBg`).
     pub layer_backdrop: Color32,
+    /// Group member name colours by palette slot (`historyPeer1NameFg`..`historyPeer8NameFg`).
+    pub peer_name_fg: [Color32; 8],
+    /// The same in a selected message (`historyPeerNNameFgSelected`).
+    pub peer_name_fg_selected: [Color32; 8],
 }
+
+/// `historyPeerNNameFg` names by palette slot.
+pub const PEER_NAME_FG_KEYS: [&str; 8] = [
+    "historyPeer1NameFg",
+    "historyPeer2NameFg",
+    "historyPeer3NameFg",
+    "historyPeer4NameFg",
+    "historyPeer5NameFg",
+    "historyPeer6NameFg",
+    "historyPeer7NameFg",
+    "historyPeer8NameFg",
+];
+
+/// `historyPeerNNameFgSelected` names by palette slot.
+pub const PEER_NAME_FG_SELECTED_KEYS: [&str; 8] = [
+    "historyPeer1NameFgSelected",
+    "historyPeer2NameFgSelected",
+    "historyPeer3NameFgSelected",
+    "historyPeer4NameFgSelected",
+    "historyPeer5NameFgSelected",
+    "historyPeer6NameFgSelected",
+    "historyPeer7NameFgSelected",
+    "historyPeer8NameFgSelected",
+];
+
+/// Day `historyPeerNNameFg` (`colors.palette`; slot 4 is `windowActiveTextFg`). Selected
+/// messages use the same colours there.
+const DAY_PEER_NAME_FG: [Color32; 8] = [
+    Color32::from_rgb(0xC0, 0x3D, 0x33),
+    Color32::from_rgb(0x4F, 0xAD, 0x2D),
+    Color32::from_rgb(0xD0, 0x93, 0x06),
+    Color32::from_rgb(0x16, 0x8A, 0xCD),
+    Color32::from_rgb(0x85, 0x44, 0xD6),
+    Color32::from_rgb(0xCD, 0x40, 0x73),
+    Color32::from_rgb(0x29, 0x96, 0xAD),
+    Color32::from_rgb(0xCE, 0x67, 0x1B),
+];
+
+/// Night `historyPeerNNameFg` (`night.tdesktop-theme`); selected messages use white there.
+const NIGHT_PEER_NAME_FG: [Color32; 8] = [
+    Color32::from_rgb(0xFB, 0x61, 0x69),
+    Color32::from_rgb(0x85, 0xDE, 0x85),
+    Color32::from_rgb(0xF3, 0xBC, 0x5C),
+    Color32::from_rgb(0x65, 0xBD, 0xF3),
+    Color32::from_rgb(0xB4, 0x8B, 0xF2),
+    Color32::from_rgb(0xFF, 0x56, 0x94),
+    Color32::from_rgb(0x62, 0xD4, 0xE3),
+    Color32::from_rgb(0xFA, 0xA3, 0x57),
+];
 
 impl Palette {
     /// Returns the palette corresponding to `mode`.
@@ -158,6 +211,8 @@ impl Palette {
             sidebar_fg: Color32::from_rgb(0x95, 0xA5, 0xB5),
             sidebar_fg_active: Color32::from_rgb(0x5E, 0xB5, 0xF7),
             layer_backdrop: Color32::from_rgba_premultiplied(0, 0, 0, 96),
+            peer_name_fg: DAY_PEER_NAME_FG,
+            peer_name_fg_selected: DAY_PEER_NAME_FG,
         }
     }
 
@@ -190,6 +245,8 @@ impl Palette {
             sidebar_fg: Color32::from_rgb(0x76, 0x8C, 0x9E),
             sidebar_fg_active: Color32::from_rgb(0x6A, 0xB2, 0xF2),
             layer_backdrop: Color32::from_rgba_premultiplied(0, 0, 0, 140),
+            peer_name_fg: NIGHT_PEER_NAME_FG,
+            peer_name_fg_selected: [Color32::WHITE; 8],
         }
     }
 
@@ -269,6 +326,16 @@ impl Palette {
                 fallback.sidebar_fg_active,
             ),
             layer_backdrop: pick(PaletteColor::LAYER_BG, fallback.layer_backdrop),
+            peer_name_fg: std::array::from_fn(|i| {
+                colors
+                    .get(PEER_NAME_FG_KEYS[i])
+                    .unwrap_or(fallback.peer_name_fg[i])
+            }),
+            peer_name_fg_selected: std::array::from_fn(|i| {
+                colors
+                    .get(PEER_NAME_FG_SELECTED_KEYS[i])
+                    .unwrap_or(fallback.peer_name_fg_selected[i])
+            }),
         }
     }
 
@@ -279,6 +346,7 @@ impl Palette {
             ThemeMode::Day => Visuals::light(),
             ThemeMode::Night => Visuals::dark(),
         };
+        tg_ui::fonts::apply_tdesktop_text_rendering(&mut visuals);
         visuals.panel_fill = self.window_bg;
         visuals.window_fill = self.window_bg;
         visuals.extreme_bg_color = self.input_bg;

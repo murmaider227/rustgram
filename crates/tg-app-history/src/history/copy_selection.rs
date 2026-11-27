@@ -317,6 +317,7 @@ mod tests {
             reply_to_msg_id: tg_app_core::stand_in::types::MsgId(7),
             author_name: "Ivo Marten".to_owned(),
             author_color_id: 0,
+            author_accent: None,
             preview_text: "lunch\nat noon?".to_owned(),
             preview_thumb_rgb: None,
             preview_thumb: None,

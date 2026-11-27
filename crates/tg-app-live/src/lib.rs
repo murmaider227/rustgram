@@ -47,6 +47,7 @@ pub mod paid_messages;
 pub mod passkeys;
 pub mod passport_upload;
 pub mod payments;
+pub mod peer_accent;
 pub mod peer_emoji_status;
 pub mod polls_stats;
 pub mod preview_text;

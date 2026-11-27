@@ -3570,8 +3570,9 @@ impl HistoryInnerWidget {
                                 avatar_rect,
                                 msg.from_id.0,
                             ) {
-                                EmptyUserpic::for_peer(
-                                    msg.from_id.bare(),
+                                // `EmptyUserpic::UserpicColor(peer->colorIndex())`.
+                                EmptyUserpic::for_color_index(
+                                    crate::history::name_line::sender_accent(msg).index,
                                     &msg.sender_name,
                                     &ui_colors,
                                 )

@@ -23,6 +23,10 @@ pub const LOAD_IN_ADVANCE_REMOTE_MS: i64 = 32_000;
 /// Read-ahead target for local file loaders (`kLoadInAdvanceForLocal` = 5 s).
 pub const LOAD_IN_ADVANCE_LOCAL_MS: i64 = 5_000;
 
+/// How far the clock may run past the end of the last shown frame while the decoder waits for
+/// the network, before playback pauses for data (`Player::_pausedByWaitingForData`).
+pub const STARVE_GRACE_MS: i64 = 40;
+
 /// Lifecycle stage of [`StreamingPlayer`] (mirrors `Player::Stage`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerStage {
@@ -57,6 +61,11 @@ pub struct StreamingPlayer<D: Decoder> {
     video_received_till_ms: i64,
     audio_position_ms: i64,
     audio_received_till_ms: i64,
+    /// The last [`Decoder::next_frame`] call returned [`DecodedPacket::Pending`].
+    decoder_pending: bool,
+    /// `paused_by_waiting` was set because the decoder ran dry (see [`STARVE_GRACE_MS`]).
+    waiting_starved: bool,
+    last_video_duration_ms: i64,
 }
 
 impl<D: Decoder> StreamingPlayer<D> {
@@ -120,6 +129,9 @@ impl<D: Decoder> StreamingPlayer<D> {
             video_received_till_ms: initial_video_recv,
             audio_position_ms: initial_pos.max(0),
             audio_received_till_ms: initial_audio_recv,
+            decoder_pending: false,
+            waiting_starved: false,
+            last_video_duration_ms: 0,
         })
     }
 
@@ -230,7 +242,17 @@ impl<D: Decoder> StreamingPlayer<D> {
         let target = position_ms.max(0);
         self.video_position_ms = target;
         self.audio_position_ms = target;
+        self.last_video_duration_ms = 0;
         self.clock.seek(target, world_now_ms);
+        // Like tdesktop after a seek, hold the clock until the first frames are decoded, so a
+        // background decoder's first frames are not dropped as stale.
+        if let Some(now) = world_now_ms
+            && self.stage == PlayerStage::Started
+            && self.decoder.info().video.is_some()
+        {
+            self.waiting_starved = true;
+            self.set_waiting_for_data(true, now);
+        }
         Ok(())
     }
 
@@ -371,6 +393,7 @@ impl<D: Decoder> StreamingPlayer<D> {
     /// Decodes frames from the underlying [`Decoder`] until the video frame queue is full
     /// or EOF is reached.
     pub fn fill_buffers(&mut self) -> Result<()> {
+        self.decoder_pending = false;
         while !self.eof_reached && self.video_queue.needs_frame() {
             match self.decoder.next_frame() {
                 Ok(DecodedPacket::Video(frame)) => {
@@ -391,6 +414,10 @@ impl<D: Decoder> StreamingPlayer<D> {
                 }
                 Ok(DecodedPacket::EndOfStream) => {
                     self.eof_reached = true;
+                    break;
+                }
+                Ok(DecodedPacket::Pending) => {
+                    self.decoder_pending = true;
                     break;
                 }
                 Err(err) => {
@@ -414,12 +441,14 @@ impl<D: Decoder> StreamingPlayer<D> {
             self.start(world_now_ms);
         }
         self.fill_buffers()?;
+        self.update_starvation(world_now_ms);
         let track_now = self.clock.track_time(world_now_ms).track_time_ms;
         let outcome = self.video_queue.pop_ready(track_now, self.options.speed);
         match &outcome {
             FramePopOutcome::Ready { frame, .. } => {
                 self.current_video_frame = Some(frame.clone());
                 self.video_position_ms = frame.pts_ms;
+                self.last_video_duration_ms = frame.duration_ms;
                 let reported_pos = if self.options.loop_playback {
                     let dur = self.total_duration_ms();
                     if dur > 0 && dur != DURATION_UNAVAILABLE {
@@ -460,8 +489,50 @@ impl<D: Decoder> StreamingPlayer<D> {
                     self.stage = PlayerStage::Finished;
                     return Ok(None);
                 }
+                DecodedPacket::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
             }
         }
+    }
+
+    /// Waits for data when a background decoder runs dry because the loader has not delivered
+    /// the bytes yet, instead of letting the clock run on and then dropping every frame that
+    /// arrives late; resumes once the frame queue is full again, restarting the clock at the
+    /// first queued frame so nothing is skipped. A decoder that is merely slow (busy CPU) keeps
+    /// the clock running and late frames are dropped, as tdesktop's `VideoTrack` does.
+    fn update_starvation(&mut self, world_now_ms: i64) {
+        if self.waiting_starved {
+            if !self.video_queue.needs_frame() || self.eof_reached {
+                if let Some(pts) = self.video_queue.front_pts() {
+                    self.clock.seek(pts, Some(world_now_ms));
+                }
+                self.waiting_starved = false;
+                self.set_waiting_for_data(false, world_now_ms);
+            }
+            return;
+        }
+        if !self.decoder_pending
+            || self.paused_by_user
+            || self.paused_by_waiting
+            || self.stage != PlayerStage::Started
+            || self.eof_reached
+            || !self.video_queue.is_empty()
+            || self.decoder.info().video.is_none()
+            || !self.decoder.waiting_for_data()
+        {
+            return;
+        }
+        let shown_till = self.video_position_ms + self.last_video_duration_ms.max(1);
+        let track_now = self.clock.track_time(world_now_ms).track_time_ms;
+        if track_now > shown_till + STARVE_GRACE_MS {
+            self.waiting_starved = true;
+            self.set_waiting_for_data(true, world_now_ms);
+        }
+    }
+
+    /// `true` while playback waits for the background decoder to refill the frame queue.
+    #[must_use]
+    pub const fn is_waiting_for_data(&self) -> bool {
+        self.paused_by_waiting
     }
 
     /// Sets waiting-for-data buffering pause state and emits [`StreamingUpdate::WaitingForData`].

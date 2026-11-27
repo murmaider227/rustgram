@@ -1149,6 +1149,7 @@ impl ThemesBackend for LiveSession {
                     c.peer_colors = options.clone();
                     c.peer_colors_suggested = suggested.clone();
                 });
+                crate::peer_accent::apply_color_sets(&options);
                 self.bridge_state().notify_ui();
                 Ok(PeerColorsResult::Colors {
                     hash: data.hash,

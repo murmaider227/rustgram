@@ -1330,6 +1330,7 @@ impl MockSessionState {
                     reply_to_msg_id: rid,
                     author_name: target.sender_name.clone(),
                     author_color_id: target.from_id.bare(),
+                    author_accent: None,
                     preview_text: target.preview_snippet(),
                     preview_thumb_rgb: None,
                     preview_thumb: None,
@@ -4151,6 +4152,7 @@ impl HistoryBackend for SharedSessionHandle {
                 reply_to_msg_id: rid,
                 author_name,
                 author_color_id,
+                author_accent: None,
                 preview_text,
                 preview_thumb_rgb: None,
                 preview_thumb: None,
@@ -4222,6 +4224,7 @@ impl HistoryBackend for SharedSessionHandle {
                 send_failed: false,
                 sender_badge: None,
                 sender_status: None,
+                sender_accent: None,
             },
         };
 
@@ -13214,6 +13217,7 @@ fn build_initial_histories() -> (
                     reply_to_msg_id: MsgId(101),
                     author_name: "Sam Chen".to_owned(),
                     author_color_id: session_peers::USER_SAM.bare(),
+                    author_accent: None,
                     preview_text: "Unified App Checklist: dialogs, history, info/boxes..."
                         .to_owned(),
                     preview_thumb_rgb: None,
@@ -14329,6 +14333,7 @@ fn build_initial_forum_and_replies() -> (
         reply_to_msg_id: MsgId(7101),
         author_name: "Sam Chen".to_owned(),
         author_color_id: sam.bare(),
+        author_accent: None,
         preview_text: "Awesome Instant View writeup! Does the layout cache stay bounded on resize?"
             .to_owned(),
         preview_thumb_rgb: None,

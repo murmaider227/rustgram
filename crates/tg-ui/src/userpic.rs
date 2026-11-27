@@ -85,6 +85,23 @@ pub fn peer_name_color(color_index: u8, colors: &dyn Colors) -> Color32 {
     colors.color(KEYS[idx])
 }
 
+/// Look up the peer name color in a selected message for `color_index`
+/// (`historyPeerNNameFgSelected`).
+pub fn peer_name_color_selected(color_index: u8, colors: &dyn Colors) -> Color32 {
+    const KEYS: [&str; 8] = [
+        "historyPeer1NameFgSelected",
+        "historyPeer2NameFgSelected",
+        "historyPeer3NameFgSelected",
+        "historyPeer4NameFgSelected",
+        "historyPeer5NameFgSelected",
+        "historyPeer6NameFgSelected",
+        "historyPeer7NameFgSelected",
+        "historyPeer8NameFgSelected",
+    ];
+    let idx = color_index_to_palette_index(color_index) as usize;
+    colors.color(KEYS[idx])
+}
+
 /// Extract 1 or 2 uppercase initials from a peer name, matching `EmptyUserpic::fillString`
 /// in `Telegram/SourceFiles/ui/empty_userpic.cpp` (lines 582-642).
 ///

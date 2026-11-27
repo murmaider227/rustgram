@@ -5,7 +5,6 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
@@ -21,6 +20,10 @@ use tg_ui::tg_style::st;
 use tg_video::{
     FfmpegStreamDecoder, FrameData, FramePopOutcome, OutputPixelFormat, PlaybackMode,
     PlaybackOptions, PlayerStage, SliceConfig, StreamingPlayer,
+};
+
+use crate::media::video_playback::{
+    ViewerPlayer, drop_unplayed_audio, next_step_delay, viewer_decoder,
 };
 
 use crate::media::backend::{MediaBackend, MediaItem, MediaItemId, MediaItemKind};
@@ -353,7 +356,7 @@ enum ActiveContent {
         has_alpha: bool,
     },
     Video {
-        player: Box<StreamingPlayer<FfmpegStreamDecoder>>,
+        player: Box<ViewerPlayer>,
         texture: Option<TextureHandle>,
         rendered_rotation: i32,
         rendered_flip_h: bool,
@@ -795,6 +798,7 @@ impl MediaOverlayWidget {
         self.last_world_ms = world_now_ms;
         if let ActiveContent::Video { player, .. } = &mut self.content {
             let _ = player.step_video(world_now_ms);
+            drop_unplayed_audio(player);
             let dur = player
                 .total_duration_ms()
                 .max(self.gallery.current().map_or(0, |i| i.duration_ms));
@@ -915,6 +919,7 @@ impl MediaOverlayWidget {
                             SliceConfig::default(),
                             opts.clone(),
                         )
+                        .and_then(viewer_decoder)
                         .and_then(|dec| StreamingPlayer::new(dec, opts))
                         {
                             Ok(mut player) => {
@@ -1624,6 +1629,8 @@ impl MediaOverlayWidget {
                 rendered_flip_v,
             } => {
                 let outcome = player.step_video(world_now_ms);
+                drop_unplayed_audio(player);
+                let repaint_after = next_step_delay(outcome.as_ref().ok());
                 let needs_transform_refresh =
                     *rendered_rotation != rot || *rendered_flip_h != fh || *rendered_flip_v != fv;
 
@@ -1682,7 +1689,7 @@ impl MediaOverlayWidget {
                 let playing = !player.is_paused() && player.stage() == PlayerStage::Started;
                 self.controls.update_playback(playing, pos, dur, 1.0);
                 if playing {
-                    ctx.request_repaint_after(Duration::from_millis(16));
+                    ctx.request_repaint_after(repaint_after);
                 }
             }
             ActiveContent::None

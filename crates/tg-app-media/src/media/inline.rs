@@ -17,6 +17,9 @@ use crate::media::backend::MediaItemId;
 /// Default maximum number of simultaneously decoded inline clips kept alive in memory.
 pub const DEFAULT_MAX_ACTIVE_INLINE_CLIPS: usize = 24;
 
+/// Longest wait before a playing clip is checked again.
+const MAX_INLINE_STEP_MS: i64 = 40;
+
 /// Classification of an inline animated media document in chat history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InlinePlaybackKind {
@@ -250,12 +253,15 @@ impl InlinePlayback {
 
         if let Some(reader) = &mut entry.reader {
             let need_first_frame = entry.texture.is_none() || entry.texture_stale;
-            if is_playing || need_first_frame {
-                let target_ms = if is_playing {
-                    (now_ms - entry.start_ms).max(0)
-                } else {
-                    entry.paused_at_ms
-                };
+            let target_ms = if is_playing {
+                (now_ms - entry.start_ms).max(0)
+            } else {
+                entry.paused_at_ms
+            };
+            // The shown frame stays until the clock reaches the next frame's time; decoding,
+            // copying and uploading it again on every repaint only costs UI time.
+            let frame_due = reader.frame_presentation_time_ms() <= target_ms;
+            if need_first_frame || (is_playing && frame_due) {
                 match reader.read_frames_till(target_ms) {
                     Ok(frame) => {
                         entry.size = Vec2::new(frame.width as f32, frame.height as f32);
@@ -283,7 +289,11 @@ impl InlinePlayback {
                 }
             }
             if is_playing {
-                ctx.request_repaint_after(std::time::Duration::from_millis(25));
+                // Wake up when the next frame is due (`Clip::Reader` frame timer), not on a
+                // fixed 40 Hz tick that shows 30 fps clips at uneven 25 / 50 ms steps.
+                let due_in = entry.start_ms + reader.frame_presentation_time_ms() - now_ms;
+                let delay_ms = due_in.clamp(1, MAX_INLINE_STEP_MS).unsigned_abs();
+                ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
             }
 
             let duration_ms = reader.duration_ms();

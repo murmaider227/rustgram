@@ -22,7 +22,7 @@ use tg_ui::anim::{SimpleAnimation, Transition, color_lerp, with_alpha};
 use tg_ui::fonts::family_semibold;
 use tg_ui::icons::paint_style_icon;
 use tg_ui::tg_style::{DefaultPaletteResolver, st};
-use tg_ui::userpic::{EmptyUserpic, peer_name_color};
+use tg_ui::userpic::EmptyUserpic;
 use tg_ui::widgets::buttons::{IconKind, paint_icon};
 
 use crate::history::HISTORY_TOP_BAR_HEIGHT;
@@ -870,8 +870,9 @@ impl RepliesSectionWidget {
                             } else {
                                 colors.msg_in_bg
                             };
-                            let color_idx = tg_ui::userpic::decide_color_index(msg.from_id.bare());
-                            let name_fg = peer_name_color(color_idx, &ui_colors);
+                            let name_fg = crate::history::name_line::sender_name_fg(
+                                msg, colors, &ui_colors, false,
+                            );
                             let bubble_w = (list_rect.width() - 120.0).min(450.0);
 
                             ui.horizontal(|ui| {

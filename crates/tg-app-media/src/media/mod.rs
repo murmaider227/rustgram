@@ -23,9 +23,12 @@ pub mod round_video_capture;
 pub mod strings;
 pub mod style;
 #[cfg(test)]
+mod tests_inline_pacing;
+#[cfg(test)]
 mod tests_seca;
 #[cfg(test)]
 mod tests_wp14;
+pub mod video_playback;
 pub mod video_stream;
 pub mod zoom;
 
@@ -204,7 +207,9 @@ pub fn run_screenshot_capture(docs_dir: &std::path::Path) -> anyhow::Result<()> 
                             None,
                             SliceConfig::default(),
                             opts.clone(),
-                        ) && let Ok(mut player) = StreamingPlayer::new(dec, opts)
+                        )
+                        .and_then(video_playback::viewer_decoder)
+                            && let Ok(mut player) = StreamingPlayer::new(dec, opts)
                         {
                             player.start(1_200);
                             let _ = player.step_video(1_300);

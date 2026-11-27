@@ -14,6 +14,7 @@ From the MTProto protocol and its encryption up to every screen of the interface
 ![API layer](https://img.shields.io/badge/Telegram%20API-layer%20233-2CA5E0)
 ![Status](https://img.shields.io/badge/status-pre--release-yellow)
 [![CI](https://github.com/murmaider227/rustgram/actions/workflows/ci.yml/badge.svg)](https://github.com/murmaider227/rustgram/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/murmaider227/rustgram/graph/badge.svg)](https://codecov.io/gh/murmaider227/rustgram)
 
 <img src="assets/screenshots/main.png" alt="Rustgram main window" width="860">
 

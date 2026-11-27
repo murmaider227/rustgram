@@ -671,6 +671,28 @@ bitflags! {
     }
 }
 
+/// Name accent colours of a collectible peer colour (`Ui::ColorCollectible::accentColor` and
+/// `darkAccentColor`), as `0xRRGGBB`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColorCollectibleAccent {
+    /// Accent for day themes (`accent_color`).
+    pub accent: u32,
+    /// Accent for night themes (`dark_accent_color`); `None` uses `accent`.
+    pub dark_accent: Option<u32>,
+}
+
+impl ColorCollectibleAccent {
+    /// The accent for a day (`dark == false`) or night theme (`ChatStyle::collectibleNameColor`).
+    #[must_use]
+    pub fn for_theme(self, dark: bool) -> u32 {
+        if dark {
+            self.dark_accent.unwrap_or(self.accent)
+        } else {
+            self.accent
+        }
+    }
+}
+
 /// Common fields shared by every peer (`PeerData` base class fields).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PeerCommon {
@@ -696,6 +718,9 @@ pub struct PeerCommon {
     pub color_index_cloud: bool,
     /// Optional profile header color index (`0..64`).
     pub color_profile_index: Option<u8>,
+    /// Name accent of a collectible peer colour (`PeerData::colorCollectible`). While set it
+    /// replaces the `color_index` colour for the name (`Ui::FromNameFg`).
+    pub color_collectible: Option<ColorCollectibleAccent>,
     /// Background custom emoji ID for reply/quote accent.
     pub background_emoji_id: DocumentId,
     /// Background custom emoji ID for profile header.
@@ -737,6 +762,7 @@ impl PeerCommon {
             color_index: decide_color_index(id),
             color_index_cloud: false,
             color_profile_index: None,
+            color_collectible: None,
             background_emoji_id: DocumentId::ZERO,
             profile_background_emoji_id: DocumentId::ZERO,
             emoji_status: EmojiStatus::default(),

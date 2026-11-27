@@ -852,6 +852,7 @@ impl MockHistoryStore {
                     reply_to_msg_id: MsgId(102),
                     author_name: "Sam Chen".to_owned(),
                     author_color_id: sender_sam.bare(),
+                    author_accent: None,
                     preview_text: "Milestone 2 History Checklist — We now wire tg-history..."
                         .to_owned(),
                     preview_thumb_rgb: None,
@@ -959,6 +960,7 @@ impl MockHistoryStore {
                         reply_to_msg_id: MsgId(201),
                         author_name: "Jordan Patel".to_owned(),
                         author_color_id: peer_dm_jordan.bare(),
+                        author_accent: None,
                         preview_text: "Hey! Can you test multi-select, right-click context menu..."
                             .to_owned(),
                         preview_thumb_rgb: None,
@@ -1469,6 +1471,7 @@ impl HistoryBackend for MockHistoryStore {
                     reply_to_msg_id: target.id,
                     author_name: target.sender_name.clone(),
                     author_color_id: target.from_id.bare(),
+                    author_accent: None,
                     preview_text: target.preview_snippet(),
                     preview_thumb_rgb: None,
                     preview_thumb: None,
@@ -1938,6 +1941,7 @@ impl HistoryBackend for MockHistoryStore {
                 reply_to_msg_id: rid,
                 author_name,
                 author_color_id,
+                author_accent: None,
                 preview_text,
                 preview_thumb_rgb: None,
                 preview_thumb: None,

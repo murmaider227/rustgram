@@ -113,6 +113,7 @@ fn message(peer: PeerId, id: i32, date_unix: i32, n: usize) -> HistoryMessage {
         reply_to_msg_id: MsgId(id - 1),
         author_name: NAMES[(n + 11) % NAMES.len()].to_owned(),
         author_color_id: (n % 7) as u64,
+        author_accent: None,
         preview_text: TEXTS[(n + 7) % TEXTS.len()].to_owned(),
         preview_thumb_rgb: None,
         preview_thumb: None,

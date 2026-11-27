@@ -328,6 +328,37 @@ pub fn build_font_definitions_with(system_mono: Option<&SystemMonospace>) -> Fon
     defs
 }
 
+/// Gamma of the glyph coverage curve for light palettes (dark text on light backgrounds).
+///
+/// tdesktop draws text through Qt's GDI font engine (`core/launcher.cpp`,
+/// `windows:fontengine=gdi`), which blends glyphs with Windows' ClearType contrast
+/// (`SPI_GETFONTSMOOTHINGCONTRAST`, default 1200, read by Qt as gamma 1.2). egui blends
+/// coverage linearly in gamma space, which leaves dark strokes heavier; `alpha = coverage^1.2`
+/// brings Open Sans 13 / 19 px regular and semibold to within 7.4 % of tdesktop's ink per pixel
+/// (TGB-3014, measured against GDI renders that match an official 7.4.6 capture exactly).
+pub const LIGHT_TEXT_COVERAGE_GAMMA: f32 = 1.2;
+
+/// How glyph coverage turns into alpha for a light (`dark_mode == false`) or dark palette.
+///
+/// egui's own dark default (`2c - c^2`) thickens light-on-dark strokes by 18-30 % against
+/// tdesktop's night themes; linear coverage stays within 7.1 % (TGB-3014).
+#[must_use]
+pub fn tdesktop_font_color_transfer(dark_mode: bool) -> egui::epaint::FontColorTransferFunction {
+    if dark_mode {
+        egui::epaint::FontColorTransferFunction::Off
+    } else {
+        egui::epaint::FontColorTransferFunction::Gamma(LIGHT_TEXT_COVERAGE_GAMMA)
+    }
+}
+
+/// Set tdesktop's text stroke weight ([`tdesktop_font_color_transfer`]) on `visuals`.
+///
+/// Every `Visuals` given to a whole `egui::Context` must go through this: the glyph atlas is
+/// shared by all viewports and is rebuilt whenever the context's text options change.
+pub fn apply_tdesktop_text_rendering(visuals: &mut egui::Visuals) {
+    visuals.text_options.color_transfer_function = tdesktop_font_color_transfer(visuals.dark_mode);
+}
+
 /// Register Telegram Desktop's fonts and default `egui::TextStyle` sizes on `ctx`.
 pub fn register_tdesktop_fonts(ctx: &egui::Context) {
     ctx.set_fonts(build_tdesktop_font_definitions());

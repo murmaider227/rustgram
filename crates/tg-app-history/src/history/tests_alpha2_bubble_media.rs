@@ -109,6 +109,7 @@ fn photo_reply(before: bool) -> ReplyHeader {
         reply_to_msg_id: MsgId(PHOTO_MSG),
         author_name: "Noor Ilves".to_owned(),
         author_color_id: 1003,
+        author_accent: None,
         preview_text: if before { "[Photo]" } else { "Photo" }.to_owned(),
         preview_thumb_rgb: (!before).then_some([0x6E, 0xC9, 0xCB]),
         preview_thumb: (!before).then(|| ReplyThumb {
@@ -130,6 +131,7 @@ fn messages(before: bool) -> Vec<HistoryMessage> {
         reply_to_msg_id: MsgId(3),
         author_name: "Mira Vance".to_owned(),
         author_color_id: 1001,
+        author_accent: None,
         preview_text: "So far the new build feels quick, but the first start is slow".to_owned(),
         preview_thumb_rgb: None,
         preview_thumb: None,

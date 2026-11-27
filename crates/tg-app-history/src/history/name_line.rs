@@ -6,7 +6,10 @@
 
 use egui::{Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Vec2};
 
-use crate::history::backend::{HistoryMessage, SenderBadge, SenderBadgeRole};
+use tg_ui::peer_color::{PeerAccent, peer_accent_name_color, peer_accent_name_color_selected};
+use tg_ui::theme::Colors;
+
+use crate::history::backend::{HistoryMessage, ReplyHeader, SenderBadge, SenderBadgeRole};
 use crate::history::theme::HistoryColors;
 
 /// `st::dialogsPremiumIcon.icon.width()`: room the status takes after the name.
@@ -379,6 +382,60 @@ fn paint_badge(
             );
         }
     }
+}
+
+/// The sender's accent (`Element::colorIndex` / `colorCollectible`): the server's, or the
+/// id-based default when the message carries none.
+#[must_use]
+pub fn sender_accent(msg: &HistoryMessage) -> PeerAccent {
+    msg.extra
+        .sender_accent
+        .unwrap_or_else(|| PeerAccent::for_peer_id(msg.from_id.bare()))
+}
+
+/// Picks the name colour of `accent` for the active theme (`Ui::FromNameFg`).
+fn accent_name_fg(
+    accent: PeerAccent,
+    colors: &HistoryColors,
+    ui_colors: &dyn Colors,
+    selected: bool,
+) -> Color32 {
+    if selected {
+        peer_accent_name_color_selected(
+            accent,
+            ui_colors,
+            colors.is_night,
+            colors.msg_in_bg_selected,
+        )
+    } else {
+        peer_accent_name_color(accent, ui_colors, colors.is_night)
+    }
+}
+
+/// Colour of the sender name line (`Message::paintFromName`: `FromNameFg(context, colorIndex(),
+/// colorCollectible())`). `ui_colors` must be `colors.ui_colors()`.
+#[must_use]
+pub fn sender_name_fg(
+    msg: &HistoryMessage,
+    colors: &HistoryColors,
+    ui_colors: &dyn Colors,
+    selected: bool,
+) -> Color32 {
+    accent_name_fg(sender_accent(msg), colors, ui_colors, selected)
+}
+
+/// Colour of the author name in an incoming reply header (`Reply::paint`, `_colorPeer`).
+#[must_use]
+pub fn reply_author_name_fg(
+    reply: &ReplyHeader,
+    colors: &HistoryColors,
+    ui_colors: &dyn Colors,
+    selected: bool,
+) -> Color32 {
+    let accent = reply
+        .author_accent
+        .unwrap_or_else(|| PeerAccent::for_peer_id(reply.author_color_id));
+    accent_name_fg(accent, colors, ui_colors, selected)
 }
 
 #[cfg(test)]

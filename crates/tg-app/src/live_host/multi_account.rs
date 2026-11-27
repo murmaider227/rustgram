@@ -498,6 +498,8 @@ fn start_main_window_requests(live_session: &LiveSession, egui_ctx: Option<&egui
                 })
             };
             let _ = SettingsBackend::auto_download(&session);
+            // `Api::PeerColors` asks at session start: sender names past index 6 need the sets.
+            session.request_peer_color_sets();
             let _ = filters.join();
             repaint(ctx);
         });

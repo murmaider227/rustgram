@@ -38,7 +38,8 @@ pub use streaming::{
     MediaCacheSliceCache, MemoryRangeLoader, MemorySliceCache, PART_SIZE, PRELOAD_PARTS_AHEAD,
     PartsMap, PlayerStage, PriorityQueue, RangeLoader, ReaderStats, SLICES_IN_MEMORY, SliceCache,
     SliceConfig, SpeedEstimator, StreamingDocument, StreamingInstance, StreamingPlayer,
-    StreamingReader, SyncClock, TDESKTOP_PARTS_IN_SLICE, TimePoint, slice_cache_key,
+    StreamingReader, SyncClock, TDESKTOP_PARTS_IN_SLICE, THREADED_VIDEO_AHEAD, ThreadedDecoder,
+    TimePoint, slice_cache_key,
 };
 pub use thumbnail::{
     GOOD_THUMB_QUALITY, ThumbnailEncoding, ThumbnailOptions, encode_thumbnail, extract_thumbnail,

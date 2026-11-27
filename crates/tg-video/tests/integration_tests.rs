@@ -824,6 +824,7 @@ fn ffmpeg_h264_mp4_decode_rgba_yuv_audio_seek_loop_stream_and_thumbnail() {
                 audio_samples += a.samples.len();
             }
             DecodedPacket::EndOfStream => break,
+            DecodedPacket::Pending => unreachable!("FfmpegStreamDecoder decodes synchronously"),
         }
     }
     assert!(
@@ -844,7 +845,7 @@ fn ffmpeg_h264_mp4_decode_rgba_yuv_audio_seek_loop_stream_and_thumbnail() {
     let seeked = loop {
         match dec.next_frame().unwrap() {
             DecodedPacket::Video(f) => break f,
-            DecodedPacket::Audio(_) => continue,
+            DecodedPacket::Audio(_) | DecodedPacket::Pending => continue,
             DecodedPacket::EndOfStream => panic!("unexpected EOF after seek"),
         }
     };

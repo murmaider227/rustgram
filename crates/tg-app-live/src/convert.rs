@@ -1237,6 +1237,7 @@ pub fn story_reply_header(
         reply_to_msg_id: MsgId(0),
         author_name: String::new(),
         author_color_id: 0,
+        author_accent: None,
         preview_text: text,
         preview_thumb_rgb: None,
         preview_thumb: None,
@@ -1273,6 +1274,7 @@ pub fn story_reply_header(
                 reply_to_msg_id: MsgId(0),
                 author_name,
                 author_color_id: story.peer.bare(),
+                author_accent: Some(crate::peer_accent::peer_accent(session, story.peer)),
                 preview_text,
                 preview_thumb_rgb: preview_thumb
                     .as_ref()
@@ -1323,6 +1325,7 @@ pub fn reply_header_for(
         reply_to_msg_id: from_data_msg(target_id),
         author_name: String::new(),
         author_color_id: 0,
+        author_accent: None,
         preview_text: text,
         preview_thumb_rgb: None,
         preview_thumb: None,
@@ -1349,6 +1352,10 @@ pub fn reply_header_for(
                 reply_to_msg_id: from_data_msg(target_id),
                 author_name,
                 author_color_id: author_pid.bare(),
+                author_accent: Some(crate::peer_accent::peer_accent(
+                    session,
+                    crate::peer_accent::content_colors_from(orig),
+                )),
                 preview_text: preview.text,
                 preview_thumb_rgb: preview_thumb
                     .as_ref()
@@ -1384,11 +1391,8 @@ pub fn reply_header_for(
                 external.filter(|n| !n.is_empty()),
             ) {
                 (Some(text), Some(name)) => {
-                    let color = r
-                        .reply_from
-                        .as_ref()
-                        .and_then(|f| f.from_id)
-                        .map_or(0, DataPeerId::bare);
+                    let external_sender = r.reply_from.as_ref().and_then(|f| f.from_id);
+                    let color = external_sender.map_or(0, DataPeerId::bare);
                     let preview_thumb = crate::reply_preview::reply_thumb(
                         msg,
                         crate::reply_preview::ReplyTargets::default(),
@@ -1397,6 +1401,8 @@ pub fn reply_header_for(
                         reply_to_msg_id: from_data_msg(target_id),
                         author_name: name,
                         author_color_id: color,
+                        author_accent: external_sender
+                            .map(|pid| crate::peer_accent::peer_accent(session, pid)),
                         preview_text: text,
                         preview_thumb_rgb: preview_thumb.as_ref().map(|_| {
                             avatar_rgb_for_color_index((target_id.0.unsigned_abs() % 7) as u8)
@@ -1605,6 +1611,7 @@ pub fn message_to_history_message_with_resolvers(
             msg.peer_id,
             now_unix_i32(),
         ),
+        sender_accent: Some(crate::peer_accent::peer_accent(session, from_data_id)),
     };
 
     HistoryMessage {

@@ -9,7 +9,9 @@ use egui::{
 };
 use tg_ui::fonts::{ensure_tdesktop_fonts, font_id_from_style};
 use tg_ui::tg_style::st;
-use tg_video::{FfmpegStreamDecoder, FrameData, FramePopOutcome, PlayerStage, StreamingPlayer};
+use tg_video::{FrameData, FramePopOutcome, PlayerStage};
+
+use crate::media::video_playback::{ViewerPlayer, drop_unplayed_audio, next_step_delay};
 
 use crate::media::backend::MediaItem;
 use crate::media::style::{
@@ -405,7 +407,7 @@ pub enum PipEvent {
 /// Floating Picture-in-Picture video player (`Media::View::Pip`).
 pub struct PipWindow {
     item: MediaItem,
-    player: StreamingPlayer<FfmpegStreamDecoder>,
+    player: ViewerPlayer,
     texture: Option<TextureHandle>,
     rect: PipRect,
     aspect_ratio: (i32, i32),
@@ -432,12 +434,7 @@ impl std::fmt::Debug for PipWindow {
 impl PipWindow {
     /// Creates a new floating PiP window taking ownership of an active [`StreamingPlayer`].
     #[must_use]
-    pub fn new(
-        item: MediaItem,
-        player: StreamingPlayer<FfmpegStreamDecoder>,
-        screen_rect: PipRect,
-        volume: f64,
-    ) -> Self {
+    pub fn new(item: MediaItem, player: ViewerPlayer, screen_rect: PipRect, volume: f64) -> Self {
         let aspect_w = item.width.max(1) as i32;
         let aspect_h = item.height.max(1) as i32;
         let rect = default_pip_rect(screen_rect, aspect_w, aspect_h);
@@ -484,7 +481,10 @@ impl PipWindow {
     /// Advances video decoding at `world_now_ms` and updates the GPU texture.
     pub fn step(&mut self, ctx: &egui::Context, world_now_ms: i64) {
         self.last_world_ms = world_now_ms;
-        if let Ok(FramePopOutcome::Ready { frame, .. }) = self.player.step_video(world_now_ms) {
+        let outcome = self.player.step_video(world_now_ms);
+        drop_unplayed_audio(&mut self.player);
+        let repaint_after = next_step_delay(outcome.as_ref().ok());
+        if let Ok(FramePopOutcome::Ready { frame, .. }) = outcome {
             self.upload_frame(ctx, &frame);
         } else if self.texture.is_none()
             && let Some(frame) = self.player.current_video_frame().cloned()
@@ -492,7 +492,7 @@ impl PipWindow {
             self.upload_frame(ctx, &frame);
         }
         if !self.player.is_paused() && self.player.stage() == PlayerStage::Started {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            ctx.request_repaint_after(repaint_after);
         }
     }
 

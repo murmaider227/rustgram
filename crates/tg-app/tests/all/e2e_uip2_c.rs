@@ -176,6 +176,7 @@ fn seed_one_to_one(state: &mut AppTestState) -> (PeerId, MsgId) {
         reply_to_msg_id: MsgId(9702),
         author_name: "Mira Lane".to_owned(),
         author_color_id: peer.bare(),
+        author_accent: None,
         preview_text: "Hi! Testing incoming message bubble and reply styling.".to_owned(),
         preview_thumb_rgb: None,
         preview_thumb: None,
@@ -331,6 +332,7 @@ fn seed_saved(state: &mut AppTestState) -> PeerId {
         reply_to_msg_id: MsgId(9731),
         author_name: "Taylor Kim".to_owned(),
         author_color_id: peer.bare(),
+        author_accent: None,
         preview_text: "Hello! Testing UI parity between the official client and Rustgram."
             .to_owned(),
         preview_thumb_rgb: None,

@@ -66,9 +66,10 @@ pub use message::{
 pub use peer::{
     AllowedReactions, AllowedReactionsType, Birthday, BlockStatus, BotCommand, BotInfo, BotStatus,
     BotVerifyDetails, CallsStatus, Channel, ChannelFlags, ChannelLocation, Chat, ChatFlags,
-    ChatUpdateVersionStatus, ContactStatus, EmojiStatus, GeoPoint, LoadedStatus, MegagroupInfo,
-    Peer, PeerBarSettings, PeerCommon, PeerNotifySettings, ProfileTab, ReactionId, StarsRating,
-    StoriesState, UnavailableReason, User, UserFlags, Username, UsernamesInfo,
+    ChatUpdateVersionStatus, ColorCollectibleAccent, ContactStatus, EmojiStatus, GeoPoint,
+    LoadedStatus, MegagroupInfo, Peer, PeerBarSettings, PeerCommon, PeerNotifySettings, ProfileTab,
+    ReactionId, StarsRating, StoriesState, UnavailableReason, User, UserFlags, Username,
+    UsernamesInfo,
 };
 pub use rights::{
     ChatAdminRights, ChatBannedRights, ChatRestrictions, ChatRestrictionsInfo,

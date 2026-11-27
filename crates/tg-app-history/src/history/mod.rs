@@ -119,6 +119,8 @@ mod tests_spoiler_state;
 #[cfg(test)]
 mod tests_tgb2971_pull;
 #[cfg(test)]
+mod tests_tgb3012_name_colors;
+#[cfg(test)]
 mod tests_transcribe_failure_snap;
 #[cfg(test)]
 mod tests_user_errors;

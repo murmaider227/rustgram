@@ -23,6 +23,7 @@ pub mod fonts;
 pub mod icons;
 pub mod layers;
 pub mod painter;
+pub mod peer_color;
 pub mod platform;
 pub mod stand_in;
 pub mod style;
@@ -40,6 +41,9 @@ pub mod widgets;
 pub fn apply_tdesktop_visuals(ctx: &egui::Context, colors: &dyn theme::Colors) {
     theme::apply_palette_visuals(ctx, colors);
 }
+
+#[cfg(test)]
+mod text_weight_tests;
 
 #[cfg(test)]
 mod tests {

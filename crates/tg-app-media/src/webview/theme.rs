@@ -99,6 +99,7 @@ pub fn egui_visuals_from_tg_palette(palette: &TgPalette, is_night: bool) -> Visu
     } else {
         Visuals::light()
     };
+    tg_ui::fonts::apply_tdesktop_text_rendering(&mut visuals);
     let window_bg = color_to_egui(palette.window_bg);
     let window_fg = color_to_egui(palette.window_fg);
     let window_bg_over = color_to_egui(palette.window_bg_over);

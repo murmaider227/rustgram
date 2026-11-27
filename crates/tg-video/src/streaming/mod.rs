@@ -9,6 +9,7 @@ pub mod document;
 pub mod loader;
 pub mod player;
 pub mod reader;
+pub mod threaded;
 
 pub use cache::{
     BinlogSliceCache, CacheKey, MediaCacheSliceCache, MemorySliceCache, SliceCache, slice_cache_key,
@@ -39,3 +40,4 @@ pub use reader::{
     is_contiguous_serialization, parse_cached_map, parse_complex_cached_map,
     serialize_complex_parts_map,
 };
+pub use threaded::{THREADED_VIDEO_AHEAD, ThreadedDecoder};

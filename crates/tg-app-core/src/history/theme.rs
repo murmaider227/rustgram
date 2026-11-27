@@ -109,6 +109,10 @@ pub struct HistoryColors {
     pub to_down_fg: Color32,
     /// Text selection highlight fill inside a bubble.
     pub text_select_bg: Color32,
+    /// Group member name colours of the active theme by palette slot (`historyPeerNNameFg`).
+    pub peer_name_fg: [Color32; 8],
+    /// The same in a selected message (`historyPeerNNameFgSelected`).
+    pub peer_name_fg_selected: [Color32; 8],
 }
 
 impl HistoryColors {
@@ -168,6 +172,8 @@ impl HistoryColors {
                 to_down_bg_over: Color32::from_rgb(0x28, 0x38, 0x4A),
                 to_down_fg: Color32::from_rgb(0x8D, 0xA1, 0xB5),
                 text_select_bg: Color32::from_rgba_unmultiplied(0x52, 0x88, 0xC1, 95),
+                peer_name_fg: palette.peer_name_fg,
+                peer_name_fg_selected: palette.peer_name_fg_selected,
             }
         } else {
             Self {
@@ -221,6 +227,8 @@ impl HistoryColors {
                 to_down_bg_over: Color32::from_rgb(0xF2, 0xF5, 0xF8),
                 to_down_fg: Color32::from_rgb(0x70, 0x75, 0x79),
                 text_select_bg: Color32::from_rgba_unmultiplied(0x40, 0xA7, 0xE3, 72),
+                peer_name_fg: palette.peer_name_fg,
+                peer_name_fg_selected: palette.peer_name_fg_selected,
             }
         }
     }
@@ -283,8 +291,33 @@ pub struct HistoryUiColors {
     colors: HistoryColors,
 }
 
+/// Palette slot of a `historyPeerNNameFg` / `historyPeerNNameFgSelected` name, and whether it
+/// is the selected one.
+fn peer_name_slot(name: &str) -> Option<(usize, bool)> {
+    let rest = name.strip_prefix("historyPeer")?;
+    let (digit, tail) = rest.split_at_checked(1)?;
+    let slot = digit
+        .parse::<usize>()
+        .ok()?
+        .checked_sub(1)
+        .filter(|s| *s < 8)?;
+    match tail {
+        "NameFg" => Some((slot, false)),
+        "NameFgSelected" => Some((slot, true)),
+        _ => None,
+    }
+}
+
 impl Colors for HistoryUiColors {
     fn get(&self, name: &str) -> Option<Color32> {
+        // Name colours come from the active theme: night themes have their own (TGB-3012).
+        if let Some((slot, selected)) = peer_name_slot(name) {
+            return Some(if selected {
+                self.colors.peer_name_fg_selected[slot]
+            } else {
+                self.colors.peer_name_fg[slot]
+            });
+        }
         if self.colors.is_night {
             let mapped = match name {
                 "windowBg" | "menuBg" => Some(self.colors.bar_bg),

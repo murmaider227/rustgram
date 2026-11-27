@@ -268,6 +268,12 @@ impl FrameQueue {
         self.frames.is_empty()
     }
 
+    /// Presentation time of the oldest queued frame.
+    #[must_use]
+    pub fn front_pts(&self) -> Option<i64> {
+        self.frames.front().map(|f| f.pts_ms)
+    }
+
     /// Total number of late frames dropped across the lifetime of this queue.
     #[must_use]
     pub const fn dropped_total(&self) -> u64 {

@@ -162,6 +162,9 @@ pub struct ReplyHeader {
     pub author_name: String,
     /// Bare sender id for deterministic peer accent color.
     pub author_color_id: u64,
+    /// The author's accent (`Reply::_colorPeer`: `colorIndex` and `colorCollectible`). `None`:
+    /// the id-based default of `author_color_id`.
+    pub author_accent: Option<tg_ui::peer_color::PeerAccent>,
     /// Short preview text of the replied-to message.
     pub preview_text: String,
     /// `Some` when the header reserves the 32x32 media preview (`Reply::_hasPreview`); the RGB
@@ -930,6 +933,9 @@ pub struct MessageExtra {
     pub sender_badge: Option<SenderBadge>,
     /// Premium star or emoji status after the sender name (`Message::FromNameStatus`).
     pub sender_status: Option<SenderNameStatus>,
+    /// The sender's accent (`Element::colorIndex` and `colorCollectible`): the server colour
+    /// index, or a collectible colour. `None`: the id-based default of `from_id`.
+    pub sender_accent: Option<tg_ui::peer_color::PeerAccent>,
 }
 
 /// Who a sender is in a group, which picks the badge colour (`HistoryView::BadgeRole`).

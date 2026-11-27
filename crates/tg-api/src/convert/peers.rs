@@ -7,10 +7,10 @@ use tg_data::{
     AllowedReactions, AllowedReactionsType, Birthday, BlockStatus, BotCommand, BotInfo,
     BotVerifyDetails, CallId, CallsStatus, Channel, ChannelFlags, ChannelId, ChannelLocation, Chat,
     ChatAdminRights, ChatBannedRights, ChatFlags, ChatId, ChatRestrictionsInfo, CollectibleId,
-    ContactStatus, DialogKey, DocumentId, EmojiStatus, LastseenStatus, LoadedStatus, MsgId,
-    PeerBarSettings, PeerCommon, PeerId, PeerNotifySettings, PeerUpdateFlags, PhotoId, ProfileTab,
-    ReactionId, Session, StarsRating, UnavailableReason, User, UserFlags, UserId, UserStatusInput,
-    Username,
+    ColorCollectibleAccent, ContactStatus, DialogKey, DocumentId, EmojiStatus, LastseenStatus,
+    LoadedStatus, MsgId, PeerBarSettings, PeerCommon, PeerId, PeerNotifySettings, PeerUpdateFlags,
+    PhotoId, ProfileTab, ReactionId, Session, StarsRating, UnavailableReason, User, UserFlags,
+    UserId, UserStatusInput, Username,
 };
 use tg_tl::{enums as tl_enums, types as tl_types};
 
@@ -419,6 +419,9 @@ fn apply_peer_color(
             } else {
                 common.clear_color_index();
             }
+            if !is_profile {
+                common.color_collectible = None;
+            }
             let bg = c
                 .background_emoji_id
                 .map(DocumentId::from_tl)
@@ -439,6 +442,14 @@ fn apply_peer_color(
             } else {
                 common.clear_color_index();
                 common.background_emoji_id = bg;
+                // `PeerData::changeColorCollectible` (`Data::ParseColorCollectible`).
+                common.color_collectible = Some(ColorCollectibleAccent {
+                    accent: color_from_serialized(c.accent_color),
+                    dark_accent: c
+                        .dark_accent_color
+                        .filter(|v| *v != -1)
+                        .map(color_from_serialized),
+                });
             }
         }
         Some(tl_enums::PeerColor::InputPeerColorCollectible(_)) | None => {
@@ -448,9 +459,15 @@ fn apply_peer_color(
             } else {
                 common.clear_color_index();
                 common.background_emoji_id = DocumentId::ZERO;
+                common.color_collectible = None;
             }
         }
     }
+}
+
+/// `Ui::ColorFromSerialized`: the low 24 bits are `0xRRGGBB`.
+const fn color_from_serialized(value: i32) -> u32 {
+    (value as u32) & 0x00FF_FFFF
 }
 
 /// Converts an optional TL `EmojiStatus` into [`EmojiStatus`] (`Data::EmojiStatuses::parse`,

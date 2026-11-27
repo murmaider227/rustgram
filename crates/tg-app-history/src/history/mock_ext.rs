@@ -157,6 +157,7 @@ impl MockSectionsData {
             reply_to_msg_id: MsgId(7001),
             author_name: "Sam Chen".to_owned(),
             author_color_id: sam.bare(),
+            author_accent: None,
             preview_text: "Awesome progress! Does the layout cache stay bounded on resize?"
                 .to_owned(),
             preview_thumb_rgb: None,

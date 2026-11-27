@@ -579,6 +579,7 @@ pub fn palette_visuals(colors: &dyn Colors) -> Visuals {
     } else {
         Visuals::light()
     };
+    crate::fonts::apply_tdesktop_text_rendering(&mut visuals);
     visuals.panel_fill = window_bg;
     visuals.window_fill = window_bg;
     visuals.extreme_bg_color = input_bg;

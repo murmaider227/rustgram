@@ -21,7 +21,7 @@ use tg_ui::text::{
     RichTextOptions, SyntaxHighlightPalette, render_prepared_rich_text,
     render_prepared_rich_text_with_reveal, render_prepared_text_with_entities,
 };
-use tg_ui::userpic::{EmptyUserpic, peer_name_color};
+use tg_ui::userpic::EmptyUserpic;
 
 use crate::bots::inline_keyboard::{
     InlineKeyboardActivation, InlineKeyboardParams, InlineKeyboardState, show_inline_keyboard,
@@ -779,8 +779,8 @@ fn paint_message_element_internal(
             .is_none()
             .then(|| crate::history::name_line::via_fg(colors, layout.has_out_layout));
         if show_sender_name {
-            let color_idx = tg_ui::userpic::decide_color_index(msg.from_id.bare());
-            let name_fg = peer_name_color(color_idx, &ui_colors);
+            let name_fg =
+                crate::history::name_line::sender_name_fg(msg, colors, &ui_colors, is_selected);
             crate::history::name_line::paint_from_name(
                 ui.painter(),
                 msg,
@@ -852,10 +852,7 @@ fn paint_message_element_internal(
         let name_col = if layout.has_out_layout {
             bar_color
         } else {
-            peer_name_color(
-                tg_ui::userpic::decide_color_index(reply.author_color_id),
-                &ui_colors,
-            )
+            crate::history::name_line::reply_author_name_fg(reply, colors, &ui_colors, is_selected)
         };
         // history_view_reply.cpp: name in `msgNameStyle` (semibold 13px), one elided line of
         // `defaultTextStyle` (13px) in the bubble's text colour below it.
