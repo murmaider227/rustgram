@@ -5755,6 +5755,7 @@ dependencies = [
  "ed25519-dalek",
  "eframe",
  "egui",
+ "egui-wgpu",
  "egui_kittest",
  "ico",
  "image",

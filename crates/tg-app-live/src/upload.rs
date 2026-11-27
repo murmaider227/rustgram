@@ -19,10 +19,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use tg_api::RpcClient;
+use tg_api::SendMessageOutcome;
 use tg_api::convert::{apply_tl_users_and_chats, input_peer_for};
 use tg_api::rpc::InvocationError;
 use tg_crypto::hash::Md5Hasher;
-use tg_data::{FullMsgId as DataFullMsgId, MsgId as DataMsgId, PeerId as DataPeerId, Session};
+use tg_data::{
+    FullMsgId as DataFullMsgId, MessageFlags, MsgId as DataMsgId, PeerId as DataPeerId, Session,
+};
 use tg_media::transfer::download::CancelToken;
 use tg_media::transfer::upload::{
     BIG_FILE_THRESHOLD, MAX_UPLOAD_PER_SESSION, MAX_UPLOAD_SESSIONS, UploadConfig, UploadPlan,
@@ -36,9 +39,10 @@ use tracing::{debug, warn};
 use crate::bridge::LiveBridgeState;
 use crate::convert::{
     from_data_msg, from_data_peer, message_to_history_message, now_unix_i32, peer_display_title,
-    to_data_peer, ui_text_to_tl_entities,
+    to_data_msg, to_data_peer, ui_text_to_data_text, ui_text_to_tl_entities,
 };
 use crate::media::{block_on_runtime, with_rpc_timeout};
+use crate::optimistic_send::SendResolution;
 use crate::session::{LiveSession, make_input_reply_to};
 use tg_app_core::core_types::misc::transform_dynamic_image;
 use tg_app_core::history::backend::{
@@ -364,6 +368,37 @@ pub struct AlbumUploadItem {
 struct TrackedMediaUpload {
     status: MediaUploadStatus,
     cancel: CancelToken,
+}
+
+/// A registered media upload with its not yet started request
+/// (`LiveSession::prepare_media_send`).
+struct PreparedMediaSend {
+    state: Arc<Mutex<UploadLiveState>>,
+    upload_id: u64,
+    random_id: i64,
+    cancel: CancelToken,
+    /// TGB-2998: the file, to seed the media cache under the document the server returns.
+    seed_bytes: Option<Vec<u8>>,
+    request: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<tl_enums::Updates, String>> + Send>,
+    >,
+}
+
+/// Ends the tracking of `upload_id`: a success drops it from the uploads bar, a failure stays
+/// there marked failed (or cancelled).
+fn finish_tracked_upload(state: &Mutex<UploadLiveState>, upload_id: u64, error: Option<&str>) {
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if error.is_none() {
+        guard.active_uploads.remove(&upload_id);
+    } else if let Some(entry) = guard.active_uploads.get_mut(&upload_id) {
+        if entry.cancel.is_cancelled() {
+            entry.status.cancelled = true;
+        } else {
+            entry.status.failed = true;
+        }
+    }
 }
 
 struct CachedTermsOfService {
@@ -1943,6 +1978,192 @@ impl LiveSession {
         options: SendMediaOptions,
         cancel: CancelToken,
     ) -> Result<HistoryMessage, String> {
+        let send = self.prepare_media_send(peer_id, media, &options, cancel)?;
+        let send_res = block_on_runtime(self.runtime().tokio_handle(), send.request);
+
+        match send_res {
+            Ok(updates) => {
+                finish_tracked_upload(&send.state, send.upload_id, None);
+                let new_ids = self.apply_updates_to_session(&updates);
+                let msg_id = new_ids.last().copied().unwrap_or(DataMsgId(0));
+                if let Some(bytes) = send.seed_bytes {
+                    crate::sent_media_cache::seed(self, to_data_peer(peer_id), msg_id, &bytes);
+                }
+                Ok(fallback_sent_history_message(
+                    self,
+                    peer_id,
+                    msg_id,
+                    &options.caption,
+                    None,
+                    options.silent,
+                    options.schedule_date,
+                ))
+            }
+            Err(err) => {
+                finish_tracked_upload(&send.state, send.upload_id, Some(&err));
+                self.bridge_state().notify_ui();
+                Err(err)
+            }
+        }
+    }
+
+    /// Sends one media attachment the way tdesktop does (`ApiWrap::sendFile` -> `FileLoadTask`
+    /// -> `Uploader`): the local message with the clock is stored and returned at once, the
+    /// upload and `messages.sendMedia` run on the runtime, and the next history drain turns the
+    /// local message into the server one ([`HistoryLiveUpdate::LocalMessageSent`]), marks it
+    /// failed, or removes it when the upload was cancelled (TGB-3033). `shown` is the media
+    /// the pending bubble shows until then. Upload progress and cancel stay in
+    /// [`HistoryBackend::pending_media_uploads`] / [`HistoryBackend::cancel_media_upload`].
+    pub(crate) fn send_uploaded_media_queued(
+        &self,
+        peer_id: PeerId,
+        media: OutgoingMedia,
+        options: SendMediaOptions,
+        shown: HistoryMedia,
+    ) -> Result<HistoryMessage, String> {
+        let send = self.prepare_media_send(peer_id, media, &options, CancelToken::new())?;
+        let data_peer = to_data_peer(peer_id);
+        let local_id = self.sends.next_local_id();
+        let local_full = DataFullMsgId::new(data_peer, local_id);
+        let caption = ui_text_to_data_text(&options.caption);
+        let reply_to = options.reply_to;
+        let silent = options.silent;
+        let effect_id = options.effect_id;
+        let random_id = send.random_id;
+        self.sends.set_local_media(local_full, shown.clone());
+        let stored = self.write_session(move |s| {
+            let mut local = tg_data::Message::new_text(
+                data_peer,
+                local_id,
+                Some(s.self_peer_id()),
+                now_unix_i32(),
+                caption,
+            );
+            local
+                .flags
+                .insert(MessageFlags::OUTGOING | MessageFlags::BEING_SENT);
+            local.flags.set(MessageFlags::SILENT, silent);
+            local.effect_id = effect_id.map(tg_data::EffectId);
+            local.reply_to = reply_to.map(|id| tg_data::ReplyInfo {
+                reply_to_msg_id: Some(to_data_msg(id)),
+                ..tg_data::ReplyInfo::default()
+            });
+            s.register_random_id(random_id, local_full);
+            s.insert_message(local);
+            s.message(local_full)
+                .map(|m| message_to_history_message(s, m))
+        });
+        let Some(mut pending) = stored else {
+            self.sends.take_local_media(local_full);
+            finish_tracked_upload(&send.state, send.upload_id, Some("not stored"));
+            return Err("sent message was not stored in session".to_owned());
+        };
+        pending.media = Some(shown.clone());
+
+        let live = self.clone();
+        let handle = self.runtime().tokio_handle().clone();
+        let in_flight = self.sends.begin_media_send();
+        drop(self.runtime().tokio_handle().spawn_blocking(move || {
+            let _in_flight = in_flight;
+            let outcome = block_on_runtime(&handle, send.request);
+            let cancelled = send.cancel.is_cancelled();
+            finish_tracked_upload(
+                &send.state,
+                send.upload_id,
+                outcome.as_ref().err().map(String::as_str),
+            );
+            let resolution = match outcome {
+                Ok(updates) => {
+                    let sent_id = live.apply_updates_to_session(&updates).last().copied();
+                    if let (Some(id), Some(bytes)) = (sent_id, send.seed_bytes.as_deref()) {
+                        crate::sent_media_cache::seed(&live, data_peer, id, bytes);
+                    }
+                    // A server message that did not replace the local one through
+                    // `updateMessageID` still replaces it on screen.
+                    live.write_session(move |s| {
+                        s.unregister_random_id(random_id);
+                        s.delete_messages(data_peer, &[local_id]);
+                    });
+                    live.sends.take_local_media(local_full);
+                    let fallback = fallback_sent_history_message(
+                        &live,
+                        peer_id,
+                        sent_id.unwrap_or(DataMsgId(0)),
+                        &options.caption,
+                        Some(shown),
+                        silent,
+                        options.schedule_date,
+                    );
+                    SendResolution {
+                        peer: data_peer,
+                        local_ids: vec![local_id],
+                        outcome: Ok(SendMessageOutcome {
+                            messages: Vec::new(),
+                            updates: vec![updates],
+                        }),
+                        sent_ids: vec![sent_id],
+                        effect_id,
+                        fallback: sent_id.map(|_| fallback).into_iter().collect(),
+                        cancelled: false,
+                    }
+                }
+                Err(err) => {
+                    live.write_session(move |s| {
+                        s.unregister_random_id(random_id);
+                        if cancelled {
+                            // tdesktop destroys the item when its upload is cancelled.
+                            s.delete_messages(data_peer, &[local_id]);
+                        } else if let Some(msg) = s.message_mut(local_full) {
+                            msg.flags.remove(MessageFlags::BEING_SENT);
+                            msg.flags.insert(MessageFlags::SENDING_FAILED);
+                        }
+                    });
+                    if cancelled {
+                        live.sends.take_local_media(local_full);
+                    }
+                    SendResolution {
+                        peer: data_peer,
+                        local_ids: vec![local_id],
+                        outcome: Err(err),
+                        sent_ids: vec![None],
+                        effect_id,
+                        fallback: Vec::new(),
+                        cancelled,
+                    }
+                }
+            };
+            live.sends.push_resolution(resolution);
+            live.bridge_state().mark_views_changed();
+            live.bridge_state().notify_ui();
+        }));
+        self.bridge_state().notify_ui();
+        Ok(pending)
+    }
+
+    /// Waits until the media sends started without waiting have finished. `false` after
+    /// `limit`. For tests only.
+    #[doc(hidden)]
+    pub fn wait_media_sends(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while self.sends.media_sends_in_flight() > 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
+    /// Registers the upload for progress and cancel and builds the request future that
+    /// uploads `media` and sends it with `messages.sendMedia`. Nothing is sent before the
+    /// future runs.
+    fn prepare_media_send(
+        &self,
+        peer_id: PeerId,
+        media: OutgoingMedia,
+        options: &SendMediaOptions,
+        cancel: CancelToken,
+    ) -> Result<PreparedMediaSend, String> {
         let input_peer = resolve_input_peer_sync(self, peer_id)
             .ok_or_else(|| "Peer not found in session.".to_owned())?;
         let send_as = options
@@ -1998,86 +2219,60 @@ impl LiveSession {
         let effect = options.effect_id.map(|id| id as i64);
         let invert_media = options.invert_media;
         let clear_draft = options.clear_draft;
+        let request_cancel = cancel.clone();
 
-        let send_res: Result<tl_enums::Updates, String> =
-            block_on_runtime(self.runtime().tokio_handle(), async move {
-                let prepared =
-                    upload_outgoing_media_async(&rpc, &input_peer, media, cfg, &cancel, |delta| {
-                        if let Ok(mut guard) = state_for_progress.lock()
-                            && let Some(entry) = guard.active_uploads.get_mut(&upload_id)
-                        {
-                            entry.status.uploaded_bytes = entry
-                                .status
-                                .uploaded_bytes
-                                .saturating_add(delta)
-                                .min(entry.status.total_bytes);
-                        }
-                        bridge.notify_ui();
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                let req = tl_fns::messages::SendMedia {
-                    silent,
-                    background: false,
-                    clear_draft,
-                    noforwards: false,
-                    update_stickersets_order: false,
-                    invert_media,
-                    allow_paid_floodskip: false,
-                    peer: input_peer,
-                    reply_to,
-                    media: prepared.input_media,
-                    message: caption_text,
-                    random_id,
-                    reply_markup: None,
-                    entities: (!entities.is_empty()).then_some(entities),
-                    schedule_date,
-                    schedule_repeat_period: None,
-                    send_as,
-                    quick_reply_shortcut: None,
-                    effect,
-                    allow_paid_stars: None,
-                    suggested_post: None,
-                };
-                let refs: Vec<&UploadedFileResult> = prepared.uploaded_files.iter().collect();
-                invoke_with_upload_retry(&rpc, &req, &refs, cfg, &cancel).await
-            });
-
-        match send_res {
-            Ok(updates) => {
-                if let Ok(mut guard) = state_arc.lock() {
-                    guard.active_uploads.remove(&upload_id);
-                }
-                let new_ids = self.apply_updates_to_session(&updates);
-                let msg_id = new_ids.last().copied().unwrap_or(DataMsgId(0));
-                if let Some(bytes) = seed_bytes {
-                    crate::sent_media_cache::seed(self, to_data_peer(peer_id), msg_id, &bytes);
-                }
-                Ok(fallback_sent_history_message(
-                    self,
-                    peer_id,
-                    msg_id,
-                    &options.caption,
-                    None,
-                    silent,
-                    schedule_date,
-                ))
-            }
-            Err(err) => {
-                if let Ok(mut guard) = state_arc.lock()
-                    && let Some(entry) = guard.active_uploads.get_mut(&upload_id)
-                {
-                    if entry.cancel.is_cancelled() {
-                        entry.status.cancelled = true;
-                    } else {
-                        entry.status.failed = true;
+        let request = Box::pin(async move {
+            let cancel = request_cancel;
+            let prepared =
+                upload_outgoing_media_async(&rpc, &input_peer, media, cfg, &cancel, |delta| {
+                    if let Ok(mut guard) = state_for_progress.lock()
+                        && let Some(entry) = guard.active_uploads.get_mut(&upload_id)
+                    {
+                        entry.status.uploaded_bytes = entry
+                            .status
+                            .uploaded_bytes
+                            .saturating_add(delta)
+                            .min(entry.status.total_bytes);
                     }
-                }
-                self.bridge_state().notify_ui();
-                Err(err)
-            }
-        }
+                    bridge.notify_ui();
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let req = tl_fns::messages::SendMedia {
+                silent,
+                background: false,
+                clear_draft,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media,
+                allow_paid_floodskip: false,
+                peer: input_peer,
+                reply_to,
+                media: prepared.input_media,
+                message: caption_text,
+                random_id,
+                reply_markup: None,
+                entities: (!entities.is_empty()).then_some(entities),
+                schedule_date,
+                schedule_repeat_period: None,
+                send_as,
+                quick_reply_shortcut: None,
+                effect,
+                allow_paid_stars: None,
+                suggested_post: None,
+            };
+            let refs: Vec<&UploadedFileResult> = prepared.uploaded_files.iter().collect();
+            invoke_with_upload_retry(&rpc, &req, &refs, cfg, &cancel).await
+        });
+        Ok(PreparedMediaSend {
+            state: state_arc,
+            upload_id,
+            random_id,
+            cancel,
+            seed_bytes,
+            request,
+        })
     }
 
     /// Uploads a grouped album via `upload.save*FilePart` -> `messages.uploadMedia` ->
@@ -2378,6 +2573,22 @@ impl LiveSession {
 // Delegation entry points called by `live/session.rs`
 // ============================================================================
 
+/// Sends one uploaded attachment from the compose box: at once with a pending bubble
+/// (TGB-3033), except scheduled sends, which wait for the server as before.
+fn send_single_media(
+    shown: HistoryMedia,
+    live: &mut LiveSession,
+    peer_id: PeerId,
+    media: OutgoingMedia,
+    opts: SendMediaOptions,
+) -> Result<HistoryMessage, String> {
+    if opts.schedule_date.is_some() {
+        live.send_uploaded_media(peer_id, media, opts)
+    } else {
+        live.send_uploaded_media_queued(peer_id, media, opts, shown)
+    }
+}
+
 /// Handles `HistoryBackend::send_message_extended` when `request.media.is_some()`.
 pub(super) fn send_history_media_extended(
     live: &mut LiveSession,
@@ -2403,6 +2614,7 @@ pub(super) fn send_history_media_extended(
     let req_round_video_path = request.round_video_path.clone();
     let req_video_cover_jpeg = request.video_cover_jpeg;
     let req_voice_ogg = request.voice_ogg.filter(|bytes| !bytes.is_empty());
+    let shown = media.clone();
 
     match media {
         HistoryMedia::Photo(photo) => {
@@ -2412,7 +2624,9 @@ pub(super) fn send_history_media_extended(
                 photo.stripped_thumb.as_deref(),
             )?;
             let name = file_basename(&photo.file_name, "photo.jpg");
-            live.send_uploaded_media(
+            send_single_media(
+                shown,
+                live,
                 peer_id,
                 OutgoingMedia::Photo {
                     bytes,
@@ -2426,7 +2640,9 @@ pub(super) fn send_history_media_extended(
         HistoryMedia::Document(doc) => {
             let bytes = resolve_bytes_for_attachment(live, &doc.file_name, None)?;
             let name = file_basename(&doc.file_name, "file.bin");
-            live.send_uploaded_media(
+            send_single_media(
+                shown,
+                live,
                 peer_id,
                 OutgoingMedia::Document {
                     bytes,
@@ -2477,7 +2693,7 @@ pub(super) fn send_history_media_extended(
                     ttl_seconds: req_ttl_seconds,
                 }
             };
-            live.send_uploaded_media(peer_id, outgoing, opts)
+            send_single_media(shown, live, peer_id, outgoing, opts)
         }
         HistoryMedia::Voice(voice) => {
             // The recorder hands over the encoded file (`sendVoiceMessage(result.bytes, ..)`);
@@ -2486,7 +2702,9 @@ pub(super) fn send_history_media_extended(
                 Some(bytes) => bytes,
                 None => resolve_bytes_for_attachment(live, "voice.ogg", None)?,
             };
-            live.send_uploaded_media(
+            send_single_media(
+                shown,
+                live,
                 peer_id,
                 OutgoingMedia::Voice {
                     bytes,
@@ -2503,7 +2721,9 @@ pub(super) fn send_history_media_extended(
             let key = format!("sticker_{}", sticker.sticker_id);
             let bytes = resolve_bytes_for_attachment(live, &key, fallback)?;
             let is_lottie = !sticker.lottie_json.is_empty();
-            live.send_uploaded_media(
+            send_single_media(
+                shown,
+                live,
                 peer_id,
                 OutgoingMedia::Sticker {
                     bytes,
@@ -2530,7 +2750,9 @@ pub(super) fn send_history_media_extended(
                 .filter(|s| !s.is_empty())
                 .unwrap_or("round_video.mp4");
             let bytes = resolve_bytes_for_attachment(live, source_key, None)?;
-            live.send_uploaded_media(
+            send_single_media(
+                shown,
+                live,
                 peer_id,
                 OutgoingMedia::Video {
                     bytes,

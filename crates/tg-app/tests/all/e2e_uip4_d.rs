@@ -33,7 +33,11 @@ fn build_shell_harness(app: AppTestState, size: Vec2, wgpu: bool) -> Harness<'st
         .with_render_cursor(false)
         .allow_missing_glyphs()
         .with_accessibility_check(false);
-    let builder = if wgpu { builder.wgpu() } else { builder };
+    let builder = if wgpu {
+        builder.renderer(crate::common::serialized_wgpu_renderer())
+    } else {
+        builder
+    };
     builder
         .with_context_setup(|ctx| {
             register_tdesktop_fonts(ctx);

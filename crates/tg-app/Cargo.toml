@@ -47,6 +47,7 @@ winresource = "0.1.34"
 [dev-dependencies]
 ed25519-dalek = "2.1.1"
 egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
+egui-wgpu = "0.37.0"
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 num-bigint = "0.4"
 png = "0.18.1"

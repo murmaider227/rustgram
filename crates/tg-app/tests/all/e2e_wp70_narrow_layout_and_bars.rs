@@ -83,7 +83,7 @@ fn render_wgpu_snap<S: 'static>(
         .with_render_cursor(false)
         .allow_missing_glyphs()
         .with_accessibility_check(false)
-        .wgpu()
+        .renderer(crate::common::serialized_wgpu_renderer())
         .with_context_setup(|ctx| {
             tg_ui::fonts::register_tdesktop_fonts(ctx);
             apply_deterministic_style(ctx);

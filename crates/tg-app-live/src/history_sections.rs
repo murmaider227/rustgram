@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tg_api::RpcClient;
 use tg_api::convert::{
-    apply_tl_users_and_chats, entities_from_tl, input_peer_for, input_user_for, message_from_tl,
-    peer_id_from_tl, text_with_entities_from_tl,
+    apply_tl_users_and_chats, entities_from_tl_for_text, input_peer_for, input_user_for,
+    message_from_tl, peer_id_from_tl, text_with_entities_from_tl,
 };
 use tg_data::{
     ChannelFlags, ChannelId, Draft, DraftKey, FullMsgId as DataFullMsgId, MessageContent,
@@ -3864,7 +3864,7 @@ fn apply_draft_update_to_section_caches(
             let data_ents = dm
                 .entities
                 .as_deref()
-                .map(entities_from_tl)
+                .map(|e| entities_from_tl_for_text(&dm.message, e, tg_data::UserId::ZERO))
                 .unwrap_or_default();
             let data_text = tg_data::TextWithEntities::new(dm.message.clone(), data_ents);
             let ui_text = data_text_to_ui_text(&data_text);
@@ -3874,7 +3874,7 @@ fn apply_draft_update_to_section_caches(
                         let q_ents = r
                             .quote_entities
                             .as_deref()
-                            .map(entities_from_tl)
+                            .map(|e| entities_from_tl_for_text(qt, e, tg_data::UserId::ZERO))
                             .unwrap_or_default();
                         let ui_qt = data_text_to_ui_text(&tg_data::TextWithEntities::new(
                             qt.clone(),
@@ -4075,7 +4075,7 @@ fn apply_poll_update_to_data(
         let ents = res
             .solution_entities
             .as_deref()
-            .map(entities_from_tl)
+            .map(|e| entities_from_tl_for_text(sol, e, tg_data::UserId::ZERO))
             .unwrap_or_default();
         poll_data.results.solution = Some(tg_data::TextWithEntities::new(sol.clone(), ents));
     }

@@ -134,13 +134,17 @@ impl RpcClient for Wp77FakeRpc {
             }
         }
 
+        // Only an answer queued for this constructor (TGB-3035). The startup requests of the
+        // session runtime (`getDialogs`, `getPinnedDialogs`, `users.getUsers`) are not queued
+        // by the tests; on a busy machine they arrive late, and the old "else the front answer"
+        // fallback gave one of them the `upload.getFile` answer a test had just queued, so the
+        // thumbnail download got nothing and the test timed out.
         let reply = {
             let mut q = self.responses.lock().expect("lock responses");
-            if let Some(pos) = q.iter().position(|(c, _)| *c == ctor) {
-                q.remove(pos).map(|(_, r)| r)
-            } else {
-                q.pop_front().map(|(_, r)| r)
-            }
+            q.iter()
+                .position(|(c, _)| *c == ctor)
+                .and_then(|pos| q.remove(pos))
+                .map(|(_, r)| r)
         };
 
         let raw = match reply {
@@ -162,6 +166,60 @@ impl RpcClient for Wp77FakeRpc {
     fn subscribe_updates(&self) -> Option<broadcast::Receiver<tl_enums::Updates>> {
         Some(self.updates_tx.subscribe())
     }
+}
+
+/// TGB-3035: a late request the test did not queue an answer for (the runtime's startup
+/// `getDialogs`) must not take the answer queued for another request.
+#[test]
+fn fake_never_gives_a_request_another_requests_answer() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio rt");
+    let rpc = Wp77FakeRpc::new();
+    rpc.enqueue_ok(
+        tl_fns::upload::GetFile::CONSTRUCTOR_ID,
+        &tl_enums::upload::File::File(tl_types::upload::File {
+            r#type: tl_enums::storage::FileType::FileJpeg,
+            mtime: 1,
+            bytes: b"THUMB".to_vec(),
+        }),
+    );
+    rt.block_on(async {
+        let late_startup_page = rpc
+            .invoke(&tl_fns::messages::GetDialogs {
+                exclude_pinned: true,
+                folder_id: Some(0),
+                offset_date: 0,
+                offset_id: 0,
+                offset_peer: tl_enums::InputPeer::Empty,
+                limit: 20,
+                hash: 0,
+            })
+            .await;
+        assert!(late_startup_page.is_err(), "no answer was queued for it");
+        let file = rpc
+            .invoke(&tl_fns::upload::GetFile {
+                precise: false,
+                cdn_supported: false,
+                location: tl_enums::InputFileLocation::InputPhotoFileLocation(
+                    tl_types::InputPhotoFileLocation {
+                        id: 1,
+                        access_hash: 1,
+                        file_reference: Vec::new(),
+                        thumb_size: "m".to_owned(),
+                    },
+                ),
+                offset: 0,
+                limit: 4096,
+            })
+            .await
+            .expect("the thumbnail keeps its answer");
+        let tl_enums::upload::File::File(file) = file else {
+            panic!("expected upload.file");
+        };
+        assert_eq!(file.bytes, b"THUMB");
+    });
 }
 
 fn make_live(is_premium: bool) -> (tokio::runtime::Runtime, Wp77FakeRpc, LiveSession) {
@@ -449,6 +507,85 @@ fn unread_reactions_channel_visible_sends_channels_read_contents_and_preserves_m
             .badges
             .reaction
     );
+}
+
+/// TGB-3125: a mention the user sees is read (`HistoryInner::paintEvent` -> `markContentsRead`),
+/// so the "@" button's counter drops and the button hides at 0; an unplayed voice message that
+/// mentions the user stays unread until it is played.
+#[test]
+fn a_visible_mention_is_read_and_the_mentions_counter_drops() {
+    let (_rt, rpc, mut live) = make_live(false);
+    let ch_id = DataChannelId(5002);
+    let data_peer = DataPeerId::from_channel(ch_id);
+    let ui_peer = UiPeerId::from_channel(5002);
+    let author = DataPeerId::from_user(DataUserId(201));
+
+    live.write_session(|s| {
+        let mut ch = Channel::new(ch_id);
+        ch.common.name = "Mentions Group".to_owned();
+        ch.access_hash = 0x5002;
+        ch.flags = ChannelFlags::MEGAGROUP;
+        s.upsert_channel(ch, PeerUpdateFlags::NAME);
+        s.ensure_history(data_peer).in_chat_list = true;
+
+        let mut text = Message::new_text(
+            data_peer,
+            DataMsgId(60),
+            Some(author),
+            1_750_000_100,
+            TextWithEntities::plain("@self look"),
+        );
+        text.flags |= MessageFlags::MENTIONS_ME | MessageFlags::MEDIA_IS_UNREAD;
+        s.insert_message(text);
+
+        let mut voice = Message::new_text(
+            data_peer,
+            DataMsgId(61),
+            Some(author),
+            1_750_000_110,
+            TextWithEntities::plain(""),
+        );
+        voice.content = MessageContent::Regular {
+            text: TextWithEntities::plain(""),
+            media: MessageMedia::Document(Box::new(DocumentData {
+                id: DocumentId(9161),
+                kind: DocumentKind::Voice,
+                mime_type: "audio/ogg".to_owned(),
+                ..Default::default()
+            })),
+        };
+        voice.flags |= MessageFlags::MENTIONS_ME | MessageFlags::MEDIA_IS_UNREAD;
+        s.insert_message(voice);
+        s.sync_dialog_lists(data_peer);
+    });
+    let scope = UnreadThingsScope::history(ui_peer);
+    assert_eq!(live.unread_things_counts(scope).mentions, 2);
+
+    rpc.enqueue_ok(tl_fns::channels::ReadMessageContents::CONSTRUCTOR_ID, &true);
+    let marked = live
+        .mark_visible_reactions_read(ui_peer, &[UiMsgId(60), UiMsgId(61)])
+        .expect("mark visible contents read");
+    assert_eq!(marked, vec![UiMsgId(60)], "the voice note stays unread");
+    assert_eq!(
+        live.unread_things_counts(scope).mentions,
+        1,
+        "the counter drops at once"
+    );
+    assert!(live.flush_background_rpcs(Duration::from_secs(10)));
+    let reqs = rpc.recorded_decoded::<tl_fns::channels::ReadMessageContents>();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].id, vec![60]);
+    let still_mentioned = live.read_session(|s| {
+        s.message(DataFullMsgId::new(data_peer, DataMsgId(60)))
+            .is_some_and(|m| m.flags.contains(MessageFlags::MENTIONS_ME))
+    });
+    assert!(!still_mentioned);
+
+    // Seeing it again sends nothing more.
+    let again = live
+        .mark_visible_reactions_read(ui_peer, &[UiMsgId(60)])
+        .expect("again");
+    assert!(again.is_empty());
 }
 
 // =============================================================================

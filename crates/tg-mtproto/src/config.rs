@@ -115,6 +115,36 @@ impl ClientConfig {
     }
 }
 
+/// Language fields of `initConnection` (`SessionOptions` `systemLangCode`, `langPackName`,
+/// `cloudLangCode`). They can change at run time, when the user switches the app language.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InitLang {
+    /// System language code.
+    pub system_lang_code: String,
+    /// Cloud language pack name (`""` for a custom pack).
+    pub lang_pack: String,
+    /// Cloud language code of the current pack.
+    pub lang_code: String,
+}
+
+impl InitLang {
+    /// The language fields of `config`.
+    pub fn from_config(config: &ClientConfig) -> Self {
+        Self {
+            system_lang_code: config.system_lang_code.clone(),
+            lang_pack: config.lang_pack.clone(),
+            lang_code: config.lang_code.clone(),
+        }
+    }
+
+    /// Writes these fields into `config`.
+    pub fn apply_to(&self, config: &mut ClientConfig) {
+        config.system_lang_code.clone_from(&self.system_lang_code);
+        config.lang_pack.clone_from(&self.lang_pack);
+        config.lang_code.clone_from(&self.lang_code);
+    }
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {

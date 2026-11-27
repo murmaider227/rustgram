@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tg_api::RpcClient;
-use tg_api::convert::{apply_tl_users_and_chats, entities_from_tl, input_peer_for};
+use tg_api::convert::{apply_tl_users_and_chats, input_peer_for, text_with_entities_from_tl};
 use tg_data::Session;
 use tg_text::TextWithEntities;
 use tg_tl::{RemoteCall, enums as tl_enums, functions as tl_fns, types as tl_types};
@@ -202,11 +202,8 @@ fn serialize_text_with_entities(
     })
 }
 
-fn parse_tl_text_with_entities(tl: &tl_enums::TextWithEntities) -> TextWithEntities {
-    let tl_enums::TextWithEntities::TextWithEntities(inner) = tl;
-    let data =
-        tg_data::TextWithEntities::new(inner.text.clone(), entities_from_tl(&inner.entities));
-    crate::convert::data_text_to_ui_text(&data)
+pub(crate) fn parse_tl_text_with_entities(tl: &tl_enums::TextWithEntities) -> TextWithEntities {
+    crate::convert::data_text_to_ui_text(&text_with_entities_from_tl(tl))
 }
 
 // ============================================================================

@@ -57,7 +57,7 @@ fn harness(ppp: f32) -> Harness<'static, AppTestState> {
         .with_render_cursor(false)
         .allow_missing_glyphs()
         .with_accessibility_check(false)
-        .wgpu()
+        .renderer(crate::common::serialized_wgpu_renderer())
         .with_context_setup(|ctx| {
             tg_ui::fonts::register_tdesktop_fonts(ctx);
             crate::common::apply_deterministic_style(ctx);

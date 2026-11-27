@@ -861,6 +861,8 @@ fn live_session_peer_info_and_settings_rpcs() {
     h.fake
         .enqueue_ok(tl_fns::account::ResetAuthorization::CONSTRUCTOR_ID, &true);
     assert!(h.live.terminate_session(4242));
+    // Sent in the background; the session leaves the list once the server confirms (TGB-3104).
+    assert!(h.live.flush_background_rpcs(Duration::from_secs(10)));
     assert_eq!(h.live.active_sessions().len(), 1);
 
     // Scope notifications read + write

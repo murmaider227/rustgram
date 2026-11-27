@@ -1596,10 +1596,21 @@ impl SendProgressManager {
 // Cloud Draft Save Manager (`ApiWrap::saveDraftToCloudDelayed`)
 // ---------------------------------------------------------------------------
 
+/// One draft slot: a chat or a forum topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct DraftSlotKey {
+pub struct DraftSlotKey {
     peer_id: PeerId,
     topic_root_id: Option<MsgId>,
+}
+
+/// A draft save taken by [`DraftManager::take_due`]: send `request`, then hand the slot back
+/// to [`DraftManager::finish_sent`].
+#[derive(Debug, Clone)]
+pub struct DueDraft {
+    /// Slot the draft belongs to.
+    pub key: DraftSlotKey,
+    /// The `messages.saveDraft` request.
+    pub request: tl_fns::messages::SaveDraft,
 }
 
 #[derive(Debug, Clone)]
@@ -1701,29 +1712,63 @@ impl DraftManager {
         now: Instant,
         force_all: bool,
     ) -> Result<usize, ApiError> {
+        let mut to_send = self.take_matching(now, force_all).into_iter();
+        let mut saved_count = 0;
+        while let Some(due) = to_send.next() {
+            let res = invoker.messages_save_draft(due.request).await;
+            self.finish_sent(due.key, now);
+            if let Err(err) = res {
+                // The drafts after the failed one were never sent: they stay for the next flush
+                // instead of staying "in flight" forever.
+                for unsent in to_send {
+                    self.release_unsent(unsent.key);
+                }
+                return Err(err.into());
+            }
+            saved_count += 1;
+        }
+        Ok(saved_count)
+    }
+
+    /// A draft of [`Self::take_due`] that was not sent after all: it is saved by a later flush.
+    pub fn release_unsent(&mut self, key: DraftSlotKey) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.in_flight = false;
+        }
+    }
+
+    /// The bookkeeping half of [`Self::flush_due`]: marks every draft due at `now` as in flight
+    /// and returns the requests to send. Each sent one goes back through
+    /// [`Self::finish_sent`], whatever its answer.
+    pub fn take_due(&mut self, now: Instant) -> Vec<DueDraft> {
+        self.take_matching(now, false)
+    }
+
+    fn take_matching(&mut self, now: Instant, force_all: bool) -> Vec<DueDraft> {
         let mut to_send = Vec::new();
         for (&key, entry) in &mut self.entries {
             if !entry.in_flight && (force_all || entry.save_at <= now) {
                 entry.in_flight = true;
-                to_send.push((key, entry.request.clone()));
+                to_send.push(DueDraft {
+                    key,
+                    request: entry.request.clone(),
+                });
             }
         }
+        to_send
+    }
 
-        let mut saved_count = 0;
-        for (key, request) in to_send {
-            let res = invoker.messages_save_draft(request).await;
-            if let Some(entry) = self.entries.get_mut(&key) {
-                entry.in_flight = false;
-                if entry.changed_while_saving {
-                    entry.changed_while_saving = false;
-                    entry.save_at = now + SAVE_CLOUD_DRAFT_TIMEOUT;
-                } else {
-                    self.entries.remove(&key);
-                }
+    /// A draft save of [`Self::take_due`] answered at `now`: the slot is done, or saves again
+    /// after the debounce timeout when the draft changed meanwhile.
+    pub fn finish_sent(&mut self, key: DraftSlotKey, now: Instant) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.in_flight = false;
+            if entry.changed_while_saving {
+                entry.changed_while_saving = false;
+                entry.save_at = now + SAVE_CLOUD_DRAFT_TIMEOUT;
+            } else {
+                self.entries.remove(&key);
             }
-            res?;
-            saved_count += 1;
         }
-        Ok(saved_count)
     }
 }

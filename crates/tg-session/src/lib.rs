@@ -19,6 +19,7 @@
 pub mod account;
 pub mod config;
 pub mod error;
+mod folder_peers;
 pub mod proxy;
 pub mod rpc;
 pub mod runtime;

@@ -34,7 +34,11 @@ const ARCHIVE_LOADED_CHATS_MIN_COUNT: usize = 20;
 const PAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wait before a failed page is requested again.
-const RETRY_AFTER_ERROR: Duration = Duration::from_secs(5);
+const RETRY_AFTER_ERROR: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
 
 const MAIN_FOLDER_ID: FolderId = 0;
 
@@ -208,12 +212,14 @@ async fn run_loading(
                     }
                     Ok(None) => mark_exhausted(cache, folder_id),
                     Err(err) => {
+                        // The loader retries by itself after a pause (TGB-2919); before, only
+                        // the next chat-list read from the UI did, so the window polled it.
                         debug!(folder = folder_id, error = %err, "messages.getDialogs page failed");
                         set_state(cache, |s| {
-                            s.running = false;
                             s.retry_at = Some(Instant::now() + RETRY_AFTER_ERROR);
                         });
-                        return;
+                        tokio::time::sleep(RETRY_AFTER_ERROR).await;
+                        set_state(cache, |s| s.retry_at = None);
                     }
                 }
             }

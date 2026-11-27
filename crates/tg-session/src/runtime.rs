@@ -625,6 +625,8 @@ impl<C: RpcClient + Clone + 'static> SessionRuntime<C> {
             refresh_self_after_startup: false,
             self_refresh: None,
             dialog_entries: None,
+            folder_peers: crate::folder_peers::FolderPeerWatch::default(),
+            dialogs_pages: HashMap::new(),
             in_flight: JoinSet::new(),
             in_flight_kinds: HashMap::new(),
             history_requests: HashSet::new(),
@@ -1473,6 +1475,11 @@ struct SessionActor<C: RpcClient> {
     /// In-flight `messages.getPeerDialogs` for histories whose folder is unknown
     /// ([`Self::start_dialog_entries_request`]).
     dialog_entries: Option<DialogEntriesFuture>,
+    /// Chats that folders changed during the session include (TGB-2898).
+    folder_peers: crate::folder_peers::FolderPeerWatch,
+    /// Folders with a dialogs page on its way, and the `LoadDialogsPage` callers waiting for
+    /// it to finish before they get the next page (the loop used to run them one after another).
+    dialogs_pages: HashMap<FolderId, VecDeque<DialogsPageReply>>,
     /// Independent network requests (history pages, typing, read receipts, keepalive pings):
     /// they run beside the loop and come back as [`Completion`]s, so incoming updates and other
     /// commands are not queued behind them.
@@ -1517,9 +1524,13 @@ fn unauthorized_logout(error: String) -> SessionEvent {
 
 enum InFlightKind {
     History(HistoryKey),
+    /// A dialogs page of the folder; `true` when `messages.getPinnedDialogs` went with it.
+    DialogsPage(FolderId, bool),
     Ping,
     Other,
 }
+
+type DialogsPageReply = oneshot::Sender<Result<Option<DialogsPageResult>>>;
 
 /// Result of a request started with [`SessionActor::spawn_request`].
 enum Completion {
@@ -1546,6 +1557,25 @@ enum Completion {
         /// `false` when the caller already resynced (forced wake), so a failed ping must
         /// not run `getDifference` a second time.
         resync_on_failure: bool,
+    },
+    Presence {
+        result: std::result::Result<bool, InvocationError>,
+        send: tg_api::OnlineStatusSend,
+        presence: tg_api::PresenceUpdateResult,
+        reply: oneshot::Sender<Result<tg_api::PresenceUpdateResult>>,
+    },
+    Drafts {
+        sent: Vec<tg_api::DraftSlotKey>,
+        failed: Option<(tg_api::DraftSlotKey, InvocationError)>,
+        /// Drafts not sent because an earlier one failed.
+        unsent: Vec<tg_api::DraftSlotKey>,
+    },
+    DialogsPage {
+        prepared: tg_api::PreparedDialogsPage,
+        response: std::result::Result<tl_enums::messages::Dialogs, InvocationError>,
+        pinned: Option<std::result::Result<tl_types::messages::PeerDialogs, InvocationError>>,
+        /// `None` for the refetch after `updates.differenceTooLong`.
+        reply: Option<DialogsPageReply>,
     },
 }
 
@@ -1985,19 +2015,16 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                 }
             }
             SessionCommand::LoadDialogsPage { folder_id, reply } => {
-                let res = match self.dialogs.load_next_page(&self.rpc, folder_id).await {
-                    Ok(Some(page)) => {
-                        self.apply_dialogs_page(&page).await;
-                        Ok(Some(page))
-                    }
-                    Ok(None) => Ok(None),
-                    Err(err) => Err(SessionError::Api(err)),
-                };
-                let _ = reply.send(res);
+                // The page goes out beside the loop (TGB-2899): an account with thousands of
+                // chats no longer holds other commands and updates behind each round trip.
+                self.start_dialogs_page(folder_id, Some(reply));
             }
             SessionCommand::LoadFilterExceptions { filters, reply } => {
                 if let Some(filters) = filters {
                     self.dialogs.apply_dialog_filters(filters);
+                    // Folders that change from now on are watched here (TGB-2898).
+                    self.folder_peers
+                        .folders_loaded(&*self.session.read().await);
                 }
                 let res = match self.dialogs.load_next_filter_exceptions(&self.rpc).await {
                     Ok(Some(resp)) => {
@@ -2268,21 +2295,26 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             } => {
                 let now_ms = self.now_ms();
                 let last_non_idle_ms = now_ms.saturating_sub(idle_ms);
-                let mut access = SharedSession::new(&self.session);
-                let res = self
-                    .updates
-                    .update_online_timed(
-                        &self.rpc,
-                        &mut access,
-                        window_active,
-                        last_non_idle_ms,
-                        now_ms,
-                        now_unix_secs(),
-                        false,
-                    )
-                    .await
-                    .map_err(SessionError::Api);
-                let _ = reply.send(res);
+                let (presence, send) =
+                    self.updates
+                        .decide_online(window_active, last_non_idle_ms, now_ms, false);
+                match send {
+                    // `account.updateStatus` goes out beside the loop (TGB-2917).
+                    Some(send) => {
+                        let rpc = self.rpc.clone();
+                        self.spawn_request(InFlightKind::Other, async move {
+                            Completion::Presence {
+                                result: rpc.account_update_status(send.request()).await,
+                                send,
+                                presence,
+                                reply,
+                            }
+                        });
+                    }
+                    None => {
+                        let _ = reply.send(Ok(presence));
+                    }
+                }
             }
             SessionCommand::Shutdown { reply } => {
                 let _ = reply.send(());
@@ -2298,6 +2330,52 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
     {
         let handle = self.in_flight.spawn(fut);
         self.in_flight_kinds.insert(handle.id(), kind);
+    }
+
+    /// Sends the next dialogs page of `folder_id` beside the loop; the answer is applied in
+    /// [`Self::on_request_done`]. Answers `Ok(None)` at once when the folder is finished or a
+    /// page of it is already on its way.
+    fn start_dialogs_page(&mut self, folder_id: FolderId, reply: Option<DialogsPageReply>) {
+        if let Some(waiting) = self.dialogs_pages.get_mut(&folder_id) {
+            // A page of this folder is on its way: the caller gets the page after it.
+            if let Some(reply) = reply {
+                waiting.push_back(reply);
+            }
+            return;
+        }
+        let Some(prepared) = self.dialogs.prepare_next_page(folder_id) else {
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(None));
+            }
+            return;
+        };
+        self.dialogs_pages.insert(folder_id, VecDeque::new());
+        let rpc = self.rpc.clone();
+        let kind = InFlightKind::DialogsPage(folder_id, prepared.need_pinned);
+        self.spawn_request(kind, async move {
+            let (response, pinned) = tg_api::fetch_dialogs_page(&rpc, &prepared).await;
+            Completion::DialogsPage {
+                prepared,
+                response,
+                pinned,
+                reply,
+            }
+        });
+    }
+
+    /// The page of `folder_id` finished: the next waiting caller (if any) gets the next page.
+    fn next_waiting_dialogs_page(&mut self, folder_id: FolderId) {
+        let mut waiting = self.dialogs_pages.remove(&folder_id).unwrap_or_default();
+        if let Some(next) = waiting.pop_front() {
+            self.start_dialogs_page(folder_id, Some(next));
+            if let Some(queue) = self.dialogs_pages.get_mut(&folder_id) {
+                queue.extend(waiting);
+            } else {
+                for reply in waiting {
+                    self.start_dialogs_page(folder_id, Some(reply));
+                }
+            }
+        }
     }
 
     /// `messages.getHistory` for `OpenHistory`, deduplicated by `(peer, message, direction)`
@@ -2386,12 +2464,73 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                         self.history_requests.remove(&key);
                     }
                     Some(InFlightKind::Ping) => self.ping_in_flight = false,
+                    Some(InFlightKind::DialogsPage(folder_id, need_pinned)) => {
+                        self.dialogs.abandon_page(folder_id, need_pinned);
+                        self.next_waiting_dialogs_page(folder_id);
+                    }
                     Some(InFlightKind::Other) | None => {}
                 }
                 return;
             }
         };
         match completion {
+            Completion::Presence {
+                result,
+                send,
+                presence,
+                reply,
+            } => {
+                let res = match result {
+                    Ok(_) => {
+                        send.apply(&mut *self.session.write().await, now_unix_secs());
+                        Ok(presence)
+                    }
+                    Err(err) => Err(SessionError::Api(tg_api::ApiError::Invocation(err))),
+                };
+                let _ = reply.send(res);
+            }
+            Completion::Drafts {
+                sent,
+                failed,
+                unsent,
+            } => {
+                let now = Instant::now();
+                for key in sent.into_iter().chain(failed.as_ref().map(|(key, _)| *key)) {
+                    self.draft_manager.finish_sent(key, now);
+                }
+                for key in unsent {
+                    self.draft_manager.release_unsent(key);
+                }
+                if let Some((_, err)) = failed {
+                    warn!(error = %err, "flushing cloud drafts failed");
+                }
+            }
+            Completion::DialogsPage {
+                prepared,
+                response,
+                pinned,
+                reply,
+            } => {
+                let folder_id = prepared.folder_id;
+                let res = match self.dialogs.finish_page(prepared, response, pinned) {
+                    Ok(page) => {
+                        self.apply_dialogs_page(&page).await;
+                        Ok(Some(page))
+                    }
+                    Err(err) => Err(SessionError::Api(err)),
+                };
+                match reply {
+                    Some(reply) => {
+                        let _ = reply.send(res);
+                    }
+                    None => {
+                        if let Err(err) = res {
+                            warn!(error = %err, "failed to refetch dialogs after updates.differenceTooLong");
+                        }
+                    }
+                }
+                self.next_waiting_dialogs_page(folder_id);
+            }
             Completion::History { key, result, reply } => {
                 self.history_requests.remove(&key);
                 let (peer_id, around_id, direction) = key;
@@ -3028,14 +3167,36 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             self.start_read_requests(now, None);
         }
 
-        // 4. Flush due cloud drafts.
+        // 4. Flush due cloud drafts beside the loop (TGB-2917), one after another like
+        // `DraftManager::flush_due`.
         if self
             .draft_manager
             .next_deadline()
             .is_some_and(|deadline| deadline <= now)
-            && let Err(err) = self.draft_manager.flush_due(&self.rpc, now).await
         {
-            warn!(error = %err, "flushing cloud drafts failed");
+            let due = self.draft_manager.take_due(now);
+            if !due.is_empty() {
+                let rpc = self.rpc.clone();
+                self.spawn_request(InFlightKind::Other, async move {
+                    let mut sent = Vec::new();
+                    let mut due = due.into_iter();
+                    let mut failed = None;
+                    for draft in due.by_ref() {
+                        match rpc.messages_save_draft(draft.request).await {
+                            Ok(_) => sent.push(draft.key),
+                            Err(err) => {
+                                failed = Some((draft.key, err));
+                                break;
+                            }
+                        }
+                    }
+                    Completion::Drafts {
+                        sent,
+                        failed,
+                        unsent: due.map(|d| d.key).collect(),
+                    }
+                });
+            }
         }
     }
 
@@ -3106,13 +3267,29 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
     /// unknown (`Histories::sendDialogRequests`, `data/data_histories.cpp:448-494`), so a chat
     /// from the archive is not shown in the main list and a new chat appears in the right one.
     /// The request runs beside the actor loop; [`Self::apply_dialog_entries`] applies it.
+    /// It also asks for the chats that folders changed during the session include
+    /// ([`crate::folder_peers`]).
     async fn start_dialog_entries_request(&mut self) {
-        if !self.session.read().await.has_dialog_entry_requests() {
-            return;
-        }
+        let folder_peers_due = {
+            let session = self.session.read().await;
+            self.folder_peers.collect(&session);
+            let folder_peers_due = self.folder_peers.has_requests()
+                && crate::folder_peers::lists_ready_for_folder_peers(&session);
+            if !session.has_dialog_entry_requests() && !folder_peers_due {
+                return;
+            }
+            folder_peers_due
+        };
         let peers: Vec<tl_enums::InputDialogPeer> = {
             let mut session = self.session.write().await;
-            let pending = session.take_dialog_entry_requests();
+            let mut pending = session.take_dialog_entry_requests();
+            if folder_peers_due {
+                for peer in self.folder_peers.take_requests(&session) {
+                    if !pending.contains(&peer) {
+                        pending.push(peer);
+                    }
+                }
+            }
             pending
                 .into_iter()
                 .map(|pid| input_peer_for(&session, pid))
@@ -3392,16 +3569,9 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
         if needs_dialog_refetch {
             // `updates.differenceTooLong`: reset main dialog pagination and refetch dialogs
             // so dialog unread counts, top messages, and channel PTSs resynchronize with the server.
+            // The page goes out beside the loop like any other (TGB-2917).
             self.dialogs.reset_folder(0);
-            match self.dialogs.load_next_page(&self.rpc, 0).await {
-                Ok(Some(page)) => {
-                    self.apply_dialogs_page(&page).await;
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(error = %err, "failed to refetch dialogs after updates.differenceTooLong");
-                }
-            }
+            self.start_dialogs_page(0, None);
         }
     }
 

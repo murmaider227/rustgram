@@ -286,6 +286,114 @@ pub fn build_widget_harness<S>(
         )
 }
 
+/// The one wgpu device every rendering harness of this test process uses, and the lock that
+/// every GPU call of a harness takes (TGB-2944).
+///
+/// On Windows `egui_kittest` renders on WARP, the software D3D12 driver (`d3d10warp.dll`).
+/// `HarnessBuilder::wgpu()` gives each harness its own instance and device, and with harnesses
+/// on parallel test threads WARP read or wrote freed memory on one of its thread-pool threads:
+/// the whole test process died with `STATUS_ACCESS_VIOLATION` (gate runs on 2026-11-27, and
+/// `wgpu_shared_device.rs` reproduces it). Measured with 16 threads x 40 harnesses: a device per
+/// harness died 5 of 5 runs; a device per thread, used by one harness at a time but rendering in
+/// parallel with the others, died 10 of 10; one device used from all threads at once did not die
+/// but renders waited on each other past `egui_kittest`'s 10 s limit.
+///
+/// So there is one device for the process, never destroyed, and a harness creates its renderer,
+/// uploads textures, renders and drops its renderer only while it holds [`wgpu_lock`]: WARP sees
+/// one caller at a time and a render waits only for its own work. The adapter and the renderer
+/// options are `egui_kittest`'s defaults, so snapshots render the same. The instance enables only
+/// the adapter's backend: `egui_wgpu::RenderState::create` lists the adapters of every backend of
+/// the instance for each harness, and listing GL adapters from many threads timed out on the WGL
+/// context lock.
+fn shared_wgpu_device() -> &'static egui_wgpu::WgpuSetupExisting {
+    static DEVICE: std::sync::OnceLock<egui_wgpu::WgpuSetupExisting> = std::sync::OnceLock::new();
+    DEVICE.get_or_init(|| {
+        let _gpu = wgpu_lock();
+        let probe = egui_kittest::wgpu::create_render_state(
+            egui_kittest::wgpu::default_wgpu_setup(),
+            egui_wgpu::RendererOptions::PREDICTABLE,
+        );
+        let backend = probe.adapter.get_info().backend;
+        // Never destroyed either: dropping an instance unloads the GPU drivers it loaded while
+        // listing adapters, and a crash inside the unloaded AMD hook (`amdihk64.dll`) was seen.
+        std::mem::forget(probe);
+        let mut setup = egui_kittest::wgpu::default_wgpu_setup();
+        if let egui_wgpu::WgpuSetup::CreateNew(create) = &mut setup {
+            create.instance_descriptor.backends = egui_wgpu::wgpu::Backends::from(backend);
+        }
+        let state =
+            egui_kittest::wgpu::create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE);
+        egui_wgpu::WgpuSetupExisting {
+            instance: state.instance.clone(),
+            adapter: state.adapter.clone(),
+            device: state.device.clone(),
+            queue: state.queue.clone(),
+        }
+    })
+}
+
+/// Held around every GPU call of a harness (see [`shared_wgpu_device`]).
+fn wgpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `egui_kittest`'s wgpu renderer on [`shared_wgpu_device`], one GPU call at a time.
+pub struct SerializedWgpuRenderer {
+    inner: Option<egui_kittest::wgpu::WgpuTestRenderer>,
+}
+
+impl SerializedWgpuRenderer {
+    fn inner(&mut self) -> &mut egui_kittest::wgpu::WgpuTestRenderer {
+        self.inner.as_mut().expect("renderer alive until drop")
+    }
+}
+
+impl egui_kittest::TestRenderer for SerializedWgpuRenderer {
+    fn handle_delta(&mut self, delta: &mut egui::TexturesDelta) {
+        let _gpu = wgpu_lock();
+        self.inner().handle_delta(delta);
+    }
+
+    fn render(
+        &mut self,
+        ctx: &egui::Context,
+        output: &egui::FullOutput,
+    ) -> Result<image::RgbaImage, String> {
+        let _gpu = wgpu_lock();
+        match self.inner().render(ctx, output) {
+            // `egui_kittest` waits at most 10 s for the GPU. A large frame on the software
+            // adapter can take longer when other test processes load every core: let the work
+            // finish, then render the same frame again (rendering is deterministic).
+            Err(err) if err.contains("timed out") => {
+                let _ = shared_wgpu_device()
+                    .device
+                    .poll(egui_wgpu::wgpu::PollType::wait_indefinitely());
+                self.inner().render(ctx, output)
+            }
+            rendered => rendered,
+        }
+    }
+}
+
+impl Drop for SerializedWgpuRenderer {
+    fn drop(&mut self) {
+        let _gpu = wgpu_lock();
+        drop(self.inner.take());
+    }
+}
+
+/// The renderer every rendering harness of this binary uses instead of
+/// `HarnessBuilder::wgpu()` (TGB-2944).
+pub fn serialized_wgpu_renderer() -> SerializedWgpuRenderer {
+    let setup = egui_wgpu::WgpuSetup::Existing(shared_wgpu_device().clone());
+    let _gpu = wgpu_lock();
+    SerializedWgpuRenderer {
+        inner: Some(egui_kittest::wgpu::WgpuTestRenderer::from_setup(setup)),
+    }
+}
+
 /// Builds a headless `egui_kittest::Harness` with `wgpu` rendering enabled for pixel snapshots.
 pub fn build_wgpu_harness(state: AppTestState, size: Vec2) -> Harness<'static, AppTestState> {
     HarnessBuilder::default()
@@ -294,7 +402,7 @@ pub fn build_wgpu_harness(state: AppTestState, size: Vec2) -> Harness<'static, A
         .with_render_cursor(false)
         .allow_missing_glyphs()
         .with_accessibility_check(false)
-        .wgpu()
+        .renderer(serialized_wgpu_renderer())
         .with_context_setup(|ctx| {
             register_tdesktop_fonts(ctx);
             apply_deterministic_style(ctx);

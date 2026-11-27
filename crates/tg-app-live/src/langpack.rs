@@ -1031,6 +1031,12 @@ fn sync_to_global_if_enabled(inner: &LiveLangPackInner, instance: &LangInstance)
 }
 
 fn refresh_snapshot(inner: &LiveLangPackInner, core: &LiveLangPackCore, reinit_requested: bool) {
+    if reinit_requested
+        && let Some(rpc) = inner.runtime.rpc().downcast_ref::<tg_session::MtprotoRpc>()
+    {
+        // `CloudManager::changeIdAndReInitConnection`: tell the server the new language.
+        rpc.set_init_language(&core.instance);
+    }
     if let Ok(mut snap) = inner.snapshot.lock() {
         let next_reinit = if reinit_requested {
             snap.reinit_count.saturating_add(1)

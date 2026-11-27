@@ -5,6 +5,7 @@
 //! `Telegram/SourceFiles/media/stories/media_stories_share.cpp`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tg_data::{FullStoryId, PeerId, StoryId, TimeId};
 use tg_stories::{
@@ -12,6 +13,7 @@ use tg_stories::{
     SuggestedReaction, UrlArea, WeatherArea,
 };
 use tg_text::TextWithEntities as UiText;
+use tg_video::streaming::RangeLoader;
 
 /// Default story lifetime period in seconds (`86400` = 24 hours).
 pub const DEFAULT_STORY_PERIOD_SECS: i32 = 86_400;
@@ -271,7 +273,45 @@ pub enum StoryMediaAsset {
     VideoBytes(Vec<u8>),
     /// Local MP4/WebM video file path played through `tg-video::StreamingPlayer`.
     VideoPath(PathBuf),
+    /// A video streamed through a range loader (tdesktop streams story video like any
+    /// document): playback starts once the first parts arrive.
+    VideoStream(StoryVideoStream),
 }
+
+/// Shared range loader of a streamed video story. Two values are equal when they share the
+/// same loader.
+#[derive(Clone)]
+pub struct StoryVideoStream(Arc<dyn RangeLoader>);
+
+impl StoryVideoStream {
+    /// Wraps `loader`.
+    #[must_use]
+    pub fn new(loader: Arc<dyn RangeLoader>) -> Self {
+        Self(loader)
+    }
+
+    /// The loader the player reads from.
+    #[must_use]
+    pub fn loader(&self) -> Arc<dyn RangeLoader> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl std::fmt::Debug for StoryVideoStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoryVideoStream")
+            .field("size", &self.0.size())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for StoryVideoStream {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StoryVideoStream {}
 
 /// Share destination row rendered in the Share Story dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]

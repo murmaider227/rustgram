@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tg_api::RpcClient;
-use tg_api::convert::{apply_tl_users_and_chats, entities_from_tl, input_peer_for};
+use tg_api::convert::{apply_tl_users_and_chats, input_peer_for, text_with_entities_from_tl};
 use tg_data::Session;
 use tg_tl::{RemoteCall, enums as tl_enums, functions as tl_fns, types as tl_types};
 
@@ -164,9 +164,8 @@ impl LiveSession {
             tone: None,
         };
         match invoke_summary_rpc(self, req) {
-            Ok(tl_enums::TextWithEntities::TextWithEntities(res)) => {
-                let data_text =
-                    tg_data::TextWithEntities::new(res.text, entities_from_tl(&res.entities));
+            Ok(res) => {
+                let data_text = text_with_entities_from_tl(&res);
                 let ui_text = data_text_to_ui_text(&data_text);
                 let entry = MessageSummaryEntry {
                     text: ui_text,

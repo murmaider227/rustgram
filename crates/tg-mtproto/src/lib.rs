@@ -18,6 +18,7 @@ pub mod file_loader;
 pub mod keys_destroyer;
 pub mod message;
 mod qdatastream;
+pub mod receive_watchdog;
 pub mod received_ids;
 pub mod salts;
 pub mod session;
@@ -36,7 +37,7 @@ pub use tg_transport as transport;
 
 pub use auth_key::{AuthKeyType, DcKeyRequest, DcKeyResult, Dcenter, ManagedAuthKey};
 pub use client::{Client, InvokeOptions, RequestBuilder, RpcClient, Sender};
-pub use config::{ClientConfig, ClientProxyInfo, Config, ConfigFields};
+pub use config::{ClientConfig, ClientProxyInfo, Config, ConfigFields, InitLang};
 pub use config_loader::{
     CONFIG_BECOMES_OLD, CONFIG_BECOMES_OLD_FOR_BLOCKED, ConfigLoader, ConfigLoaderOptions,
     ConfigSchedulerHandle, ENUMERATE_DC_TIMEOUT, SPECIAL_REQUEST_TIMEOUT,

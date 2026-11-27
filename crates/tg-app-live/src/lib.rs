@@ -77,6 +77,7 @@ pub mod summary;
 pub mod themes;
 pub mod toggling_media;
 pub mod transcribe;
+mod typing_expiry;
 mod ui_reads;
 mod ui_rpc_queue;
 pub mod upload;
@@ -183,6 +184,8 @@ mod tests_seca;
 mod tests_settings_extra;
 #[cfg(test)]
 mod tests_settings_reads;
+#[cfg(test)]
+mod tests_settings_writes;
 #[cfg(test)]
 mod tests_spoiler_entities;
 #[cfg(test)]

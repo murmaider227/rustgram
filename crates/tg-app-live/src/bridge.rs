@@ -608,6 +608,12 @@ impl LiveBridgeState {
         }
     }
 
+    /// Asks for a repaint without changing any view version: for state the UI reads every
+    /// frame anyway (e.g. story media that finished loading).
+    pub fn request_repaint(&self) {
+        self.wake_ui();
+    }
+
     /// Repaint requests sent to `egui` so far.
     #[must_use]
     pub fn repaint_requests(&self) -> u64 {
@@ -744,6 +750,8 @@ pub struct LiveRuntimeBridge {
     state: Arc<LiveBridgeState>,
     changes_task: JoinHandle<()>,
     events_task: JoinHandle<()>,
+    /// Ends "is typing" actions on time (TGB-3128).
+    typing_task: JoinHandle<()>,
 }
 
 impl LiveRuntimeBridge {
@@ -759,12 +767,20 @@ impl LiveRuntimeBridge {
         }
 
         let session_arc = Arc::clone(runtime.session());
+        let typing = Arc::new(crate::typing_expiry::TypingExpiryState::default());
+        let typing_task = runtime
+            .tokio_handle()
+            .spawn(crate::typing_expiry::run_typing_expiry(
+                Arc::clone(&typing),
+                Arc::downgrade(&session_arc),
+            ));
         let mut changes_rx = runtime.subscribe_changes();
         let state_changes = Arc::clone(&state);
         let changes_task = runtime.tokio_handle().spawn(async move {
             loop {
                 match changes_rx.recv().await {
                     Ok(ev) => {
+                        typing.on_change(&session_arc, &ev).await;
                         let chat = change_event_chat(&ev);
                         handle_change_event(&session_arc, &state_changes, session_id, ev).await;
                         match chat {
@@ -825,6 +841,7 @@ impl LiveRuntimeBridge {
             state,
             changes_task,
             events_task,
+            typing_task,
         }
     }
 
@@ -839,6 +856,7 @@ impl Drop for LiveRuntimeBridge {
     fn drop(&mut self) {
         self.changes_task.abort();
         self.events_task.abort();
+        self.typing_task.abort();
     }
 }
 

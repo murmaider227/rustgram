@@ -1955,15 +1955,25 @@ mod stories_tests {
             .to_bytes()))
         }));
 
+        // Story media loads in the background (TGB-3101): the viewer polls each frame.
         let loaded_photo = live
-            .load_story_media(FullStoryId::new(bob_peer, 20))
+            .wait_story_media(FullStoryId::new(bob_peer, 20), Duration::from_secs(10))
             .expect("photo media");
         assert_eq!(loaded_photo, StoryMediaAsset::PhotoBytes(photo_payload));
 
         let loaded_video = live
-            .load_story_media(FullStoryId::new(self_peer, 30))
+            .wait_story_media(FullStoryId::new(self_peer, 30), Duration::from_secs(10))
             .expect("video media");
-        assert_eq!(loaded_video, StoryMediaAsset::VideoBytes(video_payload));
+        let StoryMediaAsset::VideoStream(video_stream) = loaded_video else {
+            panic!("a video story is streamed, got {loaded_video:?}");
+        };
+        assert_eq!(
+            video_stream
+                .loader()
+                .load_range(0, video_payload.len())
+                .expect("streamed video story"),
+            video_payload
+        );
 
         // Optional real FFmpeg StreamingPlayer over TelegramRangeLoader check if ffmpeg is present.
         let ffmpeg = tg_app::media::mock::find_ffmpeg_bin();

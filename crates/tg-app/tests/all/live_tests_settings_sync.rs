@@ -634,6 +634,11 @@ fn notification_exceptions_sync_with_notify_settings_store() {
             exceptions: Vec::new(),
         },
     );
+    // Applied at once, sent in the background in order (TGB-3104).
+    assert!(
+        h.live
+            .flush_background_rpcs(std::time::Duration::from_secs(10))
+    );
     let calls = h.fake.recorded_calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(

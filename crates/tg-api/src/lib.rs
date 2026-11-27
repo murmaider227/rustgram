@@ -102,7 +102,7 @@ pub use contacts_extras::{
 };
 pub use dialogs::{
     DIALOGS_FIRST_LOAD, DIALOGS_PER_PAGE, DialogsLoader, DialogsPageResult, FolderDialogsState,
-    LOAD_EXCEPTIONS_AFTER, LOAD_EXCEPTIONS_PER_REQUEST,
+    LOAD_EXCEPTIONS_AFTER, LOAD_EXCEPTIONS_PER_REQUEST, PreparedDialogsPage, fetch_dialogs_page,
 };
 pub use error::{
     ApiError, LoginErrorKind, SendMessageErrorKind, map_login_error, map_send_message_error,
@@ -140,12 +140,13 @@ pub use login::{
 };
 pub use messaging::{
     AlbumMediaItem, CANCEL_TYPING_ACTION_TIMEOUT, DEFAULT_MESSAGE_LENGTH_LIMIT,
-    DELETE_HISTORY_RETRY_LIMIT, DeleteHistoryOutcome, DraftManager, FlushedRead, ForwardItem,
-    ForwardOutcome, MessageSender, OsRandomIdSource, PendingMessage, PendingMessageState,
-    PreparedTextChunk, READ_REQUEST_TIMEOUT, RandomIdSource, ReadHistoryManager,
-    SAVE_CLOUD_DRAFT_TIMEOUT, SEND_MY_SPEAKING_INTERVAL, SEND_MY_TYPING_INTERVAL,
-    SEND_TYPINGS_TO_OFFLINE_FOR_SECS, SendMediaOutcome, SendMessageOutcome, SendMultiMediaOutcome,
-    SendProgressKind, SendProgressManager, SendProgressUpdate, TypingPeerInfo,
+    DELETE_HISTORY_RETRY_LIMIT, DeleteHistoryOutcome, DraftManager, DraftSlotKey, DueDraft,
+    FlushedRead, ForwardItem, ForwardOutcome, MessageSender, OsRandomIdSource, PendingMessage,
+    PendingMessageState, PreparedTextChunk, READ_REQUEST_TIMEOUT, RandomIdSource,
+    ReadHistoryManager, SAVE_CLOUD_DRAFT_TIMEOUT, SEND_MY_SPEAKING_INTERVAL,
+    SEND_MY_TYPING_INTERVAL, SEND_TYPINGS_TO_OFFLINE_FOR_SECS, SendMediaOutcome,
+    SendMessageOutcome, SendMultiMediaOutcome, SendProgressKind, SendProgressManager,
+    SendProgressUpdate, TypingPeerInfo,
 };
 pub use rpc::{DcId, InvocationError, RpcClient, RpcError};
 pub use saved::{
@@ -185,6 +186,6 @@ pub use updates::{
     CHANNEL_GET_DIFF_LIMIT, DEFAULT_OFFLINE_IDLE_TIMEOUT_MS, DEFAULT_ONLINE_UPDATE_PERIOD_MS,
     FAIL_DIFF_INITIAL_BACKOFF_SECS, FAIL_DIFF_MAX_BACKOFF_SECS, FAST_GAP_TIMEOUT_MS,
     IDLE_FINISH_CHECK_MS, NO_UPDATES_AFTER_SLEEP_TIMEOUT_MS, NO_UPDATES_TIMEOUT_MS,
-    PersistedUpdatesState, PresenceUpdateResult, UpdateEvent, UpdatePayload, UpdatesHandler,
-    WAIT_FOR_CHANNEL_GET_DIFF_MS, WAIT_FOR_SKIPPED_TIMEOUT_MS,
+    OnlineStatusSend, PersistedUpdatesState, PresenceUpdateResult, UpdateEvent, UpdatePayload,
+    UpdatesHandler, WAIT_FOR_CHANNEL_GET_DIFF_MS, WAIT_FOR_SKIPPED_TIMEOUT_MS,
 };

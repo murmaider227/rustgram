@@ -1241,12 +1241,26 @@ pub(crate) fn mark_visible_reactions_read(
         return Ok(Vec::new());
     }
     let data_peer = to_data_peer(peer_id);
-    let marked_data =
-        live.write_session(|session| session.mark_messages_reactions_read(data_peer, &data_ids));
+    let (reactions_read, mentions_read) = live.write_session(|session| {
+        // Read first: marking reactions read keeps the mention flags it looks at.
+        let mentions = visible_unread_mentions(session, data_peer, &data_ids);
+        let reactions = session.mark_messages_reactions_read(data_peer, &data_ids);
+        if !mentions.is_empty() {
+            let _ = session.mark_messages_contents_read(Some(data_peer), &mentions);
+        }
+        (reactions, mentions)
+    });
+    let mut marked_data = reactions_read.clone();
+    for id in &mentions_read {
+        if !marked_data.contains(id) {
+            marked_data.push(*id);
+        }
+    }
     if marked_data.is_empty() {
         return Ok(Vec::new());
     }
     let marked_ui: Vec<MsgId> = marked_data.iter().copied().map(from_data_msg).collect();
+    let mentions_ui: Vec<MsgId> = mentions_read.iter().copied().map(from_data_msg).collect();
 
     // Synchronize `LiveEngagementState`'s cached unread_reactions counters / loaded_ids so
     // `unread_things_counts(scope)` immediately reflects the newly read reactions. The state is
@@ -1265,6 +1279,22 @@ pub(crate) fn mark_visible_reactions_read(
             }
             if entry.count.is_some() {
                 entry.count = Some(scope_unread_reactions(session, data_peer, scope).max(0));
+            }
+        }
+        // The "@" button reads these counts; a cached server count would keep it at 1 after
+        // the mention was seen (TGB-3125).
+        if !mentions_ui.is_empty() {
+            for (scope, entry) in guard
+                .unread_mentions
+                .iter_mut()
+                .filter(|(scope, _)| scope.peer_id == peer_id)
+            {
+                for id in &mentions_ui {
+                    entry.loaded_ids.remove(id);
+                }
+                if entry.count.is_some() {
+                    entry.count = Some(scope_unread_mentions(session, data_peer, scope).max(0));
+                }
             }
         }
     });
@@ -1305,6 +1335,60 @@ pub(crate) fn mark_visible_reactions_read(
     });
 
     Ok(marked_ui)
+}
+
+/// Shown messages whose mention of the user is unread and that are not unplayed voice or
+/// round messages (those are read by playing them): `HistoryInner::paintEvent` reads them with
+/// `markContentsRead` (`history_inner_widget.cpp:1574-1576`, `HistoryItem::isUnreadMention` /
+/// `isUnreadMedia`).
+fn visible_unread_mentions(
+    session: &Session,
+    peer: DataPeerId,
+    ids: &[DataMsgId],
+) -> Vec<DataMsgId> {
+    let mut out: Vec<DataMsgId> = Vec::new();
+    for &id in ids {
+        if !id.is_server() || out.contains(&id) {
+            continue;
+        }
+        let Some(msg) = session.message(tg_data::FullMsgId::new(peer, id)) else {
+            continue;
+        };
+        let unread_mention = !msg.is_outgoing()
+            && msg.flags.contains(MessageFlags::MENTIONS_ME)
+            && msg.flags.contains(MessageFlags::MEDIA_IS_UNREAD);
+        let unplayed_media = match msg.media() {
+            Some(tg_data::MessageMedia::Document(doc)) => {
+                matches!(
+                    doc.kind,
+                    tg_data::DocumentKind::Voice | tg_data::DocumentKind::RoundVideo
+                ) || doc.ttl_seconds.is_some()
+            }
+            Some(tg_data::MessageMedia::Photo(photo)) => photo.ttl_seconds.is_some(),
+            _ => false,
+        };
+        if unread_mention && !unplayed_media {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// Unread mentions of `scope` (a forum topic or the main history) as the session counts them.
+fn scope_unread_mentions(
+    session: &Session,
+    data_peer: DataPeerId,
+    scope: &UnreadThingsScope,
+) -> i32 {
+    if let Some(top_id) = scope.top_msg_id {
+        return session
+            .forum(data_peer)
+            .and_then(|f| f.topic(to_data_msg(top_id)))
+            .map_or(0, |t| t.unread_mentions_count);
+    }
+    session
+        .history(data_peer)
+        .map_or(0, |h| h.unread_mentions_count)
 }
 
 /// Unread reactions of `scope` (a forum topic, a saved sublist or the main history) as the

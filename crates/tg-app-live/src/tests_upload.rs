@@ -123,7 +123,10 @@ impl RpcClient for FakeRpcClient {
             .expect("lock recorded")
             .push((ctor, bytes.clone()));
 
-        if let Some(handler) = self.dynamic.lock().expect("lock dynamic").clone()
+        // The guard must not live while the handler runs: a handler that holds a request
+        // would hold every other request with it.
+        let handler = self.dynamic.lock().expect("lock dynamic").clone();
+        if let Some(handler) = handler
             && let Some(res) = handler(ctor, &bytes)
         {
             let raw = res?;
@@ -767,6 +770,7 @@ fn send_media_supports_all_media_kinds_caption_entities_reply_silent_and_schedul
         },
     )
     .expect("send document");
+    assert!(live.wait_media_sends(Duration::from_secs(10)));
 
     // 2c. Video with attributes and thumbnail.
     let _ = live
@@ -1817,6 +1821,7 @@ fn recorded_voice_bytes_are_uploaded_and_sent_with_the_voice_attribute_only() {
         },
     )
     .expect("the recorded voice message is sent");
+    assert!(live.wait_media_sends(Duration::from_secs(10)));
 
     let parts: Vec<tl_fns::upload::SaveFilePart> = h
         .fake
@@ -1926,6 +1931,8 @@ fn a_sent_voice_message_is_in_the_media_cache_without_a_download() {
         },
     )
     .expect("the voice message is sent");
+    // The send runs in the background (TGB-3033).
+    assert!(live.wait_media_sends(Duration::from_secs(10)));
 
     let desc = HistoryBackend::inline_media_descriptor(&live, h.bob_peer, MsgId(513))
         .expect("voice descriptor");
@@ -1944,3 +1951,7 @@ fn a_sent_voice_message_is_in_the_media_cache_without_a_download() {
 
     h.shutdown();
 }
+
+#[path = "tests_media_send_pending.rs"]
+#[cfg(test)]
+mod tests_media_send_pending;

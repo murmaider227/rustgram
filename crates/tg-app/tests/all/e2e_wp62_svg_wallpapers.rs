@@ -604,7 +604,7 @@ fn wp62_fake_rpc_tgv_pattern_wallpaper_download_rasterize_and_wgpu_snapshot() {
             .with_step_dt(1.0 / 30.0)
             .with_render_cursor(false)
             .with_accessibility_check(false)
-            .wgpu()
+            .renderer(crate::common::serialized_wgpu_renderer())
             .build_ui_state(
                 |ui, chat_bg: &mut ChatBackground| {
                     let rect = ui.max_rect();

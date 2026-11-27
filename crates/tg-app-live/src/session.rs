@@ -609,6 +609,34 @@ impl LiveSession {
         });
     }
 
+    /// Drops the active sessions `gone` matches from the cached list and wakes the views.
+    fn forget_active_sessions(&self, gone: impl Fn(&ActiveSession) -> bool) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.active_sessions.retain(|s| !gone(s));
+            c.settings_reads.invalidate(SettingsRead::ActiveSessions);
+        }
+        self.bridge.state().notify_ui();
+    }
+
+    /// Like [`Self::queue_background_rpc`], with `on_done` getting the answer on the runtime.
+    pub(crate) fn queue_background_rpc_then<R>(
+        &self,
+        req: R,
+        on_done: impl FnOnce(R::Return) + Send + 'static,
+        on_error: impl FnOnce(String) + Send + 'static,
+    ) where
+        R: tg_tl::RemoteCall + Send + Sync + 'static,
+        R::Return: Send + 'static,
+    {
+        let rpc = self.runtime.rpc().clone();
+        self.ui_rpc.push(async move {
+            match with_rpc_timeout(LIVE_RPC_TIMEOUT, async move { rpc.invoke(&req).await }).await {
+                Ok(answer) => on_done(answer),
+                Err(err) => on_error(err),
+            }
+        });
+    }
+
     /// Waits until the requests the UI queued without waiting (typing, read receipts, drafts)
     /// have run. Returns `false` after `limit`. For tests and shutdown only.
     #[doc(hidden)]
@@ -2742,6 +2770,8 @@ impl LiveSession {
             slice
         });
         self.decorate_cached_translations(peer_id, &mut slice.messages);
+        self.sends
+            .attach_local_media(to_data_peer(peer_id), &mut slice.messages);
         crate::rich_message::attach_cached_rich_messages(
             self.runtime.session(),
             &mut slice.messages,
@@ -2822,6 +2852,8 @@ impl LiveSession {
             slice
         });
         self.decorate_cached_translations(peer_id, &mut slice.messages);
+        self.sends
+            .attach_local_media(to_data_peer(peer_id), &mut slice.messages);
         crate::rich_message::attach_cached_rich_messages(
             self.runtime.session(),
             &mut slice.messages,
@@ -6072,15 +6104,20 @@ impl SettingsBackend for LiveSession {
     }
 
     fn set_account_ttl_days(&mut self, days: i32) {
-        let req = tl_fns::account::SetAccountTTL {
-            ttl: tl_enums::AccountDaysTTL::AccountDaysTTL(tl_types::AccountDaysTTL { days }),
-        };
-        if self.invoke_rpc(req).is_ok()
-            && let Ok(mut c) = self.cache.lock()
-        {
+        // `Api::SelfDestruct::updateAccountTTL`: the new value is shown at once and the request
+        // goes in the background; a failure changes nothing (TGB-3104).
+        if let Ok(mut c) = self.cache.lock() {
             c.account_ttl_loaded = true;
             c.account_ttl_days = days;
+            c.settings_reads.invalidate(SettingsRead::AccountTtl);
         }
+        self.bridge.state().notify_ui();
+        self.queue_background_rpc(
+            tl_fns::account::SetAccountTTL {
+                ttl: tl_enums::AccountDaysTTL::AccountDaysTTL(tl_types::AccountDaysTTL { days }),
+            },
+            |error| warn!(%error, "account.setAccountTTL failed"),
+        );
     }
 
     fn clear_payment_info(&mut self, clear_shipping: bool, clear_credentials: bool) {
@@ -6107,35 +6144,38 @@ impl SettingsBackend for LiveSession {
         if hash == 0 {
             return false;
         }
-        let req = tl_fns::account::ResetAuthorization { hash: hash as i64 };
-        match self.invoke_rpc(req) {
-            Ok(true) => {
-                if let Ok(mut c) = self.cache.lock() {
-                    c.active_sessions.retain(|s| s.hash != hash);
+        // `Api::Authorizations::requestTerminate`: the session leaves the list when the server
+        // confirms; the request goes in the background (TGB-3104).
+        let live = self.clone();
+        self.queue_background_rpc_then(
+            tl_fns::account::ResetAuthorization { hash: hash as i64 },
+            move |done| {
+                if done {
+                    live.forget_active_sessions(|s| s.hash == hash);
                 }
-                self.bridge.state().notify_ui();
-                true
-            }
-            _ => false,
-        }
+            },
+            |error| warn!(%error, "account.resetAuthorization failed"),
+        );
+        true
     }
 
     fn terminate_all_other_sessions(&mut self) -> usize {
-        let before = self
+        let others = self
             .cache
             .lock()
             .map(|c| c.active_sessions.iter().filter(|s| s.hash != 0).count())
             .unwrap_or(0);
-        match self.invoke_rpc(tl_fns::auth::ResetAuthorizations {}) {
-            Ok(true) => {
-                if let Ok(mut c) = self.cache.lock() {
-                    c.active_sessions.retain(|s| s.hash == 0);
+        let live = self.clone();
+        self.queue_background_rpc_then(
+            tl_fns::auth::ResetAuthorizations {},
+            move |done| {
+                if done {
+                    live.forget_active_sessions(|s| s.hash != 0);
                 }
-                self.bridge.state().notify_ui();
-                before
-            }
-            _ => 0,
-        }
+            },
+            |error| warn!(%error, "auth.resetAuthorizations failed"),
+        );
+        others
     }
 
     fn update_session_permissions(
@@ -6164,32 +6204,36 @@ impl SettingsBackend for LiveSession {
             None => (Some(!accept_secret_chats), Some(!accept_calls)),
         };
 
+        // The switch shows the new state at once and the request goes in the background, with
+        // no rollback on failure, as `toggleCallsDisabled` (TGB-3104).
+        if let Ok(mut c) = self.cache.lock()
+            && let Some(entry) = c.active_sessions.iter_mut().find(|s| s.hash == hash)
+        {
+            entry.accept_calls = accept_calls;
+            entry.accept_secret_chats = accept_secret_chats;
+            c.settings_reads.invalidate(SettingsRead::ActiveSessions);
+        }
+        self.bridge.state().notify_ui();
         let rpc = self.runtime.rpc().clone();
-        let ok = block_on_runtime(self.runtime.tokio_handle(), async move {
-            tokio::time::timeout(LIVE_RPC_TIMEOUT, async move {
-                let mut mgr = tg_api::account::AuthorizationsManager::new();
+        self.ui_rpc.push(async move {
+            let mut mgr = tg_api::account::AuthorizationsManager::new();
+            let sent = tokio::time::timeout(
+                LIVE_RPC_TIMEOUT,
                 mgr.change_settings(
                     &rpc,
                     hash as i64,
                     false,
                     encrypted_requests_disabled,
                     call_requests_disabled,
-                )
-                .await
-            })
-            .await
-        })
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(false);
-
-        if ok
-            && let Ok(mut c) = self.cache.lock()
-            && let Some(entry) = c.active_sessions.iter_mut().find(|s| s.hash == hash)
-        {
-            entry.accept_calls = accept_calls;
-            entry.accept_secret_chats = accept_secret_chats;
-        }
+                ),
+            )
+            .await;
+            match sent {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => warn!(%error, "account.changeAuthorizationSettings failed"),
+                Err(_) => warn!("account.changeAuthorizationSettings timed out"),
+            }
+        });
     }
 
     fn review_authorization(&mut self, hash: u64, confirm: bool) -> Result<bool, String> {
@@ -6253,14 +6297,18 @@ impl SettingsBackend for LiveSession {
     }
 
     fn set_session_ttl_days(&mut self, days: i32) {
-        let req = tl_fns::account::SetAuthorizationTTL {
-            authorization_ttl_days: days,
-        };
-        if self.invoke_rpc(req).is_ok()
-            && let Ok(mut c) = self.cache.lock()
-        {
+        // `Api::Authorizations::updateTTL`: shown at once, sent in the background (TGB-3104).
+        if let Ok(mut c) = self.cache.lock() {
             c.session_ttl_days = days;
+            c.settings_reads.invalidate(SettingsRead::ActiveSessions);
         }
+        self.bridge.state().notify_ui();
+        self.queue_background_rpc(
+            tl_fns::account::SetAuthorizationTTL {
+                authorization_ttl_days: days,
+            },
+            |error| warn!(%error, "account.setAuthorizationTTL failed"),
+        );
     }
 
     fn blocked_users(&self) -> Vec<PeerRef> {

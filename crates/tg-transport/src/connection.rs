@@ -134,6 +134,7 @@ pub struct Connection<S = PrefixedStream<TcpStream>> {
     read_pos: usize,
     tag: String,
     ping_time: Option<Duration>,
+    bytes_received: u64,
 }
 
 impl Connection<PrefixedStream<TcpStream>> {
@@ -262,6 +263,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             read_pos: 0,
             tag,
             ping_time: None,
+            bytes_received: 0,
         })
     }
 
@@ -281,6 +283,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     #[must_use]
     pub const fn ping_time(&self) -> Option<Duration> {
         self.ping_time
+    }
+
+    /// Total bytes read from the socket so far, including parts of packets that have not
+    /// fully arrived yet. The session's receive watchdog treats any growth as "received
+    /// some" (`AbstractConnection::receivedSome` fires on every socket read in tdesktop), so a
+    /// large reply arriving slowly does not count as a silent connection.
+    #[must_use]
+    pub const fn bytes_received(&self) -> u64 {
+        self.bytes_received
     }
 
     /// Send a single MTProto packet payload over this connection.
@@ -353,6 +364,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             if n == 0 {
                 return Err(Error::Disconnected);
             }
+            self.bytes_received = self.bytes_received.saturating_add(n as u64);
             if let Some(obf) = &mut self.obfuscated {
                 obf.decrypt_incoming(&mut scratch[..n]);
             }

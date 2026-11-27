@@ -14,9 +14,10 @@
 //! 4. A task waits for the reply and records a [`SendResolution`]; the next history drain turns
 //!    it into [`HistoryLiveUpdate::LocalMessageSent`] / [`HistoryLiveUpdate::LocalMessageFailed`].
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tg_api::convert::entities_from_tl_with_self;
+use tg_api::convert::entities_from_tl_for_text;
 use tg_api::messaging::{MessageSender, PreparedTextChunk};
 use tg_api::{PendingMessageState, SendMessageOutcome, SendOptions};
 use tg_data::{
@@ -25,9 +26,9 @@ use tg_data::{
 };
 use tg_tl::enums as tl_enums;
 
-use tg_app_core::history::backend::{HistoryLiveUpdate, HistoryMessage};
+use tg_app_core::history::backend::{HistoryLiveUpdate, HistoryMedia, HistoryMessage};
 
-use crate::convert::{from_data_msg, message_to_history_message, now_unix_i32};
+use crate::convert::{from_data_msg, message_to_history_message, now_unix_i32, to_data_msg};
 
 /// First client index of the local ids the UI allocates. The runtime's own sender counts from
 /// 0; both stay below `MsgId::LOCAL_COUNT`, so every local id has a UI id.
@@ -46,6 +47,11 @@ pub(crate) struct SendResolution {
     pub sent_ids: Vec<Option<DataMsgId>>,
     /// Effect the user picked, kept on the sent message when the server does not echo it.
     pub effect_id: Option<u64>,
+    /// Message to show for each sent chunk when the session does not hold the server message
+    /// (media sends only; empty for text).
+    pub fallback: Vec<HistoryMessage>,
+    /// The user cancelled the send: the local message goes without an error.
+    pub cancelled: bool,
 }
 
 /// What the caller asks for besides the text.
@@ -64,6 +70,11 @@ pub(crate) struct QueuedSendExtras {
 pub(crate) struct OptimisticSends {
     sender: Arc<Mutex<MessageSender>>,
     resolved: Arc<Mutex<Vec<SendResolution>>>,
+    /// What the pending bubble of a local media message shows (the session's local message
+    /// holds only the caption) (TGB-3033).
+    local_media: Arc<Mutex<HashMap<DataFullMsgId, HistoryMedia>>>,
+    /// Media sends whose upload or `messages.sendMedia` is still running.
+    media_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for OptimisticSends {
@@ -73,6 +84,8 @@ impl Default for OptimisticSends {
                 MessageSender::default().with_first_local_index(UI_FIRST_LOCAL_INDEX),
             )),
             resolved: Arc::new(Mutex::new(Vec::new())),
+            local_media: Arc::new(Mutex::new(HashMap::new())),
+            media_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -89,6 +102,73 @@ impl OptimisticSends {
             .lock()
             .map(|mut s| s.prepare_text_chunks(peer, text, entities))
             .unwrap_or_default()
+    }
+
+    /// A fresh local message id from the UI's range.
+    pub(crate) fn next_local_id(&self) -> DataMsgId {
+        self.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_local_msg_id()
+    }
+
+    /// Counts a media send that starts running in the background; the guard ends it.
+    pub(crate) fn begin_media_send(&self) -> MediaSendGuard {
+        self.media_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        MediaSendGuard(Arc::clone(&self.media_in_flight))
+    }
+
+    /// Media sends still running in the background.
+    pub(crate) fn media_sends_in_flight(&self) -> usize {
+        self.media_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records a finished background send for the next history drain.
+    pub(crate) fn push_resolution(&self, resolution: SendResolution) {
+        self.resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(resolution);
+    }
+
+    /// Remembers the media the pending bubble of `local` shows.
+    pub(crate) fn set_local_media(&self, local: DataFullMsgId, media: HistoryMedia) {
+        self.local_media
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(local, media);
+    }
+
+    /// Forgets the media of `local` (its local message is gone).
+    pub(crate) fn take_local_media(&self, local: DataFullMsgId) -> Option<HistoryMedia> {
+        self.local_media
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&local)
+    }
+
+    /// Gives the local media messages of `peer` in `messages` the media they are sending.
+    pub(crate) fn attach_local_media(&self, peer: DataPeerId, messages: &mut [HistoryMessage]) {
+        let media = self
+            .local_media
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if media.is_empty() {
+            return;
+        }
+        for message in messages.iter_mut().rev() {
+            let id = to_data_msg(message.id);
+            if !id.is_client() {
+                break;
+            }
+            if message.media.is_none()
+                && let Some(shown) = media.get(&DataFullMsgId::new(peer, id))
+            {
+                message.media = Some(shown.clone());
+            }
+        }
     }
 
     /// Takes every resolution recorded so far.
@@ -163,11 +243,22 @@ impl OptimisticSends {
                     outcome,
                     sent_ids,
                     effect_id,
+                    fallback: Vec::new(),
+                    cancelled: false,
                 });
             }
             bridge.mark_views_changed();
             bridge.notify_ui();
         });
+    }
+}
+
+/// Ends one background media send of [`OptimisticSends::begin_media_send`] when dropped.
+pub(crate) struct MediaSendGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for MediaSendGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -217,7 +308,7 @@ pub(crate) fn store_local_messages(
             now,
             tg_data::TextWithEntities::new(
                 chunk.text.clone(),
-                entities_from_tl_with_self(&chunk.entities, self_user_id),
+                entities_from_tl_for_text(&chunk.text, &chunk.entities, self_user_id),
             ),
         );
         local
@@ -285,6 +376,7 @@ pub(crate) fn resolution_updates(
                 let Some(mut message) = session
                     .message(DataFullMsgId::new(peer, server_id))
                     .map(|m| message_to_history_message(session, m))
+                    .or_else(|| resolution.fallback.get(i).cloned())
                 else {
                     continue;
                 };
@@ -299,6 +391,15 @@ pub(crate) fn resolution_updates(
                     message: Box::new(message),
                 });
             }
+        }
+        Err(_) if resolution.cancelled => {
+            out.push(HistoryLiveUpdate::MessagesDeleted(
+                resolution
+                    .local_ids
+                    .iter()
+                    .map(|&local| from_data_msg(local))
+                    .collect(),
+            ));
         }
         Err(error) => {
             let mut error = Some(error.clone());

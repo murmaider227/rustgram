@@ -6,6 +6,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 mod send_wait;
+mod wgpu_shared_device;
 
 mod e2e_a11y;
 mod e2e_adaptive;

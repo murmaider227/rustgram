@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tg_api::RpcClient;
 use tg_api::convert::{apply_tl_users_and_chats, input_peer_for, input_user_for};
@@ -55,15 +55,35 @@ pub use tg_app_core::stories::backend::{
     StoryPrivacyInput, StoryUploadMedia,
 };
 use tg_app_core::stories::backend::{
-    PeerProfile as StoryPeerProfile, ShareTarget, StoriesBackend, StoryMediaAsset,
+    PeerProfile as StoryPeerProfile, ShareTarget, StoriesBackend, StoryMediaAsset, StoryVideoStream,
 };
 
 /// Default timeout for synchronous stories RPCs triggered from UI trait methods.
 const STORIES_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum video story bytes read into memory when adapting a [`TelegramRangeLoader`]
-/// into [`StoryMediaAsset::VideoBytes`] (64 MiB safety cap).
-const MAX_VIDEO_STORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Bytes of a video story read in the background before the viewer gets its loader, so the
+/// decoder's header reads find them downloaded (a story MP4 keeps `moov` at the start).
+const STORY_VIDEO_HEADER_BYTES: u64 = 512 * 1024;
+
+/// Bytes of a video story a preload downloads, as tdesktop's `kDefaultPreloadPrefix`
+/// (`data/data_media_preload.cpp`).
+const STORY_VIDEO_PRELOAD_PREFIX: u64 = 4 * 1024 * 1024;
+
+/// How long a failed story media load waits before a viewer frame may start it again.
+const STORY_MEDIA_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// Where the media of one story is: being loaded in the background, ready, or failed.
+enum StoryMediaLoad {
+    Loading,
+    Ready(StoryMediaAsset),
+    Failed(Instant),
+}
+
+/// What a background story media load fetches.
+enum StoryMediaJob {
+    Photo(crate::media::ResolvedMediaLocation),
+    Video(Box<TelegramRangeLoader<tg_app_core::core_types::erased_rpc::ErasedRpcClient>>),
+}
 
 struct PendingStoryUpload {
     id: u64,
@@ -77,7 +97,11 @@ struct LiveStoriesState {
     blocked_viewers: HashSet<DataPeerId>,
     close_friends: HashSet<DataPeerId>,
     story_media: HashMap<FullStoryId, StoryMedia>,
-    media_cache: HashMap<FullStoryId, StoryMediaAsset>,
+    media_loads: HashMap<FullStoryId, StoryMediaLoad>,
+    /// Preloads started by `StoriesAction::StartPreload` whose media is still loading.
+    preloads_waiting: HashSet<FullStoryId>,
+    /// Preloads whose load ended, for `StoriesStore::finish_preload` on the UI thread.
+    finished_preloads: Vec<(FullStoryId, bool)>,
     pending_uploads: Vec<PendingStoryUpload>,
     queued_updates: VecDeque<tl_enums::Update>,
     next_random_id: u64,
@@ -91,7 +115,9 @@ impl LiveStoriesState {
             blocked_viewers: HashSet::new(),
             close_friends: HashSet::new(),
             story_media: HashMap::new(),
-            media_cache: HashMap::new(),
+            media_loads: HashMap::new(),
+            preloads_waiting: HashSet::new(),
+            finished_preloads: Vec::new(),
             pending_uploads: Vec::new(),
             queued_updates: VecDeque::new(),
             next_random_id: 1,
@@ -235,8 +261,13 @@ impl LiveSession {
     pub fn drain_story_updates(&self, store: &mut StoriesStore, now_secs: TimeId) -> usize {
         let mut pending = self.bridge_state().drain_story_updates();
         let state = stories_state_for(self);
+        let mut finished_preloads = Vec::new();
         if let Ok(mut g) = state.lock() {
             pending.extend(g.queued_updates.drain(..));
+            finished_preloads = std::mem::take(&mut g.finished_preloads);
+        }
+        for (story_id, ok) in finished_preloads {
+            store.finish_preload(story_id, ok);
         }
         if pending.is_empty() {
             return 0;
@@ -1571,7 +1602,7 @@ impl StoriesBackend for LiveSession {
                                 let full_id = FullStoryId::new(peer_id, sid);
                                 if let Ok(mut guard) = state.lock() {
                                     guard.story_media.remove(&full_id);
-                                    guard.media_cache.remove(&full_id);
+                                    guard.media_loads.remove(&full_id);
                                 }
                                 store.apply_deleted(peer_id, sid);
                             }
@@ -1662,8 +1693,9 @@ impl StoriesBackend for LiveSession {
                 }
                 StoriesAction::StartPreload { story_id } => {
                     self.index_story_from_store(store, story_id);
-                    let ok = self.load_story_media(story_id).is_some();
-                    store.finish_preload(story_id, ok);
+                    if let Some(ok) = self.start_story_preload(story_id) {
+                        store.finish_preload(story_id, ok);
+                    }
                 }
                 StoriesAction::CancelPreload { .. } => {}
             }
@@ -1671,41 +1703,7 @@ impl StoriesBackend for LiveSession {
     }
 
     fn load_story_media(&mut self, story_id: FullStoryId) -> Option<StoryMediaAsset> {
-        let state = stories_state_for(self);
-        if let Ok(guard) = state.lock()
-            && let Some(cached) = guard.media_cache.get(&story_id)
-        {
-            return Some(cached.clone());
-        }
-
-        let media = state.lock().ok()?.story_media.get(&story_id).cloned()?;
-        let asset = match media {
-            StoryMedia::Photo(photo) => {
-                let resolved = photo_to_location(&photo);
-                let bytes = download_file_bytes(
-                    self.runtime().rpc(),
-                    self.runtime().tokio_handle(),
-                    resolved.dc_id,
-                    resolved.location,
-                    (resolved.size > 0).then_some(resolved.size),
-                )
-                .ok()?;
-                StoryMediaAsset::PhotoBytes(bytes)
-            }
-            StoryMedia::Video { document, .. } => {
-                let resolved = document_to_location(&document);
-                let total_size = resolved.size;
-                let loader = self.story_range_loader(resolved);
-                let bytes = read_all_via_range_loader(&loader, total_size)?;
-                StoryMediaAsset::VideoBytes(bytes)
-            }
-            StoryMedia::VideoStream(_) | StoryMedia::Unsupported => return None,
-        };
-
-        if let Ok(mut guard) = state.lock() {
-            guard.media_cache.insert(story_id, asset.clone());
-        }
-        Some(asset)
+        self.request_story_media(story_id, false)
     }
 
     fn send_story_reply(
@@ -2247,32 +2245,178 @@ fn story_id_from_updates(updates: &tl_enums::Updates) -> StoryId {
     found
 }
 
-/// Reads an entire video payload progressively through [`TelegramRangeLoader`] in 128 KiB
-/// chunks (bounded by [`MAX_VIDEO_STORY_BYTES`]).
-fn read_all_via_range_loader(
-    loader: &TelegramRangeLoader<tg_app_core::core_types::erased_rpc::ErasedRpcClient>,
-    known_size: u64,
-) -> Option<Vec<u8>> {
-    const CHUNK_LEN: usize = 128 * 1024;
-    if known_size > 0 {
-        let capped = known_size.min(MAX_VIDEO_STORY_BYTES) as usize;
-        return loader.load_range(0, capped).ok();
-    }
-    let mut out = Vec::new();
-    let mut offset = 0u64;
-    while offset < MAX_VIDEO_STORY_BYTES {
-        match loader.load_range(offset, CHUNK_LEN) {
-            Ok(chunk) => {
-                let len = chunk.len();
-                out.extend_from_slice(&chunk);
-                offset = offset.saturating_add(len as u64);
-                if len < CHUNK_LEN {
-                    break;
+fn lock_stories_state(
+    state: &Mutex<LiveStoriesState>,
+) -> std::sync::MutexGuard<'_, LiveStoriesState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl LiveSession {
+    /// The media of `story_id` when it is ready, otherwise `None` while it loads in the
+    /// background. Never waits for the network: the story viewer calls it on every frame
+    /// (TGB-3101). A photo is downloaded whole; a video becomes ready as a streaming loader
+    /// once its first [`STORY_VIDEO_HEADER_BYTES`] are downloaded, and the player streams the
+    /// rest. `preload` also downloads the video's preload prefix before a preload counts as
+    /// done.
+    fn request_story_media(&self, story_id: FullStoryId, preload: bool) -> Option<StoryMediaAsset> {
+        let state = stories_state_for(self);
+        let job = {
+            let mut guard = lock_stories_state(&state);
+            match guard.media_loads.get(&story_id) {
+                Some(StoryMediaLoad::Ready(asset)) => return Some(asset.clone()),
+                Some(StoryMediaLoad::Loading) => return None,
+                Some(StoryMediaLoad::Failed(at)) if at.elapsed() < STORY_MEDIA_RETRY_AFTER => {
+                    return None;
                 }
+                _ => {}
             }
-            Err(_) if !out.is_empty() => break,
-            Err(_) => return None,
+            let job = match guard.story_media.get(&story_id)? {
+                StoryMedia::Photo(photo) => StoryMediaJob::Photo(photo_to_location(photo)),
+                StoryMedia::Video { document, .. } => StoryMediaJob::Video(Box::new(
+                    self.story_range_loader(document_to_location(document)),
+                )),
+                StoryMedia::VideoStream(_) | StoryMedia::Unsupported => return None,
+            };
+            guard.media_loads.insert(story_id, StoryMediaLoad::Loading);
+            job
+        };
+        self.spawn_story_media_load(story_id, job, preload, state);
+        None
+    }
+
+    /// Polls [`StoriesBackend::load_story_media`] until the media of `story_id` is ready or
+    /// `limit` passed. For tests only: the UI never waits for story media.
+    #[doc(hidden)]
+    pub fn wait_story_media(
+        &self,
+        story_id: FullStoryId,
+        limit: Duration,
+    ) -> Option<StoryMediaAsset> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(asset) = self.request_story_media(story_id, false) {
+                return Some(asset);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
-    (!out.is_empty()).then_some(out)
+
+    /// Starts a preload of `story_id` (tdesktop's `Data::Stories::startPreloading`).
+    /// `Some(ok)` when the preload is decided now, `None` when it finishes later through
+    /// [`Self::drain_story_updates`].
+    fn start_story_preload(&self, story_id: FullStoryId) -> Option<bool> {
+        let state = stories_state_for(self);
+        {
+            let mut guard = lock_stories_state(&state);
+            if !matches!(
+                guard.story_media.get(&story_id),
+                Some(StoryMedia::Photo(_) | StoryMedia::Video { .. })
+            ) {
+                return Some(false);
+            }
+            if matches!(
+                guard.media_loads.get(&story_id),
+                Some(StoryMediaLoad::Ready(_))
+            ) {
+                return Some(true);
+            }
+            guard.preloads_waiting.insert(story_id);
+        }
+        // Starts the load unless one is running or failed moments ago.
+        if self.request_story_media(story_id, true).is_some() {
+            lock_stories_state(&state)
+                .preloads_waiting
+                .remove(&story_id);
+            return Some(true);
+        }
+        let mut guard = lock_stories_state(&state);
+        // A load that failed moments ago is not started again: the preload fails now, unless
+        // the load task has already finished it.
+        if matches!(
+            guard.media_loads.get(&story_id),
+            Some(StoryMediaLoad::Failed(_))
+        ) && guard.preloads_waiting.remove(&story_id)
+        {
+            return Some(false);
+        }
+        None
+    }
+
+    /// Loads `job` on the blocking pool, stores the result and wakes the UI.
+    fn spawn_story_media_load(
+        &self,
+        story_id: FullStoryId,
+        job: StoryMediaJob,
+        preload: bool,
+        state: Arc<Mutex<LiveStoriesState>>,
+    ) {
+        let rpc = self.runtime().rpc().clone();
+        let handle = self.runtime().tokio_handle().clone();
+        let bridge = Arc::clone(self.bridge_state());
+        drop(self.runtime().tokio_handle().spawn_blocking(move || {
+            let (asset, video) = match job {
+                StoryMediaJob::Photo(resolved) => {
+                    let bytes = download_file_bytes(
+                        &rpc,
+                        &handle,
+                        resolved.dc_id,
+                        resolved.location,
+                        (resolved.size > 0).then_some(resolved.size),
+                    );
+                    (bytes.ok().map(StoryMediaAsset::PhotoBytes), None)
+                }
+                StoryMediaJob::Video(loader) => {
+                    let loader = Arc::new(*loader);
+                    let asset =
+                        prefetch_story_video(&loader, STORY_VIDEO_HEADER_BYTES).then(|| {
+                            let shared: Arc<dyn RangeLoader> = loader.clone();
+                            StoryMediaAsset::VideoStream(StoryVideoStream::new(shared))
+                        });
+                    (asset, Some(loader))
+                }
+            };
+            let ok = asset.is_some();
+            let wants_prefix = {
+                let mut guard = lock_stories_state(&state);
+                let entry = match asset {
+                    Some(asset) => StoryMediaLoad::Ready(asset),
+                    None => StoryMediaLoad::Failed(Instant::now()),
+                };
+                guard.media_loads.insert(story_id, entry);
+                preload || guard.preloads_waiting.contains(&story_id)
+            };
+            bridge.request_repaint();
+            if ok
+                && wants_prefix
+                && let Some(loader) = &video
+            {
+                let _ = prefetch_story_video(loader, STORY_VIDEO_PRELOAD_PREFIX);
+            }
+            let mut guard = lock_stories_state(&state);
+            if guard.preloads_waiting.remove(&story_id) {
+                guard.finished_preloads.push((story_id, ok));
+                drop(guard);
+                bridge.request_repaint();
+            }
+        }));
+    }
+}
+
+/// Downloads the first `bytes` of a video story (all of it when smaller) through `loader`,
+/// so later reads of that range are local. `false` when the download failed.
+fn prefetch_story_video(
+    loader: &TelegramRangeLoader<tg_app_core::core_types::erased_rpc::ErasedRpcClient>,
+    bytes: u64,
+) -> bool {
+    let size = loader.size();
+    if size == 0 {
+        return true;
+    }
+    let len = usize::try_from(size.min(bytes)).unwrap_or(usize::MAX);
+    loader.load_range(0, len).is_ok()
 }

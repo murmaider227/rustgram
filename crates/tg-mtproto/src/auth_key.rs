@@ -584,6 +584,7 @@ struct DcenterInner {
     temporary_keys: [Option<ManagedAuthKey>; 2],
     creating: [bool; 2],
     connection_inited: bool,
+    reinit_generation: u64,
 }
 
 /// Thread-safe per-DC auth key and connection-init state (`MTP::details::Dcenter`).
@@ -605,6 +606,7 @@ impl Dcenter {
                 temporary_keys: [None, None],
                 creating: [false, false],
                 connection_inited: false,
+                reinit_generation: 0,
             })),
             key_creation_released: Arc::new(watch::Sender::new(0)),
         }
@@ -651,6 +653,31 @@ impl Dcenter {
     /// Marks this DC as having completed (or needing) `initConnection`.
     pub fn set_connection_inited(&self, inited: bool) {
         self.inner.write().connection_inited = inited;
+    }
+
+    /// Re-initialization generation (`SessionData::reInitGeneration`, tdesktop 3f11c74).
+    pub fn reinit_generation(&self) -> u64 {
+        self.inner.read().reinit_generation
+    }
+
+    /// Starts a new re-initialization (`advanceReInitGeneration`) and clears
+    /// `connection_inited`: answers to requests sent on connections opened before this call
+    /// no longer mark the DC as inited.
+    pub fn begin_reinit(&self) {
+        let mut guard = self.inner.write();
+        guard.reinit_generation = guard.reinit_generation.wrapping_add(1);
+        guard.connection_inited = false;
+    }
+
+    /// Marks the DC inited after a good answer on a connection opened at `generation`, unless a
+    /// re-initialization started since (`notifyConnectionInited` with 3f11c74's check).
+    pub fn notify_connection_inited(&self, generation: u64) -> bool {
+        let mut guard = self.inner.write();
+        if guard.reinit_generation != generation {
+            return false;
+        }
+        guard.connection_inited = true;
+        true
     }
 
     /// Destroys a matching temporary key (called on `-404` or `AUTH_KEY_PERM_EMPTY`).

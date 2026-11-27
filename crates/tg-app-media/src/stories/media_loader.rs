@@ -488,6 +488,14 @@ impl StoryMediaCache {
             StoryMediaAsset::VideoPath(path) => {
                 StoryVideoPlayback::from_path(story_id, path, silent, volume, muted, now_ms)
             }
+            StoryMediaAsset::VideoStream(stream) => StoryVideoPlayback::from_range_loader(
+                story_id,
+                stream.loader(),
+                silent,
+                volume,
+                muted,
+                now_ms,
+            ),
             StoryMediaAsset::PhotoBytes(_) => return None,
         };
         match created {

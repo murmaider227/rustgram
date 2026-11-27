@@ -737,7 +737,7 @@ fn render_wgpu_png<S: 'static>(
         .with_render_cursor(false)
         .allow_missing_glyphs()
         .with_accessibility_check(false)
-        .wgpu()
+        .renderer(crate::common::serialized_wgpu_renderer())
         .with_context_setup(move |ctx| {
             register_tdesktop_fonts(ctx);
             ctx.set_visuals(if light_theme {

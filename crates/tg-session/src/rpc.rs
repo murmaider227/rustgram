@@ -263,6 +263,16 @@ impl MtprotoRpc {
         self.inner.client.set_proxy(proxy);
     }
 
+    /// Sends `inst`'s language in `initConnection` and re-initializes the main DC after a
+    /// language switch (`Lang::CloudManager::changeIdAndReInitConnection`). The system
+    /// language code stays as it is.
+    pub fn set_init_language(&self, inst: &tg_lang::Instance) {
+        let system_lang_code = self.inner.client.init_lang().system_lang_code;
+        self.inner
+            .client
+            .set_init_lang(crate::config::init_lang_for(inst, system_lang_code));
+    }
+
     /// Updates whether IPv6 candidates are attempted when connecting.
     pub fn set_try_ipv6(&self, enabled: bool) {
         self.inner.client.set_try_ipv6(enabled);

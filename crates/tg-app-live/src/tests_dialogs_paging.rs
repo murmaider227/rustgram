@@ -446,6 +446,8 @@ struct FakeServer {
     calls: Arc<Mutex<Vec<RecordedCall>>>,
     peer_dialog_requests: Arc<Mutex<Vec<Vec<usize>>>>,
     updates_tx: broadcast::Sender<tl_enums::Updates>,
+    /// The main-list `messages.getDialogs` call (1-based) that fails once.
+    fail_main_page: Arc<Mutex<Option<usize>>>,
 }
 
 impl FakeServer {
@@ -455,6 +457,7 @@ impl FakeServer {
             calls: Arc::new(Mutex::new(Vec::new())),
             peer_dialog_requests: Arc::new(Mutex::new(Vec::new())),
             updates_tx,
+            fail_main_page: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -489,6 +492,13 @@ impl FakeServer {
                 .lock()
                 .expect("calls")
                 .push((ctor, req.folder_id));
+            if req.folder_id != Some(1) {
+                let mut fail = self.fail_main_page.lock().expect("fail");
+                if *fail == Some(self.get_dialogs_calls(0)) {
+                    *fail = None;
+                    return Err(InvocationError::Transport("page lost".to_owned()));
+                }
+            }
             let range = if req.folder_id == Some(1) {
                 MAIN_CHATS..MAIN_CHATS + ARCHIVED_CHATS
             } else {
@@ -751,4 +761,26 @@ fn a_fully_loaded_list_is_not_requested_again() {
         calls,
         "a loaded list must not be requested again"
     );
+}
+
+/// TGB-2919: a page that failed is requested again by the loader itself; nothing reads the
+/// chat list after the start (the window no longer polls it for this).
+#[test]
+fn a_failed_page_is_retried_without_any_chat_list_read() {
+    let (_rt, server, live) = start();
+    // The first background page after the initial 20 chats fails once.
+    *server.fail_main_page.lock().expect("fail") = Some(2);
+    live.start_chats_list_request(|| {});
+
+    wait_until("the main list to load after the failed page", || {
+        live.read_session(|s| s.main_list().loaded())
+    });
+    assert!(
+        server.fail_main_page.lock().expect("fail").is_none(),
+        "the second page failed once"
+    );
+    assert!(server.get_dialogs_calls(0) >= 4);
+    // Read only now that the list is loaded: every chat arrived.
+    let (main, _) = list_peers(&live, DialogListQuery::Filter(FilterId::ALL));
+    assert_eq!(main.len(), MAIN_CHATS, "every chat arrived");
 }

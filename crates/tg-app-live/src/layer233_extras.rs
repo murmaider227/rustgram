@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use tg_api::RpcClient;
 use tg_api::convert::{
-    apply_tl_users_and_chats, entities_from_tl, input_peer_for, message_from_tl,
+    apply_tl_users_and_chats, entities_from_tl_for_text, input_peer_for, message_from_tl,
 };
 use tg_data::{
     FullMsgId as DataFullMsgId, MessageContent, MessageMedia, Peer, PeerId as DataPeerId, Session,
@@ -262,7 +262,8 @@ fn ui_text_to_tl_text_with_entities(
 
 fn tl_text_with_entities_to_ui(text: &tl_enums::TextWithEntities) -> TextWithEntities {
     let tl_enums::TextWithEntities::TextWithEntities(inner) = text;
-    let data_entities = entities_from_tl(&inner.entities);
+    let data_entities =
+        entities_from_tl_for_text(&inner.text, &inner.entities, tg_data::UserId::ZERO);
     let data_text = tg_data::TextWithEntities {
         text: inner.text.clone(),
         entities: data_entities,
@@ -365,7 +366,7 @@ fn sponsored_message_from_tl(msg: &tl_enums::SponsoredMessage) -> SponsoredMessa
     let entities = d
         .entities
         .as_deref()
-        .map(entities_from_tl)
+        .map(|e| entities_from_tl_for_text(&d.message, e, tg_data::UserId::ZERO))
         .unwrap_or_default();
     let ui_text = crate::convert::data_text_to_ui_text(&tg_data::TextWithEntities {
         text: d.message.clone(),
@@ -1299,3 +1300,8 @@ impl Layer233ExtrasBackend for LiveSession {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests_entities_cut.rs"]
+#[cfg(test)]
+mod tests_entities_cut;

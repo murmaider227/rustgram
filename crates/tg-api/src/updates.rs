@@ -97,6 +97,35 @@ pub struct PresenceUpdateResult {
     pub idle_finish_check_ms: Option<u64>,
 }
 
+/// An `account.updateStatus` that [`UpdatesHandler::decide_online`] decided to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnlineStatusSend {
+    /// `true` for online, `false` for offline.
+    pub online: bool,
+    online_for_secs: TimeId,
+}
+
+impl OnlineStatusSend {
+    /// The request to send.
+    #[must_use]
+    pub const fn request(&self) -> tl_fns::account::UpdateStatus {
+        tl_fns::account::UpdateStatus {
+            offline: !self.online,
+        }
+    }
+
+    /// After the server answered: the own last-seen changes at once
+    /// (`api/api_updates.cpp:1044-1050`).
+    pub fn apply(&self, session: &mut Session, now_secs: TimeId) {
+        let expires = if self.online {
+            now_secs.saturating_add(self.online_for_secs)
+        } else {
+            now_secs.saturating_sub(1)
+        };
+        session.update_user_status(session.self_user_id(), UserStatusInput::Online { expires });
+    }
+}
+
 /// High-level side-effect events surfaced by [`UpdatesHandler`] alongside mutations to [`Session`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateEvent {
@@ -962,6 +991,27 @@ impl UpdatesHandler {
         now_secs: TimeId,
         got_other_offline: bool,
     ) -> Result<PresenceUpdateResult, ApiError> {
+        let (result, send) =
+            self.decide_online(window_active, last_non_idle_ms, now_ms, got_other_offline);
+        if let Some(send) = send {
+            session.release();
+            let _ = invoker.account_update_status(send.request()).await?;
+            let session = session.get().await;
+            send.apply(session, now_secs);
+        }
+        Ok(result)
+    }
+
+    /// The bookkeeping half of [`Self::update_online_timed`]: decides whether
+    /// `account.updateStatus` goes out and records it as sent. A returned [`OnlineStatusSend`]
+    /// is sent by the caller, which then applies it to the session.
+    pub fn decide_online(
+        &mut self,
+        window_active: bool,
+        last_non_idle_ms: u64,
+        now_ms: u64,
+        got_other_offline: bool,
+    ) -> (PresenceUpdateResult, Option<OnlineStatusSend>) {
         let mut is_online = window_active;
         let mut update_in = self.online_update_period_ms;
         let mut idle_finish_check_ms = None;
@@ -986,24 +1036,14 @@ impl UpdatesHandler {
             || (is_online && period_elapsed)
             || (is_online && got_other_offline);
 
+        let mut send = None;
         if should_send {
             self.last_was_online = is_online;
             self.last_set_online_ms = Some(now_ms);
-            session.release();
-            let _ = invoker
-                .account_update_status(tl_fns::account::UpdateStatus {
-                    offline: !is_online,
-                })
-                .await?;
-            // Match `api/api_updates.cpp:1044-1050`: update local self user's lastseen immediately.
-            let online_for_secs = (self.online_update_period_ms / 1_000) as TimeId;
-            let expires = if is_online {
-                now_secs.saturating_add(online_for_secs)
-            } else {
-                now_secs.saturating_sub(1)
-            };
-            let session = session.get().await;
-            session.update_user_status(session.self_user_id(), UserStatusInput::Online { expires });
+            send = Some(OnlineStatusSend {
+                online: is_online,
+                online_for_secs: (self.online_update_period_ms / 1_000) as TimeId,
+            });
         } else if is_online && let Some(last) = self.last_set_online_ms {
             let remaining = last
                 .saturating_add(self.online_update_period_ms)
@@ -1011,12 +1051,15 @@ impl UpdatesHandler {
             update_in = update_in.min(remaining);
         }
 
-        Ok(PresenceUpdateResult {
-            sent: should_send,
-            online: is_online,
-            next_update_in_ms: update_in,
-            idle_finish_check_ms,
-        })
+        (
+            PresenceUpdateResult {
+                sent: should_send,
+                online: is_online,
+                next_update_in_ms: update_in,
+                idle_finish_check_ms,
+            },
+            send,
+        )
     }
 
     /// Checks whether user activity resumed while idle (`Updates::checkIdleFinish`,

@@ -44,7 +44,7 @@ fn docked_harness(tab: SelectorTab) -> egui_kittest::Harness<'static, DockedStat
         .with_step_dt(1.0 / 30.0)
         .allow_missing_glyphs()
         .with_accessibility_check(false)
-        .wgpu()
+        .renderer(crate::common::serialized_wgpu_renderer())
         .with_context_setup(|ctx| {
             tg_ui::fonts::register_tdesktop_fonts(ctx);
             apply_deterministic_style(ctx);

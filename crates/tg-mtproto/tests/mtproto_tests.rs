@@ -1,7 +1,7 @@
 //! Unit, protocol, in-memory async integration, and `#[ignore]` live DC2 tests for `tg-mtproto`.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tg_mtproto::auth_key::{
     AuthKeyType, DcKeyBindState, Dcenter, ManagedAuthKey, handle_bind_temp_key_response,
@@ -482,7 +482,7 @@ fn bad_msg_notification_codes_and_state_sync() {
     // Send again, then simulate timeout -> check_sent_requests queues msgs_state_req.
     let out3 = state.build_next_outbound().expect("after reset");
     let m3 = unpack_container(&out3.body).expect("container")[0].msg_id;
-    let future = Instant::now() + CHECK_SENT_REQUEST_TIMEOUT + Duration::from_secs(1);
+    let future = tokio::time::Instant::now() + CHECK_SENT_REQUEST_TIMEOUT + Duration::from_secs(1);
     assert_eq!(
         state.check_sent_requests(future),
         CheckSentOutcome::QueuedStateRequests
@@ -510,9 +510,9 @@ fn bad_msg_notification_codes_and_state_sync() {
 
     // Also verify clear_old_containers resends after SENT_CONTAINER_LIVES.
     let _ = state.build_next_outbound();
-    assert!(
-        state.clear_old_containers(Instant::now() + SENT_CONTAINER_LIVES + Duration::from_secs(1))
-    );
+    assert!(state.clear_old_containers(
+        tokio::time::Instant::now() + SENT_CONTAINER_LIVES + Duration::from_secs(1)
+    ));
     assert_eq!(state.to_send_len(), 1);
 }
 

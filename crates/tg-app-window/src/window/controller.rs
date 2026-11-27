@@ -157,8 +157,6 @@ pub struct WindowController {
     shell_extras: WindowShellExtras,
     /// The whole chat list kept between frames for lookups by peer (TGB-2920).
     dialogs_snapshot: crate::window::dialogs_snapshot::DialogsSnapshot,
-    /// [`Self::elapsed_ms`] of the last chat-list keep-alive read (see `show_with_stories`).
-    chats_list_keepalive_ms: Option<i64>,
     native_hwnd: isize,
     fallback_shortcuts: tg_app_settings::settings::shortcuts::ShortcutManager,
     no_warning_extensions: BTreeSet<String>,
@@ -281,7 +279,6 @@ impl WindowController {
             external_passcode_verifier: None,
             shell_extras: WindowShellExtras::new(),
             dialogs_snapshot: crate::window::dialogs_snapshot::DialogsSnapshot::default(),
-            chats_list_keepalive_ms: None,
             native_hwnd: 0,
             fallback_shortcuts: tg_app_settings::settings::shortcuts::ShortcutManager::new(),
             no_warning_extensions: BTreeSet::new(),
@@ -2226,7 +2223,6 @@ impl WindowController {
 
         // Hover chat preview, Ctrl+Tab chat-switch overlay, and separate chat viewports.
         if self.root_screen == RootScreen::Main {
-            self.keep_chats_list_loading(now_ms);
             let backend = &self.session_backend;
             let snapshot = &mut self.dialogs_snapshot;
             let now = tg_app_core::clock::now();
@@ -2340,32 +2336,6 @@ impl WindowController {
         {
             session.show_back_from_stack(SectionShow::forward());
         }
-    }
-
-    /// Reads an empty slice of the main chat list at most once a second on a live session.
-    ///
-    /// The overlays used to build the whole chat list every frame. On a live session that read
-    /// also kept the background chat-list loading going (a page that failed is retried from a
-    /// list read), also while the chat-list column is hidden. The empty read keeps that without
-    /// converting a single chat.
-    fn keep_chats_list_loading(&mut self, now_ms: i64) {
-        const KEEPALIVE_INTERVAL_MS: i64 = 1000;
-        if !self.session_backend.is_live_session() {
-            return;
-        }
-        if self
-            .chats_list_keepalive_ms
-            .is_some_and(|last| now_ms.saturating_sub(last) < KEEPALIVE_INTERVAL_MS)
-        {
-            return;
-        }
-        self.chats_list_keepalive_ms = Some(now_ms);
-        let _ = tg_app_core::dialogs::backend::DialogsBackend::dialog_slice(
-            &*self.session_backend,
-            tg_app_core::dialogs::backend::DialogListQuery::Filter(FilterId::ALL),
-            0,
-            0,
-        );
     }
 
     pub(crate) fn handle_chat_switch_tab(

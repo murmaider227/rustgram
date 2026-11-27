@@ -93,7 +93,7 @@ fn build_rows_harness(rows: Vec<DialogItem>, mode: ThemeMode) -> Harness<'static
         .with_render_cursor(false)
         .allow_missing_glyphs()
         .with_accessibility_check(false)
-        .wgpu()
+        .renderer(crate::common::serialized_wgpu_renderer())
         .with_context_setup(|ctx| {
             register_tdesktop_fonts(ctx);
             apply_deterministic_style(ctx);

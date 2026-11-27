@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tg_api::RpcClient;
-use tg_api::convert::entities_from_tl;
+use tg_api::convert::text_with_entities_from_tl;
 use tg_data::{FullMsgId as DataFullMsgId, Session, TextWithEntities as DataText, UserFlags};
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 use tokio::sync::{RwLock, broadcast};
@@ -256,11 +256,7 @@ fn apply_send_action(
     let when = now_unix_i32().max(1);
     match action {
         tl_enums::SendMessageAction::SendMessageTextDraftAction(a) => {
-            let tl_enums::TextWithEntities::TextWithEntities(tw) = &a.text;
-            let data_text = DataText {
-                text: tw.text.clone(),
-                entities: entities_from_tl(&tw.entities),
-            };
+            let data_text: DataText = text_with_entities_from_tl(&a.text);
             let ui_text = data_text_to_ui_text(&data_text);
             let drafts = state
                 .streamed_drafts

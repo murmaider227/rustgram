@@ -19,6 +19,7 @@ use crate::convert::{
 };
 use crate::error::ApiError;
 use crate::invoker::Invoker;
+use crate::rpc::InvocationError;
 
 /// Limit for the very first `messages.getDialogs` page (`kDialogsFirstLoad`).
 pub const DIALOGS_FIRST_LOAD: i32 = 20;
@@ -73,6 +74,44 @@ impl FolderDialogsState {
     #[must_use]
     pub const fn is_complete(&self) -> bool {
         self.list_received && self.pinned_received
+    }
+}
+
+/// A dialogs page request built by [`DialogsLoader::prepare_next_page`], to send with
+/// [`fetch_dialogs_page`] and apply with [`DialogsLoader::finish_page`].
+#[derive(Debug, Clone)]
+pub struct PreparedDialogsPage {
+    /// Folder the page belongs to.
+    pub folder_id: FolderId,
+    /// The `messages.getDialogs` request.
+    pub request: tl_fns::messages::GetDialogs,
+    /// `messages.getPinnedDialogs` goes out with it.
+    pub need_pinned: bool,
+}
+
+/// Sends a prepared page: `messages.getDialogs` and, when needed, `messages.getPinnedDialogs`
+/// together, like `ApiWrap::requestDialogs` and `ApiWrap::requestPinnedDialogs` (apiwrap.cpp),
+/// instead of one round trip after the other.
+pub async fn fetch_dialogs_page<I: Invoker>(
+    invoker: &I,
+    prepared: &PreparedDialogsPage,
+) -> (
+    Result<tl_enums::messages::Dialogs, InvocationError>,
+    Option<Result<tl_types::messages::PeerDialogs, InvocationError>>,
+) {
+    if prepared.need_pinned {
+        let (dialogs, pinned) = tokio::join!(
+            invoker.messages_get_dialogs(prepared.request.clone()),
+            invoker.messages_get_pinned_dialogs(tl_fns::messages::GetPinnedDialogs {
+                folder_id: prepared.folder_id,
+            }),
+        );
+        (dialogs, Some(pinned))
+    } else {
+        (
+            invoker.messages_get_dialogs(prepared.request.clone()).await,
+            None,
+        )
     }
 }
 
@@ -287,14 +326,26 @@ impl DialogsLoader {
     /// yet been loaded for that folder.
     ///
     /// Returns `Ok(None)` if the folder is already finished or a request is already in flight.
+    /// [`Self::prepare_next_page`], [`fetch_dialogs_page`] and [`Self::finish_page`] are the
+    /// same steps for a caller that sends the requests outside its own loop.
     pub async fn load_next_page<I: Invoker>(
         &mut self,
         invoker: &I,
         folder_id: FolderId,
     ) -> Result<Option<DialogsPageResult>, ApiError> {
+        let Some(prepared) = self.prepare_next_page(folder_id) else {
+            return Ok(None);
+        };
+        let (response, pinned) = fetch_dialogs_page(invoker, &prepared).await;
+        self.finish_page(prepared, response, pinned).map(Some)
+    }
+
+    /// Builds the next page request of `folder_id` and marks it in flight. `None` if the folder
+    /// is finished or a page of it is already in flight.
+    pub fn prepare_next_page(&mut self, folder_id: FolderId) -> Option<PreparedDialogsPage> {
         let state = self.folders.entry(folder_id).or_default();
         if state.list_received || state.request_in_flight {
-            return Ok(None);
+            return None;
         }
 
         let first_load = state.offset_date == 0;
@@ -303,7 +354,7 @@ impl DialogsLoader {
         } else {
             DIALOGS_PER_PAGE
         };
-        let req = tl_fns::messages::GetDialogs {
+        let request = tl_fns::messages::GetDialogs {
             exclude_pinned: true,
             folder_id: Some(folder_id),
             offset_date: state.offset_date,
@@ -318,29 +369,40 @@ impl DialogsLoader {
         if need_pinned {
             state.pinned_in_flight = true;
         }
+        Some(PreparedDialogsPage {
+            folder_id,
+            request,
+            need_pinned,
+        })
+    }
 
-        // Both requests go out together, like `ApiWrap::requestDialogs` and
-        // `ApiWrap::requestPinnedDialogs` (apiwrap.cpp), instead of one round trip after the other.
-        let (response, pinned_response) = if need_pinned {
-            let (dialogs, pinned) = tokio::join!(
-                invoker.messages_get_dialogs(req),
-                invoker
-                    .messages_get_pinned_dialogs(tl_fns::messages::GetPinnedDialogs { folder_id }),
-            );
-            (dialogs, Some(pinned))
-        } else {
-            (invoker.messages_get_dialogs(req).await, None)
-        };
+    /// Clears the in-flight marks of a page whose request never answered (its task was lost),
+    /// so the folder can be requested again.
+    pub fn abandon_page(&mut self, folder_id: FolderId, need_pinned: bool) {
+        if let Some(st) = self.folders.get_mut(&folder_id) {
+            st.request_in_flight = false;
+            if need_pinned {
+                st.pinned_in_flight = false;
+            }
+        }
+    }
 
+    /// Applies the answers of a [`Self::prepare_next_page`] request to the pagination state.
+    pub fn finish_page(
+        &mut self,
+        prepared: PreparedDialogsPage,
+        response: Result<tl_enums::messages::Dialogs, InvocationError>,
+        pinned_response: Option<Result<tl_types::messages::PeerDialogs, InvocationError>>,
+    ) -> Result<DialogsPageResult, ApiError> {
+        let PreparedDialogsPage {
+            folder_id,
+            need_pinned,
+            ..
+        } = prepared;
         let response = match response {
             Ok(res) => res,
             Err(err) => {
-                if let Some(st) = self.folders.get_mut(&folder_id) {
-                    st.request_in_flight = false;
-                    if need_pinned {
-                        st.pinned_in_flight = false;
-                    }
-                }
+                self.abandon_page(folder_id, need_pinned);
                 return Err(ApiError::Invocation(err));
             }
         };
@@ -412,7 +474,7 @@ impl DialogsLoader {
         }
 
         let folder_done = self.is_folder_done(folder_id);
-        Ok(Some(DialogsPageResult {
+        Ok(DialogsPageResult {
             folder_id,
             dialogs,
             messages,
@@ -421,7 +483,7 @@ impl DialogsLoader {
             pinned,
             total_count,
             folder_done,
-        }))
+        })
     }
 
     /// Reloads pinned dialogs for `folder_id` (`ApiWrap::reloadPinnedDialogs`).

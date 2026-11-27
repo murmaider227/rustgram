@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use rand::RngCore;
@@ -26,6 +26,8 @@ use tg_tl::{
 };
 use tg_transport::{Error as TransportError, ProxyData, TransportErrorCode};
 use tokio::sync::{broadcast, mpsc, oneshot};
+// tokio's clock, so the state machine and the session runner share one (paused in tests).
+use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
 use crate::auth_key::{
@@ -33,7 +35,7 @@ use crate::auth_key::{
     ManagedAuthKey, TEMPORARY_EXPIRES_IN_SECS, TemporaryKeyType, create_dc_keys,
     handle_bind_temp_key_response, prepare_bind_temp_key_request,
 };
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, InitLang};
 use crate::dc_options::{
     DcId, DcOptions, DcType, ShiftedDcId, bare_dc_id, get_dc_id_shift, protocol_dc_id,
 };
@@ -44,6 +46,7 @@ use crate::message::{
     parse_encrypted_packet, unpack_container_with_budget, unwrap_gzip_layers_with_budget,
     wrap_init_connection, wrap_invoke_after_msg,
 };
+use crate::receive_watchdog::{ReceiveWatchdog, WatchedConnection};
 use crate::received_ids::{IDS_BUFFER_SIZE, ReceivedIdState, ReceivedIdsManager, RegisterIdResult};
 use crate::salts::SaltManager;
 use crate::time::{MtprotoClock, is_bad_server_time, is_valid_server_msg_id};
@@ -70,6 +73,9 @@ pub const HTTP_WAIT_MAX_WAIT_MS: i32 = 25_000;
 /// How long a session waits on its open connection for another session on the same DC to
 /// finish creating the auth key before falling back to the reconnect backoff.
 pub const KEY_CREATION_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A main-session ping still without a pong this long after it was sent restarts the
+/// connection (`kPingSendAfterForce = 45s`, `SessionPrivate::sendPingByTimer`).
+pub const PING_SEND_AFTER_FORCE: Duration = Duration::from_secs(45);
 
 /// Server-pushed update (or `new_session_created` notification) forwarded to callers.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +121,12 @@ pub struct QueuedRequest {
     pub force_send_in_container: bool,
     /// Timestamp when this request was last transmitted.
     pub last_sent_at: Option<Instant>,
+    /// When `msgs_state_req` last asked about this request (805bd26 `lastStateCheckTime`):
+    /// kept apart from [`Self::last_sent_at`] so a state check does not look like a send.
+    pub last_state_check_at: Option<Instant>,
+    /// Whether the server acknowledged the request while its result is still awaited
+    /// (805bd26 `delivered`); such requests no longer delay replies sent after them.
+    pub delivered: bool,
     /// Whether the caller expects an RPC response (controls ACK-without-response retention).
     pub expects_response: bool,
 }
@@ -133,9 +145,18 @@ impl QueuedRequest {
             after_request_id: None,
             force_send_in_container: false,
             last_sent_at: None,
+            last_state_check_at: None,
+            delivered: false,
             expects_response: true,
         }
     }
+}
+
+/// A sent `msgs_state_req` or `msg_resend_req` waiting for its answer.
+#[derive(Debug, Clone)]
+struct StateRequest {
+    sent_at: Instant,
+    ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,7 +275,7 @@ pub struct SessionState {
     resending_ids: BTreeMap<u64, RequestId>,
     acked_ids: BTreeMap<u64, RequestId>,
     sent_containers: BTreeMap<u64, SentContainer>,
-    state_and_resend_requests: BTreeMap<u64, Vec<u64>>,
+    state_and_resend_requests: BTreeMap<u64, StateRequest>,
     received_ids: ReceivedIdsManager,
 
     ack_queue: Vec<u64>,
@@ -271,6 +292,9 @@ pub struct SessionState {
     // HTTP transport long-poll (`http_wait`) state.
     using_http_wait: bool,
     http_wait_needed: bool,
+
+    /// `Dcenter::reinit_generation` when the current connection started (`_reInitGeneration`).
+    reinit_generation: u64,
 
     // PFS temporary key binding state.
     bind_pending: Option<(ManagedAuthKey, ManagedAuthKey, CreatingKeyType)>,
@@ -293,6 +317,14 @@ pub enum CheckSentOutcome {
 #[path = "session_tests_acked.rs"]
 #[cfg(test)]
 mod tests_acked;
+#[cfg(test)]
+#[path = "session_tests_reinit.rs"]
+#[cfg(test)]
+mod tests_reinit;
+#[cfg(test)]
+#[path = "session_tests_watchdog.rs"]
+#[cfg(test)]
+mod tests_watchdog;
 
 impl SessionState {
     /// Creates a new `SessionState` with a freshly generated random 64-bit `session_id`.
@@ -308,6 +340,7 @@ impl SessionState {
         while session_id == 0 {
             session_id = rand::thread_rng().next_u64();
         }
+        let reinit_generation = dcenter.reinit_generation();
         Self {
             shifted_dc_id,
             dc_type,
@@ -338,6 +371,7 @@ impl SessionState {
             future_salts_msg_id: None,
             using_http_wait: false,
             http_wait_needed: false,
+            reinit_generation,
             bind_pending: None,
             bind_msg_id: None,
             bind_sent_at: None,
@@ -504,12 +538,24 @@ impl SessionState {
         self.config.proxy = proxy;
     }
 
+    /// Updates the language fields sent in `initConnection` (`Session::refreshOptions`).
+    pub fn set_init_lang(&mut self, lang: &InitLang) {
+        lang.apply_to(&mut self.config);
+    }
+
+    /// Language fields this session sends in `initConnection`.
+    pub fn init_lang(&self) -> InitLang {
+        InitLang::from_config(&self.config)
+    }
+
     /// Called after a TCP reconnect on the same auth key (`authKeyChecked`).
     pub fn on_transport_connected(&mut self) {
         // Re-wrap the first request after a connect/reconnect in
         // `invokeWithLayer(LAYER, initConnection(...))` (`SessionPrivate::tryToSend` in
         // `mtproto/session_private.cpp`), then clear once the first RPC succeeds on this connection.
         self.dcenter.set_connection_inited(false);
+        // `restartNow(reInitGeneration)`: this connection belongs to the current generation.
+        self.reinit_generation = self.dcenter.reinit_generation();
         self.ping_msg_id = None;
         if let Some(in_flight_ping) = self.pending_ping_id.take()
             && self.ping_id_to_send.is_none()
@@ -583,6 +629,39 @@ impl SessionState {
         self.ack_queue.len()
     }
 
+    /// Whether packets built now carry user requests, so their replies may queue behind the
+    /// requests already sent (`sendAll` in `SessionPrivate::tryToSend`).
+    pub const fn sends_behind_unanswered(&self) -> bool {
+        self.connected_state && self.bind_pending.is_none()
+    }
+
+    /// Size of the sent requests the server has not acknowledged yet (805bd26
+    /// `haveSentBytes`): message header plus body of every undelivered request.
+    pub fn unanswered_bytes(&self) -> u64 {
+        const MESSAGE_HEADER_BYTES: u64 = 16;
+        self.have_sent
+            .values()
+            .filter(|req| !req.delivered)
+            .map(|req| req.body.len() as u64 + MESSAGE_HEADER_BYTES)
+            .sum()
+    }
+
+    /// Whether a sent ping still waits for its pong (`_pingId`).
+    pub const fn ping_awaiting_pong(&self) -> bool {
+        self.pending_ping_id.is_some()
+    }
+
+    /// Whether a ping is queued or waiting for its pong (`_pingId` / `_pingIdToSend`).
+    pub const fn ping_outstanding(&self) -> bool {
+        self.ping_id_to_send.is_some() || self.pending_ping_id.is_some()
+    }
+
+    /// Whether `ping_id` is the ping queued or awaiting its pong; a ping replaced by another
+    /// one is never answered.
+    pub fn ping_is_tracked(&self, ping_id: u64) -> bool {
+        self.ping_id_to_send == Some(ping_id) || self.pending_ping_id == Some(ping_id)
+    }
+
     /// Checks in-flight sent requests older than [`CHECK_SENT_REQUEST_TIMEOUT`] and queues
     /// `msgs_state_req` for them (`SessionPrivate::checkSentRequests`).
     pub fn check_sent_requests(&mut self, now: Instant) -> CheckSentOutcome {
@@ -594,10 +673,15 @@ impl SessionState {
         }
         let mut queued = false;
         for (&msg_id, req) in &mut self.have_sent {
-            if let Some(sent_at) = req.last_sent_at
-                && now.saturating_duration_since(sent_at) >= CHECK_SENT_REQUEST_TIMEOUT
+            // 805bd26: the state check time is kept apart from the send time.
+            let checked_at = match (req.last_sent_at, req.last_state_check_at) {
+                (Some(sent), Some(checked)) => Some(sent.max(checked)),
+                (sent, checked) => sent.or(checked),
+            };
+            if let Some(checked_at) = checked_at
+                && now.saturating_duration_since(checked_at) >= CHECK_SENT_REQUEST_TIMEOUT
             {
-                req.last_sent_at = Some(now);
+                req.last_state_check_at = Some(now);
                 if self.state_req_queue.insert(msg_id) {
                     queued = true;
                 }
@@ -608,6 +692,23 @@ impl SessionState {
         } else {
             CheckSentOutcome::NothingDue
         }
+    }
+
+    /// When [`Self::check_sent_requests`] is next due: [`CHECK_SENT_REQUEST_TIMEOUT`] after the
+    /// oldest send or state check among the requests still waiting, or after a pending bind
+    /// (`_checkSentRequestsTimer`, re-armed with `nextTimeout` while anything waits, 805bd26).
+    pub fn next_sent_check_at(&self) -> Option<Instant> {
+        let bind = self.bind_msg_id.and(self.bind_sent_at);
+        let requests = self.have_sent.values().filter_map(|req| {
+            match (req.last_sent_at, req.last_state_check_at) {
+                (Some(sent), Some(checked)) => Some(sent.max(checked)),
+                (sent, checked) => sent.or(checked),
+            }
+        });
+        bind.into_iter()
+            .chain(requests)
+            .min()
+            .map(|at| at + CHECK_SENT_REQUEST_TIMEOUT)
     }
 
     /// Evicts sent containers older than [`SENT_CONTAINER_LIVES`] and resends their still-pending
@@ -630,6 +731,10 @@ impl SessionState {
                 }
             }
         }
+        // 805bd26: state and resend requests that were never answered are dropped too.
+        self.state_and_resend_requests.retain(|_, request| {
+            now.saturating_duration_since(request.sent_at) < SENT_CONTAINER_LIVES
+        });
         resent
     }
 
@@ -763,10 +868,12 @@ impl SessionState {
                 });
             }
 
-            if !self.state_req_queue.is_empty() {
-                let ids: Vec<u64> = std::mem::take(&mut self.state_req_queue)
-                    .into_iter()
-                    .collect();
+            // 805bd26: ask only about requests that still wait for an answer.
+            let ids: Vec<u64> = std::mem::take(&mut self.state_req_queue)
+                .into_iter()
+                .filter(|id| self.have_sent.contains_key(id))
+                .collect();
+            if !ids.is_empty() {
                 let body = mtp_enums::MsgsStateReq::MsgsStateReq(mtp_types::MsgsStateReq {
                     msg_ids: ids.iter().map(|&id| id as i64).collect(),
                 })
@@ -883,6 +990,7 @@ impl SessionState {
                 let wire_body = self.prepare_user_wire_body(&req, needs_layer, is_cdn);
                 let needs_response = req.need_ack;
                 req.last_sent_at = Some(now_instant);
+                req.delivered = false;
                 if req.need_ack {
                     self.req_to_msg.insert(req.request_id, msg_id);
                     self.have_sent.insert(msg_id, req);
@@ -938,6 +1046,7 @@ impl SessionState {
             let (msg_id, seq_no) = self.assign_request_id(&mut req, force_new_msg_id);
             let wire_body = self.prepare_user_wire_body(&req, needs_layer, is_cdn);
             req.last_sent_at = Some(now_instant);
+            req.delivered = false;
             if req.need_ack {
                 self.req_to_msg.insert(req.request_id, msg_id);
                 self.have_sent.insert(msg_id, req);
@@ -1077,11 +1186,13 @@ impl SessionState {
                 true
             }
             ServiceKind::StateReq(ids) | ServiceKind::ResendReq(ids) => {
-                self.state_and_resend_requests.insert(msg_id, ids);
+                self.state_and_resend_requests
+                    .insert(msg_id, StateRequest { sent_at: now, ids });
                 true
             }
-            ServiceKind::Ack => false,
-            ServiceKind::HttpWait => true,
+            // tdesktop does not set `needAnyResponse` for `http_wait`: the server holds it
+            // up to `max_wait`, so it must not arm the receive watchdog.
+            ServiceKind::Ack | ServiceKind::HttpWait => false,
         }
     }
 
@@ -1343,7 +1454,10 @@ impl SessionState {
                     return SessionAction::RestartConnection;
                 };
                 let req_msg_id = state_info.req_msg_id as u64;
-                let Some(queried_ids) = self.state_and_resend_requests.remove(&req_msg_id) else {
+                let Some(StateRequest {
+                    ids: queried_ids, ..
+                }) = self.state_and_resend_requests.remove(&req_msg_id)
+                else {
                     return SessionAction::Continue;
                 };
                 if info.bad_time {
@@ -1487,7 +1601,10 @@ impl SessionState {
                         }
                     }
                 } else if self.bind_msg_id != Some(req_msg_id) {
-                    self.dcenter.set_connection_inited(true);
+                    // 3f11c74: an answer on a connection opened before a re-initialization
+                    // must not mark the re-initialized DC as inited.
+                    self.dcenter
+                        .notify_connection_inited(self.reinit_generation);
                 }
 
                 // Look up user request_id BEFORE requests_acked removes it from have_sent.
@@ -1725,10 +1842,11 @@ impl SessionState {
             if self.state_and_resend_requests.remove(&msg_id).is_some() {
                 continue;
             }
-            if let Some(req) = self.have_sent.get(&msg_id) {
+            if let Some(req) = self.have_sent.get_mut(&msg_id) {
                 // Keep RPC-response-bearing requests in have_sent until rpc_result arrives
                 // (mirrors tdesktop's `!byResponse && _instance->hasCallback(requestId)`).
                 if !by_response && req.expects_response {
+                    req.delivered = true;
                     continue;
                 }
                 let req_id = req.request_id;
@@ -1818,6 +1936,14 @@ pub const fn next_retry_backoff_ms(current_ms: u64) -> u64 {
         }
     } else {
         MAX_RETRY_BACKOFF_MS
+    }
+}
+
+/// Sleeps until `deadline`, or forever when there is none (a disabled `select!` timer).
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1916,6 +2042,7 @@ impl SessionHandle {
         keys_destroyer_mode: bool,
     ) -> Self {
         let try_ipv6 = Arc::new(AtomicBool::new(config.use_ipv6));
+        let init_lang = Arc::new(RwLock::new(InitLang::from_config(&config)));
         Self::spawn_with_state(
             shifted_dc_id,
             config,
@@ -1925,8 +2052,11 @@ impl SessionHandle {
             transport_factory,
             updates_tx,
             updates_broadcast_tx,
-            proxy,
-            try_ipv6,
+            SessionShared {
+                proxy,
+                try_ipv6,
+                init_lang,
+            },
             None,
             keys_destroyer_mode,
         )
@@ -1944,8 +2074,7 @@ impl SessionHandle {
         transport_factory: Arc<dyn TransportFactory>,
         updates_tx: mpsc::UnboundedSender<UpdatesMsg>,
         updates_broadcast_tx: Option<broadcast::Sender<UpdatesMsg>>,
-        proxy: Arc<RwLock<ProxyData>>,
-        try_ipv6: Arc<AtomicBool>,
+        shared: SessionShared,
         state_watch: Option<(
             Arc<RwLock<ConnectionState>>,
             broadcast::Sender<ConnectionState>,
@@ -1953,6 +2082,11 @@ impl SessionHandle {
         keys_destroyer_mode: bool,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let SessionShared {
+            proxy,
+            try_ipv6,
+            init_lang,
+        } = shared;
         let runner = SessionRunner {
             shifted_dc_id,
             config,
@@ -1964,6 +2098,7 @@ impl SessionHandle {
             updates_broadcast_tx,
             proxy,
             try_ipv6,
+            init_lang,
             state_watch,
             keys_destroyer_mode,
             cmd_rx,
@@ -2055,6 +2190,14 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Settings a [`crate::Client`] shares with its sessions; each session reads them again on
+/// every (re)connect (`Session::refreshOptions`).
+pub(crate) struct SessionShared {
+    pub(crate) proxy: Arc<RwLock<ProxyData>>,
+    pub(crate) try_ipv6: Arc<AtomicBool>,
+    pub(crate) init_lang: Arc<RwLock<InitLang>>,
+}
+
 struct SessionRunner {
     shifted_dc_id: ShiftedDcId,
     config: ClientConfig,
@@ -2066,6 +2209,7 @@ struct SessionRunner {
     updates_broadcast_tx: Option<broadcast::Sender<UpdatesMsg>>,
     proxy: Arc<RwLock<ProxyData>>,
     try_ipv6: Arc<AtomicBool>,
+    init_lang: Arc<RwLock<InitLang>>,
     state_watch: Option<(
         Arc<RwLock<ConnectionState>>,
         broadcast::Sender<ConnectionState>,
@@ -2120,6 +2264,7 @@ impl SessionRunner {
             0,
         );
         let mut last_key_id: Option<u64> = None;
+        let mut watchdog = ReceiveWatchdog::new();
 
         loop {
             // Drain any immediately queued commands before connecting (including Shutdown).
@@ -2136,6 +2281,9 @@ impl SessionRunner {
             self.config.proxy = proxy.clone();
             self.config.use_ipv6 = self.try_ipv6.load(Ordering::Acquire);
             state.set_proxy(proxy.clone());
+            let init_lang = self.init_lang.read().clone();
+            init_lang.apply_to(&mut self.config);
+            state.set_init_lang(&init_lang);
             self.set_connection_state(ConnectionState::Connecting);
             let proto_dc =
                 protocol_dc_id(self.shifted_dc_id, dc_type, self.dc_options.is_test_mode());
@@ -2212,12 +2360,17 @@ impl SessionRunner {
             };
 
             state.set_using_http_wait(conn.using_http_wait());
+            watchdog.connection_started(Instant::now());
 
             // Ensure auth key (persistent + optional PFS temporary key) exists for this DC.
-            let active_key = match self
-                .ensure_auth_key(conn.as_mut(), dc_type, proto_dc, &mut state)
-                .await
-            {
+            let (key_setup, key_reply_timed_out) = {
+                let mut watched = WatchedConnection::new(conn.as_mut(), &mut watchdog);
+                let setup = self
+                    .ensure_auth_key(&mut watched, dc_type, proto_dc, &mut state)
+                    .await;
+                (setup, watched.timed_out())
+            };
+            let active_key = match key_setup {
                 Ok(KeySetup::Ready(key)) => *key,
                 Ok(KeySetup::Restart) => {
                     conn.close().await;
@@ -2230,8 +2383,21 @@ impl SessionRunner {
                     self.fail_all_waiters();
                     return;
                 }
+                Err(_) if key_reply_timed_out => {
+                    // `waitReceivedFailed`: dial again at once with the doubled window.
+                    warn!(
+                        dc = self.shifted_dc_id,
+                        wait_ms = watchdog.wait_for_received().as_millis() as u64,
+                        "no reply during auth key creation, reconnecting"
+                    );
+                    conn.close().await;
+                    self.retry_ms = 1;
+                    self.set_connection_state(ConnectionState::Connecting);
+                    continue;
+                }
                 Err(err) => {
                     warn!(dc = self.shifted_dc_id, error = %err, "auth key setup failed");
+                    watchdog.connection_closed();
                     conn.close().await;
                     let wait = Duration::from_millis(self.retry_ms);
                     self.set_connection_state(ConnectionState::Waiting {
@@ -2265,8 +2431,9 @@ impl SessionRunner {
             }
 
             let exit = self
-                .drive_connection(conn.as_mut(), &active_key, &mut state)
+                .drive_connection(conn.as_mut(), &active_key, &mut state, &mut watchdog)
                 .await;
+            watchdog.connection_closed();
             conn.close().await;
             match exit {
                 DriveExit::Shutdown => {
@@ -2495,13 +2662,22 @@ impl SessionRunner {
         conn: &mut dyn PacketConnection,
         auth_key: &AuthKey,
         state: &mut SessionState,
+        watchdog: &mut ReceiveWatchdog,
     ) -> DriveExit {
-        if self.flush_outbound(conn, auth_key, state).await.is_err() {
+        if self
+            .flush_outbound(conn, auth_key, state, watchdog)
+            .await
+            .is_err()
+        {
             return DriveExit::Disconnected;
         }
         if conn.need_http_wait() && state.is_connected_state() {
             state.request_http_wait();
-            if self.flush_outbound(conn, auth_key, state).await.is_err() {
+            if self
+                .flush_outbound(conn, auth_key, state, watchdog)
+                .await
+                .is_err()
+            {
                 return DriveExit::Disconnected;
             }
         }
@@ -2510,12 +2686,18 @@ impl SessionRunner {
         ping_interval.tick().await;
         let mut ack_interval = tokio::time::interval(ACK_SEND_WAITING);
         ack_interval.tick().await;
-        let mut check_sent_interval = tokio::time::interval(CHECK_SENT_REQUEST_TIMEOUT);
-        check_sent_interval.tick().await;
         let mut container_interval = tokio::time::interval(SENT_CONTAINER_LIVES);
         container_interval.tick().await;
+        let mut seen_received_bytes = conn.received_bytes();
+        let mut ping_force_at: Option<Instant> = None;
 
         loop {
+            // `_pingSender`: armed when a main-session ping goes out, cleared by its pong.
+            if state.is_main_session() && state.ping_awaiting_pong() {
+                ping_force_at.get_or_insert_with(|| Instant::now() + PING_SEND_AFTER_FORCE);
+            } else {
+                ping_force_at = None;
+            }
             tokio::select! {
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
@@ -2526,7 +2708,7 @@ impl SessionRunner {
                         }
                         Some(other) => {
                             let _ = self.apply_command(other, state);
-                            if self.flush_outbound(conn, auth_key, state).await.is_err() {
+                            if self.flush_outbound(conn, auth_key, state, watchdog).await.is_err() {
                                 return DriveExit::Disconnected;
                             }
                         }
@@ -2535,11 +2717,13 @@ impl SessionRunner {
                 pkt = conn.recv() => {
                     match pkt {
                         Ok(raw) => {
+                            seen_received_bytes = conn.received_bytes();
+                            watchdog.on_received_some(Instant::now());
                             if raw.is_empty() {
                                 // Empty HTTP 200 OK body after http_wait timeout; re-arm long-poll.
                                 if conn.need_http_wait() && state.is_connected_state() {
                                     state.request_http_wait();
-                                    if self.flush_outbound(conn, auth_key, state).await.is_err() {
+                                    if self.flush_outbound(conn, auth_key, state, watchdog).await.is_err() {
                                         return DriveExit::Disconnected;
                                     }
                                 }
@@ -2554,7 +2738,7 @@ impl SessionRunner {
                             };
                             self.retry_ms = 1;
                             let outcome = state.handle_decrypted(envelope);
-                            self.dispatch_events(outcome.events);
+                            self.dispatch_events(outcome.events, state);
                             match outcome.action {
                                 Some(SessionAction::RestartConnection) => return DriveExit::Disconnected,
                                 Some(SessionAction::ResetSession) => {
@@ -2573,7 +2757,7 @@ impl SessionRunner {
                                     return DriveExit::Disconnected;
                                 }
                                 Some(SessionAction::FlushOutbound) => {
-                                    if self.flush_outbound(conn, auth_key, state).await.is_err() {
+                                    if self.flush_outbound(conn, auth_key, state, watchdog).await.is_err() {
                                         return DriveExit::Disconnected;
                                     }
                                 }
@@ -2581,7 +2765,7 @@ impl SessionRunner {
                             }
                             if conn.need_http_wait() && state.is_connected_state() {
                                 state.request_http_wait();
-                                if self.flush_outbound(conn, auth_key, state).await.is_err() {
+                                if self.flush_outbound(conn, auth_key, state, watchdog).await.is_err() {
                                     return DriveExit::Disconnected;
                                 }
                             }
@@ -2619,25 +2803,50 @@ impl SessionRunner {
                         }
                     }
                 }
+                () = sleep_until_opt(watchdog.deadline()) => {
+                    let received = conn.received_bytes();
+                    if received != seen_received_bytes {
+                        // Part of a packet arrived (`receivedSome` on a socket read).
+                        seen_received_bytes = received;
+                        watchdog.on_received_some(Instant::now());
+                        continue;
+                    }
+                    // `waitReceivedFailed`: drop the silent connection and dial again at once.
+                    watchdog.on_wait_failed();
+                    warn!(
+                        dc = self.shifted_dc_id,
+                        wait_ms = watchdog.wait_for_received().as_millis() as u64,
+                        "nothing received in time, reconnecting"
+                    );
+                    return DriveExit::Restart;
+                }
+                () = sleep_until_opt(ping_force_at) => {
+                    // `sendPingByTimer`: "Could not send ping for some seconds, restarting".
+                    warn!(dc = self.shifted_dc_id, "ping got no pong in time, restarting");
+                    return DriveExit::Disconnected;
+                }
                 _ = ping_interval.tick() => {
-                    let mut pid = rand::thread_rng().next_u64();
-                    if pid == 0 { pid = 1; }
-                    state.schedule_ping(pid);
-                    if self.flush_outbound(conn, auth_key, state).await.is_err() {
-                        return DriveExit::Disconnected;
+                    // Like `tryToSend`, never replace a ping that still waits for its pong.
+                    if !state.ping_outstanding() {
+                        let mut pid = rand::thread_rng().next_u64();
+                        if pid == 0 { pid = 1; }
+                        state.schedule_ping(pid);
+                        if self.flush_outbound(conn, auth_key, state, watchdog).await.is_err() {
+                            return DriveExit::Disconnected;
+                        }
                     }
                 }
                 _ = ack_interval.tick() => {
                     if state.pending_ack_len() > 0
-                        && self.flush_outbound(conn, auth_key, state).await.is_err()
+                        && self.flush_outbound(conn, auth_key, state, watchdog).await.is_err()
                     {
                         return DriveExit::Disconnected;
                     }
                 }
-                _ = check_sent_interval.tick() => {
+                () = sleep_until_opt(state.next_sent_check_at()) => {
                     match state.check_sent_requests(Instant::now()) {
                         CheckSentOutcome::QueuedStateRequests => {
-                            if self.flush_outbound(conn, auth_key, state).await.is_err() {
+                            if self.flush_outbound(conn, auth_key, state, watchdog).await.is_err() {
                                 return DriveExit::Disconnected;
                             }
                         }
@@ -2647,7 +2856,7 @@ impl SessionRunner {
                 }
                 _ = container_interval.tick() => {
                     if state.clear_old_containers(Instant::now())
-                        && self.flush_outbound(conn, auth_key, state).await.is_err()
+                        && self.flush_outbound(conn, auth_key, state, watchdog).await.is_err()
                     {
                         return DriveExit::Disconnected;
                     }
@@ -2661,6 +2870,7 @@ impl SessionRunner {
         conn: &mut dyn PacketConnection,
         auth_key: &AuthKey,
         state: &mut SessionState,
+        watchdog: &mut ReceiveWatchdog,
     ) -> Result<(), TransportError> {
         while let Some(out) = state.build_next_outbound() {
             let wire = build_encrypted_packet(
@@ -2673,6 +2883,15 @@ impl SessionRunner {
                 Side::Client,
             );
             conn.send(&wire).await?;
+            if out.needs_response {
+                // `onSentSome(size, sendAll)`: the reply may queue behind unanswered requests.
+                let unanswered = if state.sends_behind_unanswered() {
+                    state.unanswered_bytes()
+                } else {
+                    0
+                };
+                watchdog.on_sent_some(Instant::now(), wire.len() as u64, unanswered);
+            }
             if !out.has_more {
                 break;
             }
@@ -2708,7 +2927,7 @@ impl SessionRunner {
         }
     }
 
-    fn dispatch_events(&mut self, events: Vec<SessionEvent>) {
+    fn dispatch_events(&mut self, events: Vec<SessionEvent>, state: &SessionState) {
         for event in events {
             match event {
                 SessionEvent::RpcResult {
@@ -2734,7 +2953,20 @@ impl SessionRunner {
                 },
                 SessionEvent::Pong(pong) => {
                     if let Some(tx) = self.ping_waiters.remove(&(pong.ping_id as u64)) {
-                        let _ = tx.send(Ok(pong));
+                        let _ = tx.send(Ok(pong.clone()));
+                    }
+                    // A ping replaced by a newer one (one ping slot, like `_pingId`) is never
+                    // answered; this pong shows the connection is alive, so it answers them.
+                    let replaced: Vec<u64> = self
+                        .ping_waiters
+                        .keys()
+                        .copied()
+                        .filter(|&id| !state.ping_is_tracked(id))
+                        .collect();
+                    for id in replaced {
+                        if let Some(tx) = self.ping_waiters.remove(&id) {
+                            let _ = tx.send(Ok(pong.clone()));
+                        }
                     }
                 }
                 SessionEvent::TempKeyBound => {

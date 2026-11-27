@@ -819,3 +819,268 @@ async fn state_writes_are_debounced_off_the_actor_and_flushed_on_shutdown() {
         "shutdown must write the newest state"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// TGB-2898: a folder edited during the session requests the chats it now includes.
+// ---------------------------------------------------------------------------------------------
+
+fn tl_folder(id: i32, include: &[i64]) -> tl_enums::DialogFilter {
+    tl_enums::DialogFilter::DialogFilter(tl_types::DialogFilter {
+        contacts: false,
+        non_contacts: false,
+        groups: false,
+        broadcasts: false,
+        bots: false,
+        exclude_muted: false,
+        exclude_read: false,
+        exclude_archived: true,
+        title_noanimate: false,
+        id,
+        title: tl_enums::TextWithEntities::TextWithEntities(tl_types::TextWithEntities {
+            text: "Work".to_owned(),
+            entities: Vec::new(),
+        }),
+        emoticon: None,
+        color: None,
+        pinned_peers: Vec::new(),
+        include_peers: include
+            .iter()
+            .map(|&uid| {
+                tl_enums::InputPeer::User(tl_types::InputPeerUser {
+                    user_id: uid,
+                    access_hash: uid * 7,
+                })
+            })
+            .collect(),
+        exclude_peers: Vec::new(),
+    })
+}
+
+fn peer_dialog(uid: i64) -> tl_enums::Dialog {
+    tl_enums::Dialog::Dialog(tl_types::Dialog {
+        pinned: false,
+        unread_mark: false,
+        view_forum_as_messages: false,
+        peer: user_peer(uid),
+        top_message: 5,
+        read_inbox_max_id: 5,
+        read_outbox_max_id: 5,
+        unread_count: 0,
+        unread_mentions_count: 0,
+        unread_reactions_count: 0,
+        unread_poll_votes_count: 0,
+        notify_settings: tl_enums::PeerNotifySettings::PeerNotifySettings(
+            tl_types::PeerNotifySettings {
+                show_previews: None,
+                silent: None,
+                mute_until: None,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: None,
+                stories_hide_sender: None,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            },
+        ),
+        pts: None,
+        draft: None,
+        folder_id: None,
+        ttl_period: None,
+    })
+}
+
+async fn folder_known(rt: &Rt, uid: i64) -> bool {
+    rt.session()
+        .read()
+        .await
+        .history(peer(uid))
+        .is_some_and(|h| h.folder_known())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_folder_edited_during_the_session_requests_the_chats_it_now_includes() {
+    let (rpc, rt) = start(None).await;
+    // The chat list is loaded and the folders the session started with went to the loader.
+    let start_filters = tl_types::messages::DialogFilters {
+        tags_enabled: false,
+        filters: vec![tl_folder(2, &[])],
+    };
+    {
+        let mut s = rt.session().write().await;
+        s.set_folder_loaded(0, true);
+        let parsed = start_filters
+            .filters
+            .iter()
+            .filter_map(|f| tg_api::convert::dialog_filter_from_tl(f, None))
+            .collect();
+        s.sync_filters_from_list(parsed, false);
+    }
+    assert!(
+        !rt.load_filter_exceptions(Some(start_filters))
+            .await
+            .expect("exceptions"),
+        "the empty folder needs no chat"
+    );
+    assert_eq!(rpc.count::<tl_fns::messages::GetPeerDialogs>(), 0);
+
+    rpc.enqueue_ok::<tl_fns::messages::GetPeerDialogs>(
+        &tl_enums::messages::PeerDialogs::PeerDialogs(tl_types::messages::PeerDialogs {
+            dialogs: vec![peer_dialog(OTHER_UID)],
+            messages: vec![synthetic_msg(user_peer(OTHER_UID), 5, 1_749_999_000, "hi")],
+            chats: Vec::new(),
+            users: vec![tl_enums::User::User(synthetic_user(
+                OTHER_UID, "PeerTwo", false,
+            ))],
+            state: tl_enums::updates::State::State(tl_state(100, 1_750_000_000, 1)),
+        }),
+    );
+    // Another device adds a chat this client has no dialog entry for to the folder.
+    rpc.push_update(tl_enums::Updates::UpdateShort(tl_types::UpdateShort {
+        update: tl_enums::Update::DialogFilter(tl_types::UpdateDialogFilter {
+            id: 2,
+            filter: Some(tl_folder(2, &[OTHER_UID])),
+        }),
+        date: 1_750_000_010,
+    }));
+
+    wait_until(
+        "messages.getPeerDialogs for the folder's new chat",
+        Duration::from_secs(5),
+        async || rpc.count::<tl_fns::messages::GetPeerDialogs>() == 1,
+    )
+    .await;
+    wait_until(
+        "the new chat's folder is known",
+        Duration::from_secs(5),
+        async || folder_known(&rt, OTHER_UID).await,
+    )
+    .await;
+    // The same folder state again requests nothing more.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(rpc.count::<tl_fns::messages::GetPeerDialogs>(), 1);
+    shutdown(rt).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// TGB-2899 / TGB-2917: chat-list pages and presence updates run beside the actor loop.
+// ---------------------------------------------------------------------------------------------
+
+/// A 500-chat page held by the server while an update arrives and another command is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dialogs_page_in_flight_does_not_hold_updates_or_commands() {
+    let (rpc, rt) = start(None).await;
+    rpc.gate::<tl_fns::messages::GetDialogs>();
+    rpc.enqueue_ok::<tl_fns::messages::GetDialogs>(&tl_enums::messages::Dialogs::Slice(
+        tl_types::messages::DialogsSlice {
+            count: 1_000,
+            dialogs: vec![peer_dialog(OTHER_UID)],
+            messages: vec![synthetic_msg(user_peer(OTHER_UID), 5, 1_749_999_000, "hi")],
+            chats: Vec::new(),
+            users: vec![tl_enums::User::User(synthetic_user(
+                OTHER_UID, "PeerTwo", false,
+            ))],
+        },
+    ));
+    rpc.enqueue_ok::<tl_fns::messages::GetPinnedDialogs>(
+        &tl_enums::messages::PeerDialogs::PeerDialogs(tl_types::messages::PeerDialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+            state: tl_enums::updates::State::State(tl_state(100, 1_750_000_000, 1)),
+        }),
+    );
+
+    let page = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.load_dialogs_page(0).await }
+    });
+    wait_until("getDialogs in flight", Duration::from_secs(2), async || {
+        rpc.count::<tl_fns::messages::GetDialogs>() == 1
+    })
+    .await;
+
+    // Before TGB-2899 the actor awaited the page: the update and the snapshot waited for it.
+    let started = Instant::now();
+    rpc.push_update(short_message(101, 101, "while the page loads"));
+    wait_until(
+        "the update applied while the page is in flight",
+        Duration::from_secs(2),
+        async || has_message(&rt, PEER_UID, 101).await,
+    )
+    .await;
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), rt.snapshot(10)).await;
+    assert!(snapshot.is_ok(), "a command waited behind the dialogs page");
+    println!(
+        "measured: update + command answered after {:?} while getDialogs was held",
+        started.elapsed()
+    );
+    // A second request for the same folder while the page is on its way waits for it and then
+    // gets the next page, as when the loop ran them one after another.
+    let second = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.load_dialogs_page(0).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(rpc.count::<tl_fns::messages::GetDialogs>(), 1);
+    rpc.enqueue_ok::<tl_fns::messages::GetDialogs>(&tl_enums::messages::Dialogs::Slice(
+        tl_types::messages::DialogsSlice {
+            count: 1_000,
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        },
+    ));
+
+    rpc.open::<tl_fns::messages::GetDialogs>(2);
+    let page = page
+        .await
+        .expect("join")
+        .expect("page")
+        .expect("a page arrived");
+    assert_eq!(page.dialogs.len(), 1);
+    assert!(folder_known(&rt, OTHER_UID).await, "the page is applied");
+    let second = second
+        .await
+        .expect("join")
+        .expect("second page")
+        .expect("the next page arrived");
+    assert!(second.dialogs.is_empty());
+    assert_eq!(rpc.count::<tl_fns::messages::GetDialogs>(), 2);
+    shutdown(rt).await;
+}
+
+/// `account.updateStatus` held by the server while an update arrives (TGB-2917).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_presence_update_in_flight_does_not_hold_updates() {
+    let (rpc, rt) = start(None).await;
+    rpc.gate::<tl_fns::account::UpdateStatus>();
+    rpc.enqueue_ok::<tl_fns::account::UpdateStatus>(&true);
+
+    let presence = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.update_presence(true, 0).await }
+    });
+    wait_until(
+        "account.updateStatus in flight",
+        Duration::from_secs(2),
+        async || rpc.count::<tl_fns::account::UpdateStatus>() == 1,
+    )
+    .await;
+
+    rpc.push_update(short_message(101, 101, "while the status is sent"));
+    wait_until(
+        "the update applied while updateStatus is in flight",
+        Duration::from_secs(2),
+        async || has_message(&rt, PEER_UID, 101).await,
+    )
+    .await;
+
+    rpc.open::<tl_fns::account::UpdateStatus>(1);
+    let result = presence.await.expect("join").expect("presence");
+    assert!(result.sent && result.online);
+    shutdown(rt).await;
+}

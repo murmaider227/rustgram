@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tg_transport::PrefixedStream;
@@ -57,6 +58,14 @@ pub trait PacketConnection: Send + Sync {
     /// Human-readable transport tag (e.g. `"TCP/IPv4"`, `"HTTP/IPv4"`).
     fn transport_tag(&self) -> &str {
         "TCP"
+    }
+
+    /// Bytes received so far, counting parts of packets that are still arriving
+    /// (`AbstractConnection::receivedSome`). The session's receive watchdog treats any growth
+    /// as data received. Transports that cannot see partial reads return `0`; the watchdog
+    /// then counts whole packets only.
+    fn received_bytes(&self) -> u64 {
+        0
     }
 }
 
@@ -148,6 +157,10 @@ where
 
     fn transport_tag(&self) -> &str {
         self.inner.tag()
+    }
+
+    fn received_bytes(&self) -> u64 {
+        self.inner.bytes_received()
     }
 }
 
@@ -519,6 +532,16 @@ pub struct FakeServerPeer {
     pub rx: mpsc::UnboundedReceiver<Vec<u8>>,
     /// Sends packets (or simulated transport errors) back to the client.
     pub tx: mpsc::UnboundedSender<Result<Vec<u8>, TransportError>>,
+    partial_bytes: Arc<AtomicU64>,
+}
+
+impl FakeServerPeer {
+    /// Simulates `bytes` of a packet arriving on the socket before the packet is complete
+    /// (a large reply on a slow link): the client sees [`PacketConnection::received_bytes`]
+    /// grow while `recv` keeps waiting.
+    pub fn deliver_partial(&self, bytes: u64) {
+        self.partial_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
 }
 
 /// In-memory [`PacketConnection`] backed by unbounded tokio channels.
@@ -528,6 +551,8 @@ pub struct FakeConnection {
     closed: bool,
     http_wait: bool,
     in_flight_http: usize,
+    received_bytes: u64,
+    partial_bytes: Arc<AtomicU64>,
 }
 
 impl FakeConnection {
@@ -545,6 +570,7 @@ impl FakeConnection {
     fn pair_with_http_wait(http_wait: bool) -> (Self, FakeServerPeer) {
         let (c2s_tx, c2s_rx) = mpsc::unbounded_channel();
         let (s2c_tx, s2c_rx) = mpsc::unbounded_channel();
+        let partial_bytes = Arc::new(AtomicU64::new(0));
         (
             Self {
                 tx: c2s_tx,
@@ -552,10 +578,13 @@ impl FakeConnection {
                 closed: false,
                 http_wait,
                 in_flight_http: 0,
+                received_bytes: 0,
+                partial_bytes: Arc::clone(&partial_bytes),
             },
             FakeServerPeer {
                 rx: c2s_rx,
                 tx: s2c_tx,
+                partial_bytes,
             },
         )
     }
@@ -586,6 +615,10 @@ impl PacketConnection for FakeConnection {
                     if self.http_wait {
                         self.in_flight_http = self.in_flight_http.saturating_sub(1);
                     }
+                    if let Ok(packet) = &res {
+                        self.received_bytes =
+                            self.received_bytes.saturating_add(packet.len() as u64);
+                    }
                     res
                 }
                 None => Err(TransportError::Disconnected),
@@ -613,6 +646,11 @@ impl PacketConnection for FakeConnection {
         } else {
             "TCP/Fake"
         }
+    }
+
+    fn received_bytes(&self) -> u64 {
+        self.received_bytes
+            .saturating_add(self.partial_bytes.load(Ordering::Acquire))
     }
 }
 

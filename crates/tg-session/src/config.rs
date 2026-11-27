@@ -13,7 +13,7 @@ use tg_api::ApiCredentials;
 use tg_core::domain::Environment as CoreEnvironment;
 use tg_core::version::{APP_NAME, APP_VERSION_STR};
 use tg_lang::{CLOUD_LANG_PACK_NAME, default_language_id, language_id_or_default, with_current};
-use tg_mtproto::{ClientConfig, DcId, Environment as MtprotoEnvironment};
+use tg_mtproto::{ClientConfig, DcId, Environment as MtprotoEnvironment, InitLang};
 use tg_platform::system_info;
 
 use crate::error::{Result, SessionError};
@@ -167,9 +167,15 @@ pub fn build_mtproto_client_config(
     let device_model = non_empty_or(system_info::device_model_pretty(), "Rustgram Desktop");
     let system_version = non_empty_or(system_info::system_version_pretty(), "Windows");
     let system_lang_code = non_empty_or(system_info::system_language(), default_language_id());
-    let resolved_lang = match lang_code_override {
-        Some(code) => language_id_or_default(code).to_owned(),
-        None => with_current(|inst| language_id_or_default(inst.id()).to_owned()),
+    let (lang_pack, resolved_lang) = match lang_code_override {
+        Some(code) => (
+            CLOUD_LANG_PACK_NAME.to_owned(),
+            language_id_or_default(code).to_owned(),
+        ),
+        None => with_current(|inst| {
+            let lang = init_lang_for(inst, String::new());
+            (lang.lang_pack, lang.lang_code)
+        }),
     };
     let tz_offset_secs = jiff::ZonedDateTime::now().offset().seconds();
 
@@ -179,7 +185,7 @@ pub fn build_mtproto_client_config(
         system_version,
         app_version: format!("{APP_NAME} {APP_VERSION_STR}"),
         system_lang_code,
-        lang_pack: CLOUD_LANG_PACK_NAME.to_owned(),
+        lang_pack,
         lang_code: resolved_lang,
         tz_offset_secs: Some(tz_offset_secs),
         environment: core_env_to_mtproto(environment),
@@ -189,6 +195,18 @@ pub fn build_mtproto_client_config(
             DEFAULT_MAIN_DC_ID
         },
         ..ClientConfig::default()
+    }
+}
+
+/// `initConnection` language fields for `inst`, as tdesktop's `Instance::cloudLangCode()` and
+/// `langPackName()` give them: the current pack's cloud code (the default for a custom pack)
+/// and an empty pack name for a custom pack.
+#[must_use]
+pub fn init_lang_for(inst: &tg_lang::Instance, system_lang_code: String) -> InitLang {
+    InitLang {
+        system_lang_code,
+        lang_pack: inst.lang_pack_name().to_owned(),
+        lang_code: inst.cloud_lang_code(tg_lang::Pack::Current).to_owned(),
     }
 }
 
@@ -282,5 +300,43 @@ mod tests {
         assert_eq!(fallback_dc.main_dc_id, DEFAULT_MAIN_DC_ID);
         assert_eq!(fallback_dc.environment, MtprotoEnvironment::Production);
         assert_eq!(fallback_dc.lang_code, "en");
+    }
+
+    fn language(id: &str) -> tg_lang::Language {
+        tg_lang::Language {
+            id: id.to_owned(),
+            plural_id: "en".to_owned(),
+            base_id: String::new(),
+            name: id.to_owned(),
+            native_name: id.to_owned(),
+        }
+    }
+
+    /// TGB-3153: the language fields follow tdesktop's `cloudLangCode(Pack::Current)` and
+    /// `langPackName()`; a custom pack sends the default code and an empty pack name.
+    #[test]
+    fn init_lang_follows_the_current_language_pack() {
+        let mut inst = tg_lang::Instance::new();
+        let lang = init_lang_for(&inst, "de".to_owned());
+        assert_eq!(
+            (
+                lang.system_lang_code.as_str(),
+                lang.lang_pack.as_str(),
+                lang.lang_code.as_str()
+            ),
+            ("de", CLOUD_LANG_PACK_NAME, "en")
+        );
+        inst.switch_to_id(&language("uk"));
+        let lang = init_lang_for(&inst, "de".to_owned());
+        assert_eq!(
+            (lang.lang_pack.as_str(), lang.lang_code.as_str()),
+            (CLOUD_LANG_PACK_NAME, "uk")
+        );
+        inst.switch_to_id(&language("#TEST_X"));
+        let lang = init_lang_for(&inst, "de".to_owned());
+        assert_eq!(
+            (lang.lang_pack.as_str(), lang.lang_code.as_str()),
+            ("", "en")
+        );
     }
 }

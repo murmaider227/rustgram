@@ -31,7 +31,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::auth_key::{AuthKeyType, Dcenter, ManagedAuthKey, create_single_auth_key};
-use crate::config::{ClientConfig, Config, ConfigFields};
+use crate::config::{ClientConfig, Config, ConfigFields, InitLang};
 use crate::config_loader::{ConfigLoader, ConfigLoaderOptions, ConfigSchedulerHandle};
 use crate::dc_options::{
     DC_SHIFT, DcId, DcOptions, DcType, ShiftedDcId, bare_dc_id, download_dc_id, get_dc_id_shift,
@@ -40,7 +40,7 @@ use crate::dc_options::{
 use crate::error::{InvocationError, MigrateKind, RpcError};
 use crate::keys_destroyer::{KeysDestroyResult, KeysDestroyer};
 use crate::message::{RequestId, next_request_id};
-use crate::session::{ConnectionState, QueuedRequest, SessionHandle, UpdatesMsg};
+use crate::session::{ConnectionState, QueuedRequest, SessionHandle, SessionShared, UpdatesMsg};
 use crate::single_flight::{Joined, SingleFlight};
 use crate::special_config::{SpecialConfigError, sync_http_unixtime};
 use crate::time::MtprotoClock;
@@ -131,6 +131,7 @@ struct ClientInner {
     clock: MtprotoClock,
     proxy: Arc<RwLock<ProxyData>>,
     try_ipv6: Arc<AtomicBool>,
+    init_lang: Arc<RwLock<InitLang>>,
     connection_state: Arc<RwLock<ConnectionState>>,
     connection_state_tx: broadcast::Sender<ConnectionState>,
     transport_factory: Arc<dyn TransportFactory>,
@@ -173,6 +174,7 @@ impl Client {
         let main_dc_id = config.main_dc_id;
         let proxy = Arc::new(RwLock::new(config.proxy.clone()));
         let try_ipv6 = Arc::new(AtomicBool::new(config.use_ipv6));
+        let init_lang = Arc::new(RwLock::new(InitLang::from_config(&config)));
         let connection_state = Arc::new(RwLock::new(ConnectionState::Disconnected));
         let (connection_state_tx, _) = broadcast::channel(64);
         let (updates_tx, updates_rx) = mpsc::unbounded_channel();
@@ -188,6 +190,7 @@ impl Client {
             clock: MtprotoClock::new(),
             proxy,
             try_ipv6,
+            init_lang,
             connection_state,
             connection_state_tx,
             transport_factory,
@@ -225,11 +228,35 @@ impl Client {
 
     /// Marks `dc_id` as requiring `invokeWithLayer(initConnection(...))` on the next request
     /// (`MTP::Instance::reInitConnection` in `mtproto/mtp_instance.cpp`).
+    ///
+    /// Starts a new re-initialization generation on the DC (tdesktop 3f11c74 / bff150f: every
+    /// session sharing the DC sees it, so a late answer from before cannot mark the DC inited),
+    /// then restarts the DC's sessions, which re-read the shared settings on reconnect.
     pub fn re_init_connection(&self, dc_id: DcId) {
         let bare = bare_dc_id(dc_id);
         if let Some(dc) = self.inner.dcenters.read().get(&bare) {
-            dc.set_connection_inited(false);
+            dc.begin_reinit();
         }
+        self.restart_dc(bare);
+    }
+
+    /// Language fields sent in `initConnection`.
+    pub fn init_lang(&self) -> InitLang {
+        self.inner.init_lang.read().clone()
+    }
+
+    /// Changes the language fields sent in `initConnection` and re-initializes the main DC,
+    /// like `Lang::CloudManager::changeIdAndReInitConnection` (`reInitConnection(mainDcId())`).
+    /// Other sessions send the new values when they next connect.
+    pub fn set_init_lang(&self, lang: InitLang) {
+        {
+            let mut guard = self.inner.init_lang.write();
+            if *guard == lang {
+                return;
+            }
+            *guard = lang;
+        }
+        self.re_init_connection(self.main_dc_id());
     }
 
     /// Returns a [`Sender`] scoped to this client.
@@ -261,7 +288,7 @@ impl Client {
         // `MTP::Instance::reInitConnection` (`mtproto/mtp_instance.cpp`): re-send
         // `initConnection` on reconnect so the updated proxy metadata is reported.
         for dc in self.inner.dcenters.read().values() {
-            dc.set_connection_inited(false);
+            dc.begin_reinit();
         }
         self.restart_all_sessions();
     }
@@ -995,8 +1022,11 @@ impl Client {
                     self.inner.transport_factory.clone(),
                     self.inner.updates_tx.clone(),
                     Some(self.inner.updates_broadcast_tx.clone()),
-                    self.inner.proxy.clone(),
-                    Arc::clone(&self.inner.try_ipv6),
+                    SessionShared {
+                        proxy: self.inner.proxy.clone(),
+                        try_ipv6: Arc::clone(&self.inner.try_ipv6),
+                        init_lang: Arc::clone(&self.inner.init_lang),
+                    },
                     state_watch,
                     false,
                 )

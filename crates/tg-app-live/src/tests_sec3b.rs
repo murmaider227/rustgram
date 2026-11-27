@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use tg_app_core::stories::backend::{StoriesBackend, StoryMediaAsset};
+use tg_app_core::stories::backend::StoryMediaAsset;
 use tg_storage::cache::legacy_temp::EPHEMERAL_STREAM_DIR_PREFIX;
 use tg_storage::streamed_downloader::STREAMED_ENC_MAGIC;
 use tg_stories::{Story, StoryMedia, StoryPrivacy, StoryRepostInfo};
@@ -219,10 +219,22 @@ fn sec3_b1_story_video_streams_into_account_streamed_dir() {
     loader.stop();
     drop(loader);
 
-    // 2. The whole-file preload path (`StoriesBackend::load_story_media`).
-    let mut live = h.live.clone();
-    let asset = StoriesBackend::load_story_media(&mut live, story_id).expect("story media");
-    assert_eq!(asset, StoryMediaAsset::VideoBytes(payload.clone()));
+    // 2. The viewer's path (`StoriesBackend::load_story_media`): a streaming loader whose
+    // header is downloaded in the background.
+    let asset = h
+        .live
+        .wait_story_media(story_id, Duration::from_secs(10))
+        .expect("story media");
+    let StoryMediaAsset::VideoStream(stream) = asset else {
+        panic!("a video story is streamed, got {asset:?}");
+    };
+    let loader = stream.loader();
+    let all = loader
+        .load_range(0, payload.len())
+        .expect("whole story read");
+    assert_eq!(all, payload);
+    drop(loader);
+    drop(stream);
 
     assert!(
         assert_no_plaintext_under(&streamed_dir) >= 1,
@@ -429,3 +441,7 @@ fn sec3_b3_stream_cache_names_and_sidecar_do_not_reveal_the_document() {
     assert!(names.iter().any(|n| n.ends_with(".part.meta")), "{names:?}");
     assert_no_plaintext_under(&streamed_dir);
 }
+
+#[path = "tests_story_media.rs"]
+#[cfg(test)]
+mod tests_story_media;

@@ -849,6 +849,8 @@ fn authorization_date_fallback_single_flag_change_review_and_personal_channel() 
         &true,
     );
     live.update_session_permissions(777_888, false, true);
+    // The switch is sent in the background (TGB-3104).
+    assert!(live.flush_background_rpcs(std::time::Duration::from_secs(10)));
     let calls = rpc.recorded_calls();
     assert_eq!(calls.len(), 1);
     let chg =

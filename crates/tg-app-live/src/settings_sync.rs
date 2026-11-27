@@ -1146,14 +1146,16 @@ pub fn save_scope_notify_live(
         })
         .unwrap_or_default();
 
-    let scope_req = tl_fns::account::UpdateNotifySettings {
-        peer: notify_scope_to_tl(scope),
-        settings: notify_settings_to_tl(&settings),
-    };
-    if let Err(err) = live.invoke_rpc(scope_req) {
-        warn!(?scope, error = %err, "account.updateNotifySettings (scope) failed");
-        return;
-    }
+    // tdesktop applies notify settings locally and sends them without waiting, with no
+    // rollback (`Data::NotifySettings::defaultUpdate` / `update`): every request below goes
+    // through the ordered background queue (TGB-3104).
+    live.queue_background_rpc(
+        tl_fns::account::UpdateNotifySettings {
+            peer: notify_scope_to_tl(scope),
+            settings: notify_settings_to_tl(&settings),
+        },
+        move |error| warn!(?scope, %error, "account.updateNotifySettings (scope) failed"),
+    );
     let data_scope = notify_scope_to_data_scope(scope);
     let data_default = scope_settings_to_data(&settings);
     let now = now_unix_i32();
@@ -1192,10 +1194,9 @@ pub fn save_scope_notify_live(
                     },
                 ),
             };
-            if let Err(err) = live.invoke_rpc(req) {
-                warn!(peer = raw_peer_id, error = %err, "account.updateNotifySettings (exception) failed");
-                continue;
-            }
+            live.queue_background_rpc(req, move |error| {
+                warn!(peer = raw_peer_id, %error, "account.updateNotifySettings (exception) failed");
+            });
         }
         let data_peer = to_data_peer(pid);
         live.write_session(|session| {
@@ -1233,10 +1234,9 @@ pub fn save_scope_notify_live(
                     },
                 ),
             };
-            if let Err(err) = live.invoke_rpc(req) {
-                warn!(peer = removed_id, error = %err, "account.updateNotifySettings (reset exception) failed");
-                continue;
-            }
+            live.queue_background_rpc(req, move |error| {
+                warn!(peer = removed_id, %error, "account.updateNotifySettings (reset exception) failed");
+            });
         }
         let data_peer = to_data_peer(pid);
         live.write_session(|session| {
@@ -1252,6 +1252,8 @@ pub fn save_scope_notify_live(
         c.notify_exceptions_loaded.insert(scope);
         c.scope_notify.insert(scope, settings);
         c.notify_settings_version = c.notify_settings_version.wrapping_add(1);
+        c.settings_reads
+            .invalidate(tg_app_core::settings::backend::SettingsRead::ScopeNotifications(scope));
     }
     live.bridge.state().notify_ui();
 }
