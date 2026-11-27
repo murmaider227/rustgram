@@ -121,6 +121,8 @@ pub struct EntryMenu {
     submenu_index: Option<usize>,
     submenu_hovered: Option<usize>,
     opened_frame: u64,
+    /// Opened with [`EntryMenu::open_below`]: no `AddSeparatorAndShiftUp` shift.
+    unshifted: bool,
 }
 
 /// `expandedMenuSeparator` (`ui/chat/chat.style`): 4 px padding above and below a 6 px band.
@@ -409,7 +411,16 @@ impl EntryMenu {
         self.submenu_index = None;
         self.submenu_hovered = None;
         self.opened_frame = ctx.cumulative_frame_nr();
+        self.unshifted = false;
         ctx.request_repaint();
+    }
+
+    /// Opens the menu with its top-right corner at `top_right` (`PanelAnimation::Origin::TopRight`),
+    /// full-width separators drawn in place (a `popupMenuExpandedSeparator` menu such as the chat
+    /// top bar's) and without the chats-list shift-up.
+    pub fn open_below(&mut self, ctx: &egui::Context, top_right: Pos2) {
+        self.open_at(ctx, top_right);
+        self.unshifted = true;
     }
 
     /// Closes the menu.
@@ -454,14 +465,22 @@ impl EntryMenu {
 
         let metrics = measure(ctx, rows, style);
         let screen = ctx.viewport_rect();
+        let left = if self.unshifted {
+            self.anchor.x - metrics.width
+        } else {
+            self.anchor.x
+        };
         let pos = Pos2::new(
-            self.anchor
-                .x
-                .min(screen.max.x - metrics.width - 4.0)
+            left.min(screen.max.x - metrics.width - 4.0)
                 .max(screen.min.x + 4.0),
-            (self.anchor.y - metrics.top_shift)
-                .min(screen.max.y - metrics.height - 4.0)
-                .max(screen.min.y + 4.0),
+            (self.anchor.y
+                - if self.unshifted {
+                    0.0
+                } else {
+                    metrics.top_shift
+                })
+            .min(screen.max.y - metrics.height - 4.0)
+            .max(screen.min.y + 4.0),
         );
         let painted = paint_rows(
             ctx,

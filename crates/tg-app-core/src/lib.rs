@@ -26,6 +26,7 @@ pub mod dialogs {
 }
 pub mod history {
     pub mod backend;
+    pub mod peer_menu;
     pub mod sections_model;
     pub mod theme;
 }

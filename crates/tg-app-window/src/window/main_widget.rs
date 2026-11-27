@@ -289,6 +289,8 @@ pub struct MainWidget {
     settings_as_layer: bool,
     /// Whether the Settings layer's top-bar menu (`Settings::Main::fillTopBarMenu`) is open.
     settings_layer_menu_open: bool,
+    /// Whether this frame renders the profile main section as `Info::LayerWidget` over the chat.
+    info_as_layer: bool,
     /// Whether this frame docks the tabbed selector as a third column (`TabbedSection`).
     tabbed_docked: bool,
     /// Screen rect of the docked tabbed selector column in the last frame.
@@ -346,6 +348,7 @@ impl MainWidget {
             system_dark_mode: None,
             settings_as_layer: false,
             settings_layer_menu_open: false,
+            info_as_layer: false,
             tabbed_docked: false,
             docked_tabbed_rect: None,
             pending_forward: None,
@@ -364,6 +367,12 @@ impl MainWidget {
     #[must_use]
     pub const fn settings_shown_as_layer(&self) -> bool {
         self.settings_as_layer
+    }
+
+    /// Returns whether the last frame showed the profile as `Info::LayerWidget` over the chat.
+    #[must_use]
+    pub const fn info_shown_as_layer(&self) -> bool {
+        self.info_as_layer
     }
 
     /// Returns whether the last frame docked the Emoji / Stickers / GIFs panel as a column.
@@ -866,6 +875,8 @@ impl MainWidget {
         if !self.settings_as_layer {
             self.settings_layer_menu_open = false;
         }
+        self.info_as_layer =
+            crate::window::info_layer::info_shown_as_layer(session, full_rect.width());
 
         let show_vertical_sidebar = layout.filters_width > 0;
         let body_left = full_rect.left() + layout.filters_width as f32;
@@ -893,7 +904,8 @@ impl MainWidget {
         match layout.window_layout {
             WindowLayout::OneColumn => {
                 self.tabbed_docked = false;
-                let layer_over_dialogs = self.settings_as_layer && session.active_peer().is_zero();
+                let layer_over_dialogs = (self.settings_as_layer || self.info_as_layer)
+                    && session.active_peer().is_zero();
                 if session.is_main_section_shown() && !layer_over_dialogs {
                     self.render_main_column(
                         ui,
@@ -1087,6 +1099,22 @@ impl MainWidget {
                 embedded_theme,
                 accent_color,
                 palette,
+                &mut actions,
+            );
+        }
+
+        if self.info_as_layer
+            && let Some(SectionMemento::PeerInfo { peer_id, .. }) = session.main_section().cloned()
+        {
+            crate::window::info_layer::render_info_layer(
+                ui,
+                full_rect,
+                &mut self.main_info,
+                peer_id,
+                session,
+                session_backend,
+                palette,
+                theme_colors,
                 &mut actions,
             );
         }
@@ -1410,6 +1438,17 @@ impl MainWidget {
                         actions,
                     );
                 }
+                Some(SectionMemento::PeerInfo { .. }) if self.info_as_layer => {
+                    self.render_history_section(
+                        ui,
+                        session,
+                        session_backend,
+                        palette,
+                        strings,
+                        now_ms,
+                        actions,
+                    );
+                }
                 Some(SectionMemento::Settings { page }) => {
                     self.render_settings_section(
                         ui,
@@ -1636,7 +1675,8 @@ impl MainWidget {
         actions: &mut Vec<MainWidgetAction>,
     ) {
         let peer_id = session.active_peer();
-        let can_go_back = history_can_go_back(session, self.settings_as_layer);
+        let can_go_back =
+            history_can_go_back(session, self.settings_as_layer || self.info_as_layer);
         let info_open = session.third_section().is_some();
         let is_chat_wide = session.adaptive().is_chat_wide();
 
@@ -1721,6 +1761,9 @@ impl MainWidget {
                 }
                 HistoryAction::TogglePeerInfo(pid) => {
                     session.toggle_peer_info(pid);
+                }
+                HistoryAction::ShowPeerInfo(pid) => {
+                    session.show_peer_info_layer(pid);
                 }
                 HistoryAction::SendMessage { peer_id, .. } => {
                     Backend::mark_read(session_backend, peer_id);
@@ -1867,6 +1910,15 @@ impl MainWidget {
                     session.show_peer_info(uid, SectionShow::forward());
                 }
                 HistoryAction::Toast(msg) => actions.push(MainWidgetAction::Toast(msg)),
+                HistoryAction::PeerMenu { peer_id, command } => {
+                    crate::window::peer_menu_actions::run_peer_menu_command(
+                        peer_id,
+                        command,
+                        session,
+                        session_backend,
+                        actions,
+                    );
+                }
             }
         }
         for error in self.history.take_user_errors() {
@@ -2130,6 +2182,7 @@ impl MainWidget {
             && match session.main_section() {
                 Some(SectionMemento::PeerHistory { .. }) | None => true,
                 Some(SectionMemento::Settings { .. }) => self.settings_as_layer,
+                Some(SectionMemento::PeerInfo { .. }) => self.info_as_layer,
                 Some(_) => false,
             };
         let eligible = history_shown

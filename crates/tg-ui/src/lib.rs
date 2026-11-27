@@ -32,6 +32,7 @@ pub mod platform;
 pub mod soft_raster;
 pub mod spoiler_line;
 pub mod stand_in;
+pub mod sticker_thumbs;
 pub mod style;
 pub mod text;
 pub mod theme;

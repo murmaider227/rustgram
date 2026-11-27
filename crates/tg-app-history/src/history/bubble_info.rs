@@ -205,17 +205,18 @@ pub fn reaction_count_text(r: &ReactionCounter) -> String {
 }
 
 /// Chip widths for `MessageInput::reaction_button_widths` (`InlineList::countOptimalSize`).
-/// Private chats show reactor userpics; their width comes from `userpics_width`.
+/// A button that shows reactor userpics gets its width from `userpics_width` (`None`: the
+/// button shows its count).
 #[must_use]
 pub fn reaction_chip_widths(
     painter: &Painter,
     reactions: &[ReactionCounter],
-    userpics_width: Option<&dyn Fn(&ReactionCounter) -> i32>,
+    userpics_width: &dyn Fn(&ReactionCounter) -> Option<i32>,
 ) -> Vec<i32> {
     reactions
         .iter()
-        .map(|r| match userpics_width {
-            Some(f) => f(r),
+        .map(|r| match userpics_width(r) {
+            Some(w) => w,
             None => {
                 let text = reaction_count_text(r);
                 let w = if text.is_empty() {

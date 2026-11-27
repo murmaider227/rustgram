@@ -1448,6 +1448,14 @@ fn checklist_channel_dms_and_folder_invite_export_work_in_demo_and_live_mode() {
         let alice = env.alice_peer;
         let channel = env.channel_peer;
         let fake = env.fake.clone();
+        // The chat menu offers "Direct messages" only for a channel with direct messages
+        // (`Filler::addDirectMessages`: `broadcastMonoforum()` and `amMonoforumAdmin()`).
+        env.runtime.tokio_handle().block_on(async {
+            let mut s = env.runtime.session().write().await;
+            if let Some(ch) = s.channel_mut(tg_data::ChannelId(channel.bare())) {
+                ch.monoforum_link = Some(tg_data::ChannelId(channel.bare() + 1));
+            }
+        });
         let mut ws = env.workspace;
         ws.controller_mut()
             .session_mut()

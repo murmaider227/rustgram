@@ -50,6 +50,7 @@ pub mod passport_upload;
 pub mod payments;
 pub mod peer_accent;
 pub mod peer_emoji_status;
+pub mod peer_menu_caps;
 pub mod polls_stats;
 pub mod preview_text;
 pub mod profile_extras;
@@ -69,6 +70,7 @@ pub mod settings_sync;
 pub mod star_gifts;
 pub mod stats;
 pub mod sticker_owner;
+pub mod sticker_set_thumbs;
 pub mod stickers_reactions_extras;
 pub mod stories;
 mod stream_fill;
@@ -129,6 +131,8 @@ mod tests_fu7a_pts_pagination;
 #[cfg(test)]
 mod tests_history_clear_ticks;
 #[cfg(test)]
+mod tests_history_gaps;
+#[cfg(test)]
 mod tests_history_sections;
 #[cfg(test)]
 mod tests_layer233_extras;
@@ -148,6 +152,8 @@ mod tests_optimistic_send;
 mod tests_payments_passport;
 #[cfg(test)]
 mod tests_peer_management;
+#[cfg(test)]
+mod tests_peer_menu_caps;
 #[cfg(test)]
 mod tests_preview_spoilers;
 #[cfg(test)]

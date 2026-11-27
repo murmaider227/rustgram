@@ -15,7 +15,10 @@ use egui::{
     Color32, ColorImage, Context, Painter, Pos2, Rect, TextureHandle, TextureOptions, Ui, Vec2,
 };
 
+use crate::history::backend::{ReactionCounter, RecentReactors};
+use crate::history::bubble::ReactionUserpics;
 use crate::history::theme::HistoryColors;
+use tg_app_core::stand_in::types::PeerId;
 
 /// UI key of the paid (Stars) reaction (`Data::ReactionId::Paid()`).
 pub const PAID_REACTION_KEY: &str = "⭐";
@@ -42,6 +45,12 @@ const OUT_NON_CHOSEN_OPACITY: f32 = 0.18;
 pub const CREDITS_BG3: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x00);
 /// `creditsFg`.
 pub const CREDITS_FG: Color32 = Color32::from_rgb(0xba, 0x70, 0x00);
+/// `creditsBg2`: a chosen paid reaction below a bubble.
+pub const CREDITS_BG2: Color32 = Color32::from_rgb(0xff, 0xd9, 0x51);
+/// `st::reactionInlineUserpics`: `size`, `shift`, `stroke`.
+pub const USERPIC_SIZE: f32 = 20.0;
+const USERPIC_SHIFT: f32 = 7.0;
+const USERPIC_STROKE: f32 = 1.0;
 
 /// What a reaction button shows in its image square.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,14 +98,32 @@ pub fn paid_star_rect(inner_top_left: Pos2) -> Rect {
     )
 }
 
-/// Background and text colors of one in-bubble reaction button (`InlineList::paint`).
+/// Background and text colors of one reaction button (`InlineList::paint`,
+/// `history_view_reactions.cpp:496-548`). `in_bubble` is `InlineListData::Flag::InBubble`:
+/// below a bubble (or a sticker) the buttons use the service colors of the chat background.
 #[must_use]
 pub fn reaction_button_colors(
     colors: &HistoryColors,
     chosen: bool,
     outgoing: bool,
     paid: bool,
+    in_bubble: bool,
 ) -> (Color32, Color32) {
+    if !in_bubble {
+        let bg = if !chosen {
+            colors.service_bg
+        } else if paid {
+            CREDITS_BG2
+        } else {
+            colors.service_fg
+        };
+        let fg = if chosen {
+            adapt_chosen_service_fg(colors.service_bg)
+        } else {
+            colors.service_fg
+        };
+        return (bg, fg);
+    }
     if paid {
         if chosen {
             (CREDITS_BG3, colors.reaction_chosen_fg)
@@ -114,6 +141,70 @@ pub fn reaction_button_colors(
         (colors.reaction_out_bg, colors.msg_out_date_fg)
     } else {
         (colors.reaction_in_bg, colors.active_text_fg)
+    }
+}
+
+/// `AdaptChosenServiceFg`: the service background with at least 192 alpha.
+fn adapt_chosen_service_fg(service_bg: Color32) -> Color32 {
+    let [r, g, b, a] = service_bg.to_srgba_unmultiplied();
+    Color32::from_rgba_unmultiplied(r, g, b, a.max(192))
+}
+
+/// The reactors a button shows as userpics instead of its count (`InlineListData::recent`):
+/// in a private chat the partner (unless the only reaction is the user's) and the user
+/// (`history_view_reactions.cpp:937-950`); elsewhere the recent reactors the session listed
+/// for this reaction ([`RecentReactors`], filled only when tdesktop shows them).
+#[must_use]
+pub fn reaction_peers<'a>(
+    reaction: &ReactionCounter,
+    recent: &'a [RecentReactors],
+    private: Option<&'a ReactionUserpics>,
+) -> Option<Vec<&'a (PeerId, String)>> {
+    if let Some(pics) = private {
+        let mut list = Vec::with_capacity(2);
+        if !reaction.chosen || reaction.count > 1 {
+            list.push(&pics.peer);
+        }
+        if reaction.chosen {
+            list.push(&pics.me);
+        }
+        return Some(list);
+    }
+    recent
+        .iter()
+        .find(|r| r.reaction == reaction.emoji && !r.peers.is_empty())
+        .map(|r| r.peers.iter().collect())
+}
+
+/// Width of the userpics row of `count` reactors (`InlineList::countOptimalSize`,
+/// `userpicsWidth`).
+#[must_use]
+pub fn userpics_width(count: usize) -> f32 {
+    let n = count.max(1) as f32;
+    USERPIC_SIZE + (n - 1.0) * (USERPIC_SIZE - USERPIC_SHIFT)
+}
+
+/// Paints the userpics row whose top-left is `top_left` (`GenerateUserpicsInRow`): the last
+/// reactor first at the right, each earlier one over it with a `stroke` ring cut out in the
+/// button's `bg`, so the first reactor is on top at the left.
+pub fn paint_reaction_userpics(
+    painter: &Painter,
+    top_left: Pos2,
+    peers: &[&(PeerId, String)],
+    bg: Color32,
+    ui_colors: &dyn tg_ui::theme::Colors,
+) {
+    let step = USERPIC_SIZE - USERPIC_SHIFT;
+    for (i, (peer, name)) in peers.iter().map(|p| (&p.0, &p.1)).enumerate().rev() {
+        let pic = Rect::from_min_size(
+            top_left + Vec2::new(i as f32 * step, 0.0),
+            Vec2::splat(USERPIC_SIZE),
+        );
+        painter.circle_filled(pic.center(), USERPIC_SIZE * 0.5 + USERPIC_STROKE, bg);
+        if !tg_ui::userpic_images::paint_userpic_image(painter, pic, peer.0) {
+            tg_ui::userpic::EmptyUserpic::for_peer(peer.bare(), name, ui_colors)
+                .paint_circle(painter, pic);
+        }
     }
 }
 
@@ -235,13 +326,80 @@ mod tests {
     #[test]
     fn the_paid_button_is_gold() {
         let colors = HistoryColors::from_palette(&Palette::for_mode(ThemeMode::Day));
-        let (bg, fg) = reaction_button_colors(&colors, false, false, true);
+        let (bg, fg) = reaction_button_colors(&colors, false, false, true, true);
         assert_eq!(fg, CREDITS_FG);
         assert_eq!(bg, CREDITS_BG3.gamma_multiply(IN_NON_CHOSEN_OPACITY));
-        let (bg, _) = reaction_button_colors(&colors, true, false, true);
+        let (bg, _) = reaction_button_colors(&colors, true, false, true, true);
         assert_eq!(bg, CREDITS_BG3);
-        let (bg, _) = reaction_button_colors(&colors, false, false, false);
+        let (bg, _) = reaction_button_colors(&colors, false, false, false, true);
         assert_eq!(bg, colors.reaction_in_bg);
+    }
+
+    #[test]
+    fn buttons_below_a_bubble_use_the_service_colors() {
+        let colors = HistoryColors::from_palette(&Palette::for_mode(ThemeMode::Night));
+        // Not chosen: `msgServiceBg` with `msgServiceFg` text.
+        assert_eq!(
+            reaction_button_colors(&colors, false, false, false, false),
+            (colors.service_bg, colors.service_fg)
+        );
+        // Chosen: a `msgServiceFg` pill, the text is the service background made opaque enough.
+        let (bg, fg) = reaction_button_colors(&colors, true, true, false, false);
+        assert_eq!(bg, colors.service_fg);
+        assert!(fg.to_srgba_unmultiplied()[3] >= 192, "{fg:?}");
+        let (got, want) = (
+            fg.to_srgba_unmultiplied(),
+            colors.service_bg.to_srgba_unmultiplied(),
+        );
+        assert!(
+            (0..3).all(|i| got[i].abs_diff(want[i]) <= 2),
+            "{got:?} vs {want:?}"
+        );
+        // A chosen paid reaction is `creditsBg2`.
+        assert_eq!(
+            reaction_button_colors(&colors, true, false, true, false).0,
+            CREDITS_BG2
+        );
+    }
+
+    #[test]
+    fn known_reactors_and_private_chats_give_userpics() {
+        let reaction = ReactionCounter {
+            emoji: "❤".to_owned(),
+            count: 2,
+            chosen: true,
+        };
+        let a = (PeerId::from_user(1), "A".to_owned());
+        let b = (PeerId::from_user(2), "B".to_owned());
+        let recent = [RecentReactors {
+            reaction: "❤".to_owned(),
+            peers: vec![a.clone(), b.clone()],
+        }];
+        assert_eq!(reaction_peers(&reaction, &recent, None), Some(vec![&a, &b]));
+        assert_eq!(
+            reaction_peers(&reaction, &[], None),
+            None,
+            "unknown: the count"
+        );
+        let private = ReactionUserpics {
+            peer: b.clone(),
+            me: a.clone(),
+        };
+        // `InlineListDataFromMessage` for a user: the partner, then the user.
+        assert_eq!(
+            reaction_peers(&reaction, &[], Some(&private)),
+            Some(vec![&b, &a])
+        );
+        let only_mine = ReactionCounter {
+            count: 1,
+            ..reaction
+        };
+        assert_eq!(
+            reaction_peers(&only_mine, &[], Some(&private)),
+            Some(vec![&a])
+        );
+        assert_eq!(userpics_width(1), 20.0);
+        assert_eq!(userpics_width(3), 20.0 + 2.0 * 13.0);
     }
 
     #[test]
@@ -259,3 +417,8 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tests_tgb3182_reactions_snap.rs"]
+#[cfg(test)]
+mod tests_tgb3182_reactions_snap;

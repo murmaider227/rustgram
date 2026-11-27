@@ -33,6 +33,7 @@ use tg_text::emoji as tg_emoji_db;
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 use tracing::debug;
 
+use crate::bridge::LiveBridgeState;
 use crate::convert::{
     avatar_rgb_for_color_index, history_messages_ordered, known_peer_ids, now_unix_i32,
     to_data_peer,
@@ -46,9 +47,11 @@ use tg_app_core::chat_helpers::backend::{
     SearchStickersRequest, StickerMedia,
 };
 use tg_app_core::core_types::dto::rich_compose::MentionCandidate;
+use tg_app_core::core_types::erased_rpc::ErasedRpcClient;
 use tg_app_core::dialogs::backend::DialogsBackend;
 use tg_app_core::settings::backend::StickerSetInfo;
 use tg_app_core::stand_in::types::{MsgId, PeerId};
+use tg_session::SessionRuntime;
 
 /// Default RPC timeout for chat-helper requests.
 const CHAT_HELPERS_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2813,35 +2816,7 @@ impl LiveSession {
     }
 
     fn load_sticker_media_inner(&self, id: ChatDocId) -> Option<StickerMedia> {
-        let meta = {
-            let Ok(mut g) = self.ch_state().inner.lock() else {
-                return None;
-            };
-            if let Some(cached) = g.sticker_media_cache.get(&id) {
-                return cached.clone();
-            }
-            if g.sticker_media_in_flight.contains(&id) {
-                return None;
-            }
-            let meta = g.doc_meta.get(&id)?.clone();
-            g.sticker_media_in_flight.insert(id);
-            meta
-        };
-
-        let state = Arc::clone(&self.chat_helpers.state);
-        let bridge = Arc::downgrade(self.bridge_state());
-        let rpc = self.runtime().rpc().clone();
-        self.runtime().tokio_handle().spawn(async move {
-            let resolved = fetch_sticker_media_async(&rpc, &meta).await;
-            if let Ok(mut g) = state.inner.lock() {
-                g.sticker_media_in_flight.remove(&id);
-                g.sticker_media_cache.insert(id, resolved);
-            }
-            if let Some(b) = bridge.upgrade() {
-                b.notify_ui();
-            }
-        });
-        None
+        load_sticker_media(self.ch_state(), self.runtime(), self.bridge_state(), id)
     }
 
     /// Returns frame `frame_index` of GIF `id`. Frames that need a download are fetched and
@@ -3111,6 +3086,46 @@ fn decode_fallback_static_thumb(meta: &LiveDocumentMeta) -> Option<StickerMedia>
             rgba,
         });
     }
+    None
+}
+
+/// The media of sticker `id` (a document the session knows from a pack, `doc_meta`): cached, or
+/// downloaded in the background with the pack's file reference (`None` until then; the UI is
+/// woken when it lands).
+pub(crate) fn load_sticker_media(
+    state: &Arc<LiveChatHelpersState>,
+    runtime: &Arc<SessionRuntime<ErasedRpcClient>>,
+    bridge: &Arc<LiveBridgeState>,
+    id: ChatDocId,
+) -> Option<StickerMedia> {
+    let meta = {
+        let Ok(mut g) = state.inner.lock() else {
+            return None;
+        };
+        if let Some(cached) = g.sticker_media_cache.get(&id) {
+            return cached.clone();
+        }
+        if g.sticker_media_in_flight.contains(&id) {
+            return None;
+        }
+        let meta = g.doc_meta.get(&id)?.clone();
+        g.sticker_media_in_flight.insert(id);
+        meta
+    };
+
+    let state = Arc::clone(state);
+    let bridge = Arc::downgrade(bridge);
+    let rpc = runtime.rpc().clone();
+    runtime.tokio_handle().spawn(async move {
+        let resolved = fetch_sticker_media_async(&rpc, &meta).await;
+        if let Ok(mut g) = state.inner.lock() {
+            g.sticker_media_in_flight.remove(&id);
+            g.sticker_media_cache.insert(id, resolved);
+        }
+        if let Some(b) = bridge.upgrade() {
+            b.notify_ui();
+        }
+    });
     None
 }
 

@@ -13,6 +13,7 @@
 //! - `Telegram/SourceFiles/settings/sections/settings_local_storage.cpp`
 
 mod lru;
+mod refresh;
 mod store;
 
 use std::collections::{HashMap, HashSet};
@@ -34,11 +35,12 @@ use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
 use self::lru::ByteLru;
+pub use self::refresh::RefreshOrigin;
 use self::store::{Priority, Store, StoreActor};
 use crate::bridge::LiveBridgeState;
 use crate::media::{
-    ResolvedMediaLocation, document_thumb_location, document_to_location,
-    download_file_bytes_with_progress_async, photo_thumb_location, photo_to_location,
+    ResolvedMediaLocation, document_thumb_location, document_to_location, photo_thumb_location,
+    photo_to_location,
 };
 use tg_app_core::core_types::dto::inline_media::{
     InlineMediaDescriptor, PhotoLoadState, VoiceLoadState,
@@ -726,6 +728,7 @@ impl LiveMediaCache {
             handle,
             bridge,
             ReadMode::Blocking,
+            None,
         )
     }
 
@@ -740,6 +743,7 @@ impl LiveMediaCache {
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
         mode: ReadMode,
+        refresh: Option<&RefreshOrigin>,
     ) -> CacheFetchState {
         if resolved.size > MAX_INLINE_AUTO_DOWNLOAD_BYTES {
             return CacheFetchState::Skipped;
@@ -766,8 +770,9 @@ impl LiveMediaCache {
                 return CacheFetchState::Skipped;
             }
             if guard.misses.contains(&key) {
-                return self
-                    .begin_download(guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge);
+                return self.begin_download(
+                    guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge, refresh,
+                );
             }
             if mode == ReadMode::NonBlocking && guard.reading.contains(&key) {
                 return CacheFetchState::Pending;
@@ -784,6 +789,7 @@ impl LiveMediaCache {
             let handle = handle.clone();
             let bridge = Arc::clone(bridge);
             let counters = Arc::clone(&self.counters);
+            let refresh = refresh.cloned();
             let posted = self.actor.post(Priority::Read, move |store| {
                 if store.id != store_id {
                     return;
@@ -791,7 +797,16 @@ impl LiveMediaCache {
                 counters.disk_reads.fetch_add(1, Ordering::Relaxed);
                 let data = store.read(&key);
                 cache.finish_read(
-                    store_id, key, data, tag, resolved, tgs_doc_id, &rpc, &handle, &bridge,
+                    store_id,
+                    key,
+                    data,
+                    tag,
+                    resolved,
+                    tgs_doc_id,
+                    &rpc,
+                    &handle,
+                    &bridge,
+                    refresh.as_ref(),
                 );
             });
             if !posted {
@@ -831,7 +846,9 @@ impl LiveMediaCache {
                         total_bytes: flight.total_bytes,
                     };
                 }
-                self.begin_download(guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge)
+                self.begin_download(
+                    guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge, refresh,
+                )
             }
         }
     }
@@ -850,6 +867,7 @@ impl LiveMediaCache {
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
+        refresh: Option<&RefreshOrigin>,
     ) {
         let mut guard = self.lock();
         if guard.store_id != store_id {
@@ -867,8 +885,9 @@ impl LiveMediaCache {
             None => {
                 guard.note_miss(&key);
                 if !guard.in_flight.contains_key(&key) {
-                    let _ = self
-                        .begin_download(guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge);
+                    let _ = self.begin_download(
+                        guard, key, tag, resolved, tgs_doc_id, rpc, handle, bridge, refresh,
+                    );
                 }
             }
         }
@@ -887,6 +906,7 @@ impl LiveMediaCache {
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
+        refresh: Option<&RefreshOrigin>,
     ) -> CacheFetchState {
         let store_id = guard.store_id;
         let token = NEXT_FLIGHT_TOKEN.fetch_add(1, Ordering::Relaxed);
@@ -908,6 +928,7 @@ impl LiveMediaCache {
         let expected_size = (resolved.size > 0).then_some(resolved.size);
         let total_hint = resolved.size;
         let started = Instant::now();
+        let refresh = refresh.cloned();
         debug!(key = %key, dc = resolved.dc_id, size = total_hint, "inline media download started");
 
         let task = handle.spawn(async move {
@@ -915,8 +936,9 @@ impl LiveMediaCache {
             let progress_key = key_task.clone();
             let progress_bridge = Arc::clone(&bridge);
 
-            let res = download_file_bytes_with_progress_async(
+            let res = refresh::download(
                 &rpc,
+                refresh,
                 resolved.dc_id,
                 resolved.location,
                 expected_size,
@@ -1169,6 +1191,22 @@ impl LiveMediaCache {
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
     ) -> CacheFetchState {
+        self.fetch_nonblocking_from(key, tag, resolved, None, rpc, handle, bridge)
+    }
+
+    /// [`Self::fetch_nonblocking`] whose download fetches an expired `file_reference` again
+    /// from `refresh` (`Data::FileOrigin`, `FileLoader` on `FILE_REFERENCE_*` errors).
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_nonblocking_from<C: RpcClient + Clone + 'static>(
+        &self,
+        key: String,
+        tag: MediaCacheTag,
+        resolved: ResolvedMediaLocation,
+        refresh: Option<&RefreshOrigin>,
+        rpc: &C,
+        handle: &Handle,
+        bridge: &Arc<LiveBridgeState>,
+    ) -> CacheFetchState {
         self.fetch(
             key,
             tag,
@@ -1178,6 +1216,7 @@ impl LiveMediaCache {
             handle,
             bridge,
             ReadMode::NonBlocking,
+            refresh,
         )
     }
 
@@ -1204,16 +1243,32 @@ impl LiveMediaCache {
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
     ) -> Option<InlineMediaDescriptor> {
+        self.inline_media_descriptor_refreshing(msg, photo_autoload, None, rpc, handle, bridge)
+    }
+
+    /// [`Self::inline_media_descriptor_for_message_with`] whose sticker download asks the server
+    /// for `msg` again when its `file_reference` expired (`session` is the live session).
+    pub fn inline_media_descriptor_refreshing<C: RpcClient + Clone + 'static>(
+        &self,
+        msg: &Message,
+        photo_autoload: bool,
+        session: Option<&Arc<tokio::sync::RwLock<tg_data::Session>>>,
+        rpc: &C,
+        handle: &Handle,
+        bridge: &Arc<LiveBridgeState>,
+    ) -> Option<InlineMediaDescriptor> {
         let MessageContent::Regular { media, .. } = &msg.content else {
             return None;
         };
-        self.descriptor_for_media(media, photo_autoload, rpc, handle, bridge)
+        let refresh = session.map(|session| RefreshOrigin::message(session, msg));
+        self.descriptor_for_media(media, photo_autoload, refresh.as_ref(), rpc, handle, bridge)
     }
 
     fn descriptor_for_media<C: RpcClient + Clone + 'static>(
         &self,
         media: &MessageMedia,
         photo_autoload: bool,
+        refresh: Option<&RefreshOrigin>,
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
@@ -1223,20 +1278,20 @@ impl LiveMediaCache {
                 Some(self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge))
             }
             MessageMedia::Document(doc) => {
-                self.descriptor_for_document(doc, photo_autoload, rpc, handle, bridge)
+                self.descriptor_for_document(doc, photo_autoload, refresh, rpc, handle, bridge)
             }
             MessageMedia::WebPage(wp) => {
                 if let Some(ref photo) = wp.photo {
                     Some(self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge))
                 } else if let Some(ref doc) = wp.document {
-                    self.descriptor_for_document(doc, photo_autoload, rpc, handle, bridge)
+                    self.descriptor_for_document(doc, photo_autoload, None, rpc, handle, bridge)
                 } else {
                     None
                 }
             }
             MessageMedia::Game(game) => {
                 if let Some(ref doc) = game.document {
-                    self.descriptor_for_document(doc, photo_autoload, rpc, handle, bridge)
+                    self.descriptor_for_document(doc, photo_autoload, None, rpc, handle, bridge)
                 } else {
                     game.photo.as_ref().map(|photo| {
                         self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge)
@@ -1249,6 +1304,7 @@ impl LiveMediaCache {
                         return self.descriptor_for_media(
                             inner,
                             photo_autoload,
+                            None,
                             rpc,
                             handle,
                             bridge,
@@ -1266,7 +1322,7 @@ impl LiveMediaCache {
             }
             MessageMedia::Invoice(inv) => match inv.extended_media.as_deref() {
                 Some(ExtendedMedia::Media(inner)) => {
-                    self.descriptor_for_media(inner, photo_autoload, rpc, handle, bridge)
+                    self.descriptor_for_media(inner, photo_autoload, None, rpc, handle, bridge)
                 }
                 Some(ExtendedMedia::Preview { .. }) => Some(InlineMediaDescriptor {
                     has_spoiler: true,
@@ -1321,6 +1377,7 @@ impl LiveMediaCache {
         &self,
         doc: &DocumentData,
         autoload: bool,
+        refresh: Option<&RefreshOrigin>,
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
@@ -1454,7 +1511,7 @@ impl LiveMediaCache {
             DocumentKind::AnimatedSticker => {
                 let resolved = document_to_location(doc);
                 let key = document_cache_key(resolved.dc_id, doc.id.0);
-                let _ = self.fetch_or_spawn(
+                let _ = self.fetch(
                     key,
                     MediaCacheTag::Sticker,
                     resolved,
@@ -1462,6 +1519,8 @@ impl LiveMediaCache {
                     rpc,
                     handle,
                     bridge,
+                    ReadMode::Blocking,
+                    refresh,
                 );
                 Some(desc)
             }
@@ -1469,7 +1528,7 @@ impl LiveMediaCache {
                 desc.is_video_sticker = true;
                 let resolved = document_to_location(doc);
                 let key = document_cache_key(resolved.dc_id, doc.id.0);
-                if let CacheFetchState::Ready(bytes) = self.fetch_or_spawn(
+                if let CacheFetchState::Ready(bytes) = self.fetch(
                     key,
                     MediaCacheTag::Sticker,
                     resolved,
@@ -1477,6 +1536,8 @@ impl LiveMediaCache {
                     rpc,
                     handle,
                     bridge,
+                    ReadMode::Blocking,
+                    refresh,
                 ) {
                     desc.video_data = Some(InlineDocumentData::Bytes(bytes.to_vec()));
                 }
@@ -1485,10 +1546,11 @@ impl LiveMediaCache {
             DocumentKind::Sticker => {
                 let resolved = document_to_location(doc);
                 let key = document_cache_key(resolved.dc_id, doc.id.0);
-                desc.photo_load = photo_load_state(self.fetch_nonblocking(
+                desc.photo_load = photo_load_state(self.fetch_nonblocking_from(
                     key,
                     MediaCacheTag::Sticker,
                     resolved,
+                    refresh,
                     rpc,
                     handle,
                     bridge,

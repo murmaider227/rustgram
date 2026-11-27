@@ -2263,8 +2263,11 @@ impl HistoryInnerWidget {
 
     /// Prepends older messages while keeping the user's viewport anchored to the exact same message!
     pub fn prepend_older_slice(&mut self, older: HistorySlice, peer_kind: PeerKind) {
+        // An empty page reaches the top only when the backend says so: a page that failed to
+        // load is empty too, and taking it for the top would hide the rest of the history
+        // (TGB-3176). The backend waits before it asks the server again.
         if older.messages.is_empty() {
-            self.list.loaded_at_top = true;
+            self.list.loaded_at_top = older.loaded_at_top;
             return;
         }
         let vis_bot = (self.effective_scroll_top() + self.last_viewport_h).round() as i32;
@@ -2324,8 +2327,9 @@ impl HistoryInnerWidget {
 
     /// Appends newer messages when scrolling downward in a jumped-to historical slice.
     pub fn append_newer_slice(&mut self, newer: HistorySlice, peer_kind: PeerKind) {
+        // Like [`Self::prepend_older_slice`]: only the backend knows the bottom is reached.
         if newer.messages.is_empty() {
-            self.list.loaded_at_bottom = true;
+            self.list.loaded_at_bottom = newer.loaded_at_bottom;
             return;
         }
         if let Some(prev_last) = self.messages.last() {
@@ -4643,11 +4647,7 @@ fn build_media_input(
             max_status_width: 0,
             is_streaming: true,
             unwrapped_additional_width: 0,
-            reactions_optimal_width: measure_reactions_size(
-                &msg.reactions,
-                matches!(msg.peer_id.kind(), PeerKind::User),
-            )
-            .width,
+            reactions_optimal_width: measure_reactions_size(msg).width,
             hosted_instant_view: false,
         }),
         HistoryMedia::Game(g) => {
@@ -5156,10 +5156,7 @@ fn compute_item_layout_egui_with_quotes(
         reaction_button_widths: crate::history::bubble_info::reaction_chip_widths(
             ui.painter(),
             &msg.reactions,
-            matches!(msg.peer_id.kind(), PeerKind::User).then_some(
-                &crate::history::bubble::reaction_userpics_chip_width
-                    as &dyn Fn(&crate::history::backend::ReactionCounter) -> i32,
-            ),
+            &|r| crate::history::bubble::reaction_userpics_chip_width(msg, r),
         ),
         reactions_in_bubble: true,
         has_comments_button: msg.is_post && msg.extra.replies_count.is_some(),
@@ -5428,10 +5425,7 @@ fn compute_item_layout_headless(
             )
         ),
         bottom_info,
-        reactions_size: measure_reactions_size(
-            &msg.reactions,
-            matches!(msg.peer_id.kind(), PeerKind::User),
-        ),
+        reactions_size: measure_reactions_size(msg),
         reactions_in_bubble: true,
         has_comments_button: msg.is_post && msg.extra.replies_count.is_some(),
         comments_text_width: msg.extra.replies_count.map_or(0, |c| {

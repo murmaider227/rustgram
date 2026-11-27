@@ -25,6 +25,7 @@ mod e2e_layer233;
 mod e2e_live_window;
 mod e2e_multi_account;
 mod e2e_notifications;
+mod e2e_owner3_topbar;
 mod e2e_peer_management;
 mod e2e_profile_extras;
 mod e2e_profile_media;

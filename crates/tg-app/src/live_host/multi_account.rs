@@ -832,6 +832,10 @@ impl MultiAccountWorkspaceHost {
                     .controller_mut()
                     .set_native_hwnd(self.native_hwnd);
                 next.workspace.controller_mut().adopt_theme(&self.settings);
+                // `thirdSectionInfoEnabled` and the column widths are app-wide (TGB-3186).
+                next.workspace
+                    .controller_mut()
+                    .adopt_columns(self.settings.columns);
             }
             if let Ok(mut guard) = self.notify_state.lock() {
                 guard.active_slot = slot_index;
@@ -1350,6 +1354,7 @@ impl MultiAccountWorkspaceHost {
     pub fn on_exit(&mut self) {
         if let Some(active) = self.accounts.get(&self.active_slot) {
             self.settings = active.workspace.controller().settings().clone();
+            self.settings.columns = active.workspace.controller().saved_columns();
         }
         if let Some(notify_tray) = self.notify_tray.as_mut() {
             notify_tray.on_exit();
@@ -1360,6 +1365,12 @@ impl MultiAccountWorkspaceHost {
         let entries = std::mem::take(&mut self.accounts);
         for (slot_index, mut entry) in entries {
             entry.workspace.live_session().cleanup_account_temp_files();
+            // Every window saves into the same file: all of them save the active window's
+            // columns, so a background account cannot bring back a closed third column.
+            entry
+                .workspace
+                .controller_mut()
+                .adopt_columns(self.settings.columns);
             entry.workspace.on_exit();
             let runtime = entry.runtime;
             drop(entry.workspace);

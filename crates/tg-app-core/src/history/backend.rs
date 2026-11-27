@@ -954,6 +954,18 @@ pub struct MessageExtra {
     /// The message is protected (`noforwards`, `HistoryItem::forbidsForward`): its text is
     /// not copied and it is not forwarded.
     pub no_forwards: bool,
+    /// Who reacted, per reaction, when the reaction buttons show userpics instead of counts in
+    /// a group or channel (`InlineListData::recent`). Empty: the buttons show counts.
+    pub recent_reactors: Vec<RecentReactors>,
+}
+
+/// The recent reactors of one reaction button (`InlineListData::recent` entry).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecentReactors {
+    /// Reaction key, as in [`ReactionCounter::emoji`].
+    pub reaction: String,
+    /// The reactors in the server's order, with display names for the empty userpic.
+    pub peers: Vec<(PeerId, String)>,
 }
 
 /// Who a sender is in a group, which picks the badge colour (`HistoryView::BadgeRole`).
@@ -2723,6 +2735,13 @@ pub trait HistoryBackend: Send {
     /// Returns `true` if 1:1 content-sharing protection (`noforwards`) is enabled by us for `peer_id`.
     fn peer_no_forwards_enabled(&self, _peer_id: PeerId) -> bool {
         false
+    }
+
+    /// The rights and flags the chat's "three dots" menu reads (`Window::Filler`). The default
+    /// guesses from [`HistoryBackend::peer_info`].
+    fn peer_menu_caps(&self, peer_id: PeerId) -> Option<crate::history::peer_menu::PeerMenuCaps> {
+        self.peer_info(peer_id)
+            .map(|info| crate::history::peer_menu::PeerMenuCaps::from_peer_info(&info))
     }
 
     /// Returns `true` if a `NoForwardsRequest` service message at `(peer_id, msg_id)` has already

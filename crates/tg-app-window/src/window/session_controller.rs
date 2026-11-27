@@ -405,31 +405,42 @@ impl SessionController {
         }
     }
 
-    /// Toggles the peer info view when the user clicks the chat header or info button.
+    /// The chat top bar's info button (`TopBarWidget::toggleInfoSection`): closes the third
+    /// column when it shows the info, opens the info there when the window is wide enough
+    /// (remembering `thirdSectionInfoEnabled`), and otherwise does what a click on the chat
+    /// title does ([`Self::show_peer_info_layer`]).
     pub fn toggle_peer_info(&mut self, peer_id: PeerId) {
         if peer_id.is_zero() {
             return;
         }
-        if self.can_show_third_section_without_resize() {
-            if self.columns.third_section_info_enabled() && self.third_section.is_some() {
-                self.close_third_section();
-            } else {
-                self.show_peer_info(peer_id, SectionShow::forward());
-            }
-        } else if matches!(
-            self.main_section,
-            Some(SectionMemento::PeerInfo { peer_id: p, .. }) if p == peer_id
-        ) {
-            self.show_back_from_stack(SectionShow::forward());
+        if self.adaptive.is_three_column() && self.columns.third_section_info_enabled() {
+            self.close_third_section();
+        } else if self.can_show_third_section_without_resize() {
+            self.show_peer_info(peer_id, SectionShow::forward());
         } else {
-            self.show_section(
-                SectionMemento::PeerInfo {
-                    peer_id,
-                    tab: InfoTab::Overview,
-                },
-                SectionShow::forward(),
-            );
+            self.show_peer_info_layer(peer_id);
         }
+    }
+
+    /// A click on the chat title (`TopBarWidget::infoClicked` -> `showPeerInfo` with default
+    /// `SectionShow`): `MainWidget::showNewSection` never puts it in the third column, so the
+    /// profile becomes the main section, which the window draws as `Info::LayerWidget` over the
+    /// chat once it is at least `LayerWidget::MinimalSupportedWidth` wide.
+    pub fn show_peer_info_layer(&mut self, peer_id: PeerId) {
+        if peer_id.is_zero() {
+            return;
+        }
+        // A layer does not slide the chat under it.
+        self.show_section(
+            SectionMemento::PeerInfo {
+                peer_id,
+                tab: InfoTab::Overview,
+            },
+            SectionShow {
+                animated: false,
+                ..SectionShow::forward()
+            },
+        );
     }
 
     /// Opens the Settings section (`SessionNavigation::showSettings`).
@@ -557,6 +568,23 @@ impl SessionController {
     /// Clears the navigation stack and active peer (`SessionNavigation::clearSectionStack`).
     pub fn clear_section_stack(&mut self, params: SectionShow) {
         self.show_peer_history(PeerId::ZERO, params, MsgId::SHOW_AT_UNREAD);
+    }
+
+    /// Takes over column settings saved by another window of the app. In tdesktop
+    /// `thirdSectionInfoEnabled` and the column widths live in `Core::App().settings()`, shared by
+    /// every account, so a third column closed in one account's window stays closed in the
+    /// others.
+    pub fn adopt_saved_columns(&mut self, saved: SavedWindowColumns) {
+        if self.columns.saved() == saved {
+            return;
+        }
+        self.columns = WindowColumnsState::from_saved(saved);
+        if !saved.third_section_info_enabled
+            && matches!(self.third_section, Some(SectionMemento::PeerInfo { .. }))
+        {
+            self.third_section = None;
+        }
+        self.update_layout(self.last_layout.body_width + self.last_layout.filters_width);
     }
 
     /// Closes the third column and clears its settings toggles (`SessionController::closeThirdSection`).

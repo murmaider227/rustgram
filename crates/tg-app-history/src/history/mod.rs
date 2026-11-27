@@ -38,6 +38,7 @@ pub mod monoforum;
 pub mod name_line;
 pub mod no_forwards_request;
 pub mod paint_cache;
+pub mod peer_menu;
 pub mod photo_frame;
 pub mod pull_to_next_channel;
 pub mod quick_action;
@@ -106,6 +107,8 @@ mod tests_message_links;
 mod tests_open_at_bottom;
 #[cfg(test)]
 mod tests_open_at_unread;
+#[cfg(test)]
+mod tests_peer_menu;
 #[cfg(test)]
 mod tests_perf_frame;
 #[cfg(test)]
@@ -223,7 +226,7 @@ use crate::history::bars::{
     ContactStatusEvent, JOIN_REQUESTS_BAR_HEIGHT, PINNED_BAR_HEIGHT, PinnedBarEvent, TopBarEvent,
     UPLOAD_PROGRESS_ROW_HEIGHT, paint_bot_start_bar, paint_business_bot_bar,
     paint_contact_status_bar_with_confirm, paint_join_requests_bar, paint_pinned_bar,
-    paint_scroll_to_bottom_button, paint_selection_top_bar, paint_top_bar,
+    paint_scroll_to_bottom_button, paint_selection_top_bar, paint_top_bar_with_menu,
     paint_upload_progress_bar,
 };
 use crate::history::compose::{ComposeBotChrome, ComposeControls, ComposeEvent, SendShortcut};
@@ -250,6 +253,7 @@ use crate::history::sections_ui::{
     SubsectionTabsWidget,
 };
 use crate::history::theme::HistoryColors;
+use tg_app_core::history::peer_menu::PeerMenuCaps;
 use tg_app_core::stand_in::strings::Strings;
 use tg_app_core::stand_in::theme::Palette;
 use tg_app_core::stand_in::types::{FullMsgId, MessageItem, MsgId, PeerId, PeerKind, PeerSummary};
@@ -321,8 +325,10 @@ pub type EmojiPanelCallback = Box<dyn FnMut(PeerId) + Send>;
 pub enum HistoryAction {
     /// User clicked the top-left Back button.
     Back,
-    /// User clicked the peer header or Info toggle button.
+    /// User clicked the third-column info button (`TopBarWidget::toggleInfoSection`).
     TogglePeerInfo(PeerId),
+    /// User clicked the chat title (`TopBarWidget::infoClicked` -> `showPeerInfo`).
+    ShowPeerInfo(PeerId),
     /// User submitted a message from the compose bar.
     SendMessage {
         /// Target peer id.
@@ -464,6 +470,14 @@ pub enum HistoryAction {
     OpenPeerProfile(PeerId),
     /// Informational toast message to display in the host shell.
     Toast(String),
+    /// A chat menu row the window runs (`Filler::fillHistoryActions`): info, manage, boost,
+    /// export, report, clear / delete / leave, mute options, discussion.
+    PeerMenu {
+        /// The chat.
+        peer_id: PeerId,
+        /// The chosen row.
+        command: peer_menu::PeerMenuCommand,
+    },
 }
 
 /// Complete stateful chat history view (`HistoryWidget`).
@@ -1440,6 +1454,31 @@ impl HistoryWidget {
 
     /// Reloads the active peer's latest history slice from `backend` (e.g. after a sticker, GIF,
     /// or notification quick-reply was added outside the compose bar).
+    /// The chat menu's "Disable sharing" / "Enable sharing" (`Filler::addToggleNoForwards`,
+    /// `messages.toggleNoForwards`).
+    fn toggle_peer_no_forwards(
+        &mut self,
+        backend: &mut dyn HistoryBackend,
+        peer_id: PeerId,
+        now_secs: f64,
+    ) {
+        let next_enabled = !backend.peer_no_forwards_enabled(peer_id);
+        match backend.toggle_peer_no_forwards(peer_id, next_enabled, None) {
+            Ok(()) => {
+                self.show_toast(
+                    if next_enabled {
+                        "Sharing disabled in this chat"
+                    } else {
+                        "Requested to enable sharing in this chat"
+                    },
+                    now_secs,
+                );
+                self.reload_active_peer(backend);
+            }
+            Err(err) => self.show_toast(err, now_secs),
+        }
+    }
+
     pub fn reload_active_peer(&mut self, backend: &dyn HistoryBackend) {
         if self.active_peer.is_zero() {
             return;
@@ -2420,7 +2459,9 @@ impl HistoryWidget {
             }
             None
         } else {
-            paint_top_bar(
+            let menu_backend: &dyn HistoryBackend = backend;
+            let menu_rows = || peer_menu::host_peer_menu_rows(menu_backend, &peer_info, info_open);
+            paint_top_bar_with_menu(
                 ui,
                 top_rect,
                 &peer_info,
@@ -2428,12 +2469,14 @@ impl HistoryWidget {
                 info_open,
                 self.search_open,
                 &colors,
+                &menu_rows,
             )
         };
         if let Some(ev) = top_event {
             match ev {
                 TopBarEvent::Back => action = Some(HistoryAction::Back),
                 TopBarEvent::ToggleInfo => action = Some(HistoryAction::TogglePeerInfo(peer_id)),
+                TopBarEvent::ShowInfo => action = Some(HistoryAction::ShowPeerInfo(peer_id)),
                 TopBarEvent::ToggleSearch => {
                     if self.search_open {
                         self.close_chat_search();
@@ -2441,39 +2484,39 @@ impl HistoryWidget {
                         self.open_chat_search();
                     }
                 }
-                TopBarEvent::ToggleMute => {
-                    let muted = backend.toggle_mute(peer_id);
-                    self.show_toast(
-                        if muted {
-                            "Notifications muted"
-                        } else {
-                            "Notifications unmuted"
-                        },
-                        now_secs,
-                    );
-                }
-                TopBarEvent::OpenDirectMessages => {
-                    self.open_monoforum_section(
-                        peer_id,
-                        peer_info.summary.title.clone(),
-                        peer_info.summary.can_send,
-                    );
-                }
-                TopBarEvent::ToggleNoForwards => {
-                    let next_enabled = !backend.peer_no_forwards_enabled(peer_id);
-                    match backend.toggle_peer_no_forwards(peer_id, next_enabled, None) {
-                        Ok(()) => {
-                            self.show_toast(
-                                if next_enabled {
-                                    "Sharing disabled in this chat"
-                                } else {
-                                    "Requested to enable sharing in this chat"
-                                },
-                                now_secs,
-                            );
-                            self.reload_active_peer(backend);
+                TopBarEvent::PeerMenu(id) => {
+                    let caps = backend
+                        .peer_menu_caps(peer_id)
+                        .unwrap_or_else(|| PeerMenuCaps::from_peer_info(&peer_info));
+                    match peer_menu::peer_menu_command(&id, &caps) {
+                        // `notifySettings->update(.unmute)` / `MuteMenu` "Mute forever":
+                        // the row exists only in the matching state.
+                        Some(
+                            peer_menu::PeerMenuCommand::Unmute
+                            | peer_menu::PeerMenuCommand::MuteForever,
+                        ) => {
+                            backend.toggle_mute(peer_id);
                         }
-                        Err(err) => self.show_toast(err, now_secs),
+                        Some(peer_menu::PeerMenuCommand::CreatePoll) => {
+                            self.poll_box = Some(CreatePollBoxState::new());
+                        }
+                        Some(peer_menu::PeerMenuCommand::CreateTodoList) => {
+                            self.open_create_todo_box();
+                        }
+                        Some(peer_menu::PeerMenuCommand::DirectMessages) => {
+                            self.open_monoforum_section(
+                                peer_id,
+                                peer_info.summary.title.clone(),
+                                peer_info.summary.can_send,
+                            );
+                        }
+                        Some(peer_menu::PeerMenuCommand::ToggleNoForwards) => {
+                            self.toggle_peer_no_forwards(backend, peer_id, now_secs);
+                        }
+                        Some(command) => {
+                            action = Some(HistoryAction::PeerMenu { peer_id, command });
+                        }
+                        None => {}
                     }
                 }
                 TopBarEvent::ForwardSelected => {

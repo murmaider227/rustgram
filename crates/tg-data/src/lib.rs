@@ -34,7 +34,7 @@ pub use forum::{
 };
 pub use history::{
     Draft, DraftKey, History, IdSlice, InboxReadOutcome, SparseIdsList, SparseIdsSnapshot,
-    WebPageDraft,
+    WebPageDraft, history_page_anchor,
 };
 pub use id::{
     ARCHIVE_FOLDER_ID, BareId, BotAppId, BusinessShortcutId, CANCELLED_WEB_PAGE_ID, CLIENT_MSG_IDS,
@@ -89,7 +89,7 @@ pub use scheduled::{
     hash_update_u32, hash_update_u64, scheduled_local_to_remote_id, scheduled_remote_to_local_id,
     shortcut_local_to_remote_id, shortcut_remote_to_local_id,
 };
-pub use session::{DefaultNotifyScope, Session};
+pub use session::{DefaultNotifyScope, HistoryPage, Session};
 pub use text::{EntityKind, FormattedDateFlags, TextEntity, TextWithEntities};
 pub use updates::{
     CHANNEL_GET_DIFF_LIMIT, ChannelUpdateEnvelope, CommonUpdateEnvelope,

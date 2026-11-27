@@ -1521,6 +1521,24 @@ pub struct MediaLayout {
 }
 
 impl MediaInput {
+    /// `Media::customInfoLayout`: the media draws the message's time itself (over a photo or
+    /// video, beside a sticker), so a message whose bubble ends with it shows its reactions
+    /// below the bubble (`Message::usesMessageInfoLayout`).
+    #[must_use]
+    pub fn custom_info_layout(&self) -> bool {
+        match self {
+            Self::Photo(_)
+            | Self::Sticker(_)
+            | Self::Gif(_)
+            | Self::Call(_)
+            | Self::LargeEmoji(_)
+            | Self::CustomEmoji(_) => true,
+            Self::Grouped(g) => g.mode != crate::grouped::GroupedMode::Column,
+            Self::Location(l) => l.title_height == 0 && l.description_height == 0,
+            Self::Document(_) | Self::WebPage(_) | Self::Poll(_) | Self::Contact(_) => false,
+        }
+    }
+
     /// Computes the optimal and current layout of this media at `available_width`.
     #[must_use]
     pub fn layout(

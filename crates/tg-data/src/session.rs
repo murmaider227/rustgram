@@ -50,6 +50,7 @@ pub const DEFAULT_MAIN_PINNED_LIMIT: usize = 5;
 /// Default pinned dialogs limit for the archive folder and custom filters.
 pub const DEFAULT_FOLDER_PINNED_LIMIT: usize = 100;
 
+mod history_pages;
 mod indices;
 mod notify_defaults;
 mod service_changes;
@@ -57,6 +58,7 @@ mod service_changes;
 mod tests_perf;
 mod unload;
 
+pub use history_pages::HistoryPage;
 pub use notify_defaults::DefaultNotifyScope;
 
 /// Central TL-independent domain data registry for a Telegram account (`Data::Session`).

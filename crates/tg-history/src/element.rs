@@ -684,12 +684,28 @@ pub struct MessageLayout {
     /// One rectangle per reaction chip in element coordinates (empty unless
     /// `MessageInput::reaction_button_widths` was set).
     pub reaction_buttons: Vec<Rect>,
+    /// True if the reactions sit inside the bubble (`Message::embedReactionsInBubble`); false
+    /// when they are drawn below it on the chat background, or when there are none.
+    pub reactions_in_bubble: bool,
     /// Inline keyboard rectangle below the bubble (empty if no keyboard).
     pub keyboard_rect: Rect,
     /// Comments button rectangle at the bottom of the bubble (empty if absent).
     pub comments_rect: Rect,
     /// Computed media layout details, if media is present.
     pub media_layout: Option<MediaLayout>,
+}
+
+impl MessageLayout {
+    /// [`Self::geometry`] without the reactions drawn below the bubble (`Message::draw`:
+    /// `g.setHeight(g.height() - reactionsHeight)` when `!embedReactionsInBubble()`).
+    #[must_use]
+    pub fn geometry_without_outside_reactions(&self) -> Rect {
+        let mut g = self.geometry;
+        if !self.reactions_in_bubble && !self.reactions_rect.is_empty() {
+            g.height = (self.reactions_rect.y - MEDIA_IN_BUBBLE_SKIP - g.y).max(0);
+        }
+        g
+    }
 }
 
 /// Breakdown of header heights stacked at the top of a message bubble.
@@ -884,6 +900,7 @@ pub fn layout_message(
             bottom_info: BottomInfoLayout::default(),
             reactions_rect: Rect::ZERO,
             reaction_buttons: Vec::new(),
+            reactions_in_bubble: false,
             keyboard_rect: Rect::ZERO,
             comments_rect: Rect::ZERO,
             media_layout: None,
@@ -929,7 +946,15 @@ pub fn layout_message(
 
     let chips = &input.reaction_button_widths;
     let has_reactions = !chips.is_empty() || !input.reactions_size.is_empty();
-    let reactions_in_bubble = has_reactions && input.reactions_in_bubble && draw_bubble;
+    // `Message::embedReactionsInBubble` = `usesMessageInfoLayout`: a bubble that ends with
+    // media drawing its own time (a photo, a video, a map) keeps its reactions below it.
+    let media_draws_info = probe_media.as_ref().is_some_and(|ml| ml.is_bubble_bottom)
+        && input
+            .media
+            .as_ref()
+            .is_some_and(MediaInput::custom_info_layout);
+    let reactions_in_bubble =
+        has_reactions && input.reactions_in_bubble && draw_bubble && !media_draws_info;
     // `Message::refreshInfoSkipBlock`: in-bubble reactions carry the bottom info's skip block.
     let reactions_skip = if reactions_in_bubble && !input.hides_bottom_info {
         Size::new(
@@ -1513,6 +1538,7 @@ pub fn layout_message(
         bottom_info,
         reactions_rect,
         reaction_buttons,
+        reactions_in_bubble,
         keyboard_rect,
         comments_rect,
         media_layout: final_media,

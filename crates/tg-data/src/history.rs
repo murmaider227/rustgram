@@ -47,6 +47,18 @@ impl IdSlice {
     }
 }
 
+/// The id a history page from `msg_id` is anchored at: `msg_id` itself for a server message,
+/// [`SERVER_MAX_MSG_ID`] for anything else (a local message being sent sits below every server
+/// message, so the page before it is the bottom of history).
+#[must_use]
+pub const fn history_page_anchor(msg_id: MsgId) -> MsgId {
+    if msg_id.is_server() {
+        msg_id
+    } else {
+        SERVER_MAX_MSG_ID
+    }
+}
+
 /// Result of querying a `SparseIdsList` around a target message ID
 /// (`Storage::SparseIdsListResult`).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -113,9 +125,33 @@ impl SparseIdsList {
 
     /// Returns `true` if `msg_id` is covered by any loaded slice.
     pub fn contains_range_for(&self, msg_id: MsgId) -> bool {
-        self.slices
-            .iter()
-            .any(|s| s.range.from <= msg_id && msg_id <= s.range.till)
+        self.slice_covering(msg_id).is_some()
+    }
+
+    /// The slice whose gap-free range covers `msg_id` (`from <= msg_id <= till`).
+    ///
+    /// Slices never overlap or share an id ([`Self::add_slice`] merges those into one), so
+    /// nothing between two slices is known to be loaded and a history page must stay inside
+    /// one slice (TGB-3176).
+    pub fn slice_covering(&self, msg_id: MsgId) -> Option<&IdSlice> {
+        let idx = self.slices.partition_point(|s| s.range.till < msg_id);
+        self.slices.get(idx).filter(|s| s.range.from <= msg_id)
+    }
+
+    /// `true` when every message older than `msg_id` is loaded: the slice covering `msg_id`
+    /// starts at the top of history. A slice at the top that is separated from `msg_id` by a
+    /// gap does not count (unlike [`Self::loaded_at_top`]). A non-server `msg_id` (a local
+    /// message) stands for the bottom of history.
+    pub fn loaded_at_top_from(&self, msg_id: MsgId) -> bool {
+        self.slice_covering(history_page_anchor(msg_id))
+            .is_some_and(|s| s.range.from == MsgId::ZERO)
+    }
+
+    /// `true` when every message newer than `msg_id` is loaded: the slice covering `msg_id`
+    /// reaches the bottom of history (the mirror of [`Self::loaded_at_top_from`]).
+    pub fn loaded_at_bottom_from(&self, msg_id: MsgId) -> bool {
+        self.slice_covering(history_page_anchor(msg_id))
+            .is_some_and(|s| s.range.till == SERVER_MAX_MSG_ID)
     }
 
     /// Returns the smallest loaded message ID, if any.

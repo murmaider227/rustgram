@@ -609,7 +609,21 @@ impl StickerSetBoxState {
                         StrokeKind::Inside,
                     );
 
-                    if let Some((w, h, ref rgba)) = item.thumb_rgba
+                    // The picture the preview came with, else the one the session loads from the
+                    // pack (`StickerSetBox::Inner::paintSticker` asks the document's media).
+                    let loaded = item
+                        .thumb_rgba
+                        .is_none()
+                        .then(|| tg_ui::sticker_thumbs::sticker_thumb(ui.ctx(), item.document_id))
+                        .flatten();
+                    let picture = match (&item.thumb_rgba, &loaded) {
+                        (Some((w, h, rgba)), _) => Some((*w, *h, rgba.as_slice())),
+                        (None, Some(thumb)) => {
+                            Some((thumb.width, thumb.height, thumb.rgba.as_slice()))
+                        }
+                        (None, None) => None,
+                    };
+                    if let Some((w, h, rgba)) = picture
                         && w > 0
                         && h > 0
                         && rgba.len() == (w as usize) * (h as usize) * 4
@@ -622,7 +636,7 @@ impl StickerSetBoxState {
                             h,
                             rgba,
                         );
-                        let img_rect = rect.shrink(4.0);
+                        let img_rect = fit_picture(rect.shrink(4.0), w, h);
                         ui.painter().image(
                             tex.id(),
                             img_rect,
@@ -947,6 +961,12 @@ fn format_item_tooltip(item: &StickerSetPreviewItem, idx: usize, is_emoji: bool)
     }
 }
 
+/// `w` x `h` scaled to fit `cell` whole and centred (a sticker keeps its shape).
+fn fit_picture(cell: Rect, w: u32, h: u32) -> Rect {
+    let scale = (cell.width() / w as f32).min(cell.height() / h as f32);
+    Rect::from_center_size(cell.center(), egui::vec2(w as f32, h as f32) * scale)
+}
+
 fn get_or_upload_preview_texture(
     ctx: &egui::Context,
     set_id: u64,
@@ -968,3 +988,8 @@ fn get_or_upload_preview_texture(
     ctx.data_mut(|d| d.insert_temp(key, handle.clone()));
     handle
 }
+
+#[cfg(test)]
+#[path = "tests_sticker_set_thumbs.rs"]
+#[cfg(test)]
+mod tests_sticker_set_thumbs;

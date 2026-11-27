@@ -33,8 +33,9 @@ pub(crate) fn first_open_needs_load(
         return true;
     }
     // A complete history needs no page, also when the chat has no messages: tdesktop's
-    // `isReadyFor(ShowAtUnreadMsgId)` is `loadedAtBottom()` there (TGB-3079).
-    if ranges.loaded_at_top() && ranges.loaded_at_bottom() {
+    // `isReadyFor(ShowAtUnreadMsgId)` is `loadedAtBottom()` there (TGB-3079). Complete is one
+    // range from the top to the bottom, not a range at each end with a gap between (TGB-3176).
+    if ranges.slices().len() == 1 && ranges.loaded_at_top() && ranges.loaded_at_bottom() {
         return false;
     }
     if ranges.is_empty() {

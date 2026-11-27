@@ -10,15 +10,13 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Pos2, Rect, Role, Sense, Shape, Stroke,
     Ui, Vec2, WidgetInfo,
 };
+use tg_app_info::dialogs::entry_menu::{EntryMenu, EntryMenuRow};
 use tg_ui::painter::BoxShadow;
-use tg_ui::stand_in::{
-    Align, BoxShadowStyle, Point, PopupMenuStyle, ToggleStyle, UnreadBadgeStyle,
-};
+use tg_ui::stand_in::{Align, BoxShadowStyle, Point, PopupMenuStyle, UnreadBadgeStyle};
 use tg_ui::unread_badge::{UnreadBadgeKind, paint_unread_badge};
 use tg_ui::userpic::EmptyUserpic;
 use tg_ui::widgets::buttons::{IconKind, paint_icon};
 use tg_ui::widgets::media_marker::{paint_media_marker, split_media_marker};
-use tg_ui::widgets::menu::{MenuItem, PopupMenuState};
 
 use crate::history::backend::{
     ContactStatusBanner, HistoryPeerInfo, MediaUploadStatus, PinnedMessageSummary,
@@ -45,16 +43,15 @@ const TOP_BAR_SKIP: f32 = -5.0;
 pub enum TopBarEvent {
     /// Back button clicked.
     Back,
-    /// Peer header or Info button clicked.
+    /// The third-column info button clicked (`TopBarWidget::toggleInfoSection`).
     ToggleInfo,
+    /// The chat title or the one-column userpic clicked (`TopBarWidget::infoClicked`).
+    ShowInfo,
     /// Search icon clicked.
     ToggleSearch,
-    /// Mute / unmute toggled.
-    ToggleMute,
-    /// Channel Direct Messages (monoforum) button clicked.
-    OpenDirectMessages,
-    /// Toggle 1:1 protected-chat sharing (`messages.toggleNoForwards`).
-    ToggleNoForwards,
+    /// A row of the chat "three dots" menu was chosen (its id from
+    /// [`crate::history::peer_menu::history_peer_menu_rows`]).
+    PeerMenu(String),
     /// Forward selected messages.
     ForwardSelected,
     /// Delete selected messages.
@@ -325,38 +322,8 @@ fn paint_top_bar_icon_button(
     resp.on_hover_text(label)
 }
 
-/// Chat menu (`TopBarWidget::showPeerMenu`) items available from the top bar.
-fn top_bar_menu_items(peer: &HistoryPeerInfo) -> Vec<MenuItem> {
-    let mut items = Vec::new();
-    if !peer.summary.is_saved_messages {
-        let label = if peer.summary.muted {
-            tg_lang::tr::lng_context_unmute()
-        } else {
-            tg_lang::tr::lng_context_mute()
-        };
-        items.push(MenuItem::action("mute", label));
-    }
-    match peer.summary.kind {
-        PeerKind::Channel => {
-            items.push(MenuItem::action(
-                "direct_messages",
-                tg_lang::tr::lng_profile_direct_messages(),
-            ));
-        }
-        PeerKind::User if !peer.summary.is_saved_messages => {
-            items.push(MenuItem::action(
-                "no_forwards",
-                tg_lang::tr::lng_disable_sharing(),
-            ));
-        }
-        _ => {}
-    }
-    items
-}
-
-/// Paints the normal history top bar (`history_view_top_bar_widget.cpp`, height `54px`):
-/// title + status on the left (back button and userpic only in one-column mode), and
-/// search, call / group call, profile toggle and chat menu buttons on the right.
+/// [`paint_top_bar_with_menu`] with the chat menu guessed from `peer` alone
+/// ([`tg_app_core::history::peer_menu::PeerMenuCaps::from_peer_info`]).
 #[allow(clippy::too_many_arguments)]
 pub fn paint_top_bar(
     ui: &mut Ui,
@@ -366,6 +333,43 @@ pub fn paint_top_bar(
     info_open: bool,
     search_open: bool,
     colors: &HistoryColors,
+) -> Option<TopBarEvent> {
+    let menu_rows = || {
+        crate::history::peer_menu::available_peer_menu_rows(
+            &tg_app_core::history::peer_menu::PeerMenuCaps::from_peer_info(peer),
+            crate::history::peer_menu::PeerMenuContext {
+                info_in_third_column: info_open,
+                ..Default::default()
+            },
+        )
+    };
+    paint_top_bar_with_menu(
+        ui,
+        rect,
+        peer,
+        can_go_back,
+        info_open,
+        search_open,
+        colors,
+        &menu_rows,
+    )
+}
+
+/// Paints the normal history top bar (`history_view_top_bar_widget.cpp`, height `54px`):
+/// title + status on the left (back button and userpic only in one-column mode), and
+/// search, call / group call, profile toggle and chat menu buttons on the right.
+/// `menu_rows` builds the chat menu (`TopBarWidget::showPeerMenu`); it runs only while the menu
+/// is open or being opened.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_top_bar_with_menu(
+    ui: &mut Ui,
+    rect: Rect,
+    peer: &HistoryPeerInfo,
+    can_go_back: bool,
+    info_open: bool,
+    search_open: bool,
+    colors: &HistoryColors,
+    menu_rows: &dyn Fn() -> Vec<EntryMenuRow>,
 ) -> Option<TopBarEvent> {
     use tg_ui::tg_style::st;
 
@@ -427,7 +431,7 @@ pub fn paint_top_bar(
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         if resp.clicked() {
-            event = Some(TopBarEvent::ToggleInfo);
+            event = Some(TopBarEvent::ShowInfo);
         }
     }
 
@@ -498,12 +502,13 @@ pub fn paint_top_bar(
         ),
         Vec2::new(8.0, 20.0),
     );
-    let menu_items = top_bar_menu_items(peer);
     let menu_state_id = base_id.with("menu_state");
-    let mut menu_state: PopupMenuState = ui
+    let mut menu_state: EntryMenu = ui
         .data_mut(|d| d.get_temp(menu_state_id))
         .unwrap_or_default();
-    let menu_style = PopupMenuStyle::default_popup(&ui_colors);
+    // `TopBarWidget::createMenu`: `st::popupMenuExpandedSeparator` (`popupMenuWithIcons`).
+    let menu_style = PopupMenuStyle::from_tg(&st::popup_menu_with_icons, &ui_colors);
+    let mut rows = None;
     if paint_top_bar_icon_button(
         ui,
         layout.menu_rect,
@@ -515,36 +520,30 @@ pub fn paint_top_bar(
         colors,
     )
     .clicked()
-        && !menu_items.is_empty()
     {
         if menu_state.is_open() {
             menu_state.close();
         } else {
-            menu_state.open_at(
-                ui.ctx(),
-                Pos2::new(
-                    layout.menu_rect.right() - 6.0 - menu_style.menu.width_min,
-                    rect.top() + 45.0,
-                ),
-                &menu_style,
-            );
+            let built = menu_rows();
+            // `showPeerMenu`: an empty menu is closed at once.
+            if !built.is_empty() {
+                // `topBarMenuPosition` (-6, 45) from the bar's top-right corner.
+                menu_state.open_below(ui.ctx(), Pos2::new(rect.right() - 6.0, rect.top() + 45.0));
+            }
+            rows = Some(built);
         }
     }
-    let toggle_style = ToggleStyle::default_toggle(&ui_colors);
-    if let Some(triggered) = menu_state.show(
-        ui.ctx(),
-        base_id.with("menu_popup"),
-        &menu_items,
-        &menu_style,
-        &toggle_style,
-    ) {
-        menu_state.close();
-        event = match triggered.as_str() {
-            "mute" => Some(TopBarEvent::ToggleMute),
-            "direct_messages" => Some(TopBarEvent::OpenDirectMessages),
-            "no_forwards" => Some(TopBarEvent::ToggleNoForwards),
-            _ => event,
-        };
+    if menu_state.is_open() {
+        let rows = rows.unwrap_or_else(menu_rows);
+        if let Some(triggered) = menu_state.show(
+            ui.ctx(),
+            base_id.with("menu_popup"),
+            &rows,
+            &menu_style,
+            &tg_ui::theme::ColorsResolver(&ui_colors),
+        ) {
+            event = Some(TopBarEvent::PeerMenu(triggered));
+        }
     }
     ui.data_mut(|d| d.insert_temp(menu_state_id, menu_state));
 
@@ -614,12 +613,12 @@ pub fn paint_top_bar(
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     let hdr_tooltip = if title_truncated {
-        format!("{} — Click to toggle chat info", peer.summary.title)
+        format!("{} — Click to open chat info", peer.summary.title)
     } else {
-        "Click to toggle chat info".to_owned()
+        "Click to open chat info".to_owned()
     };
     if hdr_resp.on_hover_text(hdr_tooltip).clicked() {
-        event = Some(TopBarEvent::ToggleInfo);
+        event = Some(TopBarEvent::ShowInfo);
     }
 
     // Bottom 1px shadow line (`st::shadowFg`).

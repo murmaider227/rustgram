@@ -1,8 +1,8 @@
 //! End-to-end UI tests for Peer Profile (wide vs narrow), Shared Media, and Media Viewer.
 //!
 //! Covers:
-//! - Open profile from the chat header in wide layout (ThreeColumn third column)
-//! - Open profile from the chat header in narrow layout (Normal / main stack)
+//! - Open profile from the chat header: a layer over the window at any width from 420 px
+//!   (`TopBarWidget::infoClicked` -> `Info::LayerWidget`, TGB-3184), never the third column
 //! - Open shared media and switch tabs
 //! - Open the fullscreen media viewer, navigate gallery with ArrowRight/ArrowLeft, close with Esc
 
@@ -17,7 +17,7 @@ use crate::common::{
     AppTestState, DEFAULT_MAX_FRAMES, build_harness, click_at, press_key, settle_layout, wait_until,
 };
 
-/// Computes a clickable point inside the chat header title region (triggers `TopBarEvent::ToggleInfo`).
+/// Computes a clickable point inside the chat header title region (triggers `TopBarEvent::ShowInfo`).
 fn chat_header_click_pos(harness: &egui_kittest::Harness<'_, AppTestState>) -> Pos2 {
     let geo = harness
         .state()
@@ -31,8 +31,9 @@ fn chat_header_click_pos(harness: &egui_kittest::Harness<'_, AppTestState>) -> P
 }
 
 #[test]
-fn profile_opens_in_third_column_when_wide_and_main_stack_when_narrow() {
-    // 1. Wide layout (1440x900): clicking chat header opens PeerInfo in the third column.
+fn profile_opens_as_a_layer_from_the_chat_header_at_any_width() {
+    // 1. Wide layout (1440x900): the header click opens the profile as a layer over the chat
+    // (`showPeerInfo` without `thirdColumn`), not in the third column (TGB-3184).
     let mut wide = build_harness(AppTestState::main_workspace(), Vec2::new(1440.0, 900.0));
     settle_layout(&mut wide);
 
@@ -41,16 +42,15 @@ fn profile_opens_in_third_column_when_wide_and_main_stack_when_narrow() {
     wait_until(
         &mut wide,
         DEFAULT_MAX_FRAMES,
-        "opening profile in 1440px window must activate ThreeColumn with PeerInfo",
+        "the header click in a 1440px window must open the profile layer",
         |h| {
             !h.state().controller.is_animating()
                 && h.state().controller.session().is_some_and(|s| {
-                    s.layout().window_layout == WindowLayout::ThreeColumn
-                        && matches!(
-                            s.third_section(),
-                            Some(SectionMemento::PeerInfo { peer_id, .. })
-                                if *peer_id == session_peers::GROUP_CORE
-                        )
+                    matches!(
+                        s.main_section(),
+                        Some(SectionMemento::PeerInfo { peer_id, .. })
+                            if *peer_id == session_peers::GROUP_CORE
+                    )
                 })
         },
     );
@@ -59,12 +59,13 @@ fn profile_opens_in_third_column_when_wide_and_main_stack_when_narrow() {
             .controller
             .session()
             .expect("session")
-            .main_section()
+            .third_section()
             .is_none(),
-        "wide profile must keep chat history visible in the main column"
+        "the header click never opens the third column"
     );
+    assert!(wide.state().controller.main_widget().info_shown_as_layer());
 
-    // 2. Narrow layout (800x700 -> body 728px < 932px): clicking chat header pushes PeerInfo onto main stack.
+    // 2. Narrow layout (800x700 -> body 728px < 932px): the same layer.
     let mut narrow = build_harness(AppTestState::main_workspace(), Vec2::new(800.0, 700.0));
     settle_layout(&mut narrow);
 

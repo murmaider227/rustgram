@@ -9,6 +9,7 @@
 
 mod bench_data;
 mod demo_photos;
+mod peer_menu_caps;
 #[cfg(test)]
 mod tests_demo_photos;
 mod versioned_state;
@@ -3357,6 +3358,12 @@ impl DialogsBackend for MockSession {
 // =============================================================================
 
 impl HistoryBackend for SharedSessionHandle {
+    fn peer_menu_caps(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<tg_app_core::history::peer_menu::PeerMenuCaps> {
+        peer_menu_caps::demo_peer_menu_caps(self, peer_id)
+    }
     fn self_peer(&self) -> (PeerId, String) {
         self.state
             .lock()
@@ -4231,6 +4238,7 @@ impl HistoryBackend for SharedSessionHandle {
                 sender_status: None,
                 sender_accent: None,
                 no_forwards: false,
+                recent_reactors: Vec::new(),
             },
         };
 
@@ -5078,6 +5086,12 @@ impl HistoryBackend for SharedSessionHandle {
 impl HistoryBackend for MockSession {
     fn self_peer(&self) -> (PeerId, String) {
         self.handle.self_peer()
+    }
+    fn peer_menu_caps(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<tg_app_core::history::peer_menu::PeerMenuCaps> {
+        HistoryBackend::peer_menu_caps(&self.handle, peer_id)
     }
     fn peer_info(&self, peer_id: PeerId) -> Option<HistoryPeerInfo> {
         HistoryBackend::peer_info(&self.handle, peer_id)

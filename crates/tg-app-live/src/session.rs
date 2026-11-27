@@ -276,9 +276,16 @@ type HistoryRequestKey = (DataPeerId, u8, MsgId);
 enum HistoryRequestState {
     /// `open_history` is running.
     InFlight,
-    /// It finished (or failed); the next read builds the slice from what is loaded.
+    /// It finished; the next read builds the slice from what is loaded.
     Done,
+    /// It failed at this time: reads build the slice from what is loaded without asking the
+    /// server again until [`HISTORY_RETRY_AFTER`] passed (the view keeps asking every frame
+    /// while its page is not at the top or bottom, TGB-3176).
+    Failed(std::time::Instant),
 }
+
+/// How long a failed history page request waits before the next one.
+const HISTORY_RETRY_AFTER: Duration = Duration::from_secs(2);
 
 const fn direction_code(direction: LoadDirection) -> u8 {
     match direction {
@@ -1036,27 +1043,49 @@ impl LiveSession {
         } else {
             None
         };
-        let (needs_load, unread_missing) = self.read_session(|s| {
+        let is_sentinel = around_id == MsgId::SHOW_AT_END || around_id == MsgId::SHOW_AT_UNREAD;
+        let anchor = to_data_msg(around_id);
+        let (needs_load, unread_missing, edge) = self.read_session(|s| {
             let Some(h) = s.history(data_peer) else {
-                return (true, false);
+                return (true, false, None);
             };
-            let unread_missing =
-                unread_around.is_some_and(|id| !h.loaded_ranges.contains_range_for(id));
-            let needs = match direction {
-                LoadDirection::Around => crate::open_at_unread::first_open_needs_load(
-                    &h.loaded_ranges,
-                    already_loaded_initial,
-                    unread_missing,
+            let ranges = &h.loaded_ranges;
+            let unread_missing = unread_around.is_some_and(|id| !ranges.contains_range_for(id));
+            // Paging stays inside the loaded range the view shows: it needs the server while
+            // that range does not reach the end, even when another range further away does,
+            // and asks from the range's own end (`minMsgId()` / `maxMsgId()` of tdesktop's
+            // single block, `HistoryWidget::loadMessages` / `loadMessagesDown`, TGB-3176).
+            let covering = ranges.slice_covering(tg_data::history_page_anchor(anchor));
+            let (needs, edge) = match direction {
+                LoadDirection::Around if is_sentinel => (
+                    crate::open_at_unread::first_open_needs_load(
+                        ranges,
+                        already_loaded_initial,
+                        unread_missing,
+                    ),
+                    None,
                 ),
-                LoadDirection::Before => !h.loaded_ranges.loaded_at_top(),
-                LoadDirection::After => !h.loaded_ranges.loaded_at_bottom(),
+                // A message: `History::isReadyFor(msgId)` is whether it is loaded.
+                LoadDirection::Around => (anchor.is_server() && covering.is_none(), None),
+                LoadDirection::Before => (
+                    !ranges.loaded_at_top_from(anchor),
+                    covering.map(|slice| slice.range.from),
+                ),
+                LoadDirection::After => (
+                    !ranges.loaded_at_bottom_from(anchor),
+                    covering.map(|slice| slice.range.till),
+                ),
             };
-            (needs, unread_missing)
+            (needs, unread_missing, edge)
         });
         if !needs_load {
             return None;
         }
-        if matches!(direction, LoadDirection::Around) && already_loaded_initial && !unread_missing {
+        if matches!(direction, LoadDirection::Around)
+            && is_sentinel
+            && already_loaded_initial
+            && !unread_missing
+        {
             return None;
         }
         if matches!(direction, LoadDirection::Around)
@@ -1078,7 +1107,23 @@ impl LiveSession {
             };
             (DataMsgId(0), dir)
         } else {
-            (to_data_msg(around_id), direction)
+            match direction {
+                LoadDirection::Around if anchor.is_server() => (anchor, direction),
+                LoadDirection::Around => return None,
+                // Older than the range's oldest end; with no range below a local message, the
+                // newest page (`offset_id = 0`).
+                LoadDirection::Before => match edge {
+                    Some(from) => (from, direction),
+                    None if anchor.is_server() => (anchor, direction),
+                    None => (DataMsgId(0), direction),
+                },
+                // Newer than the range's newest end; nothing to ask after a local message.
+                LoadDirection::After => match edge {
+                    Some(till) => (till, direction),
+                    None if anchor.is_server() => (anchor, direction),
+                    None => return None,
+                },
+            }
         };
         Some((data_peer, data_around, effective_direction))
     }
@@ -1127,6 +1172,14 @@ impl LiveSession {
                 }
                 return true;
             }
+            Some(HistoryRequestState::Failed(at)) if at.elapsed() < HISTORY_RETRY_AFTER => {
+                return true;
+            }
+            Some(HistoryRequestState::Failed(_)) => {
+                if let Ok(mut c) = self.cache.lock() {
+                    c.history_requests.remove(&key);
+                }
+            }
             None => {}
         }
         let Some((data_peer, data_around, effective_direction)) =
@@ -1147,11 +1200,15 @@ impl LiveSession {
                 rt.open_history(data_peer, data_around, effective_direction),
             )
             .await;
-            if let Err(err) = res {
-                debug!(peer = data_peer.0, error = %err, "open_history returned error");
-            }
+            let state = match res {
+                Ok(_) => HistoryRequestState::Done,
+                Err(err) => {
+                    debug!(peer = data_peer.0, error = %err, "open_history returned error");
+                    HistoryRequestState::Failed(std::time::Instant::now())
+                }
+            };
             if let Ok(mut c) = cache.lock() {
-                c.history_requests.insert(key, HistoryRequestState::Done);
+                c.history_requests.insert(key, state);
             }
             bridge.notify_chat_changed(data_peer);
         });
@@ -2729,6 +2786,9 @@ impl LiveSession {
         self.bridge.state().clear_history_delta(data_peer);
         let media_cache = self.media_cache.clone();
         let mut slice = self.read_session(|s| {
+            // The window comes from one loaded range and is at an end only when it holds that
+            // range's end and the range reaches the end of history: the view pages the rest in
+            // (TGB-3176).
             let mut slice = build_history_slice(
                 s,
                 data_peer,
@@ -2737,27 +2797,7 @@ impl LiveSession {
                 limit_after,
                 &media_cache,
             );
-            // A window that stops short of either end of what is loaded is not at that end:
-            // the view pages the rest in from the session.
-            let ends = |first: bool| {
-                let edge = if first {
-                    s.loaded_messages(data_peer).next()
-                } else {
-                    s.loaded_messages(data_peer).next_back()
-                };
-                let shown = if first {
-                    slice.messages.first()
-                } else {
-                    slice.messages.last()
-                };
-                edge.is_none_or(|edge| shown.is_some_and(|m| m.id == from_data_msg(edge.id)))
-            };
-            let (at_oldest, at_newest) = (ends(true), ends(false));
-            slice.loaded_at_top &= at_oldest;
-            slice.loaded_at_bottom &= at_newest;
-            if at_newest {
-                append_local_messages(s, data_peer, &mut slice);
-            }
+            append_local_messages(s, data_peer, &mut slice);
             slice
         });
         self.decorate_cached_translations(peer_id, &mut slice.messages);
@@ -2786,17 +2826,18 @@ impl LiveSession {
             };
             let target = to_data_msg(before_id);
             let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
-            // A range query from `target` down, only as far as the page needs (TGB-2938).
-            let mut msgs: Vec<HistoryMessage> = s
-                .loaded_messages_before(data_peer, target)
-                .take(limit)
+            // A range query from `target` down, only as far as the page needs (TGB-2938), and
+            // only inside the loaded range of `target`: it stops at a gap (TGB-3176).
+            let page = s.history_page_before(data_peer, target, limit);
+            let msgs: Vec<HistoryMessage> = page
+                .messages
+                .iter()
                 .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
                 .collect();
-            msgs.reverse();
             HistorySlice {
                 messages: msgs,
-                loaded_at_top: history.loaded_ranges.loaded_at_top(),
-                loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
+                loaded_at_top: page.reaches_top,
+                loaded_at_bottom: page.reaches_bottom,
                 total_count: loaded_id_count(history),
                 first_unread_id: first_unread_in_history(s, data_peer),
                 unread_count: history.unread_count.unwrap_or(0).max(0) as u32,
@@ -2823,21 +2864,22 @@ impl LiveSession {
             };
             let target = to_data_msg(after_id);
             let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
-            let msgs: Vec<HistoryMessage> = s
-                .loaded_messages_after(data_peer, target)
-                .take(limit)
+            // Inside the loaded range of `target` only: it stops at a gap (TGB-3176).
+            let page = s.history_page_after(data_peer, target, limit);
+            let msgs: Vec<HistoryMessage> = page
+                .messages
+                .iter()
                 .map(|m| message_to_history_message_with_stickers(s, m, &resolve))
                 .collect();
-            let reaches_bottom = msgs.len() < limit;
             let mut slice = HistorySlice {
                 messages: msgs,
-                loaded_at_top: history.loaded_ranges.loaded_at_top(),
-                loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
+                loaded_at_top: page.reaches_top,
+                loaded_at_bottom: page.reaches_bottom,
                 total_count: loaded_id_count(history),
                 first_unread_id: first_unread_in_history(s, data_peer),
                 unread_count: history.unread_count.unwrap_or(0).max(0) as u32,
             };
-            if reaches_bottom && slice.loaded_at_bottom {
+            if slice.loaded_at_bottom {
                 append_local_messages(s, data_peer, &mut slice);
             }
             slice
@@ -3002,6 +3044,17 @@ impl HistoryBackend for LiveSession {
             let pid = s.self_peer_id();
             (from_data_peer(pid), peer_display_title(s, pid))
         })
+    }
+
+    fn peer_menu_caps(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<tg_app_core::history::peer_menu::PeerMenuCaps> {
+        let mut caps = self.read_session(|s| crate::peer_menu_caps::peer_menu_caps(s, peer_id))?;
+        caps.mute_until = crate::dialogs_actions::dialog_mute_until(self, peer_id);
+        caps.muted = caps.mute_until.is_some();
+        caps.silent = crate::dialogs_actions::dialog_notify_sound(self, peer_id).none;
+        Some(caps)
     }
 
     fn peer_info(&self, peer_id: PeerId) -> Option<HistoryPeerInfo> {
@@ -4342,9 +4395,10 @@ impl HistoryBackend for LiveSession {
                 && crate::auto_download_gate::round_video_autoplay_allowed(s, &settings, &msg);
             Some((msg, allowed))
         })?;
-        self.media_cache.inline_media_descriptor_for_message_with(
+        self.media_cache.inline_media_descriptor_refreshing(
             &msg,
             photo_autoload,
+            Some(self.runtime.session()),
             self.runtime.rpc(),
             self.runtime.tokio_handle(),
             self.bridge.state(),
@@ -4716,26 +4770,27 @@ fn build_history_slice(
     let resolve = |doc: &tg_data::DocumentData| media_cache.cached_lottie_json_for_doc(doc);
     let window = limit_before.saturating_add(limit_after).max(20);
     // Range queries over the loaded ids (TGB-2938): a page costs its own length, not the
-    // whole loaded history.
+    // whole loaded history. Each page comes from one loaded range (TGB-3176).
     let first_unread = first_unread_in_history(session, peer_id);
     let page = if around_id == MsgId::SHOW_AT_UNREAD
         && let Some(unread) = first_unread
     {
-        session.loaded_messages_around(peer_id, to_data_msg(unread), limit_before, limit_after)
+        session.history_page_around(peer_id, to_data_msg(unread), limit_before, limit_after)
     } else if around_id == MsgId::SHOW_AT_END || around_id.0 <= 0 {
-        session.last_loaded_messages(peer_id, window)
+        session.history_page_newest(peer_id, window)
     } else {
-        session.loaded_messages_around(peer_id, to_data_msg(around_id), limit_before, limit_after)
+        session.history_page_around(peer_id, to_data_msg(around_id), limit_before, limit_after)
     };
     let slice_msgs: Vec<HistoryMessage> = page
-        .into_iter()
+        .messages
+        .iter()
         .map(|m| message_to_history_message_with_stickers(session, m, &resolve))
         .collect();
 
     HistorySlice {
         messages: slice_msgs,
-        loaded_at_top: history.loaded_ranges.loaded_at_top(),
-        loaded_at_bottom: history.loaded_ranges.loaded_at_bottom(),
+        loaded_at_top: page.reaches_top,
+        loaded_at_bottom: page.reaches_bottom,
         total_count: loaded_id_count(history),
         first_unread_id: first_unread,
         unread_count: history.unread_count.unwrap_or(0).max(0) as u32,

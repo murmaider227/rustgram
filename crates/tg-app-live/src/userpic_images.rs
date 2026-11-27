@@ -155,6 +155,7 @@ pub fn install_live_userpics(ctx: &egui::Context, live: &LiveSession) {
 /// Installs `live`'s userpic source on `ctx` unless it is already the installed one (cheap;
 /// called every frame so an account switch rebinds it).
 pub fn ensure_live_userpics(ctx: &egui::Context, live: &LiveSession) {
+    crate::sticker_set_thumbs::ensure_live_sticker_thumbs(ctx, live);
     let key = Arc::as_ptr(live.bridge_state()) as usize;
     let id = egui::Id::unique("tg_app_live_userpic_source_key");
     if ctx.data(|d| d.get_temp::<usize>(id)) != Some(key) {

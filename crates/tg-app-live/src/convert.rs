@@ -1620,6 +1620,7 @@ pub fn message_to_history_message_with_resolvers(
         ),
         sender_accent: Some(crate::peer_accent::peer_accent(session, from_data_id)),
         no_forwards: msg.no_forwards(),
+        recent_reactors: crate::inline_reactions::recent_reactors_for(session, msg),
     };
 
     HistoryMessage {

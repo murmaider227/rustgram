@@ -361,6 +361,9 @@ pub struct InfoWrapWidget {
     notify_silent: Option<(PeerId, bool)>,
     /// "Disable sound" / "Enable sound" picked in the mute menu, for the host to apply.
     sound_toggle_request: Option<(PeerId, bool)>,
+    /// Shown as `Info::LayerWidget` (`Wrap::Layer`): the top bar has the x, and a back arrow
+    /// only for a sub-section.
+    layer_wrap: bool,
 }
 
 impl InfoWrapWidget {
@@ -404,7 +407,13 @@ impl InfoWrapWidget {
             mute_menu: ProfileMuteMenu::default(),
             notify_silent: None,
             sound_toggle_request: None,
+            layer_wrap: false,
         }
+    }
+
+    /// Shows the next frames as a layer over the window (`Wrap::Layer`) or as a column.
+    pub fn set_layer_wrap(&mut self, layer: bool) {
+        self.layer_wrap = layer;
     }
 
     /// Tells the profile whether `peer_id`'s notification sound is off, so the mute menu shows
@@ -715,8 +724,8 @@ impl InfoWrapWidget {
         let top_cfg = TopBarConfig {
             title: &title,
             subtitle: subtitle.as_deref(),
-            show_back: !self.back_stack.is_empty() || !in_third_column,
-            show_close: in_third_column,
+            show_back: !self.back_stack.is_empty() || (!in_third_column && !self.layer_wrap),
+            show_close: in_third_column || self.layer_wrap,
             show_search: show_search && !profile_overlay,
             show_edit: show_edit && !profile_overlay,
             menu_items,

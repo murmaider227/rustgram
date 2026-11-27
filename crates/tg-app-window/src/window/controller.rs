@@ -842,6 +842,24 @@ impl WindowController {
         }
     }
 
+    /// The column settings this window would save now (the session's, once one exists).
+    #[must_use]
+    pub fn saved_columns(&self) -> tg_app_core::stand_in::settings::SavedWindowColumns {
+        self.session
+            .as_ref()
+            .map_or(self.settings.columns, |s| s.columns().saved())
+    }
+
+    /// Takes over the column settings of another account's window: they are app-wide in
+    /// tdesktop (`Core::App().settings()`), so the third column one account closed stays closed
+    /// in the others and after a restart (TGB-3186).
+    pub fn adopt_columns(&mut self, columns: tg_app_core::stand_in::settings::SavedWindowColumns) {
+        self.settings.columns = columns;
+        if let Some(session) = self.session.as_mut() {
+            session.adopt_saved_columns(columns);
+        }
+    }
+
     /// Flushes any pending settings changes to disk immediately (called on exit).
     pub fn flush_settings(&mut self) {
         if let Some(session) = &self.session {
@@ -1982,6 +2000,7 @@ impl WindowController {
                     let chat_covered = !self.box_host.is_empty()
                         || self.layer_stack.is_layer_shown()
                         || self.media_overlay.is_open()
+                        || self.main_widget.info_shown_as_layer()
                         || matches!(
                             session.main_section(),
                             Some(crate::window::section::SectionMemento::Settings { .. })
@@ -4143,6 +4162,11 @@ mod tests_w8;
 #[path = "controller_tests_sec2a.rs"]
 #[cfg(test)]
 mod tests_sec2a;
+
+#[cfg(test)]
+#[path = "controller_tests_3186.rs"]
+#[cfg(test)]
+mod tests_3186;
 
 #[cfg(test)]
 mod tests {

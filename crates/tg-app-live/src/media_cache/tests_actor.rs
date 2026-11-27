@@ -214,7 +214,7 @@ fn photo_descriptor_hit_is_pending_then_ready_without_a_download() {
     let media = MessageMedia::Photo(Box::new(photo));
 
     let first = cache
-        .descriptor_for_media(&media, true, &rpc, runtime.handle(), &bridge)
+        .descriptor_for_media(&media, true, None, &rpc, runtime.handle(), &bridge)
         .expect("descriptor");
     assert!(matches!(first.photo_load, Some(PhotoLoadState::Pending)));
     assert_eq!(
@@ -228,7 +228,7 @@ fn photo_descriptor_hit_is_pending_then_ready_without_a_download() {
         "UI must be notified"
     );
     let ready = cache
-        .descriptor_for_media(&media, true, &rpc, runtime.handle(), &bridge)
+        .descriptor_for_media(&media, true, None, &rpc, runtime.handle(), &bridge)
         .expect("descriptor");
     match ready.photo_load {
         Some(PhotoLoadState::Ready { bytes }) => assert_eq!(&*bytes, b"JPEG_BYTES"),
@@ -257,7 +257,7 @@ fn photo_descriptor_miss_starts_one_download_and_serves_it_from_memory() {
     let mut seen_loading = false;
     assert!(wait_for(|| {
         let desc = cache
-            .descriptor_for_media(&media, true, &rpc, runtime.handle(), &bridge)
+            .descriptor_for_media(&media, true, None, &rpc, runtime.handle(), &bridge)
             .expect("descriptor");
         match desc.photo_load {
             Some(PhotoLoadState::Loading { .. }) => {

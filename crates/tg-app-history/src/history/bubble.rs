@@ -21,7 +21,6 @@ use tg_ui::text::{
     RichTextOptions, SyntaxHighlightPalette, render_prepared_rich_text_selected,
     render_prepared_text_with_entities,
 };
-use tg_ui::userpic::EmptyUserpic;
 
 use crate::bots::inline_keyboard::{
     InlineKeyboardActivation, InlineKeyboardParams, InlineKeyboardState, show_inline_keyboard,
@@ -753,7 +752,11 @@ fn paint_message_element_internal(
     let is_selected = selection.is_full();
     let ui_colors = colors.ui_colors();
 
-    let bubble_rect = hist_rect_to_egui(layout.geometry, origin.x, origin.y);
+    let bubble_rect = hist_rect_to_egui(
+        layout.geometry_without_outside_reactions(),
+        origin.x,
+        origin.y,
+    );
 
     // 1. Bubble shell (unless unwrapped, e.g. Lottie sticker).
     if layout.has_bubble {
@@ -1470,14 +1473,14 @@ fn paint_message_element_internal(
                 .collect()
         } else {
             let react_rect = hist_rect_to_egui(layout.reactions_rect, origin.x, origin.y);
-            single_row_chip_rects(ui, &msg.reactions, react_rect, reaction_userpics.is_some())
+            single_row_chip_rects(ui, msg, react_rect, reaction_userpics)
         };
         if let Some(ReactionRowAction::Toggle(emoji)) = paint_reactions_row(
             ui,
-            msg.id,
-            &msg.reactions,
+            msg,
             &chips,
             layout.has_out_layout,
+            layout.reactions_in_bubble,
             colors,
             reaction_userpics,
             assets,
@@ -1882,13 +1885,9 @@ const REACTION_SIZE: f32 = 18.0;
 const REACTION_SKIP: f32 = 3.0;
 /// `st::reactionInlineBetween`.
 const REACTION_BETWEEN: f32 = 4.0;
-/// `st::reactionInlineUserpics.size` / `.shift`.
-const REACTION_USERPIC: f32 = 20.0;
-const REACTION_USERPIC_SHIFT: f32 = 7.0;
 /// `st::reactionInlineUserpicsPadding` (left + right).
 const REACTION_USERPICS_PAD: f32 = 2.0;
 
-/// Number of userpics a private-chat reaction button shows (`InlineListDataFromMessage`).
 /// One line of `text` elided with "…" to `max_w` (`Ui::Text::String` `elisionLines = 1`).
 fn elided_line(
     ui: &Ui,
@@ -1908,8 +1907,28 @@ fn elided_line(
     ui.painter().layout_job(job)
 }
 
-fn reaction_userpic_count(r: &ReactionCounter) -> usize {
-    usize::from(!r.chosen || r.count > 1) + usize::from(r.chosen)
+/// How many userpics `r`'s button shows instead of its count, if any
+/// (`reaction_buttons::reaction_peers`).
+fn reaction_userpic_count(
+    msg: &HistoryMessage,
+    r: &ReactionCounter,
+    private: Option<&ReactionUserpics>,
+) -> Option<usize> {
+    crate::history::reaction_buttons::reaction_peers(r, &msg.extra.recent_reactors, private)
+        .map(|list| list.len())
+}
+
+/// The private-chat stand-in for layout code that has no [`ReactionUserpics`]: only the count
+/// of the userpics matters there.
+fn layout_private_userpics(msg: &HistoryMessage) -> Option<ReactionUserpics> {
+    matches!(
+        msg.peer_id.kind(),
+        tg_app_core::stand_in::types::PeerKind::User
+    )
+    .then(|| ReactionUserpics {
+        peer: (msg.peer_id, String::new()),
+        me: (msg.peer_id, String::new()),
+    })
 }
 
 fn reaction_count_text(r: &ReactionCounter) -> String {
@@ -1919,13 +1938,13 @@ fn reaction_count_text(r: &ReactionCounter) -> String {
 /// Chip rects in one row from `rect`'s top-left, for layouts computed without chip widths.
 fn single_row_chip_rects(
     ui: &Ui,
-    reactions: &[ReactionCounter],
+    msg: &HistoryMessage,
     rect: Rect,
-    private_chat: bool,
+    private: Option<&ReactionUserpics>,
 ) -> Vec<Rect> {
     let pill_h = REACTION_PAD_V * 2.0 + REACTION_SIZE;
     let mut x = rect.left();
-    reactions
+    msg.reactions
         .iter()
         .map(|r| {
             let count_w = ui
@@ -1937,7 +1956,7 @@ fn single_row_chip_rects(
                 )
                 .size()
                 .x;
-            let w = reaction_button_width(r, private_chat, count_w);
+            let w = reaction_button_width(reaction_userpic_count(msg, r, private), count_w);
             let chip = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(w, pill_h));
             x += w + REACTION_BETWEEN;
             chip
@@ -1945,33 +1964,35 @@ fn single_row_chip_rects(
         .collect()
 }
 
-/// Width of a private-chat chip with reactor userpics (`InlineList::countOptimalSize`,
-/// `widthBaseUserpics + userpicsWidth`).
+/// Width of `r`'s button when it shows reactor userpics instead of its count
+/// (`InlineList::countOptimalSize`, `widthBaseUserpics + userpicsWidth`): in a private chat, or
+/// when the session listed its recent reactors. `None`: the button shows its count.
 #[must_use]
-pub fn reaction_userpics_chip_width(r: &ReactionCounter) -> i32 {
-    reaction_button_width(r, true, 0.0).ceil() as i32
+pub fn reaction_userpics_chip_width(msg: &HistoryMessage, r: &ReactionCounter) -> Option<i32> {
+    let private = layout_private_userpics(msg);
+    reaction_userpic_count(msg, r, private.as_ref())
+        .map(|n| reaction_button_width(Some(n), 0.0).ceil() as i32)
 }
 
-fn reaction_button_width(r: &ReactionCounter, private_chat: bool, count_w: f32) -> f32 {
-    if private_chat {
-        let n = reaction_userpic_count(r) as f32;
-        REACTION_PAD_LEFT
-            + REACTION_SIZE
-            + REACTION_USERPICS_PAD
-            + REACTION_USERPIC
-            + (n - 1.0).max(0.0) * (REACTION_USERPIC - REACTION_USERPIC_SHIFT)
-    } else {
-        REACTION_PAD_LEFT + REACTION_SIZE + REACTION_SKIP + REACTION_PAD_RIGHT + count_w
+fn reaction_button_width(userpics: Option<usize>, count_w: f32) -> f32 {
+    match userpics {
+        Some(n) => {
+            REACTION_PAD_LEFT
+                + REACTION_SIZE
+                + REACTION_USERPICS_PAD
+                + crate::history::reaction_buttons::userpics_width(n)
+        }
+        None => REACTION_PAD_LEFT + REACTION_SIZE + REACTION_SKIP + REACTION_PAD_RIGHT + count_w,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn paint_reactions_row(
     ui: &mut Ui,
-    msg_id: MsgId,
-    reactions: &[ReactionCounter],
+    msg: &HistoryMessage,
     chips: &[Rect],
     outgoing: bool,
+    in_bubble: bool,
     colors: &HistoryColors,
     userpics: Option<&ReactionUserpics>,
     assets: &mut MediaAssetCache,
@@ -1979,26 +2000,21 @@ fn paint_reactions_row(
     let mut toggled = None;
     let ui_colors = colors.ui_colors();
 
-    for (idx, (r, chip)) in reactions.iter().zip(chips).enumerate() {
+    for (idx, (r, chip)) in msg.reactions.iter().zip(chips).enumerate() {
         let (x, y) = (chip.left(), chip.top());
         let paid = matches!(
             crate::history::reaction_buttons::reaction_image(&r.emoji),
             crate::history::reaction_buttons::ReactionImage::Paid
         );
         let (bg, fg) = crate::history::reaction_buttons::reaction_button_colors(
-            colors, r.chosen, outgoing, paid,
-        );
-        let count_galley = ui.painter().layout_no_wrap(
-            reaction_count_text(r),
-            FontId::new(12.0, tg_ui::fonts::family_semibold()),
-            fg,
+            colors, r.chosen, outgoing, paid, in_bubble,
         );
         let pill_rect = *chip;
         let pill_h = pill_rect.height();
 
         let resp = ui.interact(
             pill_rect,
-            Id::unique(("tg_reaction", msg_id.0, idx)),
+            Id::unique(("tg_reaction", msg.id.0, idx)),
             Sense::click(),
         );
         resp.widget_info(|| {
@@ -2033,29 +2049,29 @@ fn paint_reactions_row(
                 Color32::WHITE,
             );
         }
-        if let Some(pics) = userpics {
-            let mut list: Vec<&(PeerId, String)> = Vec::with_capacity(2);
-            if !r.chosen || r.count > 1 {
-                list.push(&pics.peer);
-            }
-            if r.chosen {
-                list.push(&pics.me);
-            }
-            let mut px = emoji_rect.right() + REACTION_USERPICS_PAD * 0.5;
-            for (peer, name) in list {
-                let pic = Rect::from_min_size(
-                    Pos2::new(px, pill_rect.center().y - REACTION_USERPIC * 0.5),
-                    Vec2::splat(REACTION_USERPIC),
-                );
-                ui.painter()
-                    .circle_filled(pic.center(), REACTION_USERPIC * 0.5 + 1.0, bg);
-                if !tg_ui::userpic_images::paint_userpic_image(ui.painter(), pic, peer.0) {
-                    EmptyUserpic::for_peer(peer.bare(), name, &ui_colors)
-                        .paint_circle(ui.painter(), pic);
-                }
-                px += REACTION_USERPIC - REACTION_USERPIC_SHIFT;
-            }
+        if let Some(list) = crate::history::reaction_buttons::reaction_peers(
+            r,
+            &msg.extra.recent_reactors,
+            userpics,
+        ) {
+            // `InlineList::paint`: the row at `inner.x + size + userpicsPadding.left`,
+            // `geometry.y + userpicsPadding.top`.
+            crate::history::reaction_buttons::paint_reaction_userpics(
+                ui.painter(),
+                Pos2::new(
+                    emoji_rect.right() + REACTION_USERPICS_PAD * 0.5,
+                    y + REACTION_USERPICS_PAD * 0.5,
+                ),
+                &list,
+                bg,
+                &ui_colors,
+            );
         } else {
+            let count_galley = ui.painter().layout_no_wrap(
+                reaction_count_text(r),
+                FontId::new(12.0, tg_ui::fonts::family_semibold()),
+                fg,
+            );
             ui.painter().galley(
                 Pos2::new(
                     emoji_rect.right() + REACTION_SKIP,
@@ -2073,7 +2089,7 @@ fn paint_reactions_row(
     toggled
 }
 
-/// Places a bubble-less round video's transcribe button like `Gif::paintTranscribe`: right of
+// Places a bubble-less round video's transcribe button like `Gif::paintTranscribe`: right of
 /// the circle and its info pill, stacked above the right action; left of the circle for
 /// outgoing messages.
 fn place_round_transcribe_button(
@@ -2116,19 +2132,22 @@ pub fn format_compact_views(views: u32) -> String {
 }
 
 /// Computes the exact size of a message's reactions row for `MessageInput::reactions_size`
-/// (`InlineList::countOptimalSize`; private chats show userpics instead of counts).
+/// (`InlineList::countOptimalSize`; buttons with known reactors show userpics instead of
+/// counts).
 #[must_use]
-pub fn measure_reactions_size(
-    reactions: &[ReactionCounter],
-    private_chat: bool,
-) -> tg_history::Size {
+pub fn measure_reactions_size(msg: &HistoryMessage) -> tg_history::Size {
+    let reactions = &msg.reactions;
     if reactions.is_empty() {
         return tg_history::Size::ZERO;
     }
+    let private = layout_private_userpics(msg);
     let mut w = 0.0f32;
     for (i, r) in reactions.iter().enumerate() {
         let digits = reaction_count_text(r).len() as f32;
-        w += reaction_button_width(r, private_chat, digits * 7.0);
+        w += reaction_button_width(
+            reaction_userpic_count(msg, r, private.as_ref()),
+            digits * 7.0,
+        );
         if i + 1 < reactions.len() {
             w += REACTION_BETWEEN;
         }
