@@ -2,7 +2,7 @@
 //! opened and decoded on a worker thread, so the first frame is shown before the last part of
 //! the file has been served, and the UI never waits for a part.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -14,26 +14,79 @@ use tg_video::{
 /// [`GatedLoader::release`], like the parts of a file that have not arrived yet.
 struct GatedLoader {
     data: Vec<u8>,
-    gate_from: u64,
+    gate_from: AtomicU64,
     open: Mutex<bool>,
     opened: Condvar,
     served_gated: AtomicBool,
+    /// Set once a read has stopped at the gate.
+    waited: AtomicBool,
 }
 
 impl GatedLoader {
     fn new(data: Vec<u8>, gate_from: u64) -> Self {
         Self {
             data,
-            gate_from,
+            gate_from: AtomicU64::new(gate_from),
             open: Mutex::new(false),
             opened: Condvar::new(),
             served_gated: AtomicBool::new(false),
+            waited: AtomicBool::new(false),
         }
     }
 
     fn release(&self) {
         *self.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
         self.opened.notify_all();
+    }
+
+    /// Holds every read from now on, until [`GatedLoader::release`].
+    fn hold_everything(&self) {
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        self.gate_from.store(0, Ordering::SeqCst);
+    }
+
+    fn wait_until_a_read_waits(&self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !self.waited.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "no read stopped at the gate");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+/// Lets the test stop the worker in its repaint callback, right after it has published a
+/// frame, so the frame it published stays there until the test has looked at it.
+#[derive(Default)]
+struct WakeGate {
+    held: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl WakeGate {
+    fn hold(&self) {
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    fn release(&self) {
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        self.changed.notify_all();
+    }
+
+    fn pass(&self) {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let _held = self
+            .changed
+            .wait_while(held, |held| *held)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// Releases the worker on the way out, also when an assertion fails.
+struct ReleaseOnDrop(Arc<WakeGate>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -43,8 +96,11 @@ impl RangeLoader for GatedLoader {
     }
 
     fn load_range(&self, offset: u64, len: usize) -> tg_video::Result<Vec<u8>> {
-        if offset + len as u64 > self.gate_from {
+        if offset + len as u64 > self.gate_from.load(Ordering::SeqCst) {
             let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+            if !*open {
+                self.waited.store(true, Ordering::SeqCst);
+            }
             let _open = self
                 .opened
                 .wait_while(open, |open| !*open)
@@ -174,6 +230,51 @@ fn seek_restarts_the_streamed_clip_at_the_position() {
         frame.pts_ms
     );
     assert_eq!(clip.frame_real_time_ms(), frame.pts_ms.max(4_000));
+}
+
+/// A frame the worker was decoding when the UI asked for a seek shows the old position: it
+/// must never be handed out after `request_seek` returns (tdesktop drops it on a seek).
+#[test]
+fn a_frame_decoded_before_a_seek_is_never_shown_after_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = round_clip(dir.path());
+    let loader = Arc::new(GatedLoader::new(file, u64::MAX));
+    let wakes = Arc::new(WakeGate::default());
+    let clip = {
+        let wakes = Arc::clone(&wakes);
+        StreamedClip::spawn(
+            Arc::clone(&loader) as Arc<dyn RangeLoader>,
+            ClipMode::Normal,
+            Some(Size::new(120, 120)),
+            false,
+            move || wakes.pass(),
+        )
+    };
+    let _ = wait_for_frame(&clip, 0);
+
+    // The worker starts a seek to the end and stops in a read that has not arrived yet.
+    loader.hold_everything();
+    clip.request_seek(7_500);
+    loader.wait_until_a_read_waits();
+
+    // The UI seeks again while that decode is still running, then the data comes in. The
+    // worker stops in its repaint callback after each frame it publishes, so the first frame
+    // the UI can take is exactly the one published first.
+    let _release = ReleaseOnDrop(Arc::clone(&wakes));
+    wakes.hold();
+    clip.request_seek(1_000);
+    let clock_after_seek = clip.frame_real_time_ms();
+    loader.release();
+    let frame = wait_for_seeked_frame(&clip);
+    assert!(
+        (500..=1_500).contains(&frame.pts_ms),
+        "frame at {} ms after a seek to 1000 ms",
+        frame.pts_ms
+    );
+    assert_eq!(clip.frame_real_time_ms(), frame.pts_ms.max(1_000));
+    // Like `ClipReader::inspect_at`, the clock moves to the seek at once, so a caller that
+    // compares it with the audio does not seek again while the frame is decoding.
+    assert_eq!(clock_after_seek, 1_000);
 }
 
 #[test]

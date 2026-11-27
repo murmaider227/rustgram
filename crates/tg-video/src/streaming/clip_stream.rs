@@ -25,6 +25,10 @@ enum Wanted {
 #[derive(Default)]
 struct State {
     wanted: Option<Wanted>,
+    /// Bumped by every [`StreamedClip::request_seek`]. A decode that started under an older
+    /// value is dropped when it finishes, so no frame from before a seek reaches the UI after
+    /// it (tdesktop's reader drops its queued frames on a seek the same way).
+    seek_generation: u64,
     closed: bool,
     opened: bool,
     duration_ms: i64,
@@ -103,11 +107,15 @@ impl StreamedClip {
     }
 
     /// Asks for the frame at `position_ms` in the stream, restarting the clock there
-    /// ([`ClipReader::inspect_at`]).
+    /// ([`ClipReader::inspect_at`]). From the return on, [`Self::take_frame`] gives no frame
+    /// decoded before the seek, and the clock reads `position_ms` until the seeked frame is in.
     pub fn request_seek(&self, position_ms: i64) {
         let mut state = self.shared.lock();
         state.wanted = Some(Wanted::Seek(position_ms));
+        state.seek_generation = state.seek_generation.wrapping_add(1);
         state.frame = None;
+        state.presentation_ms = position_ms.max(0);
+        state.real_ms = position_ms.max(0);
         drop(state);
         self.shared.changed.notify_all();
     }
@@ -175,11 +183,12 @@ fn run(
     };
     reader.set_resize(resize);
     reader.set_round_circle(round_circle);
-    {
+    let mut generation = {
         let mut state = shared.lock();
         state.opened = true;
         state.duration_ms = reader.duration_ms();
-    }
+        state.seek_generation
+    };
     // The first frame is decoded at once, so the circle shows a picture before playing.
     let mut first = Some(Wanted::FramesTill(0));
     loop {
@@ -204,6 +213,7 @@ fn run(
                     state.wanted = None;
                     continue;
                 }
+                generation = state.seek_generation;
                 next
             }
         };
@@ -212,6 +222,11 @@ fn run(
             Wanted::Seek(position_ms) => reader.inspect_at(position_ms),
         };
         let mut state = shared.lock();
+        if decoded.is_ok() && state.seek_generation != generation {
+            // A seek came in while this frame was decoding: it shows the old position. The
+            // pending seek is served next; nothing new to paint until then.
+            continue;
+        }
         match decoded {
             Ok(frame) => {
                 state.frame = Some(frame);
