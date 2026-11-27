@@ -8,3 +8,4 @@ license.workspace = true
 jiff = "1.0"
 tg-data = { path = "../tg-data" }
 tg-style = { path = "../tg-style" }
+unicode-segmentation = "1.13"

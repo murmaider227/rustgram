@@ -33,9 +33,9 @@ use tracing::{debug, warn};
 
 use crate::bridge::{LiveBridgeState, LiveRuntimeBridge};
 use crate::convert::{
-    authorization_from_tl, chat_filter_to_dialog_folder, chat_filter_to_settings_folder,
-    dialog_entry_from_session, dialog_item_from_session, draft_from_history, from_data_msg,
-    from_data_peer, history_messages_ordered, history_typing_to_send_progress, known_peer_ids,
+    chat_filter_to_dialog_folder, chat_filter_to_settings_folder, dialog_entry_from_session,
+    dialog_item_from_session, draft_from_history, from_data_msg, from_data_peer,
+    history_messages_ordered, history_typing_to_send_progress, known_peer_ids,
     message_to_audio_track_metadata, message_to_history_message,
     message_to_history_message_with_stickers, message_to_stand_in_item,
     message_to_viewer_media_item, now_unix_i32, peer_dialog_kind, peer_display_title,
@@ -52,6 +52,7 @@ use crate::media::{
 use crate::media_cache::{
     LiveMediaCache, document_cache_key, document_thumb_cache_key, photo_cache_key,
 };
+use crate::parallel_rpc::{joined, spawn_rpc};
 use tg_app_core::core_types::dto::inline_media::InlineMediaDescriptor;
 use tg_app_core::core_types::dto::rich_compose::RichThreadDraft;
 use tg_app_core::core_types::erased_rpc::ErasedRpcClient;
@@ -87,7 +88,8 @@ use tg_app_core::settings::backend::{
     CloudPasswordState, ExportRequest, GlobalPrivacySettings, LocalStorageStats,
     NotificationEventsSettings, NotifyScope, PeerRef, PrivacyKey, PrivacyRule, ProfileInfo,
     ProfilePhotoUpload, ProxyCheckStatus, SavedRingtone, ScopeNotifySettings, SettingsBackend,
-    StickerSetInfo, SuggestedFolder, UsernameStatus, WebAuthorization, validate_username_syntax,
+    SettingsRead, StickerSetInfo, SuggestedFolder, UsernameStatus, WebAuthorization,
+    validate_username_syntax,
 };
 use tg_app_core::stand_in::backend::Backend;
 use tg_app_core::stand_in::types::{
@@ -96,7 +98,7 @@ use tg_app_core::stand_in::types::{
 };
 
 /// Default timeout for synchronous RPC invocations triggered from UI trait methods.
-const LIVE_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const LIVE_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Main dialog folder constant (`0`).
 const MAIN_FOLDER_ID: FolderId = 0;
@@ -132,15 +134,17 @@ pub(super) struct LiveSessionCache {
     pub(super) global_privacy_loaded: bool,
     pub(super) global_privacy: GlobalPrivacySettings,
     pub(super) global_privacy_extra: Option<crate::settings_sync::GlobalPrivacyExtra>,
-    account_ttl_loaded: bool,
-    account_ttl_days: i32,
-    sessions_loaded: bool,
-    active_sessions: Vec<ActiveSession>,
-    session_ttl_days: i32,
+    pub(super) account_ttl_loaded: bool,
+    pub(super) account_ttl_days: i32,
+    pub(super) sessions_loaded: bool,
+    pub(super) active_sessions: Vec<ActiveSession>,
+    pub(super) session_ttl_days: i32,
     pub(super) blocked_loaded: bool,
     pub(super) blocked_peers: Vec<PeerRef>,
-    cloud_password_loaded: bool,
-    cloud_password: CloudPasswordState,
+    pub(super) cloud_password_loaded: bool,
+    pub(super) cloud_password: CloudPasswordState,
+    /// Settings reads answered in the background ([`crate::settings_reads`], TGB-3070).
+    pub(crate) settings_reads: crate::settings_reads::SettingsReads,
     pub(super) scope_notify_loaded: HashSet<NotifyScope>,
     pub(super) notify_exceptions_loaded: HashSet<NotifyScope>,
     pub(super) notify_exception_peers: HashSet<DataPeerId>,
@@ -168,6 +172,12 @@ pub(super) struct LiveSessionCache {
 }
 
 impl LiveSessionCache {
+    /// The blocked list changed locally: reload it, and drop an answer already on its way.
+    pub(crate) fn invalidate_blocked_users(&mut self) {
+        self.blocked_loaded = false;
+        self.settings_reads.invalidate(SettingsRead::BlockedUsers);
+    }
+
     fn new() -> Self {
         Self {
             proxy_enabled: false,
@@ -199,6 +209,7 @@ impl LiveSessionCache {
             blocked_peers: Vec::new(),
             cloud_password_loaded: false,
             cloud_password: CloudPasswordState::default(),
+            settings_reads: crate::settings_reads::SettingsReads::default(),
             scope_notify_loaded: HashSet::new(),
             notify_exceptions_loaded: HashSet::new(),
             notify_exception_peers: HashSet::new(),
@@ -696,6 +707,7 @@ impl LiveSession {
             c.auto_download_loaded = false;
             c.auto_download_presets = None;
             c.filters_loaded = false;
+            c.settings_reads.reset();
         }
         crate::settings_extra::invalidate_caches(self);
         crate::themes::invalidate_cache(self);
@@ -944,22 +956,19 @@ impl LiveSession {
     }
 
     fn ensure_dialogs_loaded(&self, folder_id: FolderId) {
-        let already_tried = self
-            .cache
-            .lock()
-            .map(|c| c.dialogs_loaded_folders.contains(&folder_id))
-            .unwrap_or(true);
-        if already_tried {
-            return;
-        }
         if folder_id == MAIN_FOLDER_ID {
-            // The main list shows its "Loading..." state meanwhile (`chats_list_loaded`).
+            // The main list shows its "Loading..." state meanwhile (`chats_list_loaded`); the
+            // request marks the folder as tried itself.
             let bridge = Arc::clone(self.bridge.state());
             self.start_chats_list_request(move || bridge.notify_ui());
             return;
         }
-        if let Ok(mut c) = self.cache.lock() {
-            c.dialogs_loaded_folders.insert(folder_id);
+        let first_request = self
+            .cache
+            .lock()
+            .is_ok_and(|mut c| c.dialogs_loaded_folders.insert(folder_id));
+        if !first_request {
+            return;
         }
         // `ApiWrap::requestDialogs` for the archive: the list shows what is loaded until the page
         // lands (its chats arrive through change events, the version moves, the UI repaints).
@@ -1284,76 +1293,77 @@ impl LiveSession {
             }
         });
         if let Ok(mut c) = self.cache.lock() {
-            c.blocked_loaded = false;
+            c.invalidate_blocked_users();
         }
         self.bridge.state().notify_ui();
         new_blocked
     }
 
-    fn fetch_privacy_rule_if_needed(&self, key: PrivacyKey) -> PrivacyRule {
-        let cached = self
-            .cache
-            .lock()
-            .ok()
-            .filter(|c| c.privacy_loaded.contains(&key))
-            .and_then(|c| c.privacy_rules.get(&key).cloned());
-        if let Some(rule) = cached {
-            return rule;
-        }
-        let req = tl_fns::account::GetPrivacy {
-            key: privacy_key_to_tl(key),
+    /// Requests the privacy rules of `keys` that were not requested yet (`Api::UserPrivacy::reload`),
+    /// all at once: the Privacy section waits for one round trip, not one per row. A key is asked
+    /// once; after a failure it shows the default until [`Self::invalidate_settings_caches`]
+    /// instead of being asked again on every frame.
+    fn load_privacy_rules_if_needed(&self, keys: &[PrivacyKey]) {
+        let missing: Vec<PrivacyKey> = match self.cache.lock() {
+            Ok(mut c) => keys
+                .iter()
+                .copied()
+                .filter(|&key| c.privacy_loaded.insert(key))
+                .collect(),
+            Err(_) => return,
         };
-        match self.invoke_rpc(req) {
-            Ok(tl_enums::account::PrivacyRules::PrivacyRules(resp)) => {
-                self.write_session(|s| {
-                    apply_tl_users_and_chats(s, &resp.users, &resp.chats);
-                });
-                let rule = privacy_rules_from_tl(&resp.rules);
-                if let Ok(mut c) = self.cache.lock() {
-                    c.privacy_loaded.insert(key);
-                    c.privacy_rules.insert(key, rule.clone());
+        if missing.is_empty() {
+            return;
+        }
+        let rpc = self.runtime.rpc().clone();
+        let answers = block_on_runtime(self.runtime.tokio_handle(), async move {
+            let requests: Vec<_> = missing
+                .into_iter()
+                .map(|key| {
+                    let req = tl_fns::account::GetPrivacy {
+                        key: privacy_key_to_tl(key),
+                    };
+                    (key, spawn_rpc(&rpc, req, LIVE_RPC_TIMEOUT))
+                })
+                .collect();
+            let mut answers = Vec::with_capacity(requests.len());
+            for (key, request) in requests {
+                match joined(request).await {
+                    Ok(tl_enums::account::PrivacyRules::PrivacyRules(resp)) => {
+                        answers.push((key, resp));
+                    }
+                    Err(err) => debug!(?key, error = %err, "account.getPrivacy failed"),
                 }
-                rule
             }
-            Err(err) => {
-                debug!(?key, error = %err, "account.getPrivacy failed");
-                if let Ok(mut c) = self.cache.lock() {
-                    c.privacy_loaded.insert(key);
-                }
-                PrivacyRule::default()
+            answers
+        });
+        if answers.is_empty() {
+            return;
+        }
+        self.write_session(|s| {
+            for (_, resp) in &answers {
+                apply_tl_users_and_chats(s, &resp.users, &resp.chats);
+            }
+        });
+        if let Ok(mut c) = self.cache.lock() {
+            for (key, resp) in &answers {
+                c.privacy_rules
+                    .insert(*key, privacy_rules_from_tl(&resp.rules));
             }
         }
     }
 
+    /// The loaded rule of `key`, or the default while it is not known.
+    fn cached_privacy_rule(cache: &LiveSessionCache, key: PrivacyKey) -> PrivacyRule {
+        cache.privacy_rules.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// Starts `account.getAuthorizations` in the background the first time (TGB-3070).
     fn fetch_sessions_if_needed(&self) {
-        let loaded = self.cache.lock().map(|c| c.sessions_loaded).unwrap_or(true);
-        if loaded {
+        if self.cache.lock().map_or(true, |c| c.sessions_loaded) {
             return;
         }
-        if let Ok(mut c) = self.cache.lock() {
-            c.sessions_loaded = true;
-        }
-        match self.invoke_rpc(tl_fns::account::GetAuthorizations {}) {
-            Ok(tl_enums::account::Authorizations::Authorizations(resp)) => {
-                let sessions: Vec<ActiveSession> = resp
-                    .authorizations
-                    .iter()
-                    .map(|a| {
-                        let tl_enums::Authorization::Authorization(inner) = a;
-                        authorization_from_tl(inner)
-                    })
-                    .collect();
-                if let Ok(mut c) = self.cache.lock() {
-                    c.active_sessions = sessions;
-                    if resp.authorization_ttl_days > 0 {
-                        c.session_ttl_days = resp.authorization_ttl_days;
-                    }
-                }
-            }
-            Err(err) => {
-                debug!(error = %err, "account.getAuthorizations failed");
-            }
-        }
+        self.spawn_settings_read(SettingsRead::ActiveSessions, Self::load_active_sessions);
     }
 
     fn fetch_scope_notify_if_needed(&self, scope: NotifyScope) -> ScopeNotifySettings {
@@ -2279,13 +2289,17 @@ impl DialogsBackend for LiveSession {
             )
         });
         if had_unread_mark && let Some(input_peer) = self.input_peer(peer_id) {
-            let _ = self.invoke_rpc(tl_fns::messages::MarkDialogUnread {
-                unread: false,
-                parent_peer: None,
-                peer: tl_enums::InputDialogPeer::InputDialogPeer(tl_types::InputDialogPeer {
-                    peer: input_peer,
-                }),
-            });
+            // `Histories::changeDialogUnreadMark`: sent without waiting, no fail handler.
+            self.queue_background_rpc(
+                tl_fns::messages::MarkDialogUnread {
+                    unread: false,
+                    parent_peer: None,
+                    peer: tl_enums::InputDialogPeer::InputDialogPeer(tl_types::InputDialogPeer {
+                        peer: input_peer,
+                    }),
+                },
+                |error| debug!(%error, "messages.markDialogUnread failed"),
+            );
             self.write_session(|s| {
                 s.set_history_unread_mark(data_peer, false);
             });
@@ -5965,15 +5979,25 @@ impl SettingsBackend for LiveSession {
     }
 
     fn privacy_rules(&self) -> BTreeMap<PrivacyKey, PrivacyRule> {
-        let mut map = BTreeMap::new();
-        for key in PrivacyKey::ALL {
-            map.insert(key, self.fetch_privacy_rule_if_needed(key));
-        }
-        map
+        self.load_privacy_rules_if_needed(&PrivacyKey::ALL);
+        let Ok(c) = self.cache.lock() else {
+            return PrivacyKey::ALL
+                .into_iter()
+                .map(|key| (key, PrivacyRule::default()))
+                .collect();
+        };
+        PrivacyKey::ALL
+            .into_iter()
+            .map(|key| (key, Self::cached_privacy_rule(&c, key)))
+            .collect()
     }
 
     fn privacy_rule(&self, key: PrivacyKey) -> PrivacyRule {
-        self.fetch_privacy_rule_if_needed(key)
+        self.load_privacy_rules_if_needed(&[key]);
+        self.cache
+            .lock()
+            .map(|c| Self::cached_privacy_rule(&c, key))
+            .unwrap_or_default()
     }
 
     fn set_privacy_rule(&mut self, key: PrivacyKey, mut rule: PrivacyRule) {
@@ -6026,15 +6050,8 @@ impl SettingsBackend for LiveSession {
         if let Some(days) = cached {
             return days;
         }
-        let days = match self.invoke_rpc(tl_fns::account::GetAccountTTL {}) {
-            Ok(tl_enums::AccountDaysTTL::AccountDaysTTL(ttl)) => ttl.days,
-            Err(_) => 180,
-        };
-        if let Ok(mut c) = self.cache.lock() {
-            c.account_ttl_loaded = true;
-            c.account_ttl_days = days;
-        }
-        days
+        self.spawn_settings_read(SettingsRead::AccountTtl, Self::load_account_ttl);
+        self.cache.lock().map_or(180, |c| c.account_ttl_days)
     }
 
     fn set_account_ttl_days(&mut self, days: i32) {
@@ -6050,10 +6067,15 @@ impl SettingsBackend for LiveSession {
     }
 
     fn clear_payment_info(&mut self, clear_shipping: bool, clear_credentials: bool) {
-        let _ = self.invoke_rpc(tl_fns::payments::ClearSavedInfo {
-            credentials: clear_credentials,
-            info: clear_shipping,
-        });
+        // tdesktop sends it and closes the box at once, with no fail handler
+        // (`settings_privacy_security.cpp` `ClearPaymentInfoBox`).
+        self.queue_background_rpc(
+            tl_fns::payments::ClearSavedInfo {
+                credentials: clear_credentials,
+                info: clear_shipping,
+            },
+            |error| debug!(%error, "payments.clearSavedInfo failed"),
+        );
     }
 
     fn active_sessions(&self) -> Vec<ActiveSession> {
@@ -6234,39 +6256,12 @@ impl SettingsBackend for LiveSession {
         if let Some(list) = cached {
             return list;
         }
-        let req = tl_fns::contacts::GetBlocked {
-            my_stories_from: false,
-            offset: 0,
-            limit: 100,
-        };
-        let now = now_unix_i32();
-        let list = match self.invoke_rpc(req) {
-            Ok(resp) => {
-                let (blocked, users, chats) = match resp {
-                    tl_enums::contacts::Blocked::Blocked(b) => (b.blocked, b.users, b.chats),
-                    tl_enums::contacts::Blocked::Slice(b) => (b.blocked, b.users, b.chats),
-                };
-                self.write_session(|s| {
-                    apply_tl_users_and_chats(s, &users, &chats);
-                });
-                self.read_session(|s| {
-                    blocked
-                        .iter()
-                        .filter_map(|pb| {
-                            let tl_enums::PeerBlocked::PeerBlocked(inner) = pb;
-                            let pid = tg_api::convert::peer_id_from_tl(&inner.peer_id);
-                            s.peer(pid).map(|p| peer_to_settings_ref(p, now))
-                        })
-                        .collect()
-                })
-            }
-            Err(_) => Vec::new(),
-        };
-        if let Ok(mut c) = self.cache.lock() {
-            c.blocked_loaded = true;
-            c.blocked_peers = list.clone();
-        }
-        list
+        // Until the answer is there the last list stays (`Api::BlockedPeers::slice`).
+        self.spawn_settings_read(SettingsRead::BlockedUsers, Self::load_blocked_users);
+        self.cache
+            .lock()
+            .map(|c| c.blocked_peers.clone())
+            .unwrap_or_default()
     }
 
     fn block_peer(&mut self, peer_id: i64) {
@@ -6301,17 +6296,15 @@ impl SettingsBackend for LiveSession {
         if let Some(st) = cached {
             return st;
         }
-        let state = match self.invoke_rpc(tl_fns::account::GetPassword {}) {
-            Ok(tl_enums::account::Password::Password(pwd)) => {
-                crate::admin::cloud_password_state_from_tl(&pwd)
-            }
-            Err(_) => CloudPasswordState::default(),
-        };
-        if let Ok(mut c) = self.cache.lock() {
-            c.cloud_password_loaded = true;
-            c.cloud_password = state.clone();
-        }
-        state
+        self.spawn_settings_read(SettingsRead::CloudPassword, Self::load_cloud_password);
+        self.cache
+            .lock()
+            .map(|c| c.cloud_password.clone())
+            .unwrap_or_default()
+    }
+
+    fn settings_read_pending(&self, read: SettingsRead) -> bool {
+        self.settings_read_pending_now(read)
     }
 
     fn verify_cloud_password(&self, password: &str) -> Result<(), CloudPasswordError> {
@@ -6448,6 +6441,10 @@ impl SettingsBackend for LiveSession {
                 c.notify_exceptions_loaded.clear();
                 c.notify_exception_peers.clear();
                 c.scope_notify.clear();
+                for scope in NotifyScope::ALL {
+                    c.settings_reads
+                        .invalidate(SettingsRead::ScopeNotifications(scope));
+                }
                 c.notify_settings_version = c.notify_settings_version.wrapping_add(1);
             }
             self.write_session(crate::notify_sync::reset_session_notify_settings);

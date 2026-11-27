@@ -132,15 +132,11 @@ impl CreditsAmount {
     }
 
     fn normalize(&mut self) {
-        if self.nano < 0 {
-            let shifts = (-self.nano + ONE_STAR_IN_NANO - 1) / ONE_STAR_IN_NANO;
-            self.nano += shifts * ONE_STAR_IN_NANO;
-            self.whole -= shifts;
-        } else if self.nano >= ONE_STAR_IN_NANO {
-            let shifts = self.nano / ONE_STAR_IN_NANO;
-            self.nano -= shifts * ONE_STAR_IN_NANO;
-            self.whole += shifts;
-        }
+        // `div_euclid` / `rem_euclid` normalize without the `-nano` overflow on `i64::MIN`.
+        self.whole = self
+            .whole
+            .saturating_add(self.nano.div_euclid(ONE_STAR_IN_NANO));
+        self.nano = self.nano.rem_euclid(ONE_STAR_IN_NANO);
     }
 }
 

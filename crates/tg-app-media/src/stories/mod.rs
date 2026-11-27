@@ -16,7 +16,11 @@ pub mod compose;
 pub mod layout;
 pub mod media_loader;
 pub mod mock;
+#[cfg(test)]
+mod snap_w7;
 pub mod strip;
+#[cfg(test)]
+mod tests_w7_strip;
 pub mod viewer;
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -76,6 +80,8 @@ pub struct AppStoriesHost {
     toast_text: Option<(String, i64)>,
     media_cache: StoryMediaCache,
     last_strip_rect: Option<egui::Rect>,
+    /// Whether [`Self::sync_add_story_button_hidden`] loaded the persisted pref yet.
+    add_story_pref_loaded: bool,
 }
 
 impl Default for AppStoriesHost {
@@ -105,6 +111,7 @@ impl AppStoriesHost {
             toast_text: None,
             media_cache: StoryMediaCache::new(),
             last_strip_rect: None,
+            add_story_pref_loaded: false,
         }
     }
 
@@ -124,6 +131,7 @@ impl AppStoriesHost {
             toast_text: None,
             media_cache: StoryMediaCache::new(),
             last_strip_rect: None,
+            add_story_pref_loaded: false,
         }
     }
 
@@ -147,6 +155,13 @@ impl AppStoriesHost {
     /// Returns a mutable reference to the [`StoriesStrip`] widget.
     pub fn strip_mut(&mut self) -> &mut StoriesStrip {
         &mut self.strip
+    }
+
+    /// Sets where story videos play their sound: the app's mixer, shared with the media viewer
+    /// (`AudioPlayerBar::video_sound_output`). Call it every frame like
+    /// `MediaOverlayWidget::set_video_sound_output`; it is cheap when nothing changed.
+    pub fn set_video_sound_output(&mut self, output: Option<crate::media::VideoSoundOutput>) {
+        self.media_cache.set_video_sound_output(output);
     }
 
     /// Returns a reference to the [`StoryViewerOverlay`].
@@ -399,6 +414,30 @@ impl AppStoriesHost {
         let now_secs = current_unix_secs();
         let now_ms = self.elapsed_ms();
         self.handle_strip_actions(frame.actions, now_secs, now_ms);
+    }
+
+    /// Keeps the persisted strip prefs and the strip in step: the `dialogs-add-story-hidden` pref
+    /// and `storiesClickTooltipHidden`. The first call loads them into the strip, later calls
+    /// copy a change made in the strip back. Returns `true` when a pref changed and needs saving.
+    pub fn sync_strip_prefs(
+        &mut self,
+        add_story_button_hidden: &mut bool,
+        click_tooltip_hidden: &mut bool,
+    ) -> bool {
+        if !self.add_story_pref_loaded {
+            self.add_story_pref_loaded = true;
+            self.strip
+                .set_add_story_button_hidden(*add_story_button_hidden);
+            self.strip.set_click_tooltip_hidden(*click_tooltip_hidden);
+            return false;
+        }
+        let current = (
+            self.strip.add_story_button_hidden(),
+            self.strip.click_tooltip_hidden(),
+        );
+        let changed = current != (*add_story_button_hidden, *click_tooltip_hidden);
+        (*add_story_button_hidden, *click_tooltip_hidden) = current;
+        changed
     }
 
     /// Notes that the strip is not shown this frame (search active, Archive open, narrow
@@ -671,7 +710,10 @@ impl AppStoriesHost {
                 StoriesStripAction::DismissFailedUpload(peer_id) => {
                     self.backend.dismiss_failed_uploads(peer_id);
                 }
-                StoriesStripAction::SwitchList(_) | StoriesStripAction::ExpandedChanged(_) => {}
+                StoriesStripAction::SwitchList(_)
+                | StoriesStripAction::ExpandedChanged(_)
+                | StoriesStripAction::SetAddStoryButtonHidden(_)
+                | StoriesStripAction::SetClickTooltipHidden(_) => {}
             }
         }
     }

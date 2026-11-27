@@ -9,3 +9,6 @@ bitflags = "2.9"
 regex = "1.11"
 unicode-general-category = "1.0"
 unicode-script = "0.5"
+
+[dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }

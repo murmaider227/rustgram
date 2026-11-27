@@ -40,7 +40,7 @@ use crate::dc_options::{
 use crate::error::{InvocationError, RpcError};
 use crate::message::{
     CUT_CONTAINER_ON_BYTES, DecryptedEnvelope, ReceiveBudget, RequestId, body_needs_ack,
-    build_encrypted_packet, gzip_pack_if_smaller, gzip_unpack, pack_container,
+    build_encrypted_packet, gzip_pack_if_smaller, gzip_unpack, is_file_part_upload, pack_container,
     parse_encrypted_packet, unpack_container_with_budget, unwrap_gzip_layers_with_budget,
     wrap_init_connection, wrap_invoke_after_msg,
 };
@@ -67,6 +67,9 @@ pub const HTTP_WAIT_MAX_DELAY_MS: i32 = 100;
 pub const HTTP_WAIT_WAIT_AFTER_MS: i32 = 30;
 /// `http_wait.max_wait` in milliseconds (`session_private.cpp`).
 pub const HTTP_WAIT_MAX_WAIT_MS: i32 = 25_000;
+/// How long a session waits on its open connection for another session on the same DC to
+/// finish creating the auth key before falling back to the reconnect backoff.
+pub const KEY_CREATION_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Server-pushed update (or `new_session_created` notification) forwarded to callers.
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +289,11 @@ pub enum CheckSentOutcome {
     BindTimedOut,
 }
 
+#[cfg(test)]
+#[path = "session_tests_acked.rs"]
+#[cfg(test)]
+mod tests_acked;
+
 impl SessionState {
     /// Creates a new `SessionState` with a freshly generated random 64-bit `session_id`.
     pub fn new(
@@ -464,7 +472,13 @@ impl SessionState {
         self.state_and_resend_requests.clear();
         self.bind_msg_id = None;
         self.ping_msg_id = None;
-        self.pending_ping_id = None;
+        // A ping sent in the old session is never answered in the new one; send its id again so
+        // whoever awaits that pong (`SessionHandle::ping`, the idle keepalive) is not stranded.
+        if let Some(in_flight_ping) = self.pending_ping_id.take()
+            && self.ping_id_to_send.is_none()
+        {
+            self.ping_id_to_send = Some(in_flight_ping);
+        }
         self.future_salts_msg_id = None;
         // Clear stale msg_id/seq_no on requests already queued in to_send (e.g. from an earlier
         // resend) so they do not reuse pre-reset sequence numbers after session_id rotates.
@@ -873,7 +887,7 @@ impl SessionState {
                     self.req_to_msg.insert(req.request_id, msg_id);
                     self.have_sent.insert(msg_id, req);
                 } else {
-                    self.acked_ids.insert(msg_id, req.request_id);
+                    self.remember_acked(msg_id, req.request_id);
                 }
                 return Some(OutboundMessage {
                     salt,
@@ -930,7 +944,7 @@ impl SessionState {
                 tracked_inner_ids.push(msg_id);
                 needs_response = true;
             } else {
-                self.acked_ids.insert(msg_id, req.request_id);
+                self.remember_acked(msg_id, req.request_id);
             }
             container_items.push(CoreMessage {
                 msg_id: msg_id as i64,
@@ -1030,17 +1044,21 @@ impl SessionState {
         needs_layer: bool,
         is_cdn: bool,
     ) -> Vec<u8> {
-        let mut body = req.body.clone();
+        let mut wrapped = None;
         if let Some(after_req_id) = req.after_request_id
             && let Some(&after_msg_id) = self.req_to_msg.get(&after_req_id)
             && self.have_sent.contains_key(&after_msg_id)
         {
-            body = wrap_invoke_after_msg(after_msg_id, &body);
+            wrapped = Some(wrap_invoke_after_msg(after_msg_id, &req.body));
         }
         if needs_layer && req.needs_layer {
-            body = wrap_init_connection(&self.config, LAYER, is_cdn, &body);
+            let inner = wrapped.as_deref().unwrap_or(&req.body);
+            wrapped = Some(wrap_init_connection(&self.config, LAYER, is_cdn, inner));
         }
-        gzip_pack_if_smaller(&body)
+        if is_file_part_upload(&req.body) {
+            return wrapped.unwrap_or_else(|| req.body.clone());
+        }
+        gzip_pack_if_smaller(wrapped.as_deref().unwrap_or(&req.body))
     }
 
     fn record_service_sent(&mut self, kind: ServiceKind, msg_id: u64, now: Instant) -> bool {
@@ -1684,6 +1702,18 @@ impl SessionState {
         self.clock.update_server_time(server_time, true);
     }
 
+    /// Records `msg_id` as acknowledged, keeping only the newest [`IDS_BUFFER_SIZE`] ids.
+    ///
+    /// tdesktop trims `_ackedIds` only at the end of `requestsAcked`; trimming here also bounds
+    /// the ids of requests sent without an ack, which otherwise pile up until the next ack.
+    /// After any sequence of inserts the map holds the same newest ids either way.
+    fn remember_acked(&mut self, msg_id: u64, request_id: RequestId) {
+        self.acked_ids.insert(msg_id, request_id);
+        if self.acked_ids.len() > IDS_BUFFER_SIZE {
+            self.acked_ids.pop_first();
+        }
+    }
+
     /// Marks `ids` as acknowledged, unpacking container acks (`SessionPrivate::requestsAcked`).
     fn requests_acked(&mut self, ids: &[u64], by_response: bool) {
         let mut nested = Vec::new();
@@ -1703,7 +1733,7 @@ impl SessionState {
                 }
                 let req_id = req.request_id;
                 self.have_sent.remove(&msg_id);
-                self.acked_ids.insert(msg_id, req_id);
+                self.remember_acked(msg_id, req_id);
                 continue;
             }
             if let Some(&req_id) = self.resending_ids.get(&msg_id) {
@@ -1716,15 +1746,7 @@ impl SessionState {
                 }
                 self.resending_ids.remove(&msg_id);
                 self.to_send.remove(&req_id);
-                self.acked_ids.insert(msg_id, req_id);
-            }
-        }
-
-        while self.acked_ids.len() > IDS_BUFFER_SIZE {
-            if let Some(&oldest) = self.acked_ids.keys().next() {
-                self.acked_ids.remove(&oldest);
-            } else {
-                break;
+                self.remember_acked(msg_id, req_id);
             }
         }
 
@@ -1809,6 +1831,7 @@ enum SessionCommand {
         reply_tx: oneshot::Sender<Result<Vec<u8>, InvocationError>>,
     },
     Cancel(RequestId),
+    CancelPing(u64),
     Ping {
         ping_id: u64,
         reply_tx: oneshot::Sender<Result<mtp_types::Pong, InvocationError>>,
@@ -1969,13 +1992,12 @@ impl SessionHandle {
             .map_err(|_| InvocationError::Dropped)?;
 
         let guard = CancelOnDrop {
-            request_id: req_id,
+            command: Some(SessionCommand::Cancel(req_id)),
             cmd_tx: self.cmd_tx.clone(),
-            armed: true,
         };
-        let res = reply_rx.await.map_err(|_| InvocationError::Dropped)?;
-        std::mem::forget(guard);
-        res
+        let res = reply_rx.await.map_err(|_| InvocationError::Dropped);
+        guard.disarm();
+        res?
     }
 
     /// Cancels an in-flight or queued request by ID.
@@ -1993,7 +2015,13 @@ impl SessionHandle {
         self.cmd_tx
             .send(SessionCommand::Ping { ping_id, reply_tx })
             .map_err(|_| InvocationError::Dropped)?;
-        reply_rx.await.map_err(|_| InvocationError::Dropped)?
+        let guard = CancelOnDrop {
+            command: Some(SessionCommand::CancelPing(ping_id)),
+            cmd_tx: self.cmd_tx.clone(),
+        };
+        let res = reply_rx.await.map_err(|_| InvocationError::Dropped);
+        guard.disarm();
+        res?
     }
 
     /// Forces the session to drop its current connection and reconnect immediately.
@@ -2007,16 +2035,22 @@ impl SessionHandle {
     }
 }
 
+/// Sends `command` (a cancel) to the session when the awaiting future is dropped early.
 struct CancelOnDrop {
-    request_id: RequestId,
+    command: Option<SessionCommand>,
     cmd_tx: mpsc::UnboundedSender<SessionCommand>,
-    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn disarm(mut self) {
+        self.command = None;
+    }
 }
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = self.cmd_tx.send(SessionCommand::Cancel(self.request_id));
+        if let Some(command) = self.command.take() {
+            let _ = self.cmd_tx.send(command);
         }
     }
 }
@@ -2048,6 +2082,13 @@ enum DriveExit {
     Shutdown,
     Restart,
     Disconnected,
+}
+
+/// Outcome of [`SessionRunner::ensure_auth_key`].
+enum KeySetup {
+    Ready(Box<AuthKey>),
+    Restart,
+    Shutdown,
 }
 
 impl SessionRunner {
@@ -2085,7 +2126,7 @@ impl SessionRunner {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 if self.apply_command(cmd, &mut state) {
                     self.set_connection_state(ConnectionState::Disconnected);
-                    self.fail_all_waiters(InvocationError::Dropped);
+                    self.fail_all_waiters();
                     return;
                 }
             }
@@ -2146,7 +2187,7 @@ impl SessionRunner {
                 }
                 ConnectOutcome::Shutdown => {
                     self.set_connection_state(ConnectionState::Disconnected);
-                    self.fail_all_waiters(InvocationError::Dropped);
+                    self.fail_all_waiters();
                     return;
                 }
                 ConnectOutcome::Failed(err) => {
@@ -2163,7 +2204,7 @@ impl SessionRunner {
                     self.retry_ms = next_retry_backoff_ms(self.retry_ms);
                     if self.sleep_or_commands(wait, &mut state).await {
                         self.set_connection_state(ConnectionState::Disconnected);
-                        self.fail_all_waiters(InvocationError::Dropped);
+                        self.fail_all_waiters();
                         return;
                     }
                     continue;
@@ -2177,7 +2218,18 @@ impl SessionRunner {
                 .ensure_auth_key(conn.as_mut(), dc_type, proto_dc, &mut state)
                 .await
             {
-                Ok(key) => key,
+                Ok(KeySetup::Ready(key)) => *key,
+                Ok(KeySetup::Restart) => {
+                    conn.close().await;
+                    self.set_connection_state(ConnectionState::Connecting);
+                    continue;
+                }
+                Ok(KeySetup::Shutdown) => {
+                    conn.close().await;
+                    self.set_connection_state(ConnectionState::Disconnected);
+                    self.fail_all_waiters();
+                    return;
+                }
                 Err(err) => {
                     warn!(dc = self.shifted_dc_id, error = %err, "auth key setup failed");
                     conn.close().await;
@@ -2188,7 +2240,7 @@ impl SessionRunner {
                     self.retry_ms = next_retry_backoff_ms(self.retry_ms);
                     if self.sleep_or_commands(wait, &mut state).await {
                         self.set_connection_state(ConnectionState::Disconnected);
-                        self.fail_all_waiters(InvocationError::Dropped);
+                        self.fail_all_waiters();
                         return;
                     }
                     continue;
@@ -2219,7 +2271,7 @@ impl SessionRunner {
             match exit {
                 DriveExit::Shutdown => {
                     self.set_connection_state(ConnectionState::Disconnected);
-                    self.fail_all_waiters(InvocationError::Dropped);
+                    self.fail_all_waiters();
                     return;
                 }
                 DriveExit::Restart => {
@@ -2237,27 +2289,80 @@ impl SessionRunner {
             self.retry_ms = next_retry_backoff_ms(self.retry_ms);
             if self.sleep_or_commands(wait, &mut state).await {
                 self.set_connection_state(ConnectionState::Disconnected);
-                self.fail_all_waiters(InvocationError::Dropped);
+                self.fail_all_waiters();
                 return;
             }
         }
     }
 
+    /// Returns the auth key for this connection, creating it when this session holds the
+    /// key-creation slot. While another session on the same DC creates the key, waits for it on
+    /// the open connection (tdesktop waits for the `Dcenter` key-changed signal instead of
+    /// reconnecting) and keeps handling commands.
     async fn ensure_auth_key(
         &mut self,
         conn: &mut dyn PacketConnection,
         dc_type: DcType,
         proto_dc: i16,
         state: &mut SessionState,
-    ) -> Result<AuthKey, InvocationError> {
+    ) -> Result<KeySetup, InvocationError> {
+        loop {
+            // Subscribe before looking at the keys so a release in between is not missed.
+            let mut key_released = self.dcenter.subscribe_key_creation();
+            if let Some(key) = self.try_auth_key(conn, dc_type, proto_dc, state).await? {
+                return Ok(KeySetup::Ready(Box::new(key)));
+            }
+            let wait = tokio::time::sleep(KEY_CREATION_WAIT_TIMEOUT);
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    changed = key_released.changed() => {
+                        if changed.is_err() {
+                            return Err(InvocationError::Dropped);
+                        }
+                        break;
+                    }
+                    () = &mut wait => {
+                        return Err(InvocationError::Protocol(
+                            "timed out waiting for concurrent key creation".to_string(),
+                        ));
+                    }
+                    cmd = self.cmd_rx.recv() => match cmd {
+                        None | Some(SessionCommand::Shutdown) => return Ok(KeySetup::Shutdown),
+                        Some(SessionCommand::Restart) => {
+                            self.retry_ms = 1;
+                            return Ok(KeySetup::Restart);
+                        }
+                        Some(other) => {
+                            self.apply_command(other, state);
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    /// One attempt of [`Self::ensure_auth_key`]: `Ok(None)` when another session on this DC
+    /// holds the key-creation slot.
+    async fn try_auth_key(
+        &mut self,
+        conn: &mut dyn PacketConnection,
+        dc_type: DcType,
+        proto_dc: i16,
+        state: &mut SessionState,
+    ) -> Result<Option<AuthKey>, InvocationError> {
         let bare = bare_dc_id(self.shifted_dc_id);
         let temp_slot = TemporaryKeyType::from_dc_type(dc_type);
 
         // KeysDestroyer always operates directly on the persistent key without PFS.
         if self.keys_destroyer_mode {
-            return self.dcenter.persistent_key().map(|k| k.key).ok_or_else(|| {
-                InvocationError::Protocol("missing persistent key in KeysDestroyer".to_string())
-            });
+            return self
+                .dcenter
+                .persistent_key()
+                .map(|k| Some(k.key))
+                .ok_or_else(|| {
+                    InvocationError::Protocol("missing persistent key in KeysDestroyer".to_string())
+                });
         }
 
         // CDN DCs always use unbound temporary auth keys (never persistent keys or
@@ -2266,7 +2371,7 @@ impl SessionRunner {
         // `SessionPrivate::tryAcquireKeyCreation` in `mtproto/session_private.cpp:2608-2627`).
         if !self.config.use_pfs && dc_type != DcType::Cdn {
             if let Some(perm) = self.dcenter.persistent_key() {
-                return Ok(perm.key);
+                return Ok(Some(perm.key));
             }
             // Persistent keys always belong to the Regular DC ID, never a negative MediaCluster ID
             // (`SessionPrivate::tryAcquireKeyCreation` in `mtproto/session_private.cpp:2642-2644`).
@@ -2297,30 +2402,23 @@ impl SessionRunner {
             state.salts_mut().set_salt(res.persistent_server_salt);
             let raw_key = perm.key.clone();
             self.dcenter.set_persistent_key(Some(perm));
-            return Ok(raw_key);
+            return Ok(Some(raw_key));
         }
 
         // PFS / CDN mode: use existing temporary key if present.
         if let Some(temp) = self.dcenter.temporary_key(temp_slot) {
-            return Ok(temp.key);
+            return Ok(Some(temp.key));
         }
 
         // This session already created a temporary key and holds the creation lock while the
         // bind is pending; after a reconnect, bind that key again instead of waiting on itself.
         if let Some(temp) = state.resume_pending_bind() {
-            return Ok(temp);
+            return Ok(Some(temp));
         }
 
         let creating = self.dcenter.acquire_key_creation(dc_type);
         if creating == CreatingKeyType::None {
-            // Another session on the same DC is creating the key; wait briefly and retry.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if let Some(temp) = self.dcenter.temporary_key(temp_slot) {
-                return Ok(temp.key);
-            }
-            return Err(InvocationError::Protocol(
-                "waiting for concurrent key creation".to_string(),
-            ));
+            return Ok(None);
         }
 
         // Match `SessionPrivate::tryAcquireKeyCreation` (`mtproto/session_private.cpp:2642-2644`):
@@ -2375,7 +2473,7 @@ impl SessionRunner {
                     "failed to store CDN temporary key".to_string(),
                 ));
             }
-            return Ok(raw_key);
+            return Ok(Some(raw_key));
         }
 
         let perm_key = match res.persistent_key.or_else(|| self.dcenter.persistent_key()) {
@@ -2388,7 +2486,7 @@ impl SessionRunner {
             }
         };
         state.set_pending_temp_key_bind(perm_key, temp_key, creating);
-        Ok(raw_key)
+        Ok(Some(raw_key))
     }
 
     /// Drives an established encrypted connection until disconnect, restart, or shutdown.
@@ -2596,6 +2694,10 @@ impl SessionRunner {
                 }
                 false
             }
+            SessionCommand::CancelPing(ping_id) => {
+                self.ping_waiters.remove(&ping_id);
+                false
+            }
             SessionCommand::Ping { ping_id, reply_tx } => {
                 self.ping_waiters.insert(ping_id, reply_tx);
                 state.schedule_ping(ping_id);
@@ -2616,12 +2718,20 @@ impl SessionRunner {
                         let _ = tx.send(Ok(body));
                     }
                 }
-                SessionEvent::Update(msg) => {
-                    if let Some(btx) = &self.updates_broadcast_tx {
-                        let _ = btx.send(msg.clone());
+                SessionEvent::Update(msg) => match &self.updates_broadcast_tx {
+                    // tg-session reads only the broadcast and drops the mpsc receiver: move the
+                    // update instead of deep-cloning it for a channel nobody reads.
+                    Some(btx) if self.updates_tx.is_closed() => {
+                        let _ = btx.send(msg);
                     }
-                    let _ = self.updates_tx.send(msg);
-                }
+                    Some(btx) => {
+                        let _ = btx.send(msg.clone());
+                        let _ = self.updates_tx.send(msg);
+                    }
+                    None => {
+                        let _ = self.updates_tx.send(msg);
+                    }
+                },
                 SessionEvent::Pong(pong) => {
                     if let Some(tx) = self.ping_waiters.remove(&(pong.ping_id as u64)) {
                         let _ = tx.send(Ok(pong));
@@ -2666,13 +2776,14 @@ impl SessionRunner {
         }
     }
 
-    fn fail_all_waiters(&mut self, err: InvocationError) {
-        let msg = err.to_string();
+    /// Fails every pending RPC and ping with [`InvocationError::Dropped`] when the session
+    /// stops before their replies arrive.
+    fn fail_all_waiters(&mut self) {
         for (_, tx) in self.waiters.drain() {
             let _ = tx.send(Err(InvocationError::Dropped));
         }
         for (_, tx) in self.ping_waiters.drain() {
-            let _ = tx.send(Err(InvocationError::Protocol(msg.clone())));
+            let _ = tx.send(Err(InvocationError::Dropped));
         }
     }
 }

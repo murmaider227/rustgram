@@ -977,7 +977,7 @@ impl AccountStorage {
     /// Derive `lib_storage` [`StorageEncryptionKey`] for the binlog caches (`Account::cacheKey`).
     #[must_use]
     pub fn cache_key(&self) -> StorageEncryptionKey {
-        match StorageEncryptionKey::new(self.local_key.data.to_vec()) {
+        match StorageEncryptionKey::new(self.local_key.data().to_vec()) {
             Ok(key) => key,
             Err(_) => unreachable!("256-byte AuthKey is always a valid v1 StorageEncryptionKey"),
         }
@@ -2002,7 +2002,7 @@ impl AccountStorage {
             let mut emoji = Vec::new();
 
             if scnt >= 0 {
-                stickers.reserve(scnt as usize);
+                stickers.reserve(r.capacity_for(scnt as usize, 20));
                 // Match `Storage::Account::readStickerSets` (`storage/storage_account.cpp:2235-2248`):
                 // deduplicate sticker documents by ID so stale duplicates cannot corrupt list hashes.
                 let mut seen_docs = BTreeSet::new();
@@ -2019,7 +2019,7 @@ impl AccountStorage {
                             "sticker dates_count mismatch".into(),
                         ));
                     }
-                    dates.reserve(dates_count as usize);
+                    dates.reserve(r.capacity_for(dates_count as usize, 4));
                     for _ in 0..dates_count {
                         dates.push(r.read_i32()?);
                     }
@@ -2028,7 +2028,7 @@ impl AccountStorage {
                 if emoji_count < 0 {
                     return Err(StorageError::CorruptData("negative emoji count".into()));
                 }
-                emoji.reserve(emoji_count as usize);
+                emoji.reserve(r.capacity_for(emoji_count as usize, 8));
                 for _ in 0..emoji_count {
                     let emoji_str = r.read_qstring()?;
                     let ids_count = r.read_i32()?;
@@ -2037,7 +2037,7 @@ impl AccountStorage {
                             "negative sticker ids count".into(),
                         ));
                     }
-                    let mut ids = Vec::with_capacity(ids_count as usize);
+                    let mut ids = Vec::with_capacity(r.capacity_for(ids_count as usize, 8));
                     for _ in 0..ids_count {
                         ids.push(r.read_u64()?);
                     }
@@ -2751,5 +2751,58 @@ mod tests {
             .expect("reopen");
         assert_eq!(reopened.map(), account.map());
         assert!(reopened.map().collect_good_names().contains("maps"));
+    }
+
+    /// Replaces the only occurrence of `needle` in `haystack` with `replacement` (same length).
+    fn patch_once(haystack: &mut [u8], needle: &[u8], replacement: &[u8]) {
+        let positions: Vec<usize> = haystack
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(i, w)| (w == needle).then_some(i))
+            .collect();
+        assert_eq!(positions.len(), 1, "needle must occur exactly once");
+        haystack[positions[0]..positions[0] + needle.len()].copy_from_slice(replacement);
+    }
+
+    /// A corrupt emoji count near `i32::MAX` used to size a `Vec` directly: the allocation
+    /// failed and aborted the process on startup instead of returning an error.
+    #[test]
+    fn huge_sticker_emoji_count_is_an_error_not_an_abort() {
+        let dir = TempDir::new().expect("tempdir");
+        let domain = DomainStorage::create_fresh(dir.path(), "data").expect("create domain");
+        let account =
+            AccountStorage::open(dir.path(), "data", 0, domain.local_key().clone()).expect("open");
+        let skey = generate_key(account.base_path());
+        let sets_file = StoredStickerSetsFile {
+            sets: vec![StoredStickerSet {
+                id: 1001,
+                access_hash: 2002,
+                title: "Pack".into(),
+                short_name: "pack_short".into(),
+                count: 0,
+                thumbnail_location: ImageLocation::default(),
+                emoji: vec![("x".into(), vec![0x0123_4567_89AB_CDEF])],
+                ..StoredStickerSet::default()
+            }],
+            order: vec![1001],
+        };
+        account
+            .write_sticker_sets(skey, &sets_file)
+            .expect("write stickers");
+
+        let file = read_encrypted_file_by_key(skey, account.base_path(), domain.local_key())
+            .expect("read raw");
+        let mut payload = file.data.clone();
+        // Emoji count 1, then the QString "x" (byte length 2, UTF-16BE 0x0078).
+        let tail = [0, 0, 0, 2, 0, 0x78];
+        let mut needle = 1i32.to_be_bytes().to_vec();
+        needle.extend_from_slice(&tail);
+        let mut replacement = i32::MAX.to_be_bytes().to_vec();
+        replacement.extend_from_slice(&tail);
+        patch_once(&mut payload, &needle, &replacement);
+        write_encrypted_file_by_key(skey, account.base_path(), &payload, domain.local_key())
+            .expect("write patched");
+
+        assert!(account.read_sticker_sets(skey).is_err());
     }
 }

@@ -210,11 +210,9 @@ pub fn parse_local_url(url: &str) -> Option<LocalUrlRoute> {
 }
 
 fn strip_prefix_ascii_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
 }
 
 fn parse_query_params_lowercase(query: &str) -> HashMap<String, String> {
@@ -326,5 +324,25 @@ mod tests {
 
         let settings = parse_local_url("tg://settings/proxy");
         assert_eq!(settings, Some(LocalUrlRoute::Settings("proxy".to_owned())));
+    }
+    /// Text that starts with non-ASCII characters (pasted into the Add Proxy box, or a clicked
+    /// link) used to panic: the scheme prefix was compared by slicing at a byte index that can
+    /// fall inside a multi-byte character.
+    #[test]
+    fn non_ascii_text_is_not_a_link_and_does_not_panic() {
+        for text in [
+            "Прокси сервер",
+            "N\u{1F600}CE/2\u{1F600}5",
+            "é",
+            "日本語のテキスト",
+        ] {
+            assert_eq!(try_convert_url_to_local(text), text);
+            assert_eq!(parse_local_url(text), None);
+            assert!(parse_proxy_link(text).is_none());
+        }
+        assert_eq!(
+            try_convert_url_to_local("HTTPS://T.ME/proxy?server=h&port=1&secret=00"),
+            "tg://proxy?server=h&port=1&secret=00"
+        );
     }
 }

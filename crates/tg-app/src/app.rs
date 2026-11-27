@@ -603,6 +603,12 @@ impl eframe::App for TgforkApp {
         let _frame_trace =
             crate::startup::frame_trace::begin_frame(ui.ctx(), frame.info().cpu_usage);
         let ctx = ui.ctx().clone();
+        // tdesktop's device pixel ratio and interface scale, `-scale` included (TGB-3040).
+        let config_scale = self
+            .startup
+            .as_ref()
+            .map_or(tg_core::SCALE_AUTO, |s| s.plan.global_config.config_scale);
+        tg_app_window::window::interface_scale::apply(&ctx, config_scale);
         let hwnd = extract_eframe_hwnd(frame);
         let has_crash_recovery = self
             .startup

@@ -73,11 +73,7 @@ fn warning_stroke(palette: &Palette) -> Color32 {
 }
 
 fn short_addr(addr: &str) -> String {
-    if addr.len() > 18 {
-        format!("{}...{}", &addr[..8], &addr[addr.len() - 6..])
-    } else {
-        addr.to_owned()
-    }
+    super::address_text::short_address(addr, 18)
 }
 
 fn format_signed_ton_delta(delta_nano: i128) -> String {
@@ -985,3 +981,8 @@ fn render_pending_sign_data_box(
             });
         });
 }
+
+#[cfg(test)]
+#[path = "ton_connect_ui_tests.rs"]
+#[cfg(test)]
+mod tests;

@@ -15,7 +15,7 @@ use tg_ui::widgets::buttons::RoundButton;
 
 use super::backend::{
     ACCOUNT_TTL_OPTIONS, GLOBAL_TTL_OPTIONS_SECS, PrivacyKey, PrivacyOption, PrivacyRule,
-    SettingsBackend,
+    SettingsBackend, SettingsRead,
 };
 use super::strings;
 use super::widgets::{
@@ -207,7 +207,11 @@ pub fn render_privacy_section(
     subsection_title(ui, &tr::lng_settings_security(), colors);
 
     let cloud_state = backend.cloud_password_state();
-    let cloud_label = if cloud_state.has_password {
+    // `PasswordState::Loading`: "Loading..." and the row does nothing until the state is known.
+    let cloud_loading = backend.settings_read_pending(SettingsRead::CloudPassword);
+    let cloud_label = if cloud_loading {
+        tr::lng_profile_loading()
+    } else if cloud_state.has_password {
         tr::lng_settings_cloud_password_on()
     } else {
         tr::lng_settings_cloud_password_off()
@@ -224,6 +228,7 @@ pub fn render_privacy_section(
         colors,
     )
     .clicked()
+        && !cloud_loading
     {
         out.open_cloud_password = true;
     }
@@ -291,7 +296,10 @@ pub fn render_privacy_section(
     }
 
     let blocked_count = backend.blocked_users().len();
-    let blocked_label = if blocked_count == 0 {
+    // No label until the first `contacts.getBlocked` answer (`BlockedPeers::slice`).
+    let blocked_label = if backend.settings_read_pending(SettingsRead::BlockedUsers) {
+        String::new()
+    } else if blocked_count == 0 {
         tr::lng_settings_no_blocked_users()
     } else {
         blocked_count.to_string()
@@ -520,7 +528,13 @@ pub fn render_privacy_section(
     // 4. Delete my account (Self-Destruction TTL) & Payments.
     subsection_title(ui, &tr::lng_self_destruct_title(), colors);
     let account_ttl = backend.account_ttl_days();
-    let account_ttl_str = format_ttl_days(account_ttl);
+    // No label, and no box, until `account.getAccountTTL` answers (`daysAccountTTL`).
+    let account_ttl_loading = backend.settings_read_pending(SettingsRead::AccountTtl);
+    let account_ttl_str = if account_ttl_loading {
+        String::new()
+    } else {
+        format_ttl_days(account_ttl)
+    };
     let self_destruct_desc = tr::lng_self_destruct_description();
     if settings_row(
         ui,
@@ -533,6 +547,7 @@ pub fn render_privacy_section(
         colors,
     )
     .clicked()
+        && !account_ttl_loading
     {
         state.editor = PrivacyEditor::AccountTtl {
             selected_days: account_ttl,

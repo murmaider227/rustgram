@@ -420,7 +420,7 @@ pub(crate) fn report_spam_and_block(
         }
     });
     if let Ok(mut c) = live.cache.lock() {
-        c.blocked_loaded = false;
+        c.invalidate_blocked_users();
     }
 
     // 2. Optionally report spam (`messages.reportSpam`).
@@ -464,7 +464,7 @@ pub(crate) fn unblock_and_restart_bot(live: &LiveSession, peer_id: PeerId) -> Re
             .is_some_and(|u| u.is_bot() && !u.is_support())
     });
     if let Ok(mut c) = live.cache.lock() {
-        c.blocked_loaded = false;
+        c.invalidate_blocked_users();
     }
 
     if is_restartable_bot {

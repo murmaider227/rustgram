@@ -25,8 +25,6 @@ pub mod mock;
 pub mod panel;
 pub mod recent_calls;
 pub mod screen_picker;
-#[cfg(test)]
-pub mod screenshot;
 pub mod strings;
 #[cfg(test)]
 mod tests_sec3a;
@@ -550,7 +548,6 @@ mod tests {
     use crate::calls::mock::MockCallsBackend;
     use crate::calls::panel::CallPanelState;
     use crate::calls::recent_calls::group_recent_calls;
-    use crate::calls::screenshot::{render_egui_offscreen, save_rgba_png};
     use crate::calls::theme::{CALL_BAR_HEIGHT, CallPalette};
     use crate::calls::top_bar::{CallsTopBar, TopBarState, group_bar_state};
     use tg_app_core::stand_in::types::PeerId;
@@ -885,9 +882,37 @@ mod tests {
     // 5. Offscreen egui screenshot generation (`crates/tg-app/docs/calls*.png`)
     // -------------------------------------------------------------------------
 
+    /// One frame at 1.0 DPI on `bg`, through the shared software rasterizer.
+    fn render_egui_offscreen(
+        width: u32,
+        height: u32,
+        bg: egui::Color32,
+        draw: impl FnMut(&mut egui::Ui),
+    ) -> tg_ui::soft_raster::RgbaFrame {
+        let ctx = egui::Context::default();
+        tg_ui::fonts::ensure_tdesktop_fonts(&ctx);
+        let options = tg_ui::soft_raster::RenderOptions {
+            passes: 2,
+            background: bg,
+            central_panel: false,
+            ..tg_ui::soft_raster::RenderOptions::docs(width, height, 1.0)
+        };
+        tg_ui::soft_raster::render(&ctx, &options, draw)
+    }
+
+    /// Checks the frame and, with `RUSTGRAM_UPDATE_SCREENSHOTS=1`, writes it to the docs folder.
+    fn save_calls_screenshot(name: &str, img: &tg_ui::soft_raster::RgbaFrame) {
+        assert!(img.to_png().starts_with(&[137, 80, 78, 71]));
+        let write_files = std::env::var("RUSTGRAM_UPDATE_SCREENSHOTS").as_deref() == Ok("1")
+            || std::env::var("TGFORK_UPDATE_SCREENSHOTS").as_deref() == Ok("1");
+        if write_files {
+            let path = tg_app_core::core_types::paths::workspace_app_docs_dir().join(name);
+            img.save_png(&path).expect("save calls screenshot");
+        }
+    }
+
     #[test]
     fn generate_calls_ui_screenshots() {
-        let docs_dir = tg_app_core::core_types::paths::workspace_app_docs_dir();
         let palette = CallPalette::tdesktop();
 
         // 1) Incoming call screenshot (`calls_incoming.png`)
@@ -915,9 +940,7 @@ mod tests {
                         );
                     });
             });
-            let path = docs_dir.join("calls_incoming.png");
-            save_rgba_png(&path, &img).expect("save calls_incoming.png");
-            assert!(path.exists());
+            save_calls_screenshot("calls_incoming.png", &img);
         }
 
         // 2) Active 1:1 call with emoji verification key, tooltip, signal bars & green top bar (`calls_active.png`)
@@ -956,9 +979,7 @@ mod tests {
                         );
                     });
             });
-            let path = docs_dir.join("calls_active.png");
-            save_rgba_png(&path, &img).expect("save calls_active.png");
-            assert!(path.exists());
+            save_calls_screenshot("calls_active.png", &img);
         }
 
         // 3) Group call wide mode with video tiles grid, speaking indicators, and dock (`calls_group.png`)
@@ -987,9 +1008,7 @@ mod tests {
                         );
                     });
             });
-            let path = docs_dir.join("calls_group.png");
-            save_rgba_png(&path, &img).expect("save calls_group.png");
-            assert!(path.exists());
+            save_calls_screenshot("calls_group.png", &img);
         }
     }
 }

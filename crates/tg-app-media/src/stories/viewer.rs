@@ -372,10 +372,7 @@ impl StoryViewerOverlay {
                 let paused = !self.controller.is_explicitly_paused();
                 self.controller.toggle_paused(paused, now_ms);
             } else if ctx.input(|i| i.key_pressed(Key::M)) {
-                self.muted = !self.muted;
-                if let Some(vid) = media_cache.active_video_mut(shown_id) {
-                    vid.set_volume(self.volume, self.muted);
-                }
+                self.toggle_muted(media_cache, shown_id);
             }
         }
 
@@ -616,6 +613,31 @@ impl StoryViewerOverlay {
         }
     }
 
+    /// Takes the shared video volume (saved in the settings, changed in the media viewer
+    /// too): stories play at it, and 0 shows as muted (`storiesVolume` returns
+    /// `Core::Settings::videoVolume`).
+    fn adopt_shared_volume(&mut self, media_cache: &StoryMediaCache) {
+        let Some(volume) = media_cache.video_volume() else {
+            return;
+        };
+        if volume > 0.0 {
+            self.volume = volume;
+            self.muted = false;
+        } else {
+            self.muted = true;
+        }
+    }
+
+    /// The mute button and `M`: 0 or the last volume above 0, saved for every video
+    /// (`OverlayWidget::playbackControlsVolumeToggled`).
+    fn toggle_muted(&mut self, media_cache: &mut StoryMediaCache, id: FullStoryId) {
+        self.muted = !self.muted;
+        media_cache.set_video_volume(if self.muted { 0.0 } else { self.volume });
+        if let Some(vid) = media_cache.active_video_mut(id) {
+            vid.set_volume(self.volume, self.muted);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn drive_media_and_playback(
         &mut self,
@@ -631,6 +653,7 @@ impl StoryViewerOverlay {
         let Ok(story) = store.lookup(shown_id).cloned() else {
             return;
         };
+        self.adopt_shared_volume(media_cache);
         match &story.media {
             StoryMedia::Photo(_) | StoryMedia::VideoStream(_) => {
                 media_cache.clear_active_video();
@@ -1279,10 +1302,7 @@ impl StoryViewerOverlay {
                 "story_hdr_vol",
                 "Mute / Unmute (M)",
             ) {
-                self.muted = !self.muted;
-                if let Some(vid) = media_cache.active_video_mut(story.full_id()) {
-                    vid.set_volume(self.volume, self.muted);
-                }
+                self.toggle_muted(media_cache, story.full_id());
             }
             if vol_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or(Pos2::ZERO))) {
                 self.volume_popup_open = true;

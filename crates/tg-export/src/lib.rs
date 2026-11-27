@@ -30,3 +30,6 @@ pub use controller::{
 };
 pub use output::{AbstractWriter, OutputFormat, create_writer, normalize_path};
 pub use settings::{Environment, ExportTypes, MediaSettings, MediaTypes, Settings};
+
+#[cfg(test)]
+mod fuzz_untrusted;

@@ -14,21 +14,22 @@
 //! - `Telegram/SourceFiles/media/streaming/media_streaming_utility.cpp` (`FrameResizeMayExpand`)
 
 use crate::consts::{
-    CONTACTS_PHOTO_SIZE, FontMetrics, HISTORY_CALL_HEIGHT, HISTORY_CALL_ICON_POSITION,
+    CONTACTS_PHOTO_SIZE, EMOJI_SIZE, FontMetrics, HISTORY_CALL_HEIGHT, HISTORY_CALL_ICON_POSITION,
     HISTORY_CALL_ICON_SKIP, HISTORY_CALL_LEFT, HISTORY_CALL_STATUS_SKIP, HISTORY_CALL_WIDTH,
     HISTORY_PAGE_BUTTON_HEIGHT, HISTORY_PAGE_BUTTON_PADDING, HISTORY_PAGE_PREVIEW_PADDING,
     HISTORY_PHOTO_BUBBLE_MIN_WIDTH, HISTORY_POLL_ANSWER_PADDING,
     HISTORY_POLL_ANSWER_PADDING_NO_MEDIA, HISTORY_POLL_ANSWERS_SKIP,
     HISTORY_POLL_BOTTOM_BUTTON_SKIP, HISTORY_POLL_QUESTION_TOP, HISTORY_POLL_SUBTITLE_SKIP,
-    HISTORY_POLL_TOTAL_VOTES_SKIP, HISTORY_TRANSCRIBE_SIZE, HISTORY_TRANSCRIBE_SKIP, LOCATION_SIZE,
+    HISTORY_POLL_TOTAL_VOTES_SKIP, HISTORY_TRANSCRIBE_SIZE, HISTORY_TRANSCRIBE_SKIP,
+    LARGE_EMOJI_OUTLINE, LARGE_EMOJI_SIZE, LARGE_EMOJI_SKIP, LOCATION_SIZE,
     MAX_ANIMATED_EMOJI_SIZE, MAX_GIF_SIZE, MAX_MEDIA_SIZE, MAX_STICKER_SIZE,
     MAX_VIDEO_MESSAGE_SIZE, MEDIA_IN_BUBBLE_SKIP, MEDIA_UNREAD_SIZE, MEDIA_UNREAD_SKIP,
     MIN_PHOTO_SIZE, MSG_DATE_DELTA, MSG_DATE_IMG_DELTA, MSG_DATE_IMG_PADDING, MSG_FILE_LAYOUT,
     MSG_FILE_MIN_WIDTH, MSG_FILE_THUMB_LAYOUT, MSG_FILE_TOP_MINUS, MSG_MAX_WIDTH, MSG_PADDING,
-    MSG_WAVEFORM_BAR, MSG_WAVEFORM_SKIP, STICKER_MAX_EMOJI_SIZE_FIXED, STICKER_MAX_SIZE_FIXED,
-    WAVEFORM_SAMPLES_COUNT, WEB_PAGE_PHOTO_DELTA,
+    MSG_PHOTO_SIZE, MSG_WAVEFORM_BAR, MSG_WAVEFORM_SKIP, STICKER_MAX_EMOJI_SIZE_FIXED,
+    STICKER_MAX_SIZE_FIXED, WAVEFORM_SAMPLES_COUNT, WEB_PAGE_PHOTO_DELTA,
 };
-use crate::geometry::{Margins, Size, downscaled_size, non_empty_size, safe_round};
+use crate::geometry::{Margins, Rect, Size, downscaled_size, mul_div, non_empty_size, safe_round};
 use crate::grouped::{GroupedMediaInput, GroupedMediaLayout};
 
 // ---------------------------------------------------------------------------
@@ -74,12 +75,14 @@ fn scaled_keep_aspect_ratio_by_expanding(original: Size, bounds: Size) -> Size {
     if original.is_empty() || bounds.is_empty() {
         return Size::ZERO;
     }
-    let rw = (i64::from(bounds.height) * i64::from(original.width)) / i64::from(original.height);
-    if rw >= i64::from(bounds.width) {
-        Size::new(rw as i32, bounds.height)
+    let rw = mul_div(bounds.height, original.width, original.height);
+    if rw >= bounds.width {
+        Size::new(rw, bounds.height)
     } else {
-        let rh = (i64::from(bounds.width) * i64::from(original.height)) / i64::from(original.width);
-        Size::new(bounds.width, rh as i32)
+        Size::new(
+            bounds.width,
+            mul_div(bounds.width, original.height, original.width),
+        )
     }
 }
 
@@ -200,10 +203,9 @@ pub fn photo_adjust_height_for_less_crop(dimensions: Size, current: Size) -> i32
     if dimensions.is_empty() || !frame_resize_may_expand(current, dimensions, 3, 4) {
         return current.height;
     }
-    current.height.max(
-        ((i64::from(current.width) * i64::from(dimensions.height)) / i64::from(dimensions.width))
-            as i32,
-    )
+    current
+        .height
+        .max(mul_div(current.width, dimensions.height, dimensions.width))
 }
 
 /// Computes a photo's optimal size (`Photo::countOptimalSize`, `history_view_photo.cpp:329-368`).
@@ -676,8 +678,7 @@ pub fn gif_adjust_height_for_less_crop(dimensions: Size, current: Size) -> i32 {
     if dimensions.is_empty() {
         return current.height;
     }
-    let proportional = ((i64::from(current.width) * i64::from(dimensions.height))
-        / i64::from(dimensions.width)) as i32;
+    let proportional = mul_div(current.width, dimensions.height, dimensions.width);
     let max_expanded = (current.height * 4) / 3;
     current.height.max(proportional.min(max_expanded))
 }
@@ -825,8 +826,7 @@ fn article_thumb_width(photo_size: Size, height: i32) -> i32 {
     if photo_size.is_empty() || height <= 0 {
         return 0;
     }
-    let w =
-        ((i64::from(photo_size.width) * i64::from(height)) / i64::from(photo_size.height)) as i32;
+    let w = mul_div(photo_size.width, height, photo_size.height);
     w.clamp(1, height)
 }
 
@@ -1313,6 +1313,60 @@ pub enum MediaInput {
     Call(CallInput),
     /// Grouped media album (mosaic grid or playlist column).
     Grouped(GroupedMediaInput),
+    /// A message of only 1-3 emoji drawn large without a bubble.
+    LargeEmoji(LargeEmojiInput),
+}
+
+// ---------------------------------------------------------------------------
+// Large emoji (history_view_large_emoji.cpp inside history_view_media_unwrapped.cpp)
+// ---------------------------------------------------------------------------
+
+/// A message of only 1-3 emoji (`Ui::Text::IsolatedEmoji`): `UnwrappedMedia` around
+/// `HistoryView::LargeEmoji`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LargeEmojiInput {
+    /// Emoji count, `1..=ISOLATED_EMOJI_LIMIT`.
+    pub count: usize,
+    /// `UnwrappedMedia::bottomInfoWidth`: `msgReplyPadding.left + infoWidth +
+    /// 2 * msgDateImgPadding.x`, `0` when the bottom info is hidden. The media reserves it to the
+    /// right of the emoji, where an incoming message draws its time.
+    pub bottom_info_width: i32,
+}
+
+/// Size of the emoji row (`LargeEmoji::countOptimalSize`): each emoji with its outline, steps of
+/// `largeEmojiSkip - 2 * largeEmojiOutline` between them, no padding.
+#[must_use]
+pub const fn large_emoji_size(count: usize) -> Size {
+    let single = LARGE_EMOJI_SIZE + 2 * LARGE_EMOJI_OUTLINE;
+    let skip = LARGE_EMOJI_SKIP - 2 * LARGE_EMOJI_OUTLINE;
+    let count = if count == 0 { 1 } else { count as i32 };
+    Size::new(count * single + (count - 1) * skip, single)
+}
+
+/// Where the emoji row sits in the media rectangle (`UnwrappedMedia::draw`): at the right edge of
+/// a right-aligned message, at the bottom left otherwise.
+#[must_use]
+pub const fn large_emoji_inner_rect(
+    media_rect: Rect,
+    count: usize,
+    has_right_layout: bool,
+) -> Rect {
+    let size = large_emoji_size(count);
+    if has_right_layout {
+        Rect::new(
+            media_rect.x + media_rect.width - size.width,
+            media_rect.y,
+            size.width,
+            size.height,
+        )
+    } else {
+        Rect::new(
+            media_rect.x,
+            media_rect.y + media_rect.height - size.height,
+            size.width,
+            size.height,
+        )
+    }
 }
 
 /// Computed media sizing properties consumed by [`crate::element::layout_message`].
@@ -1377,6 +1431,26 @@ impl MediaInput {
                     skip_bubble_tail: false,
                     is_bubble_top: d.is_bubble_top,
                     is_bubble_bottom: d.is_bubble_bottom,
+                    grouped: None,
+                }
+            }
+            Self::LargeEmoji(e) => {
+                // `UnwrappedMedia::countOptimalSize`: the content plus the info width, at least
+                // `max(emojiSize, msgPhotoSize)` high.
+                let content = large_emoji_size(e.count);
+                let optimal = Size::new(
+                    content.width + e.bottom_info_width,
+                    content.height.max(EMOJI_SIZE.max(MSG_PHOTO_SIZE)),
+                );
+                MediaLayout {
+                    optimal_size: optimal,
+                    current_size: Size::new(optimal.width.min(available_width), optimal.height),
+                    needs_bubble: false,
+                    unwrapped: true,
+                    enforce_bubble_width: false,
+                    skip_bubble_tail: true,
+                    is_bubble_top: true,
+                    is_bubble_bottom: true,
                     grouped: None,
                 }
             }

@@ -9,6 +9,7 @@
 pub mod apply;
 pub mod checker;
 pub mod github;
+pub mod launch;
 pub mod package;
 pub mod version;
 
@@ -26,6 +27,14 @@ pub const UPDATER_EXE_NAME: &str = "rustgram-updater.exe";
 
 /// Staging directory created inside the working directory, matching tdesktop.
 pub const TUPDATES_DIR_NAME: &str = "tupdates";
+
+/// Folder name of the default working directory inside `%APPDATA%`; must equal
+/// `tg_core::version::APP_NAME` (checked by a `tg-app` test).
+pub const APP_DATA_DIR_NAME: &str = "Rustgram";
+
+/// Portable-mode marker folder next to the executable; must equal
+/// `tg_core::version::PORTABLE_FOLDER_NAME` (checked by a `tg-app` test).
+pub const PORTABLE_FOLDER_NAME: &str = "RustgramForcePortable";
 
 /// Unique Inno Setup AppId GUID shared with `packaging/windows/tgfork.iss`.
 pub const APP_ID_GUID: &str = "{46C2F7F5-7D28-455F-8E02-5102E303855E}";
@@ -208,3 +217,6 @@ pub enum UpdateError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+#[cfg(test)]
+mod fuzz_untrusted;

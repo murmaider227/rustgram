@@ -11,3 +11,6 @@ serde_json = "1.0"
 tg-data = { path = "../tg-data" }
 tg-tl = { path = "../tg-tl" }
 thiserror = "2.0"
+
+[dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }

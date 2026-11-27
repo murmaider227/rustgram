@@ -80,3 +80,6 @@ pub use wallpaper::{
     colors_from_string, from_legacy_background_id, is_valid_wallpaper_slug, parse_wallpaper_url,
     string_from_colors,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

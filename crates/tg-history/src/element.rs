@@ -16,11 +16,11 @@ use crate::consts::{
     HISTORY_REPLY_PADDING, HISTORY_REPLY_PREVIEW, HISTORY_REPLY_PREVIEW_MARGIN, HISTORY_REPLY_TOP,
     HISTORY_SEND_STATE_SPACE, HISTORY_SHORTCUT_STATE_SPACE, HISTORY_SILENT_WIDTH,
     HISTORY_UNREAD_BAR_HEIGHT, HISTORY_UNREAD_BAR_MARGIN, HISTORY_VIEWS_SPACE, HISTORY_VIEWS_WIDTH,
-    LINE_WIDTH, MAX_RECENT_REPLIERS, MAX_SIGNATURE_SIZE, MEDIA_IN_BUBBLE_SKIP,
-    MSG_BOT_KB_BUTTON_MARGIN, MSG_DATE_DELTA, MSG_DATE_IMG_DELTA, MSG_DATE_IMG_PADDING,
-    MSG_DATE_SPACE, MSG_MARGIN, MSG_MARGIN_TOP_ATTACHED, MSG_MAX_WIDTH, MSG_MIN_WIDTH, MSG_PADDING,
-    MSG_PHOTO_SKIP, MSG_SERVICE_MARGIN, MSG_SERVICE_PADDING, REACTION_INFO_BETWEEN,
-    REACTION_INFO_SIZE, REACTION_INFO_SKIP, REPLY_NON_EXPANDED_LINES_LIMIT,
+    LARGE_EMOJI_OUTLINE, LARGE_EMOJI_SIZE, LINE_WIDTH, MAX_RECENT_REPLIERS, MAX_SIGNATURE_SIZE,
+    MEDIA_IN_BUBBLE_SKIP, MSG_BOT_KB_BUTTON_MARGIN, MSG_DATE_DELTA, MSG_DATE_IMG_DELTA,
+    MSG_DATE_IMG_PADDING, MSG_DATE_SPACE, MSG_MARGIN, MSG_MARGIN_TOP_ATTACHED, MSG_MAX_WIDTH,
+    MSG_MIN_WIDTH, MSG_PADDING, MSG_PHOTO_SKIP, MSG_SERVICE_MARGIN, MSG_SERVICE_PADDING,
+    REACTION_INFO_BETWEEN, REACTION_INFO_SIZE, REACTION_INFO_SKIP, REPLY_NON_EXPANDED_LINES_LIMIT,
     TOPIC_BUTTON_ARROW_SKIP, TOPIC_BUTTON_PADDING, TOPIC_BUTTON_SKIP,
 };
 use crate::datetime::{CivilDate, LocalDateTime};
@@ -1295,13 +1295,23 @@ pub fn layout_message(
 
         bubble_height = y - margin_top;
     } else if let Some(ref ml) = final_media {
-        media_rect = Rect::new(
-            content_left,
-            margin_top,
-            ml.current_size.width,
-            ml.current_size.height,
-        );
-        bubble_height = ml.current_size.height;
+        let mut height = ml.current_size.height;
+        if has_right_layout && let Some(MediaInput::LargeEmoji(e)) = &input.media {
+            // `UnwrappedMedia::countCurrentSize`: a right-aligned message keeps room for its
+            // time below the emoji.
+            let info_height = if input.hides_bottom_info {
+                0
+            } else {
+                2 * MSG_DATE_IMG_PADDING.y + bottom_info.current_size.height
+            };
+            let content = crate::media::large_emoji_size(e.count).height;
+            let minimal = (LARGE_EMOJI_SIZE + 2 * LARGE_EMOJI_OUTLINE).min(content);
+            if info_height > 0 {
+                height = height.max(minimal + MSG_DATE_IMG_DELTA + info_height);
+            }
+        }
+        media_rect = Rect::new(content_left, margin_top, ml.current_size.width, height);
+        bubble_height = height;
     }
 
     let mut total_content_height = bubble_height;
@@ -1379,6 +1389,39 @@ pub fn layout_message(
         (
             InfoDisplayType::Background,
             Rect::new(full_right - pill_w, y, pill_w, pill_h),
+        )
+    } else if unwrapped && let Some(MediaInput::LargeEmoji(e)) = &input.media {
+        let pill_w = bottom_info.current_size.width + 2 * MSG_DATE_IMG_PADDING.x;
+        let pill_h = bottom_info.current_size.height + 2 * MSG_DATE_IMG_PADDING.y;
+        let inner = crate::media::large_emoji_inner_rect(media_rect, e.count, has_right_layout);
+        let right_skip = MSG_PADDING.left
+            + if input.has_from_photo {
+                MSG_MARGIN.right
+            } else {
+                MSG_PADDING.right
+            };
+        // `calculateFullRight` works in the media's own coordinates and clamps to the element
+        // width.
+        let mut full_right = inner.x - media_rect.x
+            + inner.width
+            + if has_right_layout {
+                0
+            } else {
+                e.bottom_info_width
+            };
+        if full_right + right_skip > viewport_width {
+            full_right = viewport_width - right_skip;
+        }
+        let full_right = media_rect.x + full_right;
+        let full_bottom = media_rect.y + media_rect.height;
+        (
+            InfoDisplayType::Background,
+            Rect::new(
+                full_right - MSG_DATE_IMG_DELTA - pill_w,
+                full_bottom - MSG_DATE_IMG_DELTA - pill_h,
+                pill_w,
+                pill_h,
+            ),
         )
     } else if unwrapped {
         let pill_w = bottom_info.current_size.width + 2 * MSG_DATE_IMG_PADDING.x;

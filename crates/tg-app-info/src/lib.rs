@@ -2,6 +2,7 @@
 
 pub mod boxes;
 pub mod dialogs;
+pub mod elide;
 pub mod info;
 pub mod payments;
 pub mod statistics;

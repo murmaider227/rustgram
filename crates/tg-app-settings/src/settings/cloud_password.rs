@@ -74,6 +74,10 @@ pub struct CloudPasswordWizard {
 impl CloudPasswordWizard {
     /// Synchronizes the initial wizard step with the backend's current 2FA state.
     pub fn sync_initial_step(&mut self, backend: &dyn SettingsBackend) {
+        // The step follows the real state, not the placeholder shown while it loads.
+        if backend.settings_read_pending(super::backend::SettingsRead::CloudPassword) {
+            return;
+        }
         let st = backend.cloud_password_state();
         if self.step == CloudPasswordStep::Start {
             if !st.unconfirmed_email_pattern.is_empty() {

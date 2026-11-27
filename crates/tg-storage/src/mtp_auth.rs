@@ -103,7 +103,7 @@ fn write_keys(w: &mut QDataStreamWriter, keys: &[MtpAuthKeyEntry]) {
     w.write_i32(keys.len() as i32);
     for entry in keys {
         w.write_i32(entry.dc_id);
-        w.write_raw(&entry.key.data);
+        w.write_raw(entry.key.data());
     }
 }
 

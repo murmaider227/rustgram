@@ -27,6 +27,7 @@ url = "2.5.9"
 zeroize = { version = "1.9.2", features = ["derive"] }
 
 [dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }
 tempfile = "3.27.0"
 tg-crypto = { path = "../tg-crypto" }
 tg-mtproto = { path = "../tg-mtproto" }

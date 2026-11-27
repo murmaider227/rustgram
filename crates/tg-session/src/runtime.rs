@@ -1090,9 +1090,10 @@ impl<C: RpcClient + Clone + 'static> SessionRuntime<C> {
         rx.await.map_err(|_| SessionError::RuntimeClosed)?
     }
 
-    /// Handles OS wake from sleep (`Updates::checkLastUpdate(true)`): sends a keepalive ping
-    /// if idle past `NO_UPDATES_AFTER_SLEEP_TIMEOUT_MS` (or forces a resync when
-    /// `force_resync == true` or if the ping fails). Returns `true` if a ping or resync ran.
+    /// Handles OS wake from sleep (`Updates::checkLastUpdate(true)`): starts a keepalive ping
+    /// if idle past `NO_UPDATES_AFTER_SLEEP_TIMEOUT_MS` or when `force_resync == true`, and
+    /// resyncs at once when `force_resync == true`. Returns without waiting for the pong; a
+    /// failed ping resyncs later. Returns `true` if a ping or resync was started.
     pub async fn on_wake_from_sleep(&self, force_resync: bool) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1542,6 +1543,9 @@ enum Completion {
     },
     Ping {
         result: std::result::Result<(), InvocationError>,
+        /// `false` when the caller already resynced (forced wake), so a failed ping must
+        /// not run `getDifference` a second time.
+        resync_on_failure: bool,
     },
 }
 
@@ -2457,10 +2461,16 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
                     }
                 }
             }
-            Completion::Ping { result } => {
+            Completion::Ping {
+                result,
+                resync_on_failure,
+            } => {
                 self.ping_in_flight = false;
                 match result {
                     Ok(()) => self.updates.mark_ping_sent(self.now_ms()),
+                    Err(err) if !resync_on_failure => {
+                        warn!(error = %err, "post-sleep keepalive ping failed after a forced resync");
+                    }
                     Err(err) => {
                         warn!(error = %err, "idle updates keepalive ping failed; triggering resync");
                         let now_ms = self.now_ms();
@@ -2933,22 +2943,18 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
         self.persist_updates_state_if_changed();
     }
 
+    /// The keepalive ping runs beside the loop like the idle one in [`Self::handle_tick`]
+    /// (tdesktop's `Updates::checkLastUpdate` never waits for the pong), so a wake with no
+    /// network does not stall commands until the connection is back. A failed ping resyncs
+    /// in [`Self::on_request_done`] unless this call already resynced.
     async fn handle_wake_from_sleep(&mut self, force_resync: bool) -> Result<bool> {
         let now_ms = self.now_ms();
         let need_ping = self.updates.check_last_update(true, now_ms);
-        let mut acted = false;
-        let mut ping_failed = false;
-        if need_ping || force_resync {
-            acted = true;
-            if let Err(err) = self.rpc.ping().await {
-                let mapped: tg_api::InvocationError = err.into();
-                warn!(error = %mapped, "post-sleep keepalive ping failed; resyncing updates");
-                ping_failed = true;
-            } else {
-                self.updates.mark_ping_sent(self.now_ms());
-            }
+        let acted = need_ping || force_resync;
+        if acted {
+            self.start_ping(!force_resync);
         }
-        if force_resync || ping_failed {
+        if force_resync {
             let now_ms = self.now_ms();
             // Match `Api::Updates::applyDifferenceSlice` -> `History::addNewMessage`
             // (`api/api_updates.cpp`, `history/history.cpp`).
@@ -2962,6 +2968,22 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             res?;
         }
         Ok(acted)
+    }
+
+    /// Sends a keepalive ping beside the loop unless one is already in flight; its result
+    /// comes back as [`Completion::Ping`].
+    fn start_ping(&mut self, resync_on_failure: bool) {
+        if self.ping_in_flight {
+            return;
+        }
+        self.ping_in_flight = true;
+        let rpc = self.rpc.clone();
+        self.spawn_request(InFlightKind::Ping, async move {
+            Completion::Ping {
+                result: rpc.ping().await.map_err(Into::into),
+                resync_on_failure,
+            }
+        });
     }
 
     async fn handle_tick(&mut self) {
@@ -2992,13 +3014,7 @@ impl<C: RpcClient + Clone + 'static> SessionActor<C> {
             && !self.ping_in_flight
             && self.updates.check_last_update(detected_sleep, now_ms)
         {
-            self.ping_in_flight = true;
-            let rpc = self.rpc.clone();
-            self.spawn_request(InFlightKind::Ping, async move {
-                Completion::Ping {
-                    result: rpc.ping().await.map_err(Into::into),
-                }
-            });
+            self.start_ping(true);
         }
 
         self.persist_updates_state_if_changed();

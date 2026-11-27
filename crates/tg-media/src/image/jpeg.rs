@@ -75,46 +75,59 @@ pub fn is_progressive_jpeg(bytes: &[u8]) -> bool {
     jpeg_frame_info(bytes).is_some_and(|info| info.progressive)
 }
 
+/// Header segments of a JPEG file: `(marker, payload)` pairs from after `SOI` up to the first
+/// `SOS`/`EOI`, a truncated segment, or a byte that is not a marker.
+struct Segments<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Segments<'a> {
+    /// Starts after the `SOI` marker; `None` when `bytes` is not a JPEG.
+    fn new(bytes: &'a [u8]) -> Option<Self> {
+        (bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8).then_some(Self { bytes, pos: 2 })
+    }
+}
+
+impl<'a> Iterator for Segments<'a> {
+    type Item = (u8, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.bytes;
+        loop {
+            if *bytes.get(self.pos)? != 0xFF {
+                return None;
+            }
+            // Skip fill 0xFF bytes before the marker.
+            while bytes.get(self.pos) == Some(&0xFF) {
+                self.pos += 1;
+            }
+            let marker = *bytes.get(self.pos)?;
+            self.pos += 1;
+            match marker {
+                // Standalone markers without payload.
+                0x01 | 0xD0..=0xD8 => continue,
+                // EOI or SOS: the header is over.
+                0xD9 | 0xDA => return None,
+                _ => {}
+            }
+            let len = bytes.get(self.pos..self.pos + 2)?;
+            let seg_len = usize::from(u16::from_be_bytes([len[0], len[1]]));
+            if seg_len < 2 {
+                return None;
+            }
+            let payload = bytes.get(self.pos + 2..self.pos + seg_len)?;
+            self.pos += seg_len;
+            return Some((marker, payload));
+        }
+    }
+}
+
 /// Parses JPEG header markers to extract frame dimensions, progressive flag, and EXIF orientation.
 #[must_use]
 pub fn jpeg_frame_info(bytes: &[u8]) -> Option<JpegFrameInfo> {
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return None;
-    }
-    let mut pos = 2usize;
     let mut orientation = None;
-
-    while pos < bytes.len() {
-        // Skip any fill 0xFF bytes before marker.
-        if bytes[pos] != 0xFF {
-            return None;
-        }
-        while pos < bytes.len() && bytes[pos] == 0xFF {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            return None;
-        }
-        let marker = bytes[pos];
-        pos += 1;
-
-        match marker {
-            // Standalone markers without payload.
-            0x01 | 0xD0..=0xD8 => continue,
-            // EOI or SOS before any SOF means invalid/incomplete header.
-            0xD9 | 0xDA => return None,
-            _ => {}
-        }
-
-        if pos + 2 > bytes.len() {
-            return None;
-        }
-        let seg_len = usize::from(u16::from_be_bytes([bytes[pos], bytes[pos + 1]]));
-        if seg_len < 2 || pos + seg_len > bytes.len() {
-            return None;
-        }
-        let seg_data = &bytes[pos + 2..pos + seg_len];
-
+    for (marker, seg_data) in Segments::new(bytes)? {
         match marker {
             // APP1: check for EXIF orientation.
             0xE1 => {
@@ -124,69 +137,32 @@ pub fn jpeg_frame_info(bytes: &[u8]) -> Option<JpegFrameInfo> {
             }
             // Start Of Frame markers (baseline, extended, progressive, lossless, differential, arithmetic).
             0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
-                if seg_data.len() < 6 {
+                let &[_, h0, h1, w0, w1, components, ..] = seg_data else {
                     return None;
-                }
-                let height = u16::from_be_bytes([seg_data[1], seg_data[2]]);
-                let width = u16::from_be_bytes([seg_data[3], seg_data[4]]);
-                let components = seg_data[5];
-                let progressive = matches!(marker, 0xC2 | 0xCA);
+                };
                 return Some(JpegFrameInfo {
-                    width,
-                    height,
+                    width: u16::from_be_bytes([w0, w1]),
+                    height: u16::from_be_bytes([h0, h1]),
                     components,
-                    progressive,
+                    progressive: matches!(marker, 0xC2 | 0xCA),
                     orientation,
                 });
             }
             _ => {}
         }
-
-        pos += seg_len;
     }
-
     None
 }
 
 /// Extracts the EXIF orientation from a JPEG buffer, returning `ExifOrientation::Normal` if absent.
 #[must_use]
 pub fn read_jpeg_exif_orientation(bytes: &[u8]) -> ExifOrientation {
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return ExifOrientation::Normal;
-    }
-    let mut pos = 2usize;
-    while pos < bytes.len() {
-        if bytes[pos] != 0xFF {
-            break;
-        }
-        while pos < bytes.len() && bytes[pos] == 0xFF {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            break;
-        }
-        let marker = bytes[pos];
-        pos += 1;
-        match marker {
-            0x01 | 0xD0..=0xD8 => continue,
-            0xD9 | 0xDA => break,
-            _ => {}
-        }
-        if pos + 2 > bytes.len() {
-            break;
-        }
-        let seg_len = usize::from(u16::from_be_bytes([bytes[pos], bytes[pos + 1]]));
-        if seg_len < 2 || pos + seg_len > bytes.len() {
-            break;
-        }
-        if marker == 0xE1
-            && let Some(orient) = parse_exif_app1_orientation(&bytes[pos + 2..pos + seg_len])
-        {
-            return orient;
-        }
-        pos += seg_len;
-    }
-    ExifOrientation::Normal
+    Segments::new(bytes)
+        .into_iter()
+        .flatten()
+        .filter(|&(marker, _)| marker == 0xE1)
+        .find_map(|(_, payload)| parse_exif_app1_orientation(payload))
+        .unwrap_or_default()
 }
 
 /// Parses an APP1 payload starting with `Exif\0\0` and extracts TIFF IFD0 tag `0x0112`.

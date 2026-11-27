@@ -438,7 +438,7 @@ impl LocalStorage {
         if count <= 0 {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(count as usize);
+        let mut out = Vec::with_capacity(r.capacity_for(count as usize, 20));
         for _ in 0..count {
             out.push(StoredLanguage {
                 id: r.read_qstring()?,
@@ -882,5 +882,31 @@ mod tests {
         assert_eq!(reopened.read_recent_languages().expect("read langs"), langs);
         assert_eq!(reopened.read_theme(true).expect("read theme"), Some(theme));
         assert_eq!(reopened.read_background(true).expect("read bg"), Some(bg));
+    }
+
+    /// A corrupt recent-languages count used to size a `Vec` directly and abort the process.
+    #[test]
+    fn huge_recent_languages_count_is_an_error_not_an_abort() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut local = LocalStorage::open_or_init(dir.path()).expect("init");
+        let langs = vec![StoredLanguage {
+            id: "en".into(),
+            plural_id: "en".into(),
+            base_id: String::new(),
+            name: "English".into(),
+            native_name: "English".into(),
+        }];
+        local.write_recent_languages(&langs).expect("write langs");
+
+        let key = local.settings.languages_key;
+        let file = read_encrypted_file_by_key(key, &local.tdata_path, &local.settings_key)
+            .expect("read raw");
+        let mut payload = file.data.clone();
+        assert_eq!(payload[..4], 1i32.to_be_bytes());
+        payload[..4].copy_from_slice(&i32::MAX.to_be_bytes());
+        write_encrypted_file_by_key(key, &local.tdata_path, &payload, &local.settings_key)
+            .expect("write patched");
+
+        assert!(local.read_recent_languages().is_err());
     }
 }

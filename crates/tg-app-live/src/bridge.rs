@@ -407,6 +407,9 @@ pub struct LiveBridgeState {
     pub history_deltas_lagged: AtomicBool,
     /// Current connection indicator state.
     pub connection_status: Mutex<ConnectionStatus>,
+    /// Set once a live MTProto transport reports its own state into
+    /// [`Self::connection_status`] ([`Self::follow_transport_connection_state`]).
+    connection_from_transport: AtomicBool,
     /// Last sync or RPC error banner message, if any.
     pub last_error: Mutex<Option<String>>,
     /// Monotonically increasing change counter bumped on every change event.
@@ -444,6 +447,7 @@ impl LiveBridgeState {
             history_deltas: Mutex::new(HashMap::new()),
             history_deltas_lagged: AtomicBool::new(false),
             connection_status: Mutex::new(ConnectionStatus::Connecting),
+            connection_from_transport: AtomicBool::new(false),
             last_error: Mutex::new(None),
             generation: AtomicU64::new(0),
             notify_settings_generation: AtomicU64::new(0),
@@ -702,6 +706,23 @@ impl LiveBridgeState {
         self.notify_ui();
     }
 
+    /// From now on the connection indicator follows the MTProto transport's own state, as
+    /// tdesktop's `ConnectionState` follows `MTP::Instance::state`. [`SessionEvent::Ready`] then
+    /// no longer marks the connection as up: it says the session finished its startup, and when
+    /// it arrives late (a busy machine) it would hide a reconnect already under way, e.g. right
+    /// after a proxy switch (TGB-3077).
+    pub fn follow_transport_connection_state(&self) {
+        self.connection_from_transport
+            .store(true, Ordering::Release);
+    }
+
+    /// [`SessionEvent::Ready`]: the connection is up unless the transport reports it itself.
+    fn on_session_ready(&self) {
+        if !self.connection_from_transport.load(Ordering::Acquire) {
+            self.set_connection_status(ConnectionStatus::Connected);
+        }
+    }
+
     /// Reads the latest error message, if any.
     #[must_use]
     pub fn last_error(&self) -> Option<String> {
@@ -770,7 +791,7 @@ impl LiveRuntimeBridge {
                     Ok(ev) => {
                         match &ev {
                             SessionEvent::Ready => {
-                                state_events.set_connection_status(ConnectionStatus::Connected);
+                                state_events.on_session_ready();
                                 state_events.set_last_error(None);
                             }
                             SessionEvent::SyncError(msg) => {

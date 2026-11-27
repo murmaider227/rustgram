@@ -78,12 +78,16 @@ impl StorageKey {
     /// Parses a 32-character hexadecimal stem produced by [`StorageKey::to_hex`].
     #[must_use]
     pub fn from_hex(s: &str) -> Option<Self> {
-        if s.len() != 32 {
+        // Byte-checked first: slicing a non-ASCII name at byte 16 would panic, and
+        // `from_str_radix` alone would accept a `+` sign.
+        if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        let high = u64::from_str_radix(&s[0..16], 16).ok()?;
-        let low = u64::from_str_radix(&s[16..32], 16).ok()?;
-        Some(Self { high, low })
+        let (high, low) = s.split_at(16);
+        Some(Self {
+            high: u64::from_str_radix(high, 16).ok()?,
+            low: u64::from_str_radix(low, 16).ok()?,
+        })
     }
 
     /// Derives a part-specific key for streamed/big-file chunks (`base.low + part_index`).
@@ -567,7 +571,7 @@ impl LocalFileCache {
         }
 
         let path = self.entry_path(key);
-        let raw = match std::fs::read(&path) {
+        let mut raw = match std::fs::read(&path) {
             Ok(data) if !data.is_empty() => data,
             Ok(_) => {
                 self.remove(key)?;
@@ -591,7 +595,9 @@ impl LocalFileCache {
             entry.last_access_epoch_ms = now_ms;
         }
 
-        Ok(Some(raw[1..].to_vec()))
+        // Drop the tag byte in place instead of copying the whole payload.
+        raw.drain(..1);
+        Ok(Some(raw))
     }
 
     /// Returns `true` if `key` is present in the cache index without updating LRU recency.
@@ -694,8 +700,9 @@ impl LocalFileCache {
 
     fn scan_existing(&mut self) -> Result<()> {
         let mut found: Vec<(u64, StorageKey, u8, u64)> = Vec::new();
-        for entry in std::fs::read_dir(&self.settings.root_dir)? {
-            let entry = entry?;
+        // One entry that cannot be read (locked, a directory, removed meanwhile) is skipped; it
+        // must not fail the whole cache.
+        for entry in std::fs::read_dir(&self.settings.root_dir)?.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("bin") {
                 continue;
@@ -706,12 +713,16 @@ impl LocalFileCache {
             let Some(key) = StorageKey::from_hex(stem) else {
                 continue;
             };
-            let meta = entry.metadata()?;
-            if meta.len() < 1 {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() < 1 {
                 continue;
             }
             // Read only the 1-byte tag prefix.
-            let mut file = std::fs::File::open(&path)?;
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                continue;
+            };
             let mut tag_buf = [0u8; 1];
             use std::io::Read as _;
             if file.read_exact(&mut tag_buf).is_err() {

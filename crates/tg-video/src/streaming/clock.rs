@@ -4,6 +4,7 @@
 //! `Telegram/SourceFiles/media/streaming/media_streaming_video_track.cpp`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::types::{SPEED_MAX, SPEED_MIN, TIME_UNKNOWN, VideoFrame};
 
@@ -212,8 +213,10 @@ impl SyncClock {
 pub enum FramePopOutcome {
     /// A frame is ready to be presented now (along with how many late frames were dropped).
     Ready {
-        /// The selected frame to display.
-        frame: VideoFrame,
+        /// The selected frame to display, shared with
+        /// [`crate::streaming::StreamingPlayer::current_video_frame`] instead of copied (a 1080p
+        /// RGBA frame is 8 MB).
+        frame: Arc<VideoFrame>,
         /// Number of older stale frames skipped to catch up to the clock.
         dropped: usize,
     },
@@ -266,6 +269,12 @@ impl FrameQueue {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
+    }
+
+    /// The oldest queued frame.
+    #[must_use]
+    pub fn front(&self) -> Option<&VideoFrame> {
+        self.frames.front()
     }
 
     /// Presentation time of the oldest queued frame.
@@ -326,6 +335,32 @@ impl FrameQueue {
         frame.pts_ms < track_time_ms
     }
 
+    /// Drops queued frames that a later queued frame already replaces at `track_time_ms`,
+    /// keeping the most recent due frame (`VideoTrack::Shared::prepareState` with
+    /// `dropStaleFrames`). Does nothing with `wait_for_mark_as_shown`. Returns how many frames
+    /// were dropped.
+    pub fn drop_stale(&mut self, track_time_ms: i64) -> usize {
+        if self.wait_for_mark_as_shown {
+            return 0;
+        }
+        let mut dropped = 0usize;
+        while self.frames.len() >= 2
+            && self
+                .frames
+                .get(1)
+                .is_some_and(|next| next.pts_ms <= track_time_ms)
+            && self
+                .frames
+                .front()
+                .is_some_and(|f| Self::is_stale(f, track_time_ms))
+        {
+            self.frames.pop_front();
+            dropped += 1;
+        }
+        self.dropped_total += dropped as u64;
+        dropped
+    }
+
     /// Selects the frame to display at `track_time_ms` and playback `speed`.
     ///
     /// When `!wait_for_mark_as_shown` and multiple frames are queued behind `track_time_ms`,
@@ -343,33 +378,16 @@ impl FrameQueue {
             return FramePopOutcome::Wait { delay_ms };
         }
 
-        let mut dropped = 0usize;
-        if !self.wait_for_mark_as_shown {
-            while self.frames.len() >= 2 {
-                let next_is_due = self
-                    .frames
-                    .get(1)
-                    .is_some_and(|next| next.pts_ms <= track_time_ms);
-                if next_is_due
-                    && self
-                        .frames
-                        .front()
-                        .is_some_and(|f| Self::is_stale(f, track_time_ms))
-                {
-                    self.frames.pop_front();
-                    dropped += 1;
-                } else {
-                    break;
-                }
-            }
-        }
-        self.dropped_total += dropped as u64;
+        let dropped = self.drop_stale(track_time_ms);
         let Some(frame) = self.frames.pop_front() else {
             return FramePopOutcome::Empty;
         };
         if self.wait_for_mark_as_shown {
             self.awaiting_shown = true;
         }
-        FramePopOutcome::Ready { frame, dropped }
+        FramePopOutcome::Ready {
+            frame: Arc::new(frame),
+            dropped,
+        }
     }
 }

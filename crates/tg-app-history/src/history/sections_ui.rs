@@ -2980,37 +2980,21 @@ pub(crate) fn elide_tab_title(
         return (title.to_owned(), false);
     }
     let ellipsis = "\u{2026}";
-    let chars: Vec<char> = title.chars().collect();
-    if chars.is_empty() {
+    if title.is_empty() {
         return (String::new(), false);
     }
-    let mut lo = 0usize;
-    let mut hi = chars.len();
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        let prefix: String = chars[..mid].iter().collect();
-        let candidate = format!("{}{ellipsis}", prefix.trim_end());
-        let w = painter
-            .layout_no_wrap(candidate, font_id.clone(), Color32::WHITE)
+    let kept = tg_history::text_cut::longest_fitting_prefix(title, |prefix| {
+        painter
+            .layout_no_wrap(
+                format!("{}{ellipsis}", prefix.trim_end()),
+                font_id.clone(),
+                Color32::WHITE,
+            )
             .size()
-            .x;
-        if w <= max_width {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    if lo == 0 {
-        (ellipsis.to_owned(), true)
-    } else {
-        let prefix: String = chars[..lo].iter().collect();
-        let trimmed = prefix.trim_end();
-        if trimmed.is_empty() {
-            (ellipsis.to_owned(), true)
-        } else {
-            (format!("{trimmed}{ellipsis}"), true)
-        }
-    }
+            .x
+            <= max_width
+    });
+    (format!("{}{ellipsis}", title[..kept].trim_end()), true)
 }
 
 /// Formats an unread counter matching `Ui::FormatUnreadCounter` compact conventions.

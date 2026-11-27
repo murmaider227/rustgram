@@ -5,6 +5,7 @@ pub mod chat_preview;
 pub mod connecting_widget;
 pub mod controller;
 pub mod deep_links;
+pub mod interface_scale;
 pub mod layer_stack;
 pub mod lock_widgets;
 pub mod main_menu;

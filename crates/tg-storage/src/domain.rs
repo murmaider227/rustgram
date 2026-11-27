@@ -145,7 +145,7 @@ pub fn random_salt() -> Vec<u8> {
 
 /// Wrap `local_key` under `wrap_key` using `PrepareEncrypted` (`WrapLocalKey`).
 pub fn wrap_local_key(local_key: &AuthKey, wrap_key: &AuthKey) -> Result<Vec<u8>> {
-    prepare_encrypted(&local_key.data, wrap_key)
+    prepare_encrypted(local_key.data(), wrap_key)
 }
 
 /// Unwrap a 256-byte `local_key` from `key_encrypted` using `wrap_key` (`UnwrapLocalKey`).

@@ -17,6 +17,7 @@ pub mod list;
 pub mod media;
 pub mod reactions;
 pub mod selection;
+pub mod text_cut;
 
 pub use consts::{FontMetrics, LayoutConsts};
 pub use datetime::{CivilDate, LocalDateTime, Weekday};
@@ -51,15 +52,16 @@ pub use list::{
 };
 pub use media::{
     CallInput, ContactInput, DocumentInput, DocumentKind, ExpandDecision, GifInput, GifKind,
-    LocationInput, MediaInput, MediaLayout, PhotoInput, PollAnswerInput, PollInput, StickerInput,
-    StickerKind, WebPageInput, count_call_optimal_size, count_contact_optimal_size,
-    count_desired_media_size, count_document_current_size, count_document_optimal_size,
-    count_gif_current_size, count_gif_optimal_size, count_gif_thumb_size,
-    count_location_current_size, count_location_optimal_size, count_media_size,
-    count_photo_current_size, count_photo_media_size, count_photo_optimal_size,
+    LargeEmojiInput, LocationInput, MediaInput, MediaLayout, PhotoInput, PollAnswerInput,
+    PollInput, StickerInput, StickerKind, WebPageInput, count_call_optimal_size,
+    count_contact_optimal_size, count_desired_media_size, count_document_current_size,
+    count_document_optimal_size, count_gif_current_size, count_gif_optimal_size,
+    count_gif_thumb_size, count_location_current_size, count_location_optimal_size,
+    count_media_size, count_photo_current_size, count_photo_media_size, count_photo_optimal_size,
     count_poll_current_size, count_poll_optimal_size, count_sticker_optimal_size,
     count_web_page_current_size, count_web_page_optimal_size, decide_frame_resize,
-    frame_resize_may_expand, sticker_emoji_size, sticker_max_size, waveform_bar_count,
+    frame_resize_may_expand, large_emoji_inner_rect, large_emoji_size, sticker_emoji_size,
+    sticker_max_size, waveform_bar_count,
 };
 pub use reactions::{
     InlineReactionsLayout, format_count_to_short, inline_reactions_optimal_size,

@@ -22,7 +22,7 @@ use tg_tl::{
     Deserializable, Identifiable, RemoteCall, Serializable, enums as tl_enums, functions as tl_fns,
     types as tl_types,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 #[derive(Debug, Clone)]
 struct RecordedCall {
@@ -49,6 +49,8 @@ struct ScriptedRpcInner {
     updates_tx: broadcast::Sender<tl_enums::Updates>,
     ping_count: AtomicUsize,
     fail_next_ping: AtomicBool,
+    hold_pings: AtomicBool,
+    ping_release: Semaphore,
     restart_count: AtomicUsize,
 }
 
@@ -68,6 +70,8 @@ impl ScriptedRpc {
                 updates_tx,
                 ping_count: AtomicUsize::new(0),
                 fail_next_ping: AtomicBool::new(false),
+                hold_pings: AtomicBool::new(false),
+                ping_release: Semaphore::new(0),
                 restart_count: AtomicUsize::new(0),
             }),
         }
@@ -105,6 +109,29 @@ impl ScriptedRpc {
 
     fn ping_count(&self) -> usize {
         self.inner.ping_count.load(Ordering::SeqCst)
+    }
+
+    /// Makes every later ping wait for its pong until [`Self::release_pings`], like a wake
+    /// with no network.
+    fn hold_pings(&self) {
+        self.inner.hold_pings.store(true, Ordering::SeqCst);
+    }
+
+    fn release_pings(&self) {
+        self.inner.hold_pings.store(false, Ordering::SeqCst);
+        self.inner
+            .ping_release
+            .add_permits(Semaphore::MAX_PERMITS / 2);
+    }
+
+    async fn wait_for_ping_count(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.ping_count() < count {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("ping not sent in time");
     }
 
     fn restart_count(&self) -> usize {
@@ -154,6 +181,9 @@ impl RpcClient for ScriptedRpc {
 
     async fn ping(&self) -> Result<(), Self::Error> {
         self.inner.ping_count.fetch_add(1, Ordering::SeqCst);
+        if self.inner.hold_pings.load(Ordering::SeqCst) {
+            let _permit = self.inner.ping_release.acquire().await;
+        }
         if self.inner.fail_next_ping.swap(false, Ordering::SeqCst) {
             Err(InvocationError::Transport("simulated ping timeout".into()))
         } else {
@@ -769,6 +799,12 @@ async fn session_runtime_network_change_sleep_ping_failure_and_active_channel_po
     rpc.set_fail_next_ping(true);
     let acted = rt.on_wake_from_sleep(true).await.expect("wake");
     assert!(acted);
+    // The ping runs beside the actor loop (TGB-3072); the forced resync already ran, so its
+    // failure must not start a second getDifference.
+    rpc.wait_for_ping_count(1).await;
+    rt.persisted_updates_state().await.expect("actor alive");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    rt.persisted_updates_state().await.expect("actor alive");
     assert_eq!(rpc.ping_count(), 1);
     assert_eq!(rpc.calls_of::<tl_fns::updates::GetDifference>().len(), 2);
     assert_eq!(
@@ -785,6 +821,62 @@ async fn session_runtime_network_change_sleep_ping_failure_and_active_channel_po
         Some(&55)
     );
 
+    rt.shutdown_async().await;
+}
+
+/// TGB-3072: a wake with no network used to await the pong inside the session actor, so
+/// every later command waited until the connection came back.
+#[tokio::test]
+async fn wake_from_sleep_ping_does_not_block_commands_until_pong() {
+    let rpc = ScriptedRpc::new(2);
+    rpc.enqueue_ok::<tl_fns::updates::GetState>(&tl_state(10, 0, 1_770_000_000, 1));
+    rpc.enqueue_ok::<tl_fns::updates::GetDifference>(&tl_enums::updates::Difference::Empty(
+        tl_types::updates::DifferenceEmpty {
+            date: 1_770_000_020,
+            seq: 3,
+        },
+    ));
+    let cfg = SessionRuntimeConfig {
+        init_updates_state: true,
+        run_get_difference_on_start: false,
+        load_initial_dialogs: false,
+        fetch_self_user_on_start: false,
+        idle_ping_enabled: false,
+        ..SessionRuntimeConfig::default()
+    }
+    .with_initial_updates_state(PersistedUpdatesState::default());
+    let rt = SessionRuntime::start_on(
+        UserId::from_tl(700_070),
+        rpc.clone(),
+        tokio::runtime::Handle::current(),
+        cfg,
+    )
+    .expect("start");
+    rt.wait_ready().await.expect("ready");
+
+    rpc.hold_pings();
+    let acted = tokio::time::timeout(Duration::from_secs(2), rt.on_wake_from_sleep(true))
+        .await
+        .expect("wake must not wait for the pong")
+        .expect("wake");
+    assert!(acted);
+    rpc.wait_for_ping_count(1).await;
+    let state = tokio::time::timeout(Duration::from_secs(2), rt.persisted_updates_state())
+        .await
+        .expect("a command sent during the ping must be handled before the pong")
+        .expect("state");
+    assert_eq!(state.seq, 3);
+    assert_eq!(rpc.calls_of::<tl_fns::updates::GetDifference>().len(), 1);
+
+    // A second wake while the first ping still waits does not stack another ping.
+    tokio::time::timeout(Duration::from_secs(2), rt.on_wake_from_sleep(false))
+        .await
+        .expect("second wake")
+        .expect("wake");
+    assert_eq!(rpc.ping_count(), 1);
+
+    rpc.release_pings();
+    rt.persisted_updates_state().await.expect("actor alive");
     rt.shutdown_async().await;
 }
 

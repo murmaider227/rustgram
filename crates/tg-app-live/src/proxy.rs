@@ -149,6 +149,7 @@ impl LiveProxyController {
         });
 
         if let Some(rpc) = mtproto_rpc {
+            bridge.follow_transport_connection_state();
             // Sync initial connection state from the live client.
             let initial_conn = rpc.connection_state();
             if initial_conn != ConnectionState::Disconnected {

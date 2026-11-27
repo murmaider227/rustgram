@@ -256,6 +256,71 @@ pub struct ApplyOutcome {
     pub relaunched: bool,
 }
 
+/// Returns `true` when `working_dir` holds an update the updater can install: the
+/// `tupdates/temp/ready` marker, or the legacy `tupdates/ready` folder (`update()` in
+/// `updater_win.cpp`).
+#[must_use]
+pub fn has_staged_update(working_dir: &Path) -> bool {
+    let tupdates = working_dir.join(TUPDATES_DIR_NAME);
+    tupdates.join("temp").join("ready").is_file() || tupdates.join("ready").is_dir()
+}
+
+/// Where [`resolve_working_dir`] found the working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingDirSource {
+    /// `-workdir <dir>` on the command line.
+    Flag,
+    /// The updater's current directory (tdesktop's only source: `update()` opens `tupdates\temp`
+    /// relative to it, and the app starts the updater with its working dir as current dir).
+    CurrentDir,
+    /// The app's default working directory, found because the current directory holds no staged
+    /// update. Rescues releases up to 0.2.0-alpha.1, which started the updater with the install
+    /// directory as its current directory and without `-workdir`.
+    AppDefault,
+}
+
+/// The app's default working directory for an executable in `exe_dir`, with the same precedence as
+/// `tg_core::launcher::resolve_working_dir` without `-workdir`: `<exe_dir>/RustgramForcePortable`,
+/// then `<exe_dir>` when `<exe_dir>/tdata` exists, then `<app_data>/Rustgram`, then `<exe_dir>`.
+#[must_use]
+pub fn app_default_working_dir(exe_dir: &Path, app_data: Option<&Path>) -> PathBuf {
+    let portable = exe_dir.join(crate::PORTABLE_FOLDER_NAME);
+    if portable.is_dir() {
+        return portable;
+    }
+    if exe_dir.join("tdata").is_dir() {
+        return exe_dir.to_path_buf();
+    }
+    match app_data {
+        Some(base) => base.join(crate::APP_DATA_DIR_NAME),
+        None => exe_dir.to_path_buf(),
+    }
+}
+
+/// Picks the working directory whose `tupdates` the updater installs from.
+///
+/// `-workdir` wins; otherwise the current directory, like tdesktop. When the current directory
+/// holds no staged update, the app's default working directory is used if it holds one (see
+/// [`WorkingDirSource::AppDefault`]); the app only ever stages verified packages there.
+#[must_use]
+pub fn resolve_working_dir(
+    workdir_flag: Option<&Path>,
+    current_dir: &Path,
+    exe_dir: &Path,
+    app_data: Option<&Path>,
+) -> (PathBuf, WorkingDirSource) {
+    if let Some(dir) = workdir_flag {
+        return (dir.to_path_buf(), WorkingDirSource::Flag);
+    }
+    if !has_staged_update(current_dir) {
+        let default_dir = app_default_working_dir(exe_dir, app_data);
+        if has_staged_update(&default_dir) {
+            return (default_dir, WorkingDirSource::AppDefault);
+        }
+    }
+    (current_dir.to_path_buf(), WorkingDirSource::CurrentDir)
+}
+
 /// Removes `tupdates/ready`, `tupdates/temp`, and `tupdates` (if empty).
 pub fn clear_tupdates(working_dir: &Path) {
     let tupdates = working_dir.join(TUPDATES_DIR_NAME);
@@ -897,5 +962,117 @@ mod win32 {
         unsafe {
             let _ = RegCloseKey(hkey);
         }
+    }
+}
+
+#[cfg(test)]
+mod working_dir_tests {
+    use super::*;
+
+    fn stage(dir: &Path) {
+        let temp = dir.join(TUPDATES_DIR_NAME).join("temp");
+        fs::create_dir_all(&temp).expect("temp");
+        fs::write(temp.join("ready"), b"1").expect("ready");
+    }
+
+    struct Dirs {
+        _root: tempfile::TempDir,
+        cwd: PathBuf,
+        exe_dir: PathBuf,
+        app_data: PathBuf,
+    }
+
+    fn dirs() -> Dirs {
+        let root = tempfile::TempDir::new().expect("temp");
+        let cwd = root.path().join("cwd");
+        let exe_dir = root.path().join("install");
+        let app_data = root.path().join("appdata");
+        for d in [&cwd, &exe_dir, &app_data] {
+            fs::create_dir_all(d).expect("dir");
+        }
+        Dirs {
+            _root: root,
+            cwd,
+            exe_dir,
+            app_data,
+        }
+    }
+
+    #[test]
+    fn workdir_flag_wins() {
+        let d = dirs();
+        stage(&d.app_data.join(crate::APP_DATA_DIR_NAME));
+        let flag = d.cwd.join("custom");
+        assert_eq!(
+            resolve_working_dir(Some(&flag), &d.cwd, &d.exe_dir, Some(&d.app_data)),
+            (flag.clone(), WorkingDirSource::Flag)
+        );
+    }
+
+    #[test]
+    fn current_dir_with_staged_update_wins_over_app_default() {
+        let d = dirs();
+        stage(&d.cwd);
+        stage(&d.app_data.join(crate::APP_DATA_DIR_NAME));
+        assert_eq!(
+            resolve_working_dir(None, &d.cwd, &d.exe_dir, Some(&d.app_data)),
+            (d.cwd.clone(), WorkingDirSource::CurrentDir)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_app_data_when_current_dir_has_nothing() {
+        let d = dirs();
+        let default_dir = d.app_data.join(crate::APP_DATA_DIR_NAME);
+        stage(&default_dir);
+        assert_eq!(
+            resolve_working_dir(None, &d.exe_dir, &d.exe_dir, Some(&d.app_data)),
+            (default_dir, WorkingDirSource::AppDefault)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_portable_marker_folder() {
+        let d = dirs();
+        let portable = d.exe_dir.join(crate::PORTABLE_FOLDER_NAME);
+        stage(&portable);
+        stage(&d.app_data.join(crate::APP_DATA_DIR_NAME));
+        assert_eq!(
+            resolve_working_dir(None, &d.exe_dir, &d.exe_dir, Some(&d.app_data)),
+            (portable, WorkingDirSource::AppDefault)
+        );
+    }
+
+    #[test]
+    fn adjacent_tdata_means_the_exe_dir_is_the_working_dir() {
+        let d = dirs();
+        fs::create_dir_all(d.exe_dir.join("tdata")).expect("tdata");
+        // Another profile's staged update in %APPDATA% is not this install's.
+        stage(&d.app_data.join(crate::APP_DATA_DIR_NAME));
+        assert_eq!(
+            resolve_working_dir(None, &d.cwd, &d.exe_dir, Some(&d.app_data)),
+            (d.cwd.clone(), WorkingDirSource::CurrentDir)
+        );
+    }
+
+    #[test]
+    fn nothing_staged_anywhere_keeps_current_dir() {
+        let d = dirs();
+        assert_eq!(
+            resolve_working_dir(None, &d.cwd, &d.exe_dir, Some(&d.app_data)),
+            (d.cwd.clone(), WorkingDirSource::CurrentDir)
+        );
+        assert_eq!(
+            resolve_working_dir(None, &d.cwd, &d.exe_dir, None),
+            (d.cwd.clone(), WorkingDirSource::CurrentDir)
+        );
+    }
+
+    #[test]
+    fn legacy_ready_folder_counts_as_staged() {
+        let d = dirs();
+        fs::create_dir_all(d.cwd.join(TUPDATES_DIR_NAME).join("ready")).expect("legacy");
+        assert!(has_staged_update(&d.cwd));
+        assert!(!has_staged_update(&d.exe_dir));
     }
 }

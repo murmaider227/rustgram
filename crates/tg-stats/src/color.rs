@@ -39,7 +39,7 @@ impl Color {
     /// Parses `#RRGGBB`, `#RRGGBBAA`, or `#RGB` hex strings.
     #[must_use]
     pub fn from_hex(hex: &str) -> Option<Self> {
-        let s = hex.strip_prefix('#')?;
+        let s = hex.strip_prefix('#').filter(|s| s.is_ascii())?;
         match s.len() {
             3 => {
                 let r = u8::from_str_radix(&s[0..1], 16).ok()?;

@@ -1,0 +1,23 @@
+[package]
+name = "tg-fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Deterministic panic-fuzz helpers for tests over untrusted-input parsers (dev-dependency only)."
+
+[dependencies]
+tg-tl-gen = { path = "../tg-tl-gen" }
+
+[dev-dependencies]
+tg-api = { path = "../tg-api" }
+tg-bots = { path = "../tg-bots" }
+tg-core = { path = "../tg-core" }
+tg-data = { path = "../tg-data" }
+tg-export = { path = "../tg-export" }
+tg-iv = { path = "../tg-iv" }
+tg-passport = { path = "../tg-passport" }
+tg-payments = { path = "../tg-payments" }
+tg-stories = { path = "../tg-stories" }
+tg-tl = { path = "../tg-tl" }
+tg-wallet = { path = "../tg-wallet" }

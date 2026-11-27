@@ -346,22 +346,16 @@ fn truncate_single_line(ui: &mut Ui, text: &str, font: &FontId, max_width: f32) 
     if full_w <= max_width {
         return text.to_owned();
     }
-    let mut out = String::new();
-    for ch in text.chars() {
-        let candidate = format!("{out}{ch}…");
-        let w = ui.fonts_mut(|f| {
-            f.layout_no_wrap(candidate, font.clone(), Color32::WHITE)
+    let kept = tg_history::text_cut::longest_fitting_prefix(text, |prefix| {
+        ui.fonts_mut(|f| {
+            f.layout_no_wrap(format!("{prefix}…"), font.clone(), Color32::WHITE)
                 .size()
                 .x
-        });
-        if w > max_width {
-            break;
-        }
-        out.push(ch);
-    }
-    if out.is_empty() {
-        "…".to_owned()
-    } else {
-        format!("{out}…")
-    }
+        }) <= max_width
+    });
+    format!("{}…", &text[..kept])
 }
+
+#[cfg(test)]
+#[path = "inline_keyboard_elide_tests.rs"]
+mod elide_tests;

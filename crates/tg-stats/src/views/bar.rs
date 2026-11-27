@@ -97,7 +97,7 @@ impl BarChartView {
             let mut sum: ChartValue = 0;
             for line in &chart_data.lines {
                 if lines_filter.is_enabled(line.id) {
-                    sum += line.y[i];
+                    sum = sum.saturating_add(line.y[i]);
                 }
             }
             y_sum.push(sum);

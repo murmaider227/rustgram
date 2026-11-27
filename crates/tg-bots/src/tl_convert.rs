@@ -1194,7 +1194,8 @@ pub fn bot_recommendations_from_tl(res: &tl_enums::users::Users) -> BotRecommend
         },
         tl_enums::users::Users::Slice(s) => {
             let bot_ids: Vec<UserId> = s.users.iter().map(extract_id).collect();
-            let more_count = (s.count - bot_ids.len() as i32).max(0);
+            let shown = i32::try_from(bot_ids.len()).unwrap_or(i32::MAX);
+            let more_count = s.count.saturating_sub(shown).max(0);
             BotRecommendations {
                 bot_ids,
                 more_count,

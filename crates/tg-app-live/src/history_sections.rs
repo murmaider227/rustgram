@@ -599,17 +599,11 @@ impl LiveSession {
             return Vec::new();
         }
         let state = sections_state_for(self);
-        let already_loaded = state
+        let first_request = state
             .lock()
-            .map(|g| g.forum_topics_loaded.contains(&peer_id))
-            .unwrap_or(true);
-        if !already_loaded {
-            if let Ok(mut g) = state.lock() {
-                g.forum_topics_loaded.insert(peer_id);
-            }
-            if let Err(err) = self.load_more_forum_topics(peer_id) {
-                debug!(peer = peer_id.0, error = %err, "messages.getForumTopics failed");
-            }
+            .is_ok_and(|mut g| g.forum_topics_loaded.insert(peer_id));
+        if first_request && let Err(err) = self.load_more_forum_topics(peer_id) {
+            debug!(peer = peer_id.0, error = %err, "messages.getForumTopics failed");
         }
         state
             .lock()
@@ -1639,61 +1633,55 @@ impl LiveSession {
     ) -> Vec<HistoryMessage> {
         let state = sections_state_for(self);
         let key = (peer_id, topic_root_id);
-        let already_loaded = state
+        let first_request = state
             .lock()
-            .map(|g| g.topic_messages_loaded.contains(&key))
-            .unwrap_or(true);
-        if !already_loaded {
-            if let Ok(mut g) = state.lock() {
-                g.topic_messages_loaded.insert(key);
-            }
-            if let Some(peer) = input_peer(self, peer_id) {
-                let req = tl_fns::messages::GetReplies {
-                    peer,
-                    msg_id: topic_root_id.0,
-                    offset_id: 0,
-                    offset_date: 0,
-                    add_offset: 0,
-                    limit: SECTION_HISTORY_LIMIT,
-                    max_id: 0,
-                    min_id: 0,
-                    hash: 0,
-                };
-                match invoke_rpc(self, req) {
-                    Ok(resp) => {
-                        let (raw_msgs, chats, users, channel_pts) = extract_messages_payload(resp);
-                        if let Some(pts) = channel_pts
-                            && let Some(ch_id) = to_data_peer(peer_id).to_channel()
-                        {
-                            let _ = self.apply_channel_pts(ch_id, pts, 0);
-                        }
-                        let mut converted = write_session(self, |session| {
-                            apply_tl_users_and_chats(session, &users, &chats);
-                            let self_uid = session.self_user_id();
-                            let mut out = Vec::with_capacity(raw_msgs.len());
-                            for raw in &raw_msgs {
-                                if let Some(dm) = message_from_tl(raw, self_uid) {
-                                    let mut hm = message_to_history_message(session, &dm);
-                                    hm.extra.thread_id = Some(topic_root_id);
-                                    session.insert_existing_message(dm);
-                                    out.push(hm);
-                                }
+            .is_ok_and(|mut g| g.topic_messages_loaded.insert(key));
+        if first_request && let Some(peer) = input_peer(self, peer_id) {
+            let req = tl_fns::messages::GetReplies {
+                peer,
+                msg_id: topic_root_id.0,
+                offset_id: 0,
+                offset_date: 0,
+                add_offset: 0,
+                limit: SECTION_HISTORY_LIMIT,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            };
+            match invoke_rpc(self, req) {
+                Ok(resp) => {
+                    let (raw_msgs, chats, users, channel_pts) = extract_messages_payload(resp);
+                    if let Some(pts) = channel_pts
+                        && let Some(ch_id) = to_data_peer(peer_id).to_channel()
+                    {
+                        let _ = self.apply_channel_pts(ch_id, pts, 0);
+                    }
+                    let mut converted = write_session(self, |session| {
+                        apply_tl_users_and_chats(session, &users, &chats);
+                        let self_uid = session.self_user_id();
+                        let mut out = Vec::with_capacity(raw_msgs.len());
+                        for raw in &raw_msgs {
+                            if let Some(dm) = message_from_tl(raw, self_uid) {
+                                let mut hm = message_to_history_message(session, &dm);
+                                hm.extra.thread_id = Some(topic_root_id);
+                                session.insert_existing_message(dm);
+                                out.push(hm);
                             }
-                            out
-                        });
-                        converted.sort_by_key(|m| m.id.0);
-                        if let Ok(mut g) = state.lock() {
-                            g.topic_messages.insert(key, converted);
                         }
+                        out
+                    });
+                    converted.sort_by_key(|m| m.id.0);
+                    if let Ok(mut g) = state.lock() {
+                        g.topic_messages.insert(key, converted);
                     }
-                    Err(err) => {
-                        debug!(
-                            peer = peer_id.0,
-                            topic = topic_root_id.0,
-                            error = %err,
-                            "messages.getReplies for forum topic failed"
-                        );
-                    }
+                }
+                Err(err) => {
+                    debug!(
+                        peer = peer_id.0,
+                        topic = topic_root_id.0,
+                        error = %err,
+                        "messages.getReplies for forum topic failed"
+                    );
                 }
             }
         }
@@ -1775,17 +1763,13 @@ impl LiveSession {
         topic_root_id: Option<MsgId>,
     ) -> Vec<HistoryMessage> {
         let state = sections_state_for(self);
-        let already_loaded = state
+        let first_request = state
             .lock()
-            .map(|g| g.scheduled_loaded.contains(&peer_id))
-            .unwrap_or(true);
-        if !already_loaded {
-            if let Ok(mut g) = state.lock() {
-                g.scheduled_loaded.insert(peer_id);
-            }
-            if let Err(err) = self.refresh_scheduled_messages(peer_id, now_unix_ms(), false) {
-                debug!(peer = peer_id.0, error = %err, "messages.getScheduledHistory failed");
-            }
+            .is_ok_and(|mut g| g.scheduled_loaded.insert(peer_id));
+        if first_request
+            && let Err(err) = self.refresh_scheduled_messages(peer_id, now_unix_ms(), false)
+        {
+            debug!(peer = peer_id.0, error = %err, "messages.getScheduledHistory failed");
         }
 
         let all = state
@@ -2305,43 +2289,37 @@ impl LiveSession {
     #[must_use]
     pub fn admin_log_admins_live(&self, peer_id: PeerId) -> Vec<AdminLogAdmin> {
         let state = sections_state_for(self);
-        let already_loaded = state
+        let first_request = state
             .lock()
-            .map(|g| g.admin_log_admins_loaded.contains(&peer_id))
-            .unwrap_or(true);
-        if !already_loaded {
-            if let Ok(mut g) = state.lock() {
-                g.admin_log_admins_loaded.insert(peer_id);
-            }
-            if let Some(channel) = input_channel(self, peer_id) {
-                let req = tl_fns::channels::GetParticipants {
-                    channel,
-                    filter: tl_enums::ChannelParticipantsFilter::ChannelParticipantsAdmins,
-                    offset: 0,
-                    limit: 200,
-                    hash: 0,
-                };
-                match invoke_rpc(self, req) {
-                    Ok(tl_enums::channels::ChannelParticipants::ChannelParticipants(cp)) => {
-                        let admins = write_session(self, |session| {
-                            apply_tl_users_and_chats(session, &cp.users, &cp.chats);
-                            cp.participants
-                                .iter()
-                                .filter_map(|p| channel_participant_to_admin(session, p))
-                                .collect::<Vec<_>>()
-                        });
-                        if let Ok(mut g) = state.lock() {
-                            g.admin_log_admins.insert(peer_id, admins);
-                        }
+            .is_ok_and(|mut g| g.admin_log_admins_loaded.insert(peer_id));
+        if first_request && let Some(channel) = input_channel(self, peer_id) {
+            let req = tl_fns::channels::GetParticipants {
+                channel,
+                filter: tl_enums::ChannelParticipantsFilter::ChannelParticipantsAdmins,
+                offset: 0,
+                limit: 200,
+                hash: 0,
+            };
+            match invoke_rpc(self, req) {
+                Ok(tl_enums::channels::ChannelParticipants::ChannelParticipants(cp)) => {
+                    let admins = write_session(self, |session| {
+                        apply_tl_users_and_chats(session, &cp.users, &cp.chats);
+                        cp.participants
+                            .iter()
+                            .filter_map(|p| channel_participant_to_admin(session, p))
+                            .collect::<Vec<_>>()
+                    });
+                    if let Ok(mut g) = state.lock() {
+                        g.admin_log_admins.insert(peer_id, admins);
                     }
-                    Ok(tl_enums::channels::ChannelParticipants::NotModified) => {}
-                    Err(err) => {
-                        debug!(
-                            peer = peer_id.0,
-                            error = %err,
-                            "channels.getParticipants(Admins) failed"
-                        );
-                    }
+                }
+                Ok(tl_enums::channels::ChannelParticipants::NotModified) => {}
+                Err(err) => {
+                    debug!(
+                        peer = peer_id.0,
+                        error = %err,
+                        "channels.getParticipants(Admins) failed"
+                    );
                 }
             }
         }
@@ -2421,17 +2399,11 @@ impl LiveSession {
     #[must_use]
     pub fn saved_sublists_live(&self, peer_id: PeerId) -> Vec<SavedSublist> {
         let state = sections_state_for(self);
-        let already_loaded = state
+        let first_request = state
             .lock()
-            .map(|g| g.saved_sublists_loaded.contains(&peer_id))
-            .unwrap_or(true);
-        if !already_loaded {
-            if let Ok(mut g) = state.lock() {
-                g.saved_sublists_loaded.insert(peer_id);
-            }
-            if let Err(err) = self.load_more_saved_sublists(peer_id) {
-                debug!(peer = peer_id.0, error = %err, "messages.getSavedDialogs failed");
-            }
+            .is_ok_and(|mut g| g.saved_sublists_loaded.insert(peer_id));
+        if first_request && let Err(err) = self.load_more_saved_sublists(peer_id) {
+            debug!(peer = peer_id.0, error = %err, "messages.getSavedDialogs failed");
         }
         state
             .lock()
@@ -2449,69 +2421,63 @@ impl LiveSession {
     ) -> Vec<HistoryMessage> {
         let state = sections_state_for(self);
         let key = (peer_id, sublist_peer_id);
-        let already_loaded = state
+        let first_request = state
             .lock()
-            .map(|g| g.saved_sublist_messages_loaded.contains(&key))
-            .unwrap_or(true);
-        if !already_loaded {
-            if let Ok(mut g) = state.lock() {
-                g.saved_sublist_messages_loaded.insert(key);
-            }
-            if let Some(sub_input) = input_peer(self, sublist_peer_id) {
-                let req = tl_fns::messages::GetSavedHistory {
-                    parent_peer: None,
-                    peer: sub_input,
-                    offset_id: 0,
-                    offset_date: 0,
-                    add_offset: 0,
-                    limit: SECTION_HISTORY_LIMIT,
-                    max_id: 0,
-                    min_id: 0,
-                    hash: 0,
-                };
-                match invoke_rpc(self, req) {
-                    Ok(resp) => {
-                        let (raw_msgs, chats, users, channel_pts) = extract_messages_payload(resp);
-                        if let Some(pts) = channel_pts
-                            && let Some(ch_id) = to_data_peer(peer_id)
-                                .to_channel()
-                                .or_else(|| to_data_peer(sublist_peer_id).to_channel())
+            .is_ok_and(|mut g| g.saved_sublist_messages_loaded.insert(key));
+        if first_request && let Some(sub_input) = input_peer(self, sublist_peer_id) {
+            let req = tl_fns::messages::GetSavedHistory {
+                parent_peer: None,
+                peer: sub_input,
+                offset_id: 0,
+                offset_date: 0,
+                add_offset: 0,
+                limit: SECTION_HISTORY_LIMIT,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            };
+            match invoke_rpc(self, req) {
+                Ok(resp) => {
+                    let (raw_msgs, chats, users, channel_pts) = extract_messages_payload(resp);
+                    if let Some(pts) = channel_pts
+                        && let Some(ch_id) = to_data_peer(peer_id)
+                            .to_channel()
+                            .or_else(|| to_data_peer(sublist_peer_id).to_channel())
+                    {
+                        let _ = self.apply_channel_pts(ch_id, pts, 0);
+                    }
+                    let mut converted = write_session(self, |session| {
+                        apply_tl_users_and_chats(session, &users, &chats);
+                        let self_uid = session.self_user_id();
+                        let mut out = Vec::with_capacity(raw_msgs.len());
+                        for raw in &raw_msgs {
+                            if let Some(dm) = message_from_tl(raw, self_uid) {
+                                let mut hm = message_to_history_message(session, &dm);
+                                hm.extra.saved_from_peer = Some(sublist_peer_id);
+                                out.push(hm);
+                            }
+                        }
+                        out
+                    });
+                    converted.sort_by_key(|m| m.id.0);
+                    let count = converted.len() as u32;
+                    if let Ok(mut g) = state.lock() {
+                        if let Some(list) = g.saved_sublists.get_mut(&peer_id)
+                            && let Some(sub) = list
+                                .iter_mut()
+                                .find(|s| s.sublist_peer_id == sublist_peer_id)
                         {
-                            let _ = self.apply_channel_pts(ch_id, pts, 0);
+                            sub.message_count = count;
                         }
-                        let mut converted = write_session(self, |session| {
-                            apply_tl_users_and_chats(session, &users, &chats);
-                            let self_uid = session.self_user_id();
-                            let mut out = Vec::with_capacity(raw_msgs.len());
-                            for raw in &raw_msgs {
-                                if let Some(dm) = message_from_tl(raw, self_uid) {
-                                    let mut hm = message_to_history_message(session, &dm);
-                                    hm.extra.saved_from_peer = Some(sublist_peer_id);
-                                    out.push(hm);
-                                }
-                            }
-                            out
-                        });
-                        converted.sort_by_key(|m| m.id.0);
-                        let count = converted.len() as u32;
-                        if let Ok(mut g) = state.lock() {
-                            if let Some(list) = g.saved_sublists.get_mut(&peer_id)
-                                && let Some(sub) = list
-                                    .iter_mut()
-                                    .find(|s| s.sublist_peer_id == sublist_peer_id)
-                            {
-                                sub.message_count = count;
-                            }
-                            g.saved_sublist_messages.insert(key, converted);
-                        }
+                        g.saved_sublist_messages.insert(key, converted);
                     }
-                    Err(err) => {
-                        debug!(
-                            sublist = sublist_peer_id.0,
-                            error = %err,
-                            "messages.getSavedHistory failed"
-                        );
-                    }
+                }
+                Err(err) => {
+                    debug!(
+                        sublist = sublist_peer_id.0,
+                        error = %err,
+                        "messages.getSavedHistory failed"
+                    );
                 }
             }
         }

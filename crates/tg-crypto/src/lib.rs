@@ -28,9 +28,10 @@ pub use aes::{
     try_aes_ige_encrypt,
 };
 pub use auth_key::{
-    AUTH_KEY_SIZE, AuthKey, DecryptedMessage, MAX_PADDING_V2, MIN_PADDING_V2, Side,
-    compute_msg_key_v2, decrypt_data_v1, decrypt_data_v2, decrypt_message_v2, encrypt_data_v1,
-    encrypt_data_v2, encrypt_data_v2_with_padding,
+    AUTH_KEY_SIZE, AuthKey, DecryptedMessage, MAX_PADDING_V2, MAX_RANDOM_PADDING_V2,
+    MIN_PADDING_V2, PACKET_HEADER_SIZE, Side, compute_msg_key_v2, decrypt_data_v1, decrypt_data_v2,
+    decrypt_message_v2, encrypt_data_v1, encrypt_data_v2, encrypt_data_v2_with_padding,
+    encrypt_packet_v2_in_place, encrypt_reserved_v2,
 };
 pub use dh::{
     GOOD_PRIME, ModExpFirst, create_auth_key, create_mod_exp, dh_new_nonce_hash,

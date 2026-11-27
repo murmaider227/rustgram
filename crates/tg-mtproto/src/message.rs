@@ -7,7 +7,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tg_crypto::{AuthKey, Side, decrypt_message_v2, encrypt_data_v2};
+use tg_crypto::{
+    AuthKey, DecryptedMessage, MAX_RANDOM_PADDING_V2, PACKET_HEADER_SIZE, Side, decrypt_message_v2,
+    encrypt_reserved_v2,
+};
 use tg_tl::mtproto::{CoreMessage, GzipPacked, MsgContainer, types as mtp_types};
 use tg_tl::{
     Boxed, Cursor, Deserializable, Identifiable, RawObject, Serializable, enums as tl_enums,
@@ -247,14 +250,21 @@ pub fn build_encrypted_packet(
     auth_key: &AuthKey,
     side: Side,
 ) -> Vec<u8> {
-    let mut plaintext = Vec::with_capacity(32 + body.len());
-    plaintext.extend_from_slice(&salt.to_le_bytes());
-    plaintext.extend_from_slice(&session_id.to_le_bytes());
-    plaintext.extend_from_slice(&msg_id.to_le_bytes());
-    plaintext.extend_from_slice(&seq_no.to_le_bytes());
-    plaintext.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    plaintext.extend_from_slice(body);
-    encrypt_data_v2(&plaintext, auth_key, side)
+    // One buffer end to end: reserved `auth_key_id || msg_key`, the 32-byte inner header, the
+    // body and room for the random padding, encrypted in place by tg-crypto.
+    let mut packet =
+        Vec::with_capacity(PACKET_HEADER_SIZE + 32 + body.len() + MAX_RANDOM_PADDING_V2);
+    packet.resize(PACKET_HEADER_SIZE, 0);
+    packet.extend_from_slice(&salt.to_le_bytes());
+    packet.extend_from_slice(&session_id.to_le_bytes());
+    packet.extend_from_slice(&msg_id.to_le_bytes());
+    packet.extend_from_slice(&seq_no.to_le_bytes());
+    packet.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    packet.extend_from_slice(body);
+    match encrypt_reserved_v2(packet, auth_key, side) {
+        Ok(wire) => wire,
+        Err(_) => unreachable!("the 24-byte packet header is reserved above"),
+    }
 }
 
 /// Decrypts and parses an incoming MTProto 2.0 wire packet (`SessionPrivate::handleReceived`).
@@ -263,13 +273,20 @@ pub fn parse_encrypted_packet(
     auth_key: &AuthKey,
     expected_side: Side,
 ) -> Result<DecryptedEnvelope, InvocationError> {
-    if packet.len() > MAX_MESSAGE_LENGTH + 24 + 1024 {
+    check_encrypted_packet_len(packet.len())?;
+    envelope_from(decrypt_message_v2(packet, auth_key, expected_side)?)
+}
+
+fn check_encrypted_packet_len(len: usize) -> Result<(), InvocationError> {
+    if len > MAX_MESSAGE_LENGTH + 24 + 1024 {
         return Err(InvocationError::Protocol(format!(
-            "encrypted packet exceeds limit: {} bytes",
-            packet.len()
+            "encrypted packet exceeds limit: {len} bytes"
         )));
     }
-    let decrypted = decrypt_message_v2(packet, auth_key, expected_side)?;
+    Ok(())
+}
+
+fn envelope_from(decrypted: DecryptedMessage) -> Result<DecryptedEnvelope, InvocationError> {
     if decrypted.body.len() > MAX_MESSAGE_LENGTH {
         return Err(InvocationError::Protocol(format!(
             "invalid inner message length {}",
@@ -347,6 +364,18 @@ pub fn unpack_container_with_budget(
         });
     }
     Ok(messages)
+}
+
+/// Returns `true` for `upload.saveFilePart` / `upload.saveBigFilePart` requests. Their payload is
+/// usually already-compressed media, so deflating it costs CPU without shrinking it (tdesktop
+/// never compresses outgoing requests).
+pub fn is_file_part_upload(body: &[u8]) -> bool {
+    body.first_chunk::<4>()
+        .map(|ctor| u32::from_le_bytes(*ctor))
+        .is_some_and(|ctor| {
+            ctor == tl_functions::upload::SaveFilePart::CONSTRUCTOR_ID
+                || ctor == tl_functions::upload::SaveBigFilePart::CONSTRUCTOR_ID
+        })
 }
 
 /// Compresses `body` into `gzip_packed#3072cfa1` if `body.len() >= GZIP_COMPRESS_THRESHOLD`

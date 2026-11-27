@@ -355,6 +355,20 @@ impl<'a> QDataStreamReader<'a> {
         self.data.len().saturating_sub(self.pos)
     }
 
+    /// Capacity to reserve for `count` items that take at least `min_item_bytes` each on the
+    /// wire: never more than the unread bytes could hold, so a corrupt count read from a file
+    /// cannot request a huge allocation (which aborts the process instead of returning an error).
+    #[must_use]
+    pub const fn capacity_for(&self, count: usize, min_item_bytes: usize) -> usize {
+        let fits = self.remaining()
+            / if min_item_bytes == 0 {
+                1
+            } else {
+                min_item_bytes
+            };
+        if count < fits { count } else { fits }
+    }
+
     /// Return `true` when all bytes have been consumed (`QDataStream::atEnd`).
     #[must_use]
     pub const fn at_end(&self) -> bool {

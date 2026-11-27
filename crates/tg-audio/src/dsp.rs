@@ -11,20 +11,27 @@ use crate::types::{clamp_speed, equal_speeds};
 /// Converts interleaved multi-channel `f32` PCM into stereo (`2` channels).
 #[must_use]
 pub fn to_stereo_f32(samples: &[f32], channels: usize) -> Vec<f32> {
+    let mut out = Vec::new();
+    to_stereo_into(samples, channels, &mut out);
+    out
+}
+
+/// Appends `samples` folded to interleaved stereo to `out` (see [`to_stereo_f32`]); lets a
+/// caller reuse one buffer per chunk.
+pub fn to_stereo_into(samples: &[f32], channels: usize, out: &mut Vec<f32>) {
     match channels {
-        0 => Vec::new(),
+        0 => {}
         1 => {
-            let mut out = Vec::with_capacity(samples.len() * 2);
+            out.reserve(samples.len() * 2);
             for &s in samples {
                 out.push(s);
                 out.push(s);
             }
-            out
         }
-        2 => samples.to_vec(),
+        2 => out.extend_from_slice(samples),
         n => {
             let frames = samples.len() / n;
-            let mut out = Vec::with_capacity(frames * 2);
+            out.reserve(frames * 2);
             for frame in samples.chunks_exact(n) {
                 // Standard front-left / front-right fold-down with center if present.
                 if n >= 3 {
@@ -36,7 +43,6 @@ pub fn to_stereo_f32(samples: &[f32], channels: usize) -> Vec<f32> {
                     out.push(frame[1]);
                 }
             }
-            out
         }
     }
 }
@@ -207,16 +213,15 @@ impl Resampler {
 
         self.phase -= in_frames as f64;
 
-        // Shift the last 3 frames of the combined buffer into `self.history`.
-        let total = 3 + in_frames;
-        let mut new_hist = vec![0.0; 3 * ch];
-        for h in 0..3 {
-            let src_frame = total - 3 + h;
-            for c in 0..ch {
-                new_hist[h * ch + c] = sample_at(src_frame, c, &self.history, input);
-            }
+        // The last 3 frames of the combined buffer become the history, in place: old history
+        // frames that are still among them move to the front, the rest come from the input.
+        let keep = 3usize.saturating_sub(in_frames);
+        if keep > 0 {
+            self.history.copy_within((3 - keep) * ch..3 * ch, 0);
         }
-        self.history = new_hist;
+        let from_input = 3 - keep;
+        self.history[keep * ch..3 * ch]
+            .copy_from_slice(&input[(in_frames - from_input) * ch..in_frames * ch]);
     }
 
     /// Convenience helper to resample an entire buffer in one call.

@@ -66,11 +66,7 @@ pub fn render_overview(
         .address
         .map(|a| a.to_friendly(false, testnet))
         .unwrap_or_default();
-    let short_addr = if friendly.len() > 16 {
-        format!("{}...{}", &friendly[..8], &friendly[friendly.len() - 6..])
-    } else {
-        friendly.clone()
-    };
+    let short_addr = super::address_text::short_address(&friendly, 16);
 
     // Styled balance card (`wallet_own_card.cpp`, `walletCardRadius = 16px`).
     let card_fill = card_backdrop_color(card_state.background_address.as_deref(), palette);
@@ -400,14 +396,8 @@ fn render_tx_row(
     };
     let peer_display = if !tx.counterparty_label.is_empty() {
         tx.counterparty_label.clone()
-    } else if tx.counterparty_address.len() > 16 {
-        format!(
-            "{}...{}",
-            &tx.counterparty_address[..8],
-            &tx.counterparty_address[tx.counterparty_address.len() - 6..]
-        )
     } else {
-        tx.counterparty_address.clone()
+        super::address_text::short_address(&tx.counterparty_address, 16)
     };
 
     let resp = Frame::NONE

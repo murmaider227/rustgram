@@ -220,7 +220,11 @@ pub fn parse_text_entities(text: &str, entities: &[TextEntityInput]) -> Vec<Text
         let start = entity.offset;
         let length = entity.length;
         // Matches tdesktop bounds check against UTF-8 size while slicing UTF-16 `QString::mid`.
-        if start < offset || length <= 0 || start + length > byte_size {
+        // i64: hostile server offsets would overflow `start + length` in i32.
+        if start < offset
+            || length <= 0
+            || i64::from(start) + i64::from(length) > i64::from(byte_size)
+        {
             continue;
         }
         if start > offset {
@@ -3109,9 +3113,9 @@ pub fn format_grams_amount(nanos: i64) -> String {
 pub fn format_file_size(size: i64) -> String {
     let tenths = |value: i64| format!("{}.{}", value / 10, value % 10);
     if size >= 1024 * 1024 {
-        format!("{} MB", tenths(size * 10 / (1024 * 1024)))
+        format!("{} MB", tenths(size.saturating_mul(10) / (1024 * 1024)))
     } else if size >= 1024 {
-        format!("{} KB", tenths(size * 10 / 1024))
+        format!("{} KB", tenths(size.saturating_mul(10) / 1024))
     } else {
         format!("{size} B")
     }

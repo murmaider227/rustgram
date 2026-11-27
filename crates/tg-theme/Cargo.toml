@@ -11,3 +11,6 @@ resvg = { version = "0.45.1", default-features = false }
 tg-style = { path = "../tg-style" }
 thiserror = "2"
 zip = { version = "9.8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }

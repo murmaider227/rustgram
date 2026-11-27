@@ -30,7 +30,7 @@ use crate::contacts::{
 use crate::convert::{
     apply_tl_chat_full, apply_tl_dialog, apply_tl_message, apply_tl_peer_dialogs_for_folder,
     apply_tl_users_and_chats, dialog_filter_from_tl, dialog_key_from_tl, draft_from_tl,
-    emoji_status_from_tl, entities_from_tl_with_self, input_channel_for,
+    emoji_status_from_tl, entities_from_tl_for_text, input_channel_for,
     message_from_short_chat_message, message_from_short_message, message_from_tl,
     message_media_from_tl, message_peer_loaded, peer_id_from_tl, peer_notify_settings_from_tl,
     reactions_from_tl, short_chat_message_data_loaded, short_message_data_loaded,
@@ -851,7 +851,7 @@ impl UpdatesHandler {
                                 text.entities = s
                                     .entities
                                     .as_deref()
-                                    .map(|e| entities_from_tl_with_self(e, self_id))
+                                    .map(|e| entities_from_tl_for_text(&text.text, e, self_id))
                                     .unwrap_or_default();
                                 if let Some(tl_media) = &s.media {
                                     *media = message_media_from_tl(tl_media);
@@ -2035,10 +2035,15 @@ impl UpdatesHandler {
             }
             tl_enums::Update::ServiceNotification(u) => {
                 if u.r#type.starts_with("AUTH_KEY_DROP_") {
+                    let entities = crate::convert::messages::entities_from_tl_for_text(
+                        &u.message,
+                        &u.entities,
+                        UserId::ZERO,
+                    );
                     self.events.push(UpdateEvent::ForceLogout {
                         notification_type: u.r#type,
                         message: u.message,
-                        entities: crate::convert::messages::entities_from_tl(&u.entities),
+                        entities,
                     });
                 }
             }
@@ -3052,7 +3057,11 @@ impl UpdatesHandler {
                     self.events.push(UpdateEvent::ForceLogout {
                         notification_type: n.r#type.clone(),
                         message: n.message.clone(),
-                        entities: crate::convert::messages::entities_from_tl(&n.entities),
+                        entities: crate::convert::messages::entities_from_tl_for_text(
+                            &n.message,
+                            &n.entities,
+                            UserId::ZERO,
+                        ),
                     });
                 }
                 tl_enums::Update::GroupCallParticipants(_)
@@ -3092,7 +3101,11 @@ impl UpdatesHandler {
                     self.events.push(UpdateEvent::ForceLogout {
                         notification_type: n.r#type.clone(),
                         message: n.message.clone(),
-                        entities: crate::convert::messages::entities_from_tl(&n.entities),
+                        entities: crate::convert::messages::entities_from_tl_for_text(
+                            &n.message,
+                            &n.entities,
+                            UserId::ZERO,
+                        ),
                     });
                 }
                 tl_enums::Update::GroupCallParticipants(_)

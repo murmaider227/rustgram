@@ -101,27 +101,15 @@ fn ellipsize_header_text(
     if full.size().x <= max_width {
         return (text.to_owned(), false);
     }
-    let ellipsis = "…";
-    let chars: Vec<char> = text.chars().collect();
-    let mut lo = 0usize;
-    let mut hi = chars.len();
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        let mut candidate: String = chars[..mid].iter().collect();
-        candidate.push_str(ellipsis);
-        let w = painter
-            .layout_no_wrap(candidate, font.clone(), Color32::WHITE)
-            .size()
-            .x;
-        if w <= max_width {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    let mut out: String = chars[..lo].iter().collect();
-    out = out.trim_end().to_owned();
-    out.push_str(ellipsis);
+    let elided = tg_ui::elide::elide_end_by(text, |s| {
+        tg_ui::elide::fits_width(painter, s, font, max_width)
+    });
+    let mut out = elided
+        .strip_suffix(tg_ui::elide::ELLIPSIS)
+        .unwrap_or(&elided)
+        .trim_end()
+        .to_owned();
+    out.push(tg_ui::elide::ELLIPSIS);
     (out, true)
 }
 

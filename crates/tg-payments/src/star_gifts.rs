@@ -981,7 +981,7 @@ pub fn star_gift_from_tl(tl: &tl_enums::StarGift) -> StarGift {
                 unique: Some(unique),
                 sticker_document_id,
                 released_by_id,
-                limited_left: u.availability_total - u.availability_issued,
+                limited_left: u.availability_total.saturating_sub(u.availability_issued),
                 limited_count: u.availability_total,
                 resell_ton_only: u.resale_ton_only,
                 require_premium: u.require_premium,

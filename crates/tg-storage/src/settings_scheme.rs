@@ -1113,7 +1113,7 @@ mod tests {
         assert_eq!(ctx.mtp_legacy_main_dc_id, 2);
         assert_eq!(ctx.mtp_legacy_keys.len(), 1);
         assert_eq!(ctx.mtp_legacy_keys[0].dc_id, 2);
-        assert_eq!(&ctx.mtp_legacy_keys[0].key.data, &[0x55u8; 256]);
+        assert_eq!(ctx.mtp_legacy_keys[0].key.data(), &[0x55u8; 256]);
         assert_eq!(ctx.theme_key_day, 0x1111);
         assert_eq!(ctx.theme_key_night, 0x2222);
         assert!(ctx.night_mode);

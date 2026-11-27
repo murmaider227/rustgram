@@ -472,7 +472,9 @@ pub fn handle_callback_answer(
             };
         }
         let converted = try_convert_url_to_local(link);
-        let is_local = converted.len() >= 5 && converted[..5].eq_ignore_ascii_case("tg://");
+        let is_local = converted
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("tg://"));
         return CallbackAnswerAction::OpenGameUrl {
             url: converted,
             is_local_link: is_local,

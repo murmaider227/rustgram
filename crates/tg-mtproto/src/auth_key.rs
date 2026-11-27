@@ -18,6 +18,7 @@ use tg_crypto::{
 use tg_tl::functions::auth::BindTempAuthKey;
 use tg_tl::mtproto::{enums as mtp_enums, functions as mtp_functions, types as mtp_types};
 use tg_tl::{BOOL_TRUE_ID, Cursor, Deserializable, Identifiable, Serializable};
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::dc_options::{DcId, DcOptions, DcType};
@@ -589,6 +590,9 @@ struct DcenterInner {
 #[derive(Debug, Clone)]
 pub struct Dcenter {
     inner: Arc<RwLock<DcenterInner>>,
+    /// Bumped whenever a key-creation slot is released, so sessions waiting for another
+    /// session's key creation wake up instead of polling (`Dcenter` key-changed signal).
+    key_creation_released: Arc<watch::Sender<u64>>,
 }
 
 impl Dcenter {
@@ -602,7 +606,19 @@ impl Dcenter {
                 creating: [false, false],
                 connection_inited: false,
             })),
+            key_creation_released: Arc::new(watch::Sender::new(0)),
         }
+    }
+
+    /// Subscribes to key-creation releases (success, failure or a key wipe). Subscribe before
+    /// checking the keys so a release between the check and the wait is not missed.
+    pub fn subscribe_key_creation(&self) -> watch::Receiver<u64> {
+        self.key_creation_released.subscribe()
+    }
+
+    fn notify_key_creation_released(&self) {
+        self.key_creation_released
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Bare DC ID.
@@ -676,6 +692,8 @@ impl Dcenter {
         guard.temporary_keys = [None, None];
         guard.creating = [false, false];
         guard.connection_inited = false;
+        drop(guard);
+        self.notify_key_creation_released();
     }
 
     /// Attempts to claim single-flight key creation for `dc_type` (`Dcenter::acquireKeyCreation`).
@@ -713,6 +731,19 @@ impl Dcenter {
         temporary_key: ManagedAuthKey,
         persistent_key_used_for_bind: Option<ManagedAuthKey>,
     ) -> bool {
+        let stored = self.store_created_key(creating, temporary_key, persistent_key_used_for_bind);
+        if creating != CreatingKeyType::None {
+            self.notify_key_creation_released();
+        }
+        stored
+    }
+
+    fn store_created_key(
+        &self,
+        creating: CreatingKeyType,
+        temporary_key: ManagedAuthKey,
+        persistent_key_used_for_bind: Option<ManagedAuthKey>,
+    ) -> bool {
         let mut guard = self.inner.write();
         let idx = match creating {
             CreatingKeyType::Persistent | CreatingKeyType::TemporaryRegular => 0,
@@ -736,15 +767,12 @@ impl Dcenter {
 
     /// Releases key creation slot after failure (`Dcenter::releaseKeyCreationOnFail`).
     pub fn release_key_creation_on_fail(&self, creating: CreatingKeyType) {
-        let mut guard = self.inner.write();
-        match creating {
-            CreatingKeyType::Persistent | CreatingKeyType::TemporaryRegular => {
-                guard.creating[0] = false;
-            }
-            CreatingKeyType::TemporaryMediaCluster => {
-                guard.creating[1] = false;
-            }
-            CreatingKeyType::None => {}
-        }
+        let slot = match creating {
+            CreatingKeyType::Persistent | CreatingKeyType::TemporaryRegular => 0,
+            CreatingKeyType::TemporaryMediaCluster => 1,
+            CreatingKeyType::None => return,
+        };
+        self.inner.write().creating[slot] = false;
+        self.notify_key_creation_released();
     }
 }

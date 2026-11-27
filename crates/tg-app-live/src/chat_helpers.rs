@@ -3458,11 +3458,15 @@ impl ChatHelpersBackend for LiveSession {
             .map(|g| (g.now_ms() / 1000) as i32)
             .unwrap_or_else(|_| now_unix_i32());
         if let Some(input_doc) = self.resolve_input_document(id) {
-            let _ = self.ch_invoke_rpc(tl_fns::messages::SaveRecentSticker {
-                attached: false,
-                id: input_doc,
-                unsave: false,
-            });
+            // Sent without waiting and without a fail handler, like tdesktop's `.send()`.
+            self.queue_background_rpc(
+                tl_fns::messages::SaveRecentSticker {
+                    attached: false,
+                    id: input_doc,
+                    unsave: false,
+                },
+                |error| debug!(%error, "messages.saveRecentSticker failed"),
+            );
         }
         if let Ok(mut g) = self.ch_state().inner.lock() {
             g.store.increment_sticker(id, now_secs);

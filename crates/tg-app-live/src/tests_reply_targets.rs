@@ -37,7 +37,7 @@ pub(super) struct FakeRpcClient {
 }
 
 impl FakeRpcClient {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let (updates_tx, _) = broadcast::channel(16);
         Self {
             recorded: Arc::new(Mutex::new(Vec::new())),
@@ -53,7 +53,7 @@ impl FakeRpcClient {
         *self.handler.lock().expect("handler") = Some(Arc::new(h));
     }
 
-    fn push_updates(&self, updates: tl_enums::Updates) {
+    pub(super) fn push_updates(&self, updates: tl_enums::Updates) {
         let _ = self.updates_tx.send(updates);
     }
 

@@ -633,11 +633,7 @@ fn render_interactive_card_canvas(
         .address
         .map(|a| a.to_friendly(false, testnet))
         .unwrap_or_default();
-    let short_addr = if friendly.len() > 16 {
-        format!("{}...{}", &friendly[..8], &friendly[friendly.len() - 6..])
-    } else {
-        friendly
-    };
+    let short_addr = super::address_text::short_address(&friendly, 16);
 
     painter.text(
         Pos2::new(rect.left() + 20.0, rect.top() + 24.0),

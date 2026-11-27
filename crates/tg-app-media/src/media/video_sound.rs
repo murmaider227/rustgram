@@ -50,6 +50,18 @@ impl VideoSoundOutput {
         &self.mixer
     }
 
+    /// The video volume every video player plays at (the mixer's, `0.0..=1.0`).
+    #[must_use]
+    pub fn volume(&self) -> f64 {
+        self.lock().video_volume()
+    }
+
+    /// Sets the video volume for every video player (`Mixer::setVideoVolume`), also when the
+    /// open video has no sound, like tdesktop's viewer.
+    pub fn set_volume(&self, volume: f64) {
+        self.lock().set_video_volume(volume);
+    }
+
     /// `true` when both handles point at the same mixer and device engine.
     #[must_use]
     pub fn same_as(&self, other: &Self) -> bool {

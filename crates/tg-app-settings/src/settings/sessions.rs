@@ -11,7 +11,9 @@ use tg_ui::tg_style::{Icon, st};
 use tg_ui::widgets::buttons::RoundButton;
 use tg_ui::widgets::input_field::InputField;
 
-use super::backend::{ActiveSession, DeviceKind, SESSION_TTL_OPTIONS, SettingsBackend};
+use super::backend::{
+    ActiveSession, DeviceKind, SESSION_TTL_OPTIONS, SettingsBackend, SettingsRead,
+};
 use super::privacy::format_ttl_days;
 use super::strings;
 use super::widgets::{
@@ -169,11 +171,18 @@ pub fn render_sessions_section(
 
     // 2. Active sessions list.
     subsection_title(ui, &tr::lng_sessions_other_header(), colors);
-    if others.is_empty() {
+    // `SessionsContent::paintEvent`: "Loading..." until `account.getAuthorizations` answers.
+    let loading = backend.settings_read_pending(SettingsRead::ActiveSessions);
+    if loading || others.is_empty() {
+        let text = if loading {
+            tr::lng_contacts_loading()
+        } else {
+            strings::NO_OTHER_SESSIONS.to_owned()
+        };
         ui.horizontal(|ui| {
             ui.add_space(pad_x);
             ui.label(
-                egui::RichText::new(strings::NO_OTHER_SESSIONS)
+                egui::RichText::new(text)
                     .font(font_id_from_style(st::normal_font))
                     .color(colors.color("windowSubTextFg")),
             );

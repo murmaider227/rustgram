@@ -36,10 +36,10 @@ pub use markdown::{
 };
 pub use message_field::prepare_mention_tag;
 pub use parse::{
-    PrepareTextOption, apply_server_cleaning, cut_part, escape_for_rich_parsing, name_sort_key,
-    parse_entities, parse_entities_in_place, prepare_for_sending, prepare_for_sending_str,
-    prepare_search_words, remove_accents, remove_emoji, single_line, single_line_with_entities,
-    trim,
+    PrepareTextOption, apply_server_cleaning, cut_part, cut_part_len, escape_for_rich_parsing,
+    name_sort_key, parse_entities, parse_entities_in_place, prepare_for_sending,
+    prepare_for_sending_str, prepare_search_words, remove_accents, remove_emoji, single_line,
+    single_line_with_entities, trim,
 };
 pub use tags::{
     MENTION_TAG_START, TextTag, TextTags, TextWithTags, convert_entities_to_text_tags,
@@ -51,3 +51,6 @@ pub use utf16::{
     utf8_to_utf16_offset, utf16_len, utf16_range_to_utf8, utf16_to_utf8_ceil, utf16_to_utf8_floor,
     utf16_to_utf8_offset,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

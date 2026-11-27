@@ -138,7 +138,10 @@ impl ZoomState {
 /// ported from `TonsiteToHttps` in `iv_controller.cpp`.
 pub fn tonsite_to_https(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if trimmed.len() < 10 || !trimmed[..10].eq_ignore_ascii_case("tonsite://") {
+    if !trimmed
+        .get(..10)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("tonsite://"))
+    {
         return None;
     }
     let part = &trimmed[10..];
@@ -162,7 +165,10 @@ pub fn tonsite_to_https(value: &str) -> Option<String> {
 /// ported from `HttpsToTonsite` in `iv_controller.cpp`.
 pub fn https_to_tonsite(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.len() < 8 || !trimmed[..8].eq_ignore_ascii_case("https://") {
+    if !trimmed
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
         return value.to_string();
     }
     let part = &trimmed[8..];

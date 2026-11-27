@@ -141,9 +141,9 @@ pub fn parse_reflector_hostname(hostname: &str) -> Option<(u8, u32)> {
 
 /// Decode a 32-character hex string into a 16-byte `peer_tag`.
 pub fn decode_hex_16(hex: &str) -> VoipResult<[u8; 16]> {
-    if hex.len() != 32 {
+    if hex.len() != 32 || !hex.is_ascii() {
         return Err(VoipError::Reflector(format!(
-            "expected 32 hex chars for peer_tag, got {}",
+            "expected 32 hex chars for peer_tag, got {} bytes",
             hex.len()
         )));
     }

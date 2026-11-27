@@ -1852,6 +1852,15 @@ impl WindowController {
         self.repaint_after_theme_change(&ctx);
         let palette = self.palette();
         let now_ms = self.elapsed_ms();
+        let mut stories = stories;
+        if let Some(host) = stories.as_deref_mut()
+            && host.sync_strip_prefs(
+                &mut self.settings.add_story_button_hidden,
+                &mut self.settings.stories_click_tooltip_hidden,
+            )
+        {
+            self.mark_settings_dirty();
+        }
 
         self.handle_global_shortcuts(&ctx, now_ms);
 
@@ -2114,10 +2123,16 @@ impl WindowController {
         if locked {
             self.close_content_windows();
         }
+        let video_sound = self.main_widget.audio_player_bar().video_sound_output();
+        if let Some(settings) = self.main_widget.settings_mut() {
+            self.media_overlay.sync_saved_video_volume(
+                &video_sound,
+                &mut settings.core_settings.video_volume,
+                tg_app_core::clock::now(),
+            );
+        }
         if self.media_overlay.is_open() {
-            self.media_overlay.set_video_sound_output(Some(
-                self.main_widget.audio_player_bar().video_sound_output(),
-            ));
+            self.media_overlay.set_video_sound_output(Some(video_sound));
             let ov_events =
                 self.media_overlay
                     .show(&ctx, screen_rect, &*self.session_backend, now_ms);

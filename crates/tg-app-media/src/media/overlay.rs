@@ -18,12 +18,12 @@ use tg_text::{EntityType, TextWithEntities, utf16_range_to_utf8};
 use tg_ui::fonts::{ensure_tdesktop_fonts, font_id_from_style};
 use tg_ui::tg_style::st;
 use tg_video::{
-    FfmpegStreamDecoder, FrameData, FramePopOutcome, OutputPixelFormat, PlaybackMode,
-    PlaybackOptions, PlayerStage, SliceConfig, StreamingPlayer,
+    FfmpegStreamDecoder, FramePopOutcome, OutputPixelFormat, PlaybackMode, PlaybackOptions,
+    PlayerStage, SliceConfig, StreamingPlayer,
 };
 
 use crate::media::video_playback::{
-    ViewerPlayer, drop_unplayed_audio, next_step_delay, viewer_decoder,
+    ViewerPlayer, drop_unplayed_audio, frame_color_image, next_step_delay, viewer_decoder,
 };
 use crate::media::video_sound::VideoSoundOutput;
 
@@ -397,6 +397,8 @@ pub struct MediaOverlayWidget {
     controls_fade: ControlsFade,
     /// Where videos play their sound (TGB-3041); `None` plays them silently.
     video_sound: Option<VideoSoundOutput>,
+    /// Mirrors the shared video volume into the saved settings (TGB-3050).
+    volume_sync: crate::media::VideoVolumeSync,
 }
 
 impl Default for MediaOverlayWidget {
@@ -447,6 +449,7 @@ impl MediaOverlayWidget {
             playback_sponsored: PlaybackSponsoredOverlay::new(),
             controls_fade: ControlsFade::default(),
             video_sound: None,
+            volume_sync: crate::media::VideoVolumeSync::new(),
         }
     }
 
@@ -461,7 +464,44 @@ impl MediaOverlayWidget {
         if !same {
             self.video_sound = output;
         }
+        if let Some(output) = self.video_sound.clone() {
+            self.adopt_shared_volume(&output);
+        }
         self.attach_video_sound();
+    }
+
+    /// The viewer plays at the shared video volume (`Core::Settings::videoVolume`), which
+    /// stories or PiP may have changed since.
+    fn adopt_shared_volume(&mut self, output: &VideoSoundOutput) {
+        let volume = output.volume();
+        if (volume - self.volume).abs() > f64::EPSILON {
+            self.volume = volume;
+            self.controls.set_volume(volume);
+        }
+    }
+
+    /// Loads the saved video volume (`CoreSettings::video_volume`) into the mixer on the
+    /// first call and saves later changes a second after they settle, as tdesktop's
+    /// `saveSettingsDelayed`. Call it every frame, whether the viewer is open or not.
+    pub fn sync_saved_video_volume(
+        &mut self,
+        output: &VideoSoundOutput,
+        saved: &mut f64,
+        now: std::time::Instant,
+    ) -> bool {
+        let changed = self.volume_sync.sync(output, saved, now);
+        // Before the first video opens, so it starts at the saved volume, not the default.
+        self.adopt_shared_volume(output);
+        changed
+    }
+
+    /// Sets the shared video volume from the viewer's controls
+    /// (`playbackControlsVolumeChanged`).
+    fn set_shared_volume(&mut self, volume: f64) {
+        self.volume = volume;
+        if let Some(output) = &self.video_sound {
+            output.set_volume(volume);
+        }
     }
 
     fn attach_video_sound(&mut self) {
@@ -1277,7 +1317,7 @@ impl MediaOverlayWidget {
                         return;
                     }
                     if let VideoStreamAction::SetVolume(vol) = act {
-                        self.volume = vol;
+                        self.set_shared_volume(vol);
                     }
                     events.push(OverlayEvent::VideoStream(act));
                 }
@@ -1679,40 +1719,19 @@ impl MediaOverlayWidget {
                 let needs_transform_refresh =
                     *rendered_rotation != rot || *rendered_flip_h != fh || *rendered_flip_v != fv;
 
+                // The presented frame is shared with the player (no copy) and converted once.
                 let frame_to_upload = match outcome {
                     Ok(FramePopOutcome::Ready { frame, .. }) => Some(frame),
                     _ if texture.is_none() || needs_transform_refresh => {
-                        player.current_video_frame().cloned()
+                        player.current_video_frame_shared()
                     }
                     _ => None,
                 };
 
-                if let Some(frame) = frame_to_upload
-                    && let FrameData::Rgba(bytes) = &frame.data
+                if let Some(img) = frame_to_upload
+                    .as_deref()
+                    .and_then(|frame| frame_color_image(frame, rot, fh, fv))
                 {
-                    let img = if rot != 0 || fh || fv {
-                        if let Some(rgba_buf) =
-                            image::RgbaImage::from_raw(frame.width, frame.height, bytes.clone())
-                        {
-                            let dyn_img = DynamicImage::ImageRgba8(rgba_buf);
-                            let transformed = transform_dynamic_image(&dyn_img, rot, fh, fv);
-                            let out = transformed.to_rgba8();
-                            ColorImage::from_rgba_unmultiplied(
-                                [out.width() as usize, out.height() as usize],
-                                out.as_raw(),
-                            )
-                        } else {
-                            ColorImage::from_rgba_unmultiplied(
-                                [frame.width as usize, frame.height as usize],
-                                bytes,
-                            )
-                        }
-                    } else {
-                        ColorImage::from_rgba_unmultiplied(
-                            [frame.width as usize, frame.height as usize],
-                            bytes,
-                        )
-                    };
                     if let Some(tex) = texture {
                         tex.set(img, TextureOptions::LINEAR);
                     } else {
@@ -1973,13 +1992,13 @@ impl MediaOverlayWidget {
                 self.seek_video(pos_ms, world_now_ms);
             }
             PlaybackControlsAction::VolumeChanged(vol) => {
-                self.volume = vol;
+                self.set_shared_volume(vol);
                 if let ActiveContent::Video { player, .. } = &mut self.content {
                     let _ = player.set_volume(vol);
                 }
             }
             PlaybackControlsAction::VolumeToggled => {
-                self.volume = self.controls.volume;
+                self.set_shared_volume(self.controls.volume);
                 if let ActiveContent::Video { player, .. } = &mut self.content {
                     let _ = player.set_volume(self.volume);
                 }
@@ -3034,58 +3053,13 @@ impl FooterLayout {
 
 /// Elides `text` in the middle to fit `max_width` (`Qt::ElideMiddle` in `updateHeader`).
 fn ellipsize_middle(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let fits = |s: &str| {
-        ui.painter()
-            .layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE)
-            .size()
-            .x
-            <= max_width
-    };
-    let mut keep = chars.len();
-    while keep > 0 {
-        let head = keep.div_ceil(2);
-        let tail = keep / 2;
-        let candidate: String = chars[..head]
-            .iter()
-            .chain(std::iter::once(&'\u{2026}'))
-            .chain(chars[chars.len() - tail..].iter())
-            .collect();
-        if fits(&candidate) {
-            return candidate;
-        }
-        keep -= 1;
-    }
-    "\u{2026}".to_owned()
+    tg_ui::elide::elide_middle_by(text, |s| {
+        tg_ui::elide::fits_width(ui.painter(), s, font, max_width)
+    })
 }
 
 fn ellipsize_single_line(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> String {
-    let full = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE);
-    if full.size().x <= max_width {
-        return text.to_owned();
-    }
-    let ellipsis = "\u{2026}";
-    let mut best = String::new();
-    for (idx, _) in text.char_indices() {
-        let candidate = format!("{}{}", &text[..idx], ellipsis);
-        let w = ui
-            .painter()
-            .layout_no_wrap(candidate.clone(), font.clone(), Color32::WHITE)
-            .size()
-            .x;
-        if w <= max_width {
-            best = candidate;
-        } else {
-            break;
-        }
-    }
-    if best.is_empty() {
-        ellipsis.to_owned()
-    } else {
-        best
-    }
+    tg_ui::elide::elide_end(ui.painter(), text, font, max_width)
 }
 
 #[cfg(test)]
@@ -3102,3 +3076,8 @@ mod tests_wp74i_album_strip;
 #[path = "tests_uip4_e.rs"]
 #[cfg(test)]
 mod tests_uip4_e;
+
+#[cfg(test)]
+#[path = "tests_saved_volume.rs"]
+#[cfg(test)]
+mod tests_saved_volume;

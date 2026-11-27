@@ -8,6 +8,11 @@ license.workspace = true
 name = "rustgram-updater"
 path = "src/bin/tgfork_updater.rs"
 
+# Also acts as the fake `rustgram.exe` the updater relaunches, so it needs its own `main`.
+[[test]]
+name = "e2e_tgb3113_workdir"
+harness = false
+
 [dependencies]
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 hex = "0.4.3"
@@ -28,5 +33,6 @@ windows-sys = { version = "0.52.0", features = [
 ] }
 
 [dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }
 rand = "0.8.8"
 tempfile = "3.27.0"

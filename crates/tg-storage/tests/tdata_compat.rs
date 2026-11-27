@@ -102,7 +102,7 @@ fn synthetic_tdata_exact_on_disk_wire_layout() {
     // Verify open wrap decrypts with CreateLocalKey("", open_salt)
     let open_wrap_key = create_local_key(b"", &kd.open_salt);
     let unwrapped_local = decrypt_local(&kd.open_key_encrypted, &open_wrap_key).expect("unwrap");
-    assert_eq!(unwrapped_local.as_slice(), &local_key.data);
+    assert_eq!(unwrapped_local.as_slice(), local_key.data());
 
     // 3. Populate account 0 ("data" -> D877F783D5D3EF8C) and account 1 ("data#2")
     let mut acc0 = AccountStorage::open(&tdata, "data", 0, local_key.clone()).expect("open acc0");
@@ -265,7 +265,7 @@ fn legacy_single_account_map_with_passcode_opens_correctly() {
     let passcode = b"legacy-pass";
     let passcode_key = create_legacy_local_key(passcode, &salt);
     let local_key = AuthKey::new([0xC3u8; 256]);
-    let legacy_key_enc = prepare_encrypted(&local_key.data, &passcode_key).expect("wrap");
+    let legacy_key_enc = prepare_encrypted(local_key.data(), &passcode_key).expect("wrap");
 
     let mut map_payload = QDataStreamWriter::new();
     map_payload.write_u32(tg_storage::LskKeyType::Locations as u32);
@@ -316,5 +316,5 @@ fn legacy_pre_tdf_inline_encrypted_settings_stream() {
     assert_eq!(ctx.mtp_legacy_user_id, 4242);
     assert_eq!(ctx.mtp_legacy_main_dc_id, 2);
     assert_eq!(ctx.mtp_legacy_keys.len(), 1);
-    assert_eq!(&ctx.mtp_legacy_keys[0].key.data, &[0x99u8; 256]);
+    assert_eq!(ctx.mtp_legacy_keys[0].key.data(), &[0x99u8; 256]);
 }

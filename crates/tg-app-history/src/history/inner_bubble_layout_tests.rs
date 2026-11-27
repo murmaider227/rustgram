@@ -44,7 +44,7 @@ fn message(id: i32, from: i64, text: &str) -> HistoryMessage {
 
 fn layout_of(ui: &Ui, msg: &HistoryMessage, attached: bool) -> tg_history::MessageLayout {
     let colors = HistoryColors::from_palette(&Palette::day());
-    let mut item = build_list_item(msg, true);
+    let mut item = build_list_item(msg, true, true);
     item.attach_state.attached_to_previous = attached;
     item.attach_state.bubble_attached_to_previous = attached;
     match compute_item_layout_egui(

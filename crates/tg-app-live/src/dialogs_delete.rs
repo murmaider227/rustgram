@@ -76,10 +76,15 @@ pub(crate) fn remove_peer_from_all_folders(live: &LiveSession, peer_id: PeerId) 
             continue;
         };
         live.write_session(|s| s.set_filter(filter.clone()));
-        let _ = live.invoke_rpc(tl_fns::messages::UpdateDialogFilter {
-            id: filter.id,
-            filter: Some(tl_filter),
-        });
+        // tdesktop sends it without a fail handler (`RemoveChatFromFilters`).
+        let filter_id = filter.id;
+        live.queue_background_rpc(
+            tl_fns::messages::UpdateDialogFilter {
+                id: filter.id,
+                filter: Some(tl_filter),
+            },
+            move |error| tracing::debug!(filter_id, %error, "messages.updateDialogFilter failed"),
+        );
     }
     live.bridge.state().notify_ui();
 }

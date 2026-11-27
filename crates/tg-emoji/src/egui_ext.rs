@@ -88,21 +88,31 @@ impl SharedTiles {
         ctx.data_mut(|d| d.get_temp_mut_or_default::<Self>(id).clone())
     }
 
+    #[cfg(test)]
     fn slot(&self, tile: usize) -> TileSlot {
         let slots = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         slots.get(tile).cloned().unwrap_or(TileSlot::Failed)
     }
 
-    /// Marks `tile` as being decoded; returns `false` when another caller already started it.
-    fn claim(&self, tile: usize) -> bool {
+    /// Returns the tile's state, claiming it for this caller (marked decoding, returned as
+    /// `Empty`) when nobody started it. One lock: reading the slot and claiming it under two
+    /// locks let another handle finish the tile in between, and the tile then read as ready
+    /// without its handle (`tile_texture` returned `None` for that frame).
+    fn lookup_or_claim(&self, tile: usize) -> TileSlot {
         let mut slots = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         match slots.get_mut(tile) {
             Some(slot @ TileSlot::Empty) => {
                 *slot = TileSlot::Decoding;
-                true
+                TileSlot::Empty
             }
-            _ => false,
+            Some(slot) => slot.clone(),
+            None => TileSlot::Failed,
         }
+    }
+
+    #[cfg(test)]
+    fn claim(&self, tile: usize) -> bool {
+        matches!(self.lookup_or_claim(tile), TileSlot::Empty)
     }
 
     fn finish(&self, tile: usize, result: Option<TextureHandle>) {
@@ -209,7 +219,7 @@ impl EmojiTextureCache {
             return TileStatus::Ready(handle.id());
         }
         let shared = SharedTiles::for_context(ctx, self.atlas);
-        match shared.slot(tile) {
+        match shared.lookup_or_claim(tile) {
             TileSlot::Ready(handle) => {
                 let id = handle.id();
                 self.textures[tile] = Some(handle);
@@ -217,14 +227,8 @@ impl EmojiTextureCache {
             }
             TileSlot::Decoding => return TileStatus::Pending,
             TileSlot::Failed => return TileStatus::Unavailable,
+            // Claimed: this caller decodes it.
             TileSlot::Empty => {}
-        }
-        if !shared.claim(tile) {
-            return match shared.slot(tile) {
-                TileSlot::Ready(handle) => TileStatus::Ready(handle.id()),
-                TileSlot::Decoding => TileStatus::Pending,
-                TileSlot::Empty | TileSlot::Failed => TileStatus::Unavailable,
-            };
         }
         if self.background.unwrap_or_else(background_decode_enabled) && tile_worker::available() {
             let job = TileJob {

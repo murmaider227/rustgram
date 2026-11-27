@@ -102,3 +102,60 @@ Installed copies with automatic updates on check every few hours (8 by default),
    ship the fix under a new number.
 6. If the release key may be compromised, also follow `SECURITY.md`: a release signed with a leaked key
    cannot be pulled from clients that trust that key.
+
+## Users stuck on a broken updater
+
+Releases up to and including **v0.2.0-alpha.1** start `rustgram-updater.exe` in the folder of
+`rustgram.exe` and do not tell it where the update was downloaded. The update waits in
+`tupdates` inside the **working folder**, so whenever the working folder is not the program folder
+the updater finds nothing: "Restart to update" reopens the same version and the update button comes
+back. The fix shipped in v0.2.0-alpha.2.
+
+Who is affected: a portable copy without its own data folder (working folder `%APPDATA%\Rustgram`), a
+portable copy with `RustgramForcePortable` (working folder `<program folder>\RustgramForcePortable`),
+and an installed copy moved out of the installer's default folder. The installer's default folder is
+`%APPDATA%\Rustgram`, the same as the working folder, so default installs update normally.
+
+**Nothing downloaded yet** (an affected v0.2.0-alpha.1 that has not shown "New version is ready"):
+no action. The update package carries the new `rustgram-updater.exe`, and the old app copies it into
+the program folder before the restart. The new updater looks in the default working folder by itself
+when its current folder holds no update, so "Restart to update" installs v0.2.0-alpha.2 or later.
+
+**An update already downloaded by an affected build** (for example v0.1.0-alpha.2 showing "New
+version is ready · v0.2.0-alpha.1"): that update's updater is the broken one. Install it by hand once,
+starting the updater in the working folder. In PowerShell:
+
+```powershell
+# 1. Quit Rustgram (also from the tray icon). This must print nothing:
+Get-Process rustgram -ErrorAction SilentlyContinue
+
+# 2. The folder that holds rustgram.exe, and the working folder
+#    (%APPDATA%\Rustgram, or "$app\RustgramForcePortable" if that folder exists):
+$app  = "C:\path\to\Rustgram"
+$work = "$env:APPDATA\Rustgram"
+
+# 3. An update is staged when this prints True:
+Test-Path "$work\tupdates\temp\ready"
+
+# 4. Install it. Exit code 0 means installed; Rustgram then starts again by itself.
+$p = Start-Process -FilePath "$app\rustgram-updater.exe" -ArgumentList '-update' `
+     -WorkingDirectory $work -Wait -PassThru
+$p.ExitCode
+```
+
+Exit code 1 means the updater found no update in `$work`: check the two paths. Rustgram now runs the
+version that was waiting. That version still has the old updater, but the next update it downloads
+(v0.2.0-alpha.2 or later) brings the new updater along and installs the usual way.
+
+Alternative without PowerShell: quit Rustgram, delete the `tupdates` folder in the working folder and
+start Rustgram again. It then downloads the newest release (v0.1.0-alpha.x needs **Settings >
+Advanced > Install beta versions** on), whose updater installs it at the next restart.
+
+**If neither works**, replace the files by hand: download `rustgram-<version>-win-x64-portable.zip`
+from the newest release, quit Rustgram, unzip it over the program folder (replace all files), delete
+the `tupdates` folder in the working folder, and start `rustgram.exe`. The profile in the working
+folder is not touched.
+
+The steps above were tested against the released v0.2.0-alpha.1 `rustgram-updater.exe` with
+`crates/tg-updater/tests/e2e_tgb3113_workdir.rs`
+(`RUSTGRAM_E2E_RELEASED_UPDATER=<path to that exe> cargo test -p tg-updater --test e2e_tgb3113_workdir`).

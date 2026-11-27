@@ -518,6 +518,8 @@ pub struct HistoryInnerWidget {
     summary_fingerprints: HashMap<MsgId, (bool, bool, usize)>,
     /// Configured double-click quick action (`CoreSettings::chat_quick_action`).
     chat_quick_action: tg_core::settings::DoubleClickQuickAction,
+    /// Messages of only 1-3 emoji drawn large without a bubble (`CoreSettings::large_emoji`).
+    large_emoji: bool,
     /// Whether hover corner Quick Reply pill is enabled (`CoreSettings::corner_reply`).
     corner_reply: bool,
     /// Whether hover corner Quick React pill is enabled (`CoreSettings::corner_reaction`).
@@ -611,6 +613,7 @@ impl HistoryInnerWidget {
             last_media_poll_ms: 0,
             summary_fingerprints: HashMap::new(),
             chat_quick_action: tg_core::settings::DoubleClickQuickAction::Reply,
+            large_emoji: true,
             corner_reply: true,
             corner_reaction: true,
             quick_reaction_emoji: crate::history::quick_action::DEFAULT_QUICK_REACTION_EMOJI
@@ -805,7 +808,7 @@ impl HistoryInnerWidget {
         let items: Vec<HistoryListItem> = self
             .messages
             .iter()
-            .map(|m| build_list_item(m, is_group))
+            .map(|m| build_list_item(m, is_group, self.large_emoji))
             .collect();
         self.list.set_items(items);
         self.update_date_and_unread_heights();
@@ -863,10 +866,32 @@ impl HistoryInnerWidget {
     pub fn apply_core_settings(&mut self, settings: &tg_core::settings::CoreSettings) {
         self.media_runtime.apply_core_settings(settings);
         self.chat_quick_action = settings.chat_quick_action;
+        self.set_large_emoji(settings.large_emoji);
         self.corner_reply = settings.corner_reply;
         self.corner_reaction = settings.corner_reaction;
         self.reduced_motion =
             settings.is_power_saving_on(tg_core::settings::PowerSavingFlags::ANIMATIONS);
+    }
+
+    /// Turns "Large emoji" on or off (`Element::refreshMedia` for every emoji-only message):
+    /// their layouts and bubble attachment change.
+    pub fn set_large_emoji(&mut self, enabled: bool) {
+        if self.large_emoji == enabled {
+            return;
+        }
+        self.large_emoji = enabled;
+        let mut changed = false;
+        for (msg, item) in self.messages.iter().zip(self.list.items_mut()) {
+            if crate::history::large_emoji::large_emoji_of(msg, true).is_some() {
+                item.attach_meta.unwrapped = enabled;
+                self.layout_cache.remove(&msg.id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.list.recount_attachments();
+            self.list.relayout_positions();
+        }
     }
 
     /// Returns the configured double-click quick action (`HistoryView::CurrentQuickAction`).
@@ -1638,7 +1663,7 @@ impl HistoryInnerWidget {
         let items: Vec<HistoryListItem> = self
             .messages
             .iter()
-            .map(|m| build_list_item(m, is_group))
+            .map(|m| build_list_item(m, is_group, self.large_emoji))
             .collect();
 
         self.list.loaded_at_top = slice.loaded_at_top;
@@ -1702,7 +1727,7 @@ impl HistoryInnerWidget {
             self.layout_cache.remove(&prev_last.id);
         }
         let is_group = matches!(peer_kind, PeerKind::Group);
-        let item = build_list_item(&msg, is_group);
+        let item = build_list_item(&msg, is_group, self.large_emoji);
         self.messages.push(msg);
         self.list.push_back(item);
         self.update_date_and_unread_heights();
@@ -1774,7 +1799,7 @@ impl HistoryInnerWidget {
             if let Some(prev_last) = self.messages.last() {
                 self.layout_cache.remove(&prev_last.id);
             }
-            let item = build_list_item(&msg, is_group);
+            let item = build_list_item(&msg, is_group, self.large_emoji);
             let idx = self.messages.len();
             self.messages.push(msg);
             self.list.push_back(item);
@@ -1799,7 +1824,7 @@ impl HistoryInnerWidget {
                 .map(|u| if u >= idx { u + 1 } else { u });
             // The other items keep their measured heights; only the new one is estimated.
             let mut items = self.list.items().to_vec();
-            items.insert(idx, build_list_item(&msg, is_group));
+            items.insert(idx, build_list_item(&msg, is_group, self.large_emoji));
             self.messages.insert(idx, msg);
             self.list.set_items(items);
             self.list.set_unread_bar(prev_unread_bar);
@@ -1988,7 +2013,7 @@ impl HistoryInnerWidget {
         self.media_backlog.remove(&local_id);
         self.media_watch.dirty = true;
         let is_group = matches!(peer_kind, PeerKind::Group);
-        let fresh = build_list_item(&sent, is_group);
+        let fresh = build_list_item(&sent, is_group, self.large_emoji);
         if let Some(slot) = self.list.items_mut().get_mut(index) {
             *slot = HistoryListItem {
                 y: slot.y,
@@ -2057,7 +2082,7 @@ impl HistoryInnerWidget {
         let items: Vec<HistoryListItem> = self
             .messages
             .iter()
-            .map(|m| build_list_item(m, is_group))
+            .map(|m| build_list_item(m, is_group, self.large_emoji))
             .collect();
         self.list.set_items(items);
         self.list
@@ -2167,7 +2192,7 @@ impl HistoryInnerWidget {
         let older_items: Vec<HistoryListItem> = older
             .messages
             .iter()
-            .map(|m| build_list_item(m, is_group))
+            .map(|m| build_list_item(m, is_group, self.large_emoji))
             .collect();
 
         if let Some(prev_first) = self.messages.first() {
@@ -2225,7 +2250,7 @@ impl HistoryInnerWidget {
         }
         let is_group = matches!(peer_kind, PeerKind::Group);
         for msg in newer.messages {
-            let item = build_list_item(&msg, is_group);
+            let item = build_list_item(&msg, is_group, self.large_emoji);
             self.messages.push(msg);
             self.list.push_back(item);
         }
@@ -2280,6 +2305,7 @@ impl HistoryInnerWidget {
                 is_chat_wide,
                 show_sender_in_chat,
                 &fonts,
+                self.large_emoji,
             );
             let new_h = cached_layout_height(&cached);
             if self.list.items()[v.index].height != new_h {
@@ -4050,6 +4076,7 @@ impl HistoryInnerWidget {
             transcribe_h,
             summary_entry,
             expanded_quotes,
+            self.large_emoji,
         );
         let new_h = cached_layout_height(&cached);
         let changed = self.list.items()[index].height != new_h;
@@ -4128,7 +4155,7 @@ fn cached_layout_height(cached: &CachedItemLayout) -> i32 {
     }
 }
 
-fn build_list_item(msg: &HistoryMessage, is_group: bool) -> HistoryListItem {
+fn build_list_item(msg: &HistoryMessage, is_group: bool, large_emoji: bool) -> HistoryListItem {
     let full_id = to_hist_full(FullMsgId {
         peer: msg.peer_id,
         msg: msg.id,
@@ -4137,10 +4164,11 @@ fn build_list_item(msg: &HistoryMessage, is_group: bool) -> HistoryListItem {
         full_id,
         date: msg.date_unix,
     };
-    let unwrapped = matches!(
+    let unwrapped = (matches!(
         msg.media,
         Some(HistoryMedia::Sticker(_) | HistoryMedia::RoundVideo(_))
-    ) && msg.text.is_empty();
+    ) && msg.text.is_empty())
+        || crate::history::large_emoji::large_emoji_of(msg, large_emoji).is_some();
     let meta = AttachMetadata {
         date: msg.date_unix,
         date_time: LocalDateTime::from_unix_local(i64::from(msg.date_unix)),
@@ -4274,6 +4302,21 @@ fn media_textual_max_width(has_text: bool, text_max_width: i32) -> i32 {
     } else {
         0
     }
+}
+
+/// `UnwrappedMedia` around `LargeEmoji` for an emoji-only message; `info_width` is the bottom
+/// info's optimal width (`Element::infoWidth`).
+fn large_emoji_media_input(
+    emoji: &crate::history::large_emoji::IsolatedEmoji,
+    info_width: i32,
+) -> MediaInput {
+    MediaInput::LargeEmoji(tg_history::LargeEmojiInput {
+        count: emoji.len(),
+        // `UnwrappedMedia::bottomInfoWidth`.
+        bottom_info_width: tg_history::consts::MSG_REPLY_PADDING.left
+            + info_width
+            + 2 * tg_history::consts::MSG_DATE_IMG_PADDING.x,
+    })
 }
 
 fn build_media_input(
@@ -4614,6 +4657,7 @@ fn compute_item_layout_egui(
         transcribe_text_height,
         summary_entry,
         &[],
+        true,
     )
 }
 
@@ -4632,6 +4676,7 @@ fn compute_item_layout_egui_with_quotes(
     transcribe_text_height: i32,
     summary_entry: Option<&MessageSummaryEntry>,
     expanded_quotes: &[usize],
+    large_emoji: bool,
 ) -> CachedItemLayout {
     let chat_mode = if is_chat_wide {
         ElementChatMode::Wide
@@ -4743,6 +4788,10 @@ fn compute_item_layout_egui_with_quotes(
         &msg.text
     };
     let has_rich_body = msg.extra.rich_message.is_some();
+    let summary_shown = summary_entry.is_some_and(|s| s.shown);
+    let large = (!summary_shown)
+        .then(|| crate::history::large_emoji::large_emoji_of(msg, large_emoji))
+        .flatten();
     let (mut text_max_w, text_wrapped_h, mut text_real_w) =
         if let Some(ref rich_payload) = msg.extra.rich_message {
             let view_style =
@@ -4762,7 +4811,7 @@ fn compute_item_layout_egui_with_quotes(
             let w = (sz.x.ceil() as i32).clamp(80, max_text_wrap);
             let h = (sz.y.ceil() as i32).max(fonts.normal.height);
             (w, h, w)
-        } else if active_text.is_empty() {
+        } else if active_text.is_empty() || large.is_some() {
             (0, 0, 0)
         } else {
             measure_message_text(
@@ -4819,18 +4868,17 @@ fn compute_item_layout_egui_with_quotes(
     let bottom_info = crate::history::bubble_info::bottom_info_input(ui.painter(), msg);
     let bottom_info_w =
         build_bottom_info_input(msg).author_edited_date_width + bottom_info.views_text_width + 24;
-    let info_skip_w = tg_history::skip_block_width(
-        tg_history::BottomInfoLayout::compute(&bottom_info, i32::MAX, fonts)
-            .optimal_size
-            .width,
-    );
+    let info_optimal_w = tg_history::BottomInfoLayout::compute(&bottom_info, i32::MAX, fonts)
+        .optimal_size
+        .width;
+    let info_skip_w = tg_history::skip_block_width(info_optimal_w);
     let lp_extra_h = msg
         .extra
         .link_preview
         .as_ref()
         .map_or(0, |lp| link_preview_card_height(lp) + 8);
     let has_lp = lp_extra_h > 0;
-    let has_body_text = has_rich_body || !msg.text.is_empty() || has_lp;
+    let has_body_text = has_rich_body || (!msg.text.is_empty() && large.is_none()) || has_lp;
     let text_max_w = if has_lp {
         text_max_w.max(240.min(max_text_wrap))
     } else {
@@ -4848,7 +4896,12 @@ fn compute_item_layout_egui_with_quotes(
         text_max_w,
         bottom_info_w,
         transcribe_text_height,
-    );
+    )
+    .or_else(|| {
+        large
+            .as_ref()
+            .map(|emoji| large_emoji_media_input(emoji, info_optimal_w))
+    });
 
     // Extra vertical space so bottom-right timestamp never overlaps the final text line or preview card.
     // tdesktop appends a skip block for the date to the last text line (`Ui::Text::String`
@@ -5031,6 +5084,7 @@ fn compute_item_layout_headless(
     is_chat_wide: bool,
     show_sender_in_chat: bool,
     fonts: &FontMetrics,
+    large_emoji: bool,
 ) -> CachedItemLayout {
     let chat_mode = if is_chat_wide {
         ElementChatMode::Wide
@@ -5100,6 +5154,7 @@ fn compute_item_layout_headless(
         - MSG_PADDING.horizontal())
     .max(120);
     let has_rich_body = msg.extra.rich_message.is_some();
+    let large = crate::history::large_emoji::large_emoji_of(msg, large_emoji);
     let (tw, th) = if let Some(ref rich_payload) = msg.extra.rich_message {
         let sz = tg_app_media::webview::rich_page_view::estimate_rich_page_size(
             &rich_payload.page,
@@ -5110,6 +5165,8 @@ fn compute_item_layout_headless(
             (sz.x.ceil() as i32).clamp(80, max_text_wrap),
             (sz.y.ceil() as i32).max(fonts.normal.height) + 18,
         )
+    } else if large.is_some() {
+        (0, 0)
     } else {
         estimate_text_metrics(&msg.text.text, max_text_wrap)
     };
@@ -5143,14 +5200,22 @@ fn compute_item_layout_headless(
         .as_ref()
         .map_or(0, |lp| link_preview_card_height(lp) + 8);
     let has_lp = lp_extra_h > 0;
-    let has_body_text = has_rich_body || !msg.text.is_empty() || has_lp;
+    let has_body_text = has_rich_body || (!msg.text.is_empty() && large.is_none()) || has_lp;
     let tw = if has_lp {
         tw.max(240.min(max_text_wrap))
     } else {
         tw
     };
     let th = th + lp_extra_h + if has_lp { 18 } else { 0 };
-    let media = build_media_input(msg, has_header, has_body_text, tw, bottom_info_w, 0);
+    let media =
+        build_media_input(msg, has_header, has_body_text, tw, bottom_info_w, 0).or_else(|| {
+            large.as_ref().map(|emoji| {
+                let info_w = tg_history::BottomInfoLayout::compute(&bottom_info, i32::MAX, fonts)
+                    .optimal_size
+                    .width;
+                large_emoji_media_input(emoji, info_w)
+            })
+        });
 
     let inline_keyboard = msg
         .extra

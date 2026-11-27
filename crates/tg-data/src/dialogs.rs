@@ -10,6 +10,7 @@
 //! lists, letter-indexed dialog lists, main/archive lists, unread state & badge
 //! calculations, and chat filters (custom folders) matching logic.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
@@ -197,35 +198,38 @@ impl UnreadState {
     }
 }
 
+/// Saturating: the counters come from the server (`dialog.unread_count`), and a hostile or buggy
+/// total must not overflow (tdesktop's `int` math is undefined behaviour there).
 impl AddAssign for UnreadState {
     fn add_assign(&mut self, rhs: Self) {
-        self.messages += rhs.messages;
-        self.messages_muted += rhs.messages_muted;
-        self.chats += rhs.chats;
-        self.chats_muted += rhs.chats_muted;
-        self.marks += rhs.marks;
-        self.marks_muted += rhs.marks_muted;
-        self.reactions += rhs.reactions;
-        self.reactions_muted += rhs.reactions_muted;
-        self.mentions += rhs.mentions;
-        self.polls += rhs.polls;
-        self.polls_muted += rhs.polls_muted;
+        self.messages = self.messages.saturating_add(rhs.messages);
+        self.messages_muted = self.messages_muted.saturating_add(rhs.messages_muted);
+        self.chats = self.chats.saturating_add(rhs.chats);
+        self.chats_muted = self.chats_muted.saturating_add(rhs.chats_muted);
+        self.marks = self.marks.saturating_add(rhs.marks);
+        self.marks_muted = self.marks_muted.saturating_add(rhs.marks_muted);
+        self.reactions = self.reactions.saturating_add(rhs.reactions);
+        self.reactions_muted = self.reactions_muted.saturating_add(rhs.reactions_muted);
+        self.mentions = self.mentions.saturating_add(rhs.mentions);
+        self.polls = self.polls.saturating_add(rhs.polls);
+        self.polls_muted = self.polls_muted.saturating_add(rhs.polls_muted);
     }
 }
 
+/// Saturating, like [`AddAssign`].
 impl SubAssign for UnreadState {
     fn sub_assign(&mut self, rhs: Self) {
-        self.messages -= rhs.messages;
-        self.messages_muted -= rhs.messages_muted;
-        self.chats -= rhs.chats;
-        self.chats_muted -= rhs.chats_muted;
-        self.marks -= rhs.marks;
-        self.marks_muted -= rhs.marks_muted;
-        self.reactions -= rhs.reactions;
-        self.reactions_muted -= rhs.reactions_muted;
-        self.mentions -= rhs.mentions;
-        self.polls -= rhs.polls;
-        self.polls_muted -= rhs.polls_muted;
+        self.messages = self.messages.saturating_sub(rhs.messages);
+        self.messages_muted = self.messages_muted.saturating_sub(rhs.messages_muted);
+        self.chats = self.chats.saturating_sub(rhs.chats);
+        self.chats_muted = self.chats_muted.saturating_sub(rhs.chats_muted);
+        self.marks = self.marks.saturating_sub(rhs.marks);
+        self.marks_muted = self.marks_muted.saturating_sub(rhs.marks_muted);
+        self.reactions = self.reactions.saturating_sub(rhs.reactions);
+        self.reactions_muted = self.reactions_muted.saturating_sub(rhs.reactions_muted);
+        self.mentions = self.mentions.saturating_sub(rhs.mentions);
+        self.polls = self.polls.saturating_sub(rhs.polls);
+        self.polls_muted = self.polls_muted.saturating_sub(rhs.polls_muted);
     }
 }
 
@@ -572,6 +576,9 @@ impl IndexedList {
 
     /// Inserts or updates `key` with its sort key, name, and search tokens,
     /// maintaining exact ordering and first-letter index buckets.
+    ///
+    /// Moves only this entry: `ordered` stays sorted, so its old and new positions are found by
+    /// binary search instead of re-sorting the whole list on every update.
     pub fn upsert(
         &mut self,
         key: DialogKey,
@@ -580,48 +587,80 @@ impl IndexedList {
         name_words: BTreeSet<String>,
         first_letters: BTreeSet<char>,
     ) {
-        if let Some(existing) = self.entries.get_mut(&key) {
-            let old_letters = std::mem::replace(&mut existing.first_letters, first_letters.clone());
-            existing.sort_key = sort_key;
-            existing.name_sort_key = name_sort_key;
-            existing.name_words = name_words;
-
-            for ch in old_letters.difference(&first_letters) {
-                if let Some(bucket) = self.by_letter.get_mut(ch) {
-                    bucket.retain(|&k| k != key);
-                    if bucket.is_empty() {
-                        self.by_letter.remove(ch);
-                    }
-                }
-            }
-            for &ch in first_letters.difference(&old_letters) {
-                self.by_letter.entry(ch).or_default().push(key);
-            }
-        } else {
+        let Some(existing) = self.entries.get(&key) else {
             for &ch in &first_letters {
                 self.by_letter.entry(ch).or_default().push(key);
             }
-            self.entries.insert(
+            let entry = IndexedEntry {
                 key,
-                IndexedEntry {
-                    key,
-                    sort_key,
-                    name_sort_key,
-                    name_words,
-                    first_letters,
-                },
-            );
-            self.ordered.push(key);
+                sort_key,
+                name_sort_key,
+                name_words,
+                first_letters,
+            };
+            let at = self.insert_position(&entry);
+            self.ordered.insert(at, key);
+            self.entries.insert(key, entry);
+            return;
+        };
+
+        let moves = match self.sort_mode {
+            SortMode::Date => existing.sort_key != sort_key,
+            SortMode::Name => existing.name_sort_key != name_sort_key,
+            SortMode::Add => false,
+        };
+        let from = moves.then(|| self.current_position(existing)).flatten();
+        let removed_letters: Vec<char> = existing
+            .first_letters
+            .difference(&first_letters)
+            .copied()
+            .collect();
+        let added_letters: Vec<char> = first_letters
+            .difference(&existing.first_letters)
+            .copied()
+            .collect();
+        if let Some(from) = from {
+            self.ordered.remove(from);
         }
-        self.resort();
+        for ch in removed_letters {
+            if let Some(bucket) = self.by_letter.get_mut(&ch) {
+                bucket.retain(|&k| k != key);
+                if bucket.is_empty() {
+                    self.by_letter.remove(&ch);
+                }
+            }
+        }
+        for ch in added_letters {
+            self.by_letter.entry(ch).or_default().push(key);
+        }
+
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return;
+        };
+        entry.sort_key = sort_key;
+        entry.name_sort_key = name_sort_key;
+        entry.name_words = name_words;
+        entry.first_letters = first_letters;
+        if moves {
+            let Some(entry) = self.entries.get(&key) else {
+                return;
+            };
+            let at = self.insert_position(entry);
+            self.ordered.insert(at, key);
+        }
     }
 
     /// Removes `key` from the main ordering and all letter buckets.
     pub fn remove(&mut self, key: DialogKey) -> bool {
-        let Some(removed) = self.entries.remove(&key) else {
+        let Some(removed) = self.entries.get(&key) else {
             return false;
         };
-        self.ordered.retain(|&k| k != key);
+        if let Some(at) = self.current_position(removed) {
+            self.ordered.remove(at);
+        }
+        let Some(removed) = self.entries.remove(&key) else {
+            return true;
+        };
         for ch in removed.first_letters {
             if let Some(bucket) = self.by_letter.get_mut(&ch) {
                 bucket.retain(|&k| k != key);
@@ -631,6 +670,38 @@ impl IndexedList {
             }
         }
         true
+    }
+
+    /// List order of two entries: date mode by sort key descending, name mode by name
+    /// ascending, ties by key so the order is total (`None` in insertion-order mode).
+    fn compare(&self, a: &IndexedEntry, b: &IndexedEntry) -> Option<Ordering> {
+        let primary = match self.sort_mode {
+            SortMode::Date => b.sort_key.cmp(&a.sort_key),
+            SortMode::Name => a.name_sort_key.cmp(&b.name_sort_key),
+            SortMode::Add => return None,
+        };
+        Some(primary.then_with(|| a.key.cmp(&b.key)))
+    }
+
+    /// Where `entry` (not yet in `ordered`) belongs.
+    fn insert_position(&self, entry: &IndexedEntry) -> usize {
+        if self.sort_mode == SortMode::Add {
+            return self.ordered.len();
+        }
+        self.ordered.partition_point(|k| {
+            self.entries
+                .get(k)
+                .and_then(|other| self.compare(other, entry))
+                .is_some_and(Ordering::is_lt)
+        })
+    }
+
+    /// Index of `entry` in `ordered`, found by binary search with the values it was placed by.
+    fn current_position(&self, entry: &IndexedEntry) -> Option<usize> {
+        (self.sort_mode != SortMode::Add)
+            .then(|| self.insert_position(entry))
+            .filter(|&at| self.ordered.get(at) == Some(&entry.key))
+            .or_else(|| self.ordered.iter().position(|&k| k == entry.key))
     }
 
     /// Clears all entries and indices.
@@ -679,32 +750,6 @@ impl IndexedList {
             .collect();
         self.sort_slice(&mut matched);
         matched
-    }
-
-    fn resort(&mut self) {
-        if self.sort_mode == SortMode::Add {
-            return;
-        }
-        let entries = &self.entries;
-        match self.sort_mode {
-            SortMode::Date => {
-                self.ordered.sort_by(|a, b| {
-                    let ea = &entries[a];
-                    let eb = &entries[b];
-                    eb.sort_key.cmp(&ea.sort_key).then_with(|| a.cmp(b))
-                });
-            }
-            SortMode::Name => {
-                self.ordered.sort_by(|a, b| {
-                    let ea = &entries[a];
-                    let eb = &entries[b];
-                    ea.name_sort_key
-                        .cmp(&eb.name_sort_key)
-                        .then_with(|| a.cmp(b))
-                });
-            }
-            SortMode::Add => {}
-        }
     }
 
     fn sort_slice(&self, keys: &mut [DialogKey]) {
@@ -910,8 +955,9 @@ impl MainList {
         unread_muted_peers: i32,
         unread_unmuted_peers: i32,
     ) {
-        self.cloud_unread_state.messages = unread_muted_messages + unread_unmuted_messages;
-        self.cloud_unread_state.chats = unread_muted_peers + unread_unmuted_peers;
+        self.cloud_unread_state.messages =
+            unread_muted_messages.saturating_add(unread_unmuted_messages);
+        self.cloud_unread_state.chats = unread_muted_peers.saturating_add(unread_unmuted_peers);
         self.finalize_cloud_unread();
         self.cloud_unread_state.known = true;
     }

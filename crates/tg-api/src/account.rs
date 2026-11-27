@@ -1219,7 +1219,7 @@ impl NotifyTarget {
             Self::ForumTopic { peer, top_msg_id } => {
                 tl_enums::InputNotifyPeer::InputNotifyForumTopic(tl_types::InputNotifyForumTopic {
                     peer: input_peer_for(session, peer),
-                    top_msg_id: top_msg_id.0 as i32,
+                    top_msg_id: top_msg_id.server_i32().unwrap_or(0),
                 })
             }
             Self::Community(channel_id) => {

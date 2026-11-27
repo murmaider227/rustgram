@@ -158,6 +158,19 @@ impl TextEntity {
             && self.length <= text_utf16_len - self.offset
     }
 
+    /// Cuts this entity to `[0, text_utf16_len]`, as tdesktop's consumers do when they `mid()`
+    /// the text. `None` when the offset is negative, the length is not positive or nothing of the
+    /// entity is inside the text. Pass `i32::MAX` when the text is unknown: the result still has
+    /// `offset + length <= i32::MAX`, so the sum never overflows.
+    #[must_use]
+    pub fn clamped_to_text(mut self, text_utf16_len: i32) -> Option<Self> {
+        if self.offset < 0 || self.length <= 0 || self.offset >= text_utf16_len {
+            return None;
+        }
+        self.length = self.length.min(text_utf16_len - self.offset);
+        Some(self)
+    }
+
     /// Extracts the substring covered by this entity from `text`, interpreting
     /// `offset` and `length` as UTF-16 code units.
     pub fn slice_text(&self, text: &str) -> Option<String> {

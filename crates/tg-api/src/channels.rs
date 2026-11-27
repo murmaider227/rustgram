@@ -353,7 +353,7 @@ impl ChannelParticipantsFilter {
                 tl_enums::ChannelParticipantsFilter::ChannelParticipantsMentions(
                     tl_types::ChannelParticipantsMentions {
                         q: query.clone().filter(|s| !s.is_empty()),
-                        top_msg_id: top_msg_id.and_then(|id| (id.0 > 0).then_some(id.0 as i32)),
+                        top_msg_id: top_msg_id.and_then(MsgId::server_i32),
                     },
                 )
             }
@@ -1346,7 +1346,7 @@ pub fn build_read_channel_history(
 ) -> tl_fns::channels::ReadHistory {
     tl_fns::channels::ReadHistory {
         channel,
-        max_id: max_id.0 as i32,
+        max_id: max_id.server_i32().unwrap_or(0),
     }
 }
 
@@ -1370,7 +1370,7 @@ pub fn build_read_channel_message_contents(
 ) -> tl_fns::channels::ReadMessageContents {
     tl_fns::channels::ReadMessageContents {
         channel,
-        id: ids.iter().map(|id| id.0 as i32).collect(),
+        id: ids.iter().copied().filter_map(MsgId::server_i32).collect(),
     }
 }
 
@@ -1391,7 +1391,7 @@ pub async fn read_channel_message_contents<R: RpcClient>(
 #[must_use]
 pub fn build_read_common_message_contents(ids: &[MsgId]) -> tl_fns::messages::ReadMessageContents {
     tl_fns::messages::ReadMessageContents {
-        id: ids.iter().map(|id| id.0 as i32).collect(),
+        id: ids.iter().copied().filter_map(MsgId::server_i32).collect(),
     }
 }
 

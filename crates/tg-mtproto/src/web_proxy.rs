@@ -473,11 +473,34 @@ pub struct WebSocketDecoder {
 
 impl WebSocketDecoder {
     /// Decodes all complete client WebSocket frames from `input`, draining consumed bytes.
+    ///
+    /// Frames are read at an offset and the consumed prefix is drained once (also when an
+    /// error stops decoding), so a read holding many small frames moves each byte once.
     pub fn decode(&mut self, input: &mut Vec<u8>) -> Result<Vec<WebSocketMessage>, WebProxyError> {
         let mut messages = Vec::new();
-        while input.len() >= 2 {
-            let b0 = input[0];
-            let b1 = input[1];
+        let mut consumed = 0usize;
+        let result = self.decode_from(input, &mut consumed, &mut messages);
+        if consumed > 0 {
+            input.drain(..consumed);
+        }
+        result.map(|()| messages)
+    }
+
+    /// Decodes frames from `input[*consumed..]`, adding each complete frame's length to
+    /// `consumed`.
+    fn decode_from(
+        &mut self,
+        input: &[u8],
+        consumed: &mut usize,
+        messages: &mut Vec<WebSocketMessage>,
+    ) -> Result<(), WebProxyError> {
+        loop {
+            let rest = &input[*consumed..];
+            if rest.len() < 2 {
+                break;
+            }
+            let b0 = rest[0];
+            let b1 = rest[1];
             let fin = (b0 & 0x80) != 0;
             let rsv = b0 & 0x70;
             let opcode = b0 & 0x0F;
@@ -492,10 +515,10 @@ impl WebSocketDecoder {
             let mut size = u64::from(b1 & 0x7F);
             let mut header = 2usize;
             if size == 126 {
-                if input.len() < 4 {
+                if rest.len() < 4 {
                     break;
                 }
-                size = u64::from(u16::from_be_bytes([input[2], input[3]]));
+                size = u64::from(u16::from_be_bytes([rest[2], rest[3]]));
                 if size < 126 {
                     return Err(WebProxyError::WebSocket {
                         code: 1002,
@@ -504,17 +527,17 @@ impl WebSocketDecoder {
                 }
                 header = 4;
             } else if size == 127 {
-                if input.len() < 10 {
+                if rest.len() < 10 {
                     break;
                 }
-                if (input[2] & 0x80) != 0 {
+                if (rest[2] & 0x80) != 0 {
                     return Err(WebProxyError::WebSocket {
                         code: 1002,
                         reason: "64-bit length MSB set",
                     });
                 }
                 let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&input[2..10]);
+                bytes.copy_from_slice(&rest[2..10]);
                 size = u64::from_be_bytes(bytes);
                 if size <= 0xFFFF {
                     return Err(WebProxyError::WebSocket {
@@ -534,21 +557,21 @@ impl WebSocketDecoder {
             }
 
             let full = header + 4 + size as usize;
-            if input.len() < full {
+            if rest.len() < full {
                 break;
             }
 
             let mask = [
-                input[header],
-                input[header + 1],
-                input[header + 2],
-                input[header + 3],
+                rest[header],
+                rest[header + 1],
+                rest[header + 2],
+                rest[header + 3],
             ];
-            let mut payload = input[header + 4..full].to_vec();
+            let mut payload = rest[header + 4..full].to_vec();
             for (idx, byte) in payload.iter_mut().enumerate() {
                 *byte ^= mask[idx % 4];
             }
-            input.drain(..full);
+            *consumed += full;
 
             match opcode {
                 0x08 => {
@@ -613,7 +636,7 @@ impl WebSocketDecoder {
                 }
             }
         }
-        Ok(messages)
+        Ok(())
     }
 }
 
@@ -1383,13 +1406,32 @@ pub fn encode_masked_websocket_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) 
 }
 
 /// Decodes unmasked server-to-client RFC 6455 WebSocket frames from `input`, draining consumed bytes.
+///
+/// Like [`WebSocketDecoder::decode`], the consumed prefix is drained once at the end.
 pub fn decode_server_websocket_frames(
     input: &mut Vec<u8>,
 ) -> Result<Vec<WebSocketMessage>, WebProxyError> {
     let mut out = Vec::new();
-    while input.len() >= 2 {
-        let b0 = input[0];
-        let b1 = input[1];
+    let mut consumed = 0usize;
+    let result = decode_server_websocket_frames_from(input, &mut consumed, &mut out);
+    if consumed > 0 {
+        input.drain(..consumed);
+    }
+    result.map(|()| out)
+}
+
+fn decode_server_websocket_frames_from(
+    input: &[u8],
+    consumed: &mut usize,
+    out: &mut Vec<WebSocketMessage>,
+) -> Result<(), WebProxyError> {
+    loop {
+        let rest = &input[*consumed..];
+        if rest.len() < 2 {
+            break;
+        }
+        let b0 = rest[0];
+        let b1 = rest[1];
         let fin = (b0 & 0x80) != 0;
         let rsv = b0 & 0x70;
         let opcode = b0 & 0x0F;
@@ -1403,17 +1445,17 @@ pub fn decode_server_websocket_frames(
         let mut size = u64::from(b1 & 0x7F);
         let mut header = 2usize;
         if size == 126 {
-            if input.len() < 4 {
+            if rest.len() < 4 {
                 break;
             }
-            size = u64::from(u16::from_be_bytes([input[2], input[3]]));
+            size = u64::from(u16::from_be_bytes([rest[2], rest[3]]));
             header = 4;
         } else if size == 127 {
-            if input.len() < 10 {
+            if rest.len() < 10 {
                 break;
             }
             let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&input[2..10]);
+            bytes.copy_from_slice(&rest[2..10]);
             size = u64::from_be_bytes(bytes);
             header = 10;
         }
@@ -1424,11 +1466,11 @@ pub fn decode_server_websocket_frames(
             });
         }
         let full = header + size as usize;
-        if input.len() < full {
+        if rest.len() < full {
             break;
         }
-        let payload = input[header..full].to_vec();
-        input.drain(..full);
+        let payload = rest[header..full].to_vec();
+        *consumed += full;
         match opcode {
             0x01 => out.push(WebSocketMessage::Text(payload)),
             0x02 => out.push(WebSocketMessage::Binary(payload)),
@@ -1443,7 +1485,7 @@ pub fn decode_server_websocket_frames(
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Probes a WebSocket WebProxy relay at `addr` (e.g. a local fake relay or loopback bridge),

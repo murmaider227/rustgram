@@ -16,7 +16,7 @@ use crate::emoji::{find_emoji, find_emoji_utf16};
 use crate::entity::{EntitiesInText, EntityInText, EntityType, TextParseFlags, TextWithEntities};
 use crate::markdown::parse_markdown_in_place;
 use crate::url::{is_valid_protocol, is_valid_top_domain, match_domain, match_domain_explicit};
-use crate::utf16::{OffsetMapper, utf16_len};
+use crate::utf16::{OffsetMapper, utf16_len, utf16_to_utf8_floor};
 
 /// Option for string-only `prepare_for_sending_str` (`TextUtilities::PrepareTextOption`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -370,7 +370,7 @@ pub fn parse_entities_in_place(result: &mut TextWithEntities, flags: TextParseFl
             && result.entities[existing_idx].offset() <= lnk_start_i32
         {
             let entity = result.entities[existing_idx].clone();
-            existing_end_u16 = existing_end_u16.max(entity.offset() + entity.length());
+            existing_end_u16 = existing_end_u16.max(entity.end());
             new_entities.push(entity);
             existing_idx += 1;
         }
@@ -509,7 +509,7 @@ pub fn apply_server_cleaning(result: &mut TextWithEntities) {
 
     for entity in &mut result.entities {
         let old_start = entity.offset().clamp(0, old_u16_len as i32) as usize;
-        let old_end = (entity.offset() + entity.length()).clamp(0, old_u16_len as i32) as usize;
+        let old_end = entity.end().clamp(0, old_u16_len as i32) as usize;
         let new_start = pos_map[old_start];
         let new_end = pos_map[old_end];
         let new_len = (new_end - new_start).max(0);
@@ -568,188 +568,184 @@ pub fn trim(result: &mut TextWithEntities) {
     }
 }
 
-/// Splits the next message chunk of up to `limit` characters/codepoints from `left` into `sending`,
-/// choosing the best break point (paragraphs, newlines, sentence ends, spaces, word separators)
-/// without splitting emojis or non-breakable entities (`TextUtilities::CutPart`).
+/// Moves the next message part of up to `limit` Unicode scalar values from `left` into `sending`
+/// (`TextUtilities::CutPart`, `ui/text/text_entity.cpp:1521`). The text breaks where
+/// [`cut_part_len`] says. Entities before the break go to `sending`, entities after it move to
+/// `left`, and an entity the break falls inside is split when it is `pre`, `code` or
+/// `blockquote` and dropped otherwise, as in tdesktop.
 ///
-/// Returns `false` if `left` is empty.
+/// Unlike tdesktop, every entity is placed by its own range, so an entity nested inside another
+/// one (bold inside a blockquote) stays where it is instead of being lost with its container.
+///
+/// Returns `false` if `left` is empty or `limit` is 0.
 pub fn cut_part(sending: &mut TextWithEntities, left: &mut TextWithEntities, limit: usize) -> bool {
     if limit == 0 || left.text.is_empty() {
         return false;
     }
-
-    let units: Vec<u16> = left.text.encode_utf16().collect();
-    let end = units.len();
-
-    let half = limit / 2;
-    let mut s = 0usize;
-    let mut good_level = 0i32;
-    let mut good_pos = 0usize;
-    let mut i = 0usize;
-
-    let is_breakable_for_cut = |t: EntityType| {
-        matches!(
-            t,
-            EntityType::Pre
-                | EntityType::Blockquote
-                | EntityType::Code
-                | EntityType::Bold
-                | EntityType::Italic
-                | EntityType::Underline
-                | EntityType::StrikeOut
-                | EntityType::Spoiler
-        )
-    };
-
-    while i < end {
-        if s > half {
-            // Check ALL entities spanning UTF-16 offset `i`, not just a single cursor index,
-            // so nested and overlapping entities (e.g. Bold inside Blockquote, Bold + Italic)
-            // are never dropped or corrupted when splitting (`ui/text/text_entity.cpp`,
-            // `TextUtilities::CutPart`).
-            let i_i32 = i as i32;
-            let mut in_entity = false;
-            let mut can_break_entity = true;
-            let mut has_block_boundary = false;
-
-            for entity in &left.entities {
-                let ent_start = entity.offset();
-                let ent_end = ent_start + entity.length();
-                if i_i32 > ent_start && i_i32 < ent_end {
-                    in_entity = true;
-                    if !matches!(
-                        entity.entity_type(),
-                        EntityType::Pre | EntityType::Blockquote | EntityType::Code
-                    ) {
-                        can_break_entity = false;
-                    }
-                }
-                if ((i + 1) as i32 == ent_start || i_i32 == ent_end)
-                    && matches!(
-                        entity.entity_type(),
-                        EntityType::Pre | EntityType::Blockquote
-                    )
-                {
-                    has_block_boundary = true;
-                }
-            }
-            let no_entity_level = if in_entity { 0 } else { 1 };
-
-            let mut mark_good = |new_level: i32| {
-                if good_level > new_level {
-                    return;
-                }
-                good_level = new_level;
-                good_pos = i;
-            };
-
-            let ch = char::from_u32(u32::from(units[i])).unwrap_or('\u{FFFD}');
-            let next_is_newline =
-                i + 1 < end && char::from_u32(u32::from(units[i + 1])).is_some_and(is_newline);
-            let prev_ch = if i > 0 {
-                char::from_u32(u32::from(units[i - 1])).unwrap_or('\u{FFFD}')
-            } else {
-                '\0'
-            };
-
-            if in_entity && !can_break_entity {
-                mark_good(0);
-            } else if is_newline(ch) {
-                if in_entity {
-                    if next_is_newline {
-                        mark_good(12);
-                    } else {
-                        mark_good(11);
-                    }
-                } else if next_is_newline {
-                    mark_good(15);
-                } else if has_block_boundary {
-                    mark_good(14);
-                } else {
-                    mark_good(13);
-                }
-            } else if is_space(ch) {
-                if is_sentence_end(prev_ch) {
-                    mark_good(9 + no_entity_level);
-                } else if is_sentence_part_end(prev_ch) {
-                    mark_good(7 + no_entity_level);
-                } else {
-                    mark_good(5 + no_entity_level);
-                }
-            } else if is_word_separator(prev_ch) {
-                mark_good(3 + no_entity_level);
-            } else {
-                mark_good(1 + no_entity_level);
-            }
-        }
-
-        // Advance past whole emoji or surrogate pair, counting Unicode scalar values in `s`.
-        if let Some((_, elen)) = find_emoji_utf16(&units, i) {
-            let mut j = 0;
-            while j < elen {
-                let u = units[i + j];
-                if (0xD800..=0xDBFF).contains(&u)
-                    && j + 1 < elen
-                    && (0xDC00..=0xDFFF).contains(&units[i + j + 1])
-                {
-                    j += 2;
-                } else {
-                    j += 1;
-                }
-                s += 1;
-            }
-            i += elen;
-        } else if (0xD800..=0xDBFF).contains(&units[i])
-            && i + 1 < end
-            && (0xDC00..=0xDFFF).contains(&units[i + 1])
-        {
-            i += 2;
-            s += 1;
-        } else {
-            i += 1;
-            s += 1;
-        }
-
-        if s >= limit {
-            let split_u16 = if good_pos > 0 { good_pos } else { i };
-            let mapper = OffsetMapper::new(&left.text);
-            let split_byte = mapper.utf16_to_utf8_floor(split_u16);
-            sending.text = left.text[..split_byte].to_string();
-            left.text = left.text[split_byte..].to_string();
-            let shift = split_u16 as i32;
-
-            let old_entities = std::mem::take(&mut left.entities);
-            sending.entities.clear();
-            for entity in old_entities {
-                let ent_start = entity.offset();
-                let ent_end = ent_start + entity.length();
-                if ent_end <= shift {
-                    sending.entities.push(entity);
-                } else if ent_start >= shift {
-                    let mut moved = entity;
-                    moved.shift_left(shift);
-                    if moved.length() > 0 {
-                        left.entities.push(moved);
-                    }
-                } else if is_breakable_for_cut(entity.entity_type()) {
-                    let mut head = entity.clone();
-                    head.update_text_end(shift);
-                    if head.length() > 0 {
-                        sending.entities.push(head);
-                    }
-                    let mut tail = entity;
-                    tail.shift_left(shift);
-                    if tail.length() > 0 {
-                        left.entities.push(tail);
-                    }
-                }
-            }
-            return true;
-        }
+    let cut = cut_part_len(
+        &left.text,
+        left.entities
+            .iter()
+            .map(|entity| (entity.offset(), entity.length(), entity.entity_type())),
+        limit,
+    );
+    if cut >= left.text.len() {
+        *sending = std::mem::take(left);
+        return true;
     }
 
-    *sending = std::mem::take(left);
+    sending.text = left.text[..cut].to_owned();
+    left.text.replace_range(..cut, "");
+    let shift = i32::try_from(utf16_len(&sending.text)).unwrap_or(i32::MAX);
+    sending.entities.clear();
+    for entity in std::mem::take(&mut left.entities) {
+        let start = entity.offset();
+        let end = start.saturating_add(entity.length());
+        if end <= shift {
+            sending.entities.push(entity);
+        } else if start >= shift {
+            let mut moved = entity;
+            moved.shift_left(shift);
+            if moved.length() > 0 {
+                left.entities.push(moved);
+            }
+        } else if matches!(
+            entity.entity_type(),
+            EntityType::Pre | EntityType::Code | EntityType::Blockquote
+        ) {
+            let mut head = entity.clone();
+            head.update_text_end(shift);
+            if head.length() > 0 {
+                sending.entities.push(head);
+            }
+            let mut tail = entity;
+            tail.shift_left(shift);
+            if tail.length() > 0 {
+                left.entities.push(tail);
+            }
+        }
+    }
     true
+}
+
+/// Byte length of the part [`cut_part`] sends from `text`: at most `limit` Unicode scalar values,
+/// ending at the break `TextUtilities::CutPart` picks (`ui/text/text_entity.cpp:1521-1638`). That
+/// is the best of paragraph, newline, sentence end, space or word separator in the second half of
+/// the part, never inside an emoji, and inside a link, mention or other unsplittable entity only
+/// when nothing better exists.
+///
+/// `entities` are `(offset, length, type)` in UTF-16 units; negative or overflowing spans are
+/// ignored. Returns `text.len()` when the whole text fits, and at least one character otherwise.
+pub fn cut_part_len<I>(text: &str, entities: I, limit: usize) -> usize
+where
+    I: IntoIterator<Item = (i32, i32, EntityType)>,
+{
+    /// An entity span in UTF-16 units; `splittable` for `pre`, `code` and `blockquote`, the only
+    /// kinds CutPart may break, and `block` for `pre` and `blockquote`.
+    struct Span {
+        start: usize,
+        end: usize,
+        splittable: bool,
+        block: bool,
+    }
+
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let unit_char = |i: usize| char::from_u32(u32::from(units[i])).unwrap_or('\u{FFFD}');
+    let mut spans: Vec<Span> = entities
+        .into_iter()
+        .filter_map(|(offset, length, entity_type)| {
+            let start = usize::try_from(offset).ok()?;
+            let end = start.checked_add(usize::try_from(length).ok()?)?;
+            let block = matches!(entity_type, EntityType::Pre | EntityType::Blockquote);
+            Some(Span {
+                start,
+                end,
+                splittable: block || entity_type == EntityType::Code,
+                block,
+            })
+        })
+        .collect();
+    spans.sort_by_key(|span| span.start);
+
+    let half = limit / 2;
+    let mut current = 0usize;
+    let mut good = 0usize;
+    let mut good_level = 0;
+    // Code points before `i`: tdesktop's `s`, which it compares with `limit` before counting the
+    // current character, so the character at index `limit` is still a break candidate.
+    let mut chars = 0usize;
+    let mut i = 0usize;
+    while i < units.len() {
+        while spans.get(current).is_some_and(|span| i >= span.end) {
+            current += 1;
+        }
+        if chars > half {
+            let span = spans.get(current);
+            let in_entity = span.is_some_and(|span| i > span.start && i < span.end);
+            let no_entity_level = i32::from(!in_entity);
+            let ch = unit_char(i);
+            let prev = unit_char(i - 1);
+            let next_is_newline = i + 1 < units.len() && is_newline(unit_char(i + 1));
+            let level = if in_entity && !span.is_some_and(|span| span.splittable) {
+                0
+            } else if is_newline(ch) {
+                if in_entity {
+                    if next_is_newline { 12 } else { 11 }
+                } else if next_is_newline {
+                    15
+                } else if span.is_some_and(|span| i + 1 == span.start && span.block)
+                    || current
+                        .checked_sub(1)
+                        .and_then(|prev_span| spans.get(prev_span))
+                        .is_some_and(|span| i == span.end && span.block)
+                {
+                    14
+                } else {
+                    13
+                }
+            } else if is_space(ch) {
+                if is_sentence_end(prev) {
+                    9 + no_entity_level
+                } else if is_sentence_part_end(prev) {
+                    7 + no_entity_level
+                } else {
+                    5 + no_entity_level
+                }
+            } else if is_word_separator(prev) {
+                3 + no_entity_level
+            } else {
+                1 + no_entity_level
+            };
+            if level >= good_level {
+                good_level = level;
+                good = i;
+            }
+        }
+
+        // One step is a whole emoji sequence or one code point; both count one per code point.
+        let step = find_emoji_utf16(&units, i)
+            .map(|(_, len)| len)
+            .unwrap_or_else(|| {
+                let pair = (0xD800..=0xDBFF).contains(&units[i])
+                    && units
+                        .get(i + 1)
+                        .is_some_and(|u| (0xDC00..=0xDFFF).contains(u));
+                if pair { 2 } else { 1 }
+            })
+            .clamp(1, units.len() - i);
+        let code_points = char::decode_utf16(units[i..i + step].iter().copied()).count();
+        chars += code_points - 1;
+        if chars >= limit {
+            let cut_units = if good > 0 { good } else { i + step };
+            return match utf16_to_utf8_floor(text, cut_units) {
+                0 => text.chars().next().map_or(text.len(), char::len_utf8),
+                cut => cut,
+            };
+        }
+        chars += 1;
+        i += step;
+    }
+    text.len()
 }
 
 /// Escapes `\` and `[` for rich parsing (`TextUtilities::EscapeForRichParsing`).

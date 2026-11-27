@@ -28,14 +28,39 @@ pub fn entities_from_tl(entities: &[tl_enums::MessageEntity]) -> Vec<TextEntity>
 /// Converts TL `MessageEntity` items into `tg_data::TextEntity` values, resolving
 /// `InputUser::Self_` in `InputMessageEntityMentionName` to `self_id`
 /// (`api/api_text_entities.cpp:176-182`, `Api::EntitiesFromMTP`).
+///
+/// Server bounds are checked here, once: entities with a negative offset or a non-positive
+/// length are dropped and the rest end at `i32::MAX` at most, so `offset + length` never
+/// overflows. Prefer [`entities_from_tl_for_text`] when the text is at hand.
 #[must_use]
 pub fn entities_from_tl_with_self(
     entities: &[tl_enums::MessageEntity],
     self_id: UserId,
 ) -> Vec<TextEntity> {
+    entities_within(entities, self_id, i32::MAX)
+}
+
+/// [`entities_from_tl_with_self`] with every entity also cut to the UTF-16 length of `text`,
+/// as tdesktop's consumers do when they `mid()` the text: afterwards
+/// `0 <= offset < offset + length <= text length` holds for each entity, in server order.
+#[must_use]
+pub fn entities_from_tl_for_text(
+    text: &str,
+    entities: &[tl_enums::MessageEntity],
+    self_id: UserId,
+) -> Vec<TextEntity> {
+    let text_len = i32::try_from(tg_text::utf16_len(text)).unwrap_or(i32::MAX);
+    entities_within(entities, self_id, text_len)
+}
+
+fn entities_within(
+    entities: &[tl_enums::MessageEntity],
+    self_id: UserId,
+    text_utf16_len: i32,
+) -> Vec<TextEntity> {
     entities
         .iter()
-        .filter_map(|e| entity_from_tl(e, self_id))
+        .filter_map(|e| entity_from_tl(e, self_id)?.clamped_to_text(text_utf16_len))
         .collect()
 }
 
@@ -407,7 +432,10 @@ fn entity_to_tl(
 #[must_use]
 pub fn text_with_entities_from_tl(text: &tl_enums::TextWithEntities) -> TextWithEntities {
     let tl_enums::TextWithEntities::TextWithEntities(t) = text;
-    TextWithEntities::new(t.text.clone(), entities_from_tl(&t.entities))
+    TextWithEntities::new(
+        t.text.clone(),
+        entities_from_tl_for_text(&t.text, &t.entities, UserId::ZERO),
+    )
 }
 
 /// Converts a `tg_data::TextWithEntities` into a TL `TextWithEntities`.
@@ -880,7 +908,7 @@ pub fn message_from_tl(tl_msg: &tl_enums::Message, self_id: UserId) -> Option<Me
             let entities = m
                 .entities
                 .as_deref()
-                .map(|e| entities_from_tl_with_self(e, self_id))
+                .map(|e| entities_from_tl_for_text(&m.message, e, self_id))
                 .unwrap_or_default();
             if entities
                 .iter()
@@ -1127,7 +1155,7 @@ pub fn message_from_short_message(
     let entities = short
         .entities
         .as_deref()
-        .map(|e| entities_from_tl_with_self(e, self_id))
+        .map(|e| entities_from_tl_for_text(&short.message, e, self_id))
         .unwrap_or_default();
     let mut msg = Message::new_text(
         peer_id,
@@ -1161,7 +1189,7 @@ pub fn message_from_short_chat_message(
     let entities = short
         .entities
         .as_deref()
-        .map(|e| entities_from_tl_with_self(e, self_id))
+        .map(|e| entities_from_tl_for_text(&short.message, e, self_id))
         .unwrap_or_default();
     let mut msg = Message::new_text(
         peer_id,

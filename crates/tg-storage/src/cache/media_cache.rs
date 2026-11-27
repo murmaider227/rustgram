@@ -63,7 +63,7 @@ fn normalize_registry_path(path: &Path) -> PathBuf {
 /// (`Storage::Account::cacheKey` in `storage/storage_account.cpp:1879-1887`).
 #[must_use]
 pub fn cache_key_from_local_key(local_key: &AuthKey) -> StorageEncryptionKey {
-    match StorageEncryptionKey::new(local_key.data.to_vec()) {
+    match StorageEncryptionKey::new(local_key.data().to_vec()) {
         Ok(key) => key,
         Err(_) => unreachable!("256-byte AuthKey is always a valid v1 StorageEncryptionKey"),
     }
@@ -79,12 +79,12 @@ pub fn derive_media_cache_key(
     account_data_name: &str,
 ) -> StorageEncryptionKey {
     let left = sha256(&[
-        &local_key.data[..128],
+        &local_key.data()[..128],
         b"rustgram.media_cache.key.v1\0",
         account_data_name.as_bytes(),
     ]);
     let right = sha256(&[
-        &local_key.data[128..],
+        &local_key.data()[128..],
         b"rustgram.media_cache.key.v1\0",
         account_data_name.as_bytes(),
     ]);

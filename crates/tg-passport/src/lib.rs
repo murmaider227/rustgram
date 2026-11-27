@@ -89,3 +89,6 @@ pub enum PassportError {
     #[error("invalid state: {0}")]
     InvalidState(String),
 }
+
+#[cfg(test)]
+mod fuzz_untrusted;

@@ -1,5 +1,5 @@
 //! WP-77 verification suite (fake-only, zero real network traffic):
-//! 1. Unread reactions: `HistoryBackend::mark_visible_reactions_read` sends
+//! 1. Unread reactions: `HistoryBackend::mark_visible_reactions_read` queues
 //!    `messages.readMessageContents` (DM/group, applying `AffectedMessages` PTS) or
 //!    `channels.readMessageContents` (supergroup/channel), clears local `HAS_UNREAD_REACTION` /
 //!    recent-reactor unread flags, decrements/zeros `unread_things_counts` (floating "♥ N" button)
@@ -294,6 +294,8 @@ fn unread_reactions_dm_visible_marks_read_sends_messages_read_contents_feeds_pts
     let marked = live
         .mark_visible_reactions_read(ui_peer, &[UiMsgId(10)])
         .expect("mark_visible_reactions_read ok");
+    // The request goes out on the background queue; wait for it before checking the server side.
+    assert!(live.flush_background_rpcs(Duration::from_secs(10)));
     assert_eq!(marked, vec![UiMsgId(10)]);
     assert_eq!(live.updates_common_pts(), 201);
     assert_eq!(live.unread_things_counts(scope).reactions, 1);
@@ -344,6 +346,8 @@ fn unread_reactions_dm_visible_marks_read_sends_messages_read_contents_feeds_pts
     let marked2 = live
         .mark_visible_reactions_read(ui_peer, &[UiMsgId(11)])
         .expect("mark msg 11");
+    // The request goes out on the background queue; wait for it before checking the server side.
+    assert!(live.flush_background_rpcs(Duration::from_secs(10)));
     assert_eq!(marked2, vec![UiMsgId(11)]);
     assert_eq!(live.updates_common_pts(), 202);
     assert_eq!(
@@ -407,6 +411,8 @@ fn unread_reactions_channel_visible_sends_channels_read_contents_and_preserves_m
     let marked = live
         .mark_visible_reactions_read(ui_peer, &[UiMsgId(-5), UiMsgId(50), UiMsgId(50)])
         .expect("channel mark_visible_reactions_read ok");
+    // The request goes out on the background queue; wait for it before checking the server side.
+    assert!(live.flush_background_rpcs(Duration::from_secs(10)));
     assert_eq!(marked, vec![UiMsgId(50)]);
 
     let ch_reqs = rpc.recorded_decoded::<tl_fns::channels::ReadMessageContents>();

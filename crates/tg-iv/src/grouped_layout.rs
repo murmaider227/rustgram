@@ -124,7 +124,10 @@ pub fn layout_media_group(
 
     if count == 1 {
         let width = max_width;
-        let height = (normalized[0].height * width) / normalized[0].width;
+        // i64: a hostile server height times our width overflows i32.
+        let height =
+            i64::from(normalized[0].height) * i64::from(width) / i64::from(normalized[0].width);
+        let height = i32::try_from(height).unwrap_or(i32::MAX);
         return vec![GroupMediaLayout {
             geometry: MediaRect::new(0, 0, width, height.max(1)),
         }];

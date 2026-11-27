@@ -882,9 +882,5 @@ fn tab_button(ui: &mut Ui, label: &str, active: bool, palette: &Palette) -> bool
 }
 
 fn short_addr(addr: &str) -> String {
-    if addr.len() > 16 {
-        format!("{}...{}", &addr[..8], &addr[addr.len() - 6..])
-    } else {
-        addr.to_owned()
-    }
+    super::address_text::short_address(addr, 16)
 }

@@ -358,24 +358,19 @@ impl CutSearch {
     }
 }
 
-/// The character boundary nearest to `target` that lies strictly between `after` and `before`,
-/// or `None` when no character ends between them.
+/// The grapheme boundary nearest to `target` that lies strictly between `after` and `before`,
+/// or `None` when no grapheme ends between them (a cut never splits an emoji or a letter from
+/// its combining marks, see [`crate::text_cut`]).
 fn boundary_between(text: &str, after: usize, before: usize, target: usize) -> Option<usize> {
     if before <= after + 1 {
         return None;
     }
     let target = target.clamp(after + 1, before - 1);
-    let mut down = target;
-    while !text.is_char_boundary(down) {
-        down -= 1;
-    }
+    let down = crate::text_cut::grapheme_floor(text, target);
     if down > after {
         return Some(down);
     }
-    let mut up = target;
-    while !text.is_char_boundary(up) {
-        up += 1;
-    }
+    let up = crate::text_cut::grapheme_ceil(text, target);
     (up < before).then_some(up)
 }
 
@@ -846,9 +841,11 @@ fn place_badges(
 
 #[cfg(test)]
 mod elide_tests {
+    use unicode_segmentation::UnicodeSegmentation;
+
     use super::{elide_text_right, elide_text_right_hinted};
 
-    /// The previous implementation: one measurement per character from the start.
+    /// The reference: one measurement per grapheme from the start.
     fn elide_every_prefix(
         text: &str,
         max_width: i32,
@@ -865,8 +862,8 @@ mod elide_tests {
             return String::new();
         }
         let mut best = 0usize;
-        for (idx, ch) in text.char_indices() {
-            let end = idx + ch.len_utf8();
+        for (idx, grapheme) in text.grapheme_indices(true) {
+            let end = idx + grapheme.len();
             if measure(&text[..end]) + ellipsis_w <= max_width {
                 best = end;
             } else {
@@ -904,6 +901,8 @@ mod elide_tests {
         "mixed ascii и кириллица と 日本語 together in one row",
         "🙂🙃🙂🙃 emoji 🚀 in the middle 🎉 and at the end 🎈🎈🎈",
         "a\u{0301}e\u{0301}i\u{0301} combining marks o\u{0301}u\u{0301} everywhere",
+        "Team \u{1F44D}\u{1F3FD}\u{1F44D}\u{1F3FF} and \u{1F1FA}\u{1F1E6}\u{1F1FA}\u{1F1E6} flags",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466} family chat",
         "x",
         "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. \
          The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.",
@@ -941,8 +940,26 @@ mod elide_tests {
     }
 
     #[test]
+    fn never_cuts_inside_an_emoji_sequence() {
+        // Skin-tone emoji, flags and a ZWJ family: the old char-by-char cut kept "👍" without its
+        // tone (another emoji), a lone regional indicator, or half a family.
+        for text in [CORPUS[11], CORPUS[12]] {
+            for max_width in 0..=width(text) + 12 {
+                let out = elide_text_right(text, max_width, width);
+                let kept = out.strip_suffix('\u{2026}').unwrap_or(&out);
+                assert!(
+                    text.starts_with(kept)
+                        && (kept.len() == text.len()
+                            || text.grapheme_indices(true).any(|(i, _)| i == kept.len())),
+                    "text {text:?} at {max_width}px cut to {out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn measures_a_handful_of_prefixes_not_every_one() {
-        let text = CORPUS[12];
+        let text = CORPUS[14];
         let chars = text.chars().count();
         assert!(chars > 150);
         let mut worst = 0usize;

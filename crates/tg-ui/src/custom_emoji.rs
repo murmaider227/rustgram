@@ -25,6 +25,10 @@ const MAX_CACHED_WEBM_FRAMES: usize = 90;
 /// Maximum total cached frame entries per [`CustomEmojiRenderer`].
 const MAX_RENDERER_FRAME_CACHE: usize = 1024;
 
+/// Entries a full cache keeps: the least recently used quarter goes in one pass, so the next
+/// 256 misses insert without another scan (TGB-3078).
+const RENDERER_CACHE_KEEP: usize = MAX_RENDERER_FRAME_CACHE * 3 / 4;
+
 /// Source payload registered for a Telegram `CustomEmoji` document ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustomEmojiAsset {
@@ -147,14 +151,20 @@ impl DecodedEmojiFrame {
     /// Converts this RGBA frame into an [`egui::ColorImage`].
     #[must_use]
     pub fn to_color_image(&self) -> ColorImage {
-        let expected = (self.width as usize)
-            .saturating_mul(self.height as usize)
-            .saturating_mul(4);
-        if self.width == 0 || self.height == 0 || self.rgba.len() != expected {
-            return ColorImage::filled([1, 1], Color32::TRANSPARENT);
-        }
-        ColorImage::from_rgba_unmultiplied([self.width as usize, self.height as usize], &self.rgba)
+        rgba_image(self.width, self.height, &self.rgba)
     }
+}
+
+/// `rgba` (unpremultiplied, `width * height * 4` bytes) as an image; a transparent pixel when the
+/// sizes do not match.
+fn rgba_image(width: u32, height: u32, rgba: &[u8]) -> ColorImage {
+    let expected = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if width == 0 || height == 0 || rgba.len() != expected {
+        return ColorImage::filled([1, 1], Color32::TRANSPARENT);
+    }
+    ColorImage::from_rgba_unmultiplied([width as usize, height as usize], rgba)
 }
 
 /// Paint-time playback context matching `Ui::Text::CustomEmoji::Context`
@@ -195,7 +205,7 @@ enum LoadedEmoji {
         text_color_tinted: bool,
     },
     Webm {
-        frames: Vec<(u32, u32, Vec<u8>, u32)>,
+        frames: Vec<WebmFrame>,
         total_duration_ms: u64,
         text_color_tinted: bool,
     },
@@ -207,7 +217,144 @@ enum LoadedEmoji {
     },
 }
 
+/// One decoded frame of a WebM custom emoji.
+struct WebmFrame {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    duration_ms: u32,
+}
+
+/// Which frame of an emoji a paint shows, known without touching its pixels.
+#[derive(Clone, Copy)]
+struct FrameSlot {
+    index: usize,
+    count: usize,
+    duration_ms: u32,
+    tinted: bool,
+}
+
 impl LoadedEmoji {
+    /// The frame `paint_ctx` shows; `None` for a video without frames.
+    fn slot(&self, paint_ctx: CustomEmojiPaintContext) -> Option<FrameSlot> {
+        let paused = paint_ctx.paused || paint_ctx.force_first_frame;
+        let held = |count: usize| {
+            if paint_ctx.force_last_frame && !paint_ctx.force_first_frame {
+                count.saturating_sub(1)
+            } else {
+                0
+            }
+        };
+        match self {
+            Self::Lottie {
+                frame_count,
+                fps,
+                text_color_tinted,
+                ..
+            } => {
+                let count = (*frame_count).max(1);
+                let index = if paused {
+                    held(count)
+                } else {
+                    ((paint_ctx.time_secs.max(0.0) * fps).floor() as usize) % count
+                };
+                Some(FrameSlot {
+                    index,
+                    count,
+                    duration_ms: ((1000.0 / fps).round() as u32).clamp(16, 1000),
+                    tinted: *text_color_tinted,
+                })
+            }
+            Self::Webm {
+                frames,
+                total_duration_ms,
+                text_color_tinted,
+            } => {
+                let count = frames.len();
+                let index = if paused {
+                    held(count)
+                } else if count == 1 {
+                    0
+                } else {
+                    let t_ms = ((paint_ctx.time_secs.max(0.0) * 1000.0) as u64)
+                        % (*total_duration_ms).max(1);
+                    frames
+                        .iter()
+                        .scan(0u64, |end, frame| {
+                            *end += u64::from(frame.duration_ms);
+                            Some(*end)
+                        })
+                        .position(|end| t_ms < end)
+                        .unwrap_or(0)
+                };
+                Some(FrameSlot {
+                    index,
+                    count,
+                    duration_ms: frames.get(index)?.duration_ms,
+                    tinted: *text_color_tinted,
+                })
+            }
+            Self::Static {
+                text_color_tinted, ..
+            } => Some(FrameSlot {
+                index: 0,
+                count: 1,
+                duration_ms: 1000,
+                tinted: *text_color_tinted,
+            }),
+        }
+    }
+
+    /// Pixels of `slot`: Lottie frames are rasterized at `px`, video and still frames copied.
+    fn decode(&self, slot: FrameSlot, px: u32) -> Option<DecodedEmojiFrame> {
+        let (width, height, rgba) = match self {
+            Self::Lottie { composition, .. } => {
+                let comp_frame = composition.in_point + slot.index as f64;
+                let fb = render_composition(composition, comp_frame, LottieSize::new(px, px));
+                (fb.width, fb.height, fb.data)
+            }
+            Self::Webm { frames, .. } => {
+                let frame = frames.get(slot.index)?;
+                (frame.width, frame.height, frame.rgba.clone())
+            }
+            Self::Static {
+                width,
+                height,
+                rgba,
+                ..
+            } => (*width, *height, rgba.clone()),
+        };
+        Some(DecodedEmojiFrame {
+            width,
+            height,
+            rgba,
+            duration_ms: slot.duration_ms,
+            text_color_tinted: slot.tinted,
+            animated: slot.count > 1,
+            frame_index: slot.index,
+            frame_count: slot.count,
+        })
+    }
+
+    /// The texture image of `slot` at `px`, built straight from the stored pixels.
+    fn color_image(&self, slot: FrameSlot, px: u32) -> ColorImage {
+        match self {
+            Self::Lottie { .. } => self
+                .decode(slot, px)
+                .map_or_else(|| rgba_image(0, 0, &[]), |frame| frame.to_color_image()),
+            Self::Webm { frames, .. } => frames.get(slot.index).map_or_else(
+                || rgba_image(0, 0, &[]),
+                |frame| rgba_image(frame.width, frame.height, &frame.rgba),
+            ),
+            Self::Static {
+                width,
+                height,
+                rgba,
+                ..
+            } => rgba_image(*width, *height, rgba),
+        }
+    }
+
     fn from_asset(asset: &CustomEmojiAsset, target_px: u32) -> Option<Self> {
         let px = target_px.clamp(8, 256);
         match asset {
@@ -269,7 +416,7 @@ impl LoadedEmoji {
         // Attempt full frame-by-frame decode through `tg-video::ClipReader`.
         if let Ok(mut reader) = ClipReader::from_bytes(bytes.to_vec(), ClipMode::Normal) {
             reader.set_resize(Some(VideoSize::new(target_px, target_px)));
-            let mut frames: Vec<(u32, u32, Vec<u8>, u32)> = Vec::new();
+            let mut frames: Vec<WebmFrame> = Vec::new();
             let mut prev_pts_ms: Option<i64> = None;
 
             for _ in 0..MAX_CACHED_WEBM_FRAMES {
@@ -282,7 +429,7 @@ impl LoadedEmoji {
                 }
                 let pts = frame.pts_ms;
                 let duration_ms = match prev_pts_ms {
-                    Some(prev) if pts > prev => ((pts - prev) as u32).clamp(16, 1000),
+                    Some(prev) if pts > prev => (pts - prev).clamp(16, 1000) as u32,
                     _ => 33,
                 };
                 prev_pts_ms = Some(pts);
@@ -291,13 +438,18 @@ impl LoadedEmoji {
                     let w = frame.width;
                     let h = frame.height;
                     if w > 0 && h > 0 && rgba.len() == (w as usize) * (h as usize) * 4 {
-                        frames.push((w, h, rgba, duration_ms));
+                        frames.push(WebmFrame {
+                            width: w,
+                            height: h,
+                            rgba,
+                            duration_ms,
+                        });
                     }
                 }
             }
 
             if !frames.is_empty() {
-                let total_duration_ms: u64 = frames.iter().map(|f| u64::from(f.3)).sum();
+                let total_duration_ms: u64 = frames.iter().map(|f| u64::from(f.duration_ms)).sum();
                 return Some(Self::Webm {
                     frames,
                     total_duration_ms: total_duration_ms.max(33),
@@ -338,19 +490,56 @@ impl LoadedEmoji {
 /// [`register_custom_emoji_asset`] registry used by `tg_ui::text::render_text_with_entities`.
 #[derive(Default)]
 pub struct CustomEmojiRenderer {
-    loaded: HashMap<String, LoadedEmoji>,
-    /// Rasterized Lottie frame cache keyed by `(document_id, frame_index, size_px)`.
-    frame_cache: HashMap<(String, usize, u32), DecodedEmojiFrame>,
-    /// Uploaded egui GPU textures keyed by `(document_id, frame_index, size_px)`.
-    textures: HashMap<(String, usize, u32), TextureHandle>,
+    emoji: HashMap<String, EmojiEntry>,
+    /// Bumped on every cache use; a full cache drops its oldest ticks first.
+    clock: u64,
+}
+
+/// A cached frame or texture with the renderer clock tick of its last use.
+struct Recent<T> {
+    value: T,
+    last_used: u64,
+}
+
+/// `(frame_index, size_px)` of a cached frame or texture.
+type FrameKey = (usize, u32);
+
+/// A registered emoji with the frames and textures made from it.
+struct EmojiEntry {
+    loaded: LoadedEmoji,
+    /// Rasterized Lottie frames [`CustomEmojiRenderer::frame_for`] returned.
+    frames: HashMap<FrameKey, Recent<DecodedEmojiFrame>>,
+    /// Uploaded egui GPU textures.
+    textures: HashMap<FrameKey, Recent<TextureHandle>>,
+}
+
+/// Drops the least recently used entries of one cache kind (frames or textures) across all
+/// emoji until `keep` remain. Ticks are unique, so the cut is exact.
+fn evict_least_recent<T>(
+    emoji: &mut HashMap<String, EmojiEntry>,
+    cache: fn(&mut EmojiEntry) -> &mut HashMap<FrameKey, Recent<T>>,
+    keep: usize,
+) {
+    let mut ticks: Vec<u64> = emoji
+        .values_mut()
+        .flat_map(|entry| cache(entry).values().map(|recent| recent.last_used))
+        .collect();
+    if ticks.len() <= keep {
+        return;
+    }
+    let drop_count = ticks.len() - keep;
+    let (_, &mut cutoff, _) = ticks.select_nth_unstable(drop_count - 1);
+    for entry in emoji.values_mut() {
+        cache(entry).retain(|_, recent| recent.last_used > cutoff);
+    }
 }
 
 impl std::fmt::Debug for CustomEmojiRenderer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CustomEmojiRenderer")
-            .field("loaded_count", &self.loaded.len())
-            .field("frame_cache_count", &self.frame_cache.len())
-            .field("textures_count", &self.textures.len())
+            .field("loaded_count", &self.emoji.len())
+            .field("frame_cache_count", &self.cached_frame_count())
+            .field("textures_count", &self.cached_texture_count())
             .finish()
     }
 }
@@ -370,27 +559,31 @@ impl CustomEmojiRenderer {
         document_id: impl Into<String>,
         asset: &CustomEmojiAsset,
     ) -> bool {
-        let doc_id = document_id.into();
         let Some(loaded) = LoadedEmoji::from_asset(asset, DEFAULT_CUSTOM_EMOJI_PX) else {
             return false;
         };
-        self.loaded.insert(doc_id.clone(), loaded);
-        self.frame_cache.retain(|(id, _, _), _| id != &doc_id);
-        self.textures.retain(|(id, _, _), _| id != &doc_id);
+        self.emoji.insert(
+            document_id.into(),
+            EmojiEntry {
+                loaded,
+                frames: HashMap::new(),
+                textures: HashMap::new(),
+            },
+        );
         true
     }
 
     /// Returns `true` if `document_id` has a ready decoded custom emoji asset.
     #[must_use]
     pub fn contains(&self, document_id: &str) -> bool {
-        self.loaded.contains_key(document_id)
+        self.emoji.contains_key(document_id)
     }
 
     /// Length of one animation loop of `document_id` in seconds; `None` for a still or an
     /// unregistered emoji.
     #[must_use]
     pub fn loop_duration_secs(&self, document_id: &str) -> Option<f64> {
-        match self.loaded.get(document_id)? {
+        match &self.emoji.get(document_id)?.loaded {
             LoadedEmoji::Lottie {
                 frame_count, fps, ..
             } => (*frame_count > 1).then(|| *frame_count as f64 / fps),
@@ -405,15 +598,28 @@ impl CustomEmojiRenderer {
 
     /// Removes `document_id` and its cached frames/textures.
     pub fn remove(&mut self, document_id: &str) {
-        self.loaded.remove(document_id);
-        self.frame_cache.retain(|(id, _, _), _| id != document_id);
-        self.textures.retain(|(id, _, _), _| id != document_id);
+        self.emoji.remove(document_id);
     }
 
     /// Clears all cached frames and GPU textures while keeping registered emoji definitions.
     pub fn clear_caches(&mut self) {
-        self.frame_cache.clear();
-        self.textures.clear();
+        for entry in self.emoji.values_mut() {
+            entry.frames.clear();
+            entry.textures.clear();
+        }
+    }
+
+    fn cached_frame_count(&self) -> usize {
+        self.emoji.values().map(|entry| entry.frames.len()).sum()
+    }
+
+    fn cached_texture_count(&self) -> usize {
+        self.emoji.values().map(|entry| entry.textures.len()).sum()
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
     }
 
     /// Computes and returns the decoded RGBA frame for `document_id` at `size_px` for `paint_ctx`.
@@ -424,118 +630,41 @@ impl CustomEmojiRenderer {
         paint_ctx: CustomEmojiPaintContext,
     ) -> Option<DecodedEmojiFrame> {
         let px = size_px.clamp(8, 256);
-        let loaded = self.loaded.get(document_id)?;
-
-        match loaded {
-            LoadedEmoji::Lottie {
-                composition,
-                frame_count,
-                fps,
-                text_color_tinted,
-            } => {
-                let frame_count = *frame_count;
-                let fps = *fps;
-                let tinted = *text_color_tinted;
-                let paused = paint_ctx.paused || paint_ctx.force_first_frame;
-                let frame_idx = if paused {
-                    if paint_ctx.force_last_frame && !paint_ctx.force_first_frame {
-                        frame_count.saturating_sub(1)
-                    } else {
-                        0
-                    }
-                } else {
-                    let elapsed = paint_ctx.time_secs.max(0.0);
-                    ((elapsed * fps).floor() as usize) % frame_count
-                };
-
-                let key = (document_id.to_owned(), frame_idx, px);
-                if let Some(cached) = self.frame_cache.get(&key) {
-                    return Some(cached.clone());
-                }
-
-                let comp_frame = composition.in_point + frame_idx as f64;
-                let fb = render_composition(composition, comp_frame, LottieSize::new(px, px));
-                let duration_ms = ((1000.0 / fps).round() as u32).clamp(16, 1000);
-                let decoded = DecodedEmojiFrame {
-                    width: fb.width,
-                    height: fb.height,
-                    rgba: fb.data,
-                    duration_ms,
-                    text_color_tinted: tinted,
-                    animated: frame_count > 1,
-                    frame_index: frame_idx,
-                    frame_count,
-                };
-                if self.frame_cache.len() >= MAX_RENDERER_FRAME_CACHE {
-                    self.frame_cache.clear();
-                }
-                self.frame_cache.insert(key, decoded.clone());
-                Some(decoded)
-            }
-            LoadedEmoji::Webm {
-                frames,
-                total_duration_ms,
-                text_color_tinted,
-            } => {
-                if frames.is_empty() {
-                    return None;
-                }
-                let frame_count = frames.len();
-                let paused = paint_ctx.paused || paint_ctx.force_first_frame;
-                let frame_idx = if paused {
-                    if paint_ctx.force_last_frame && !paint_ctx.force_first_frame {
-                        frame_count - 1
-                    } else {
-                        0
-                    }
-                } else if frame_count == 1 {
-                    0
-                } else {
-                    let t_ms = ((paint_ctx.time_secs.max(0.0) * 1000.0) as u64)
-                        % (*total_duration_ms).max(1);
-                    let mut acc = 0u64;
-                    let mut chosen = 0usize;
-                    for (idx, (_, _, _, dur)) in frames.iter().enumerate() {
-                        acc += u64::from(*dur);
-                        if t_ms < acc {
-                            chosen = idx;
-                            break;
-                        }
-                    }
-                    chosen
-                };
-                let (w, h, rgba, dur) = &frames[frame_idx];
-                Some(DecodedEmojiFrame {
-                    width: *w,
-                    height: *h,
-                    rgba: rgba.clone(),
-                    duration_ms: *dur,
-                    text_color_tinted: *text_color_tinted,
-                    animated: frame_count > 1,
-                    frame_index: frame_idx,
-                    frame_count,
-                })
-            }
-            LoadedEmoji::Static {
-                width,
-                height,
-                rgba,
-                text_color_tinted,
-            } => Some(DecodedEmojiFrame {
-                width: *width,
-                height: *height,
-                rgba: rgba.clone(),
-                duration_ms: 1000,
-                text_color_tinted: *text_color_tinted,
-                animated: false,
-                frame_index: 0,
-                frame_count: 1,
-            }),
+        let now = self.tick();
+        let entry = self.emoji.get_mut(document_id)?;
+        let slot = entry.loaded.slot(paint_ctx)?;
+        if !matches!(entry.loaded, LoadedEmoji::Lottie { .. }) {
+            return entry.loaded.decode(slot, px);
         }
+        let key = (slot.index, px);
+        if let Some(cached) = entry.frames.get_mut(&key) {
+            cached.last_used = now;
+            return Some(cached.value.clone());
+        }
+        let decoded = entry.loaded.decode(slot, px)?;
+        if self.cached_frame_count() >= MAX_RENDERER_FRAME_CACHE {
+            evict_least_recent(
+                &mut self.emoji,
+                |entry| &mut entry.frames,
+                RENDERER_CACHE_KEEP,
+            );
+        }
+        if let Some(entry) = self.emoji.get_mut(document_id) {
+            entry.frames.insert(
+                key,
+                Recent {
+                    value: decoded.clone(),
+                    last_used: now,
+                },
+            );
+        }
+        Some(decoded)
     }
 
     /// Paints custom emoji `document_id` into `rect` on `painter`, uploading/caching GPU textures
     /// and scheduling the next repaint if animated and not paused.
+    ///
+    /// A frame whose texture is cached is painted without touching its pixels.
     ///
     /// Returns `true` if the custom emoji was painted, or `false` if not registered/ready.
     pub fn paint(
@@ -548,24 +677,42 @@ impl CustomEmojiRenderer {
     ) -> bool {
         let side = rect.width().max(rect.height());
         let px = ((side * ctx.pixels_per_point()).round() as u32).clamp(16, 128);
-        let Some(frame) = self.frame_for(document_id, px, paint_ctx) else {
+        let now = self.tick();
+        let Some(entry) = self.emoji.get_mut(document_id) else {
             return false;
         };
+        let Some(slot) = entry.loaded.slot(paint_ctx) else {
+            return false;
+        };
+        let key = (slot.index, px);
+        let tex_id = if let Some(texture) = entry.textures.get_mut(&key) {
+            texture.last_used = now;
+            texture.value.id()
+        } else {
+            let image = entry.loaded.color_image(slot, px);
+            if self.cached_texture_count() >= MAX_RENDERER_FRAME_CACHE {
+                evict_least_recent(
+                    &mut self.emoji,
+                    |entry| &mut entry.textures,
+                    RENDERER_CACHE_KEEP,
+                );
+            }
+            let name = format!("tg_custom_emoji_{document_id}_{}_{px}", slot.index);
+            let texture = ctx.load_texture(name, image, TextureOptions::LINEAR);
+            let id = texture.id();
+            if let Some(entry) = self.emoji.get_mut(document_id) {
+                entry.textures.insert(
+                    key,
+                    Recent {
+                        value: texture,
+                        last_used: now,
+                    },
+                );
+            }
+            id
+        };
 
-        let key = (document_id.to_owned(), frame.frame_index, px);
-        if self.textures.len() >= MAX_RENDERER_FRAME_CACHE {
-            self.textures.clear();
-        }
-        let tex_id = self
-            .textures
-            .entry(key)
-            .or_insert_with(|| {
-                let name = format!("tg_custom_emoji_{document_id}_{}_{px}", frame.frame_index);
-                ctx.load_texture(name, frame.to_color_image(), TextureOptions::LINEAR)
-            })
-            .id();
-
-        let tint = if frame.text_color_tinted {
+        let tint = if slot.tinted {
             paint_ctx.text_color
         } else {
             Color32::WHITE
@@ -581,9 +728,9 @@ impl CustomEmojiRenderer {
             tint,
         );
 
-        if frame.animated && !paint_ctx.paused && !paint_ctx.force_first_frame {
+        if slot.count > 1 && !paint_ctx.paused && !paint_ctx.force_first_frame {
             ctx.request_repaint_after(std::time::Duration::from_millis(u64::from(
-                frame.duration_ms.max(16),
+                slot.duration_ms.max(16),
             )));
         }
         true

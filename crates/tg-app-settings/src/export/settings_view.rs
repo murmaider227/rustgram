@@ -924,14 +924,44 @@ pub fn civil_to_unix(
     secs.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as TimeId
 }
 
-/// Returns the current UTC `(year, month, day)`.
+/// UTC offset of the system time zone at `unix` (seconds east of UTC).
+fn local_offset_at(unix: i64) -> i32 {
+    tg_history::datetime::local_utc_offset_secs(unix)
+}
+
+/// `base::unixtime::parse(ts)`: `ts` as local `(year, month, day, hour, minute, second)`.
+fn local_civil(ts: TimeId) -> (i32, u32, u32, u32, u32, u32) {
+    let unix = i64::from(ts);
+    unix_to_civil(unix, local_offset_at(unix))
+}
+
+/// `base::unixtime::serialize(QDateTime(date, time))`: a local date and time as a Unix
+/// [`TimeId`] (inverse of the local reading the date range shows).
+#[must_use]
+pub fn local_civil_to_unix(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> TimeId {
+    let wall = i64::from(civil_to_unix(year, month, day, hour, minute, second));
+    // The offset in force at that local time: guess with the offset at `wall` read as UTC,
+    // then take the offset at the guess (right on both sides of a DST change).
+    let guess = wall - i64::from(local_offset_at(wall));
+    let unix = wall - i64::from(local_offset_at(guess));
+    unix.clamp(i64::from(TimeId::MIN), i64::from(TimeId::MAX)) as TimeId
+}
+
+/// Returns today's local `(year, month, day)` (`QDate::currentDate()`).
 #[must_use]
 pub fn today_civil_date() -> (i32, u32, u32) {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(1_735_689_600);
-    let (y, m, d, _, _, _) = unix_to_civil(secs, 0);
+    let (y, m, d, _, _, _) = unix_to_civil(secs, local_offset_at(secs));
     (y, m, d)
 }
 
@@ -967,14 +997,14 @@ pub const fn month_name(month: u32) -> &'static str {
 /// Formats a [`TimeId`] date as `"January 15, 2026"` (`langDayOfMonthFull`).
 #[must_use]
 pub fn format_date_long(ts: TimeId) -> String {
-    let (y, m, d, _, _, _) = unix_to_civil(i64::from(ts), 0);
+    let (y, m, d, _, _, _) = local_civil(ts);
     format!("{} {d}, {y}", month_name(m))
 }
 
-/// Formats a [`TimeId`] time as `"HH:MM"`.
+/// Formats a [`TimeId`] local time as `"HH:MM"`.
 #[must_use]
 pub fn format_time_short(ts: TimeId) -> String {
-    let (_, _, _, h, min, _) = unix_to_civil(i64::from(ts), 0);
+    let (_, _, _, h, min, _) = local_civil(ts);
     format!("{h:02}:{min:02}")
 }
 
@@ -984,11 +1014,11 @@ pub fn format_date_time_full(ts: TimeId) -> String {
     format!("{} at {}", format_date_long(ts), format_time_short(ts))
 }
 
-/// Strips the time-of-day component from `ts`, keeping UTC 00:00:00 (`removeTime` in `export_view_settings.cpp:439`).
+/// Strips the time-of-day component from `ts`, keeping local 00:00:00 (`removeTime` in `export_view_settings.cpp:439`).
 #[must_use]
 pub fn remove_time_of_day(ts: TimeId) -> TimeId {
-    let (y, m, d, _, _, _) = unix_to_civil(i64::from(ts), 0);
-    civil_to_unix(y, m, d, 0, 0, 0)
+    let (y, m, d, _, _, _) = local_civil(ts);
+    local_civil_to_unix(y, m, d, 0, 0, 0)
 }
 
 /// Applies a chosen `"From"` date timestamp (`0` resets to beginning).
@@ -1055,7 +1085,7 @@ impl DatePickerState {
     pub fn for_limit(current: TimeId, min_ts: TimeId, max_ts: TimeId) -> Self {
         let today = today_civil_date();
         let to_ymd = |ts: TimeId| {
-            let (y, m, d, _, _, _) = unix_to_civil(i64::from(ts), 0);
+            let (y, m, d, _, _, _) = local_civil(ts);
             (y, m, d)
         };
         let highlighted = if current != 0 {
@@ -1213,7 +1243,7 @@ impl DatePickerState {
 
                     if enabled && resp.clicked() {
                         self.highlighted = ymd;
-                        outcome = Some(Some(civil_to_unix(ymd.0, ymd.1, ymd.2, 0, 0, 0)));
+                        outcome = Some(Some(local_civil_to_unix(ymd.0, ymd.1, ymd.2, 0, 0, 0)));
                     }
                 }
             });
@@ -1246,10 +1276,10 @@ pub struct TimePickerState {
 }
 
 impl TimePickerState {
-    /// Initializes a `TimePickerState` from a UTC [`TimeId`].
+    /// Initializes a `TimePickerState` from the local time of a [`TimeId`].
     #[must_use]
     pub fn from_timestamp(ts: TimeId) -> Self {
-        let (_, _, _, h, m, _) = unix_to_civil(i64::from(ts), 0);
+        let (_, _, _, h, m, _) = local_civil(ts);
         Self { hour: h, minute: m }
     }
 
@@ -1312,3 +1342,7 @@ impl TimePickerState {
         outcome
     }
 }
+
+#[cfg(test)]
+#[path = "tests_local_time.rs"]
+pub(crate) mod tests_local_time;

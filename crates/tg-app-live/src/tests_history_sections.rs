@@ -2049,10 +2049,17 @@ fn real_time_updates_for_scheduled_polls_topics_and_discussion_read() {
         loaded_remote.text.entities[0].entity_type(),
         EntityType::Italic
     );
-    assert!(
+    // The session applies the update on its own path, so the draft above can be readable
+    // (session fallback of `load_rich_draft_live`) before the sections listener has updated
+    // the topic list; wait for the listener too.
+    let preview_synced = wait_until(Duration::from_secs(3), || {
         live.forum_topics(forum_peer)
             .iter()
             .any(|t| t.root_id == MsgId(201) && t.draft_preview.as_deref() == Some("Remote draft"))
+    });
+    assert!(
+        preview_synced,
+        "updateDraftMessage did not reach the topic list"
     );
 }
 

@@ -73,7 +73,7 @@ pub fn strip_support_hashtag(mut text: TextWithEntities) -> TextWithEntities {
         if entity.offset() >= new_u16_len {
             false
         } else {
-            if entity.offset() + entity.length() > new_u16_len {
+            if entity.end() > new_u16_len {
                 entity.update_text_end(new_u16_len);
             }
             true

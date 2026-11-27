@@ -149,6 +149,51 @@ impl AddProxyBoxState {
         modal
     }
 
+    /// The details table rows (`label`, `value`) shown in the box body.
+    #[must_use]
+    pub fn detail_rows(&self) -> Vec<(&'static str, String)> {
+        let server_display =
+            if self.proxy.proxy_type == CoreProxyType::Web && !self.proxy.user.is_empty() {
+                format!("{}/{}", self.proxy.host, self.proxy.user)
+            } else {
+                self.proxy.host.clone()
+            };
+        let mut v = vec![
+            ("Type", self.type_label().to_owned()),
+            ("Server", server_display),
+            ("Port", self.proxy.port.to_string()),
+        ];
+        match self.proxy.proxy_type {
+            CoreProxyType::Socks5 | CoreProxyType::Http => {
+                if !self.proxy.user.is_empty() {
+                    v.push(("Username", self.proxy.user.clone()));
+                }
+                if !self.proxy.password.is_empty() {
+                    let masked = "•".repeat(self.proxy.password.chars().count().min(12));
+                    v.push(("Password", masked));
+                }
+            }
+            CoreProxyType::Mtproto | CoreProxyType::Web => {
+                if self.proxy.proxy_type == CoreProxyType::Web && !self.proxy.user.is_empty() {
+                    v.push(("Path", format!("/{}/", self.proxy.user)));
+                }
+                if !self.proxy.password.is_empty() {
+                    // The secret comes from a link and need not be ASCII: cut on characters.
+                    let preview = match self.proxy.password.char_indices().nth(24) {
+                        Some((cut, _)) => format!("{}…", &self.proxy.password[..cut]),
+                        None => self.proxy.password.clone(),
+                    };
+                    v.push(("Secret", preview));
+                }
+            }
+            CoreProxyType::None => {}
+        }
+        if !matches!(self.check_status, ProxyCheckStatus::NotTested) {
+            v.push(("Status", self.check_status.format_label(false)));
+        }
+        v
+    }
+
     /// Renders the proxy details table and optional validation warning inside the modal body.
     pub fn show_body(&mut self, ui: &mut Ui, colors: &dyn Colors) {
         let normal = font_id_from_style(st::normal_font);
@@ -171,48 +216,7 @@ impl AddProxyBoxState {
             ui.add_space(10.0);
         }
 
-        let rows: Vec<(&str, String)> = {
-            let server_display =
-                if self.proxy.proxy_type == CoreProxyType::Web && !self.proxy.user.is_empty() {
-                    format!("{}/{}", self.proxy.host, self.proxy.user)
-                } else {
-                    self.proxy.host.clone()
-                };
-            let mut v = vec![
-                ("Type", self.type_label().to_owned()),
-                ("Server", server_display),
-                ("Port", self.proxy.port.to_string()),
-            ];
-            match self.proxy.proxy_type {
-                CoreProxyType::Socks5 | CoreProxyType::Http => {
-                    if !self.proxy.user.is_empty() {
-                        v.push(("Username", self.proxy.user.clone()));
-                    }
-                    if !self.proxy.password.is_empty() {
-                        let masked = "•".repeat(self.proxy.password.chars().count().min(12));
-                        v.push(("Password", masked));
-                    }
-                }
-                CoreProxyType::Mtproto | CoreProxyType::Web => {
-                    if self.proxy.proxy_type == CoreProxyType::Web && !self.proxy.user.is_empty() {
-                        v.push(("Path", format!("/{}/", self.proxy.user)));
-                    }
-                    if !self.proxy.password.is_empty() {
-                        let preview = if self.proxy.password.len() > 24 {
-                            format!("{}…", &self.proxy.password[..24])
-                        } else {
-                            self.proxy.password.clone()
-                        };
-                        v.push(("Secret", preview));
-                    }
-                }
-                CoreProxyType::None => {}
-            }
-            if !matches!(self.check_status, ProxyCheckStatus::NotTested) {
-                v.push(("Status", self.check_status.format_label(false)));
-            }
-            v
-        };
+        let rows = self.detail_rows();
 
         for (label, value) in rows {
             ui.horizontal(|ui| {
@@ -250,3 +254,8 @@ pub fn apply_confirmed_proxy(
     core.proxy.set_settings(ProxySettingsMode::Enabled);
     backend.apply_proxy_settings(&core.proxy)
 }
+
+#[cfg(test)]
+#[path = "add_proxy_tests.rs"]
+#[cfg(test)]
+mod tests;

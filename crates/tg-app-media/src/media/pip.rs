@@ -4,14 +4,16 @@
 //! `Telegram/SourceFiles/media/view/media_view_pip.cpp`, and `media_view.style`.
 
 use egui::{
-    Align2, Area, Color32, ColorImage, CornerRadius, Id, Order, Pos2, Rect, Sense, Stroke,
-    TextureHandle, TextureOptions, Vec2,
+    Align2, Area, Color32, CornerRadius, Id, Order, Pos2, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, Vec2,
 };
 use tg_ui::fonts::{ensure_tdesktop_fonts, font_id_from_style};
 use tg_ui::tg_style::st;
-use tg_video::{FrameData, FramePopOutcome, PlayerStage};
+use tg_video::{FramePopOutcome, PlayerStage};
 
-use crate::media::video_playback::{ViewerPlayer, drop_unplayed_audio, next_step_delay};
+use crate::media::video_playback::{
+    ViewerPlayer, drop_unplayed_audio, frame_color_image, next_step_delay,
+};
 
 use crate::media::backend::MediaItem;
 use crate::media::style::{
@@ -487,7 +489,7 @@ impl PipWindow {
         if let Ok(FramePopOutcome::Ready { frame, .. }) = outcome {
             self.upload_frame(ctx, &frame);
         } else if self.texture.is_none()
-            && let Some(frame) = self.player.current_video_frame().cloned()
+            && let Some(frame) = self.player.current_video_frame_shared()
         {
             self.upload_frame(ctx, &frame);
         }
@@ -497,13 +499,9 @@ impl PipWindow {
     }
 
     fn upload_frame(&mut self, ctx: &egui::Context, frame: &tg_video::VideoFrame) {
-        let FrameData::Rgba(bytes) = &frame.data else {
+        let Some(image) = frame_color_image(frame, 0, false, false) else {
             return;
         };
-        let image = ColorImage::from_rgba_unmultiplied(
-            [frame.width as usize, frame.height as usize],
-            bytes,
-        );
         if let Some(tex) = &mut self.texture {
             tex.set(image, TextureOptions::LINEAR);
         } else {

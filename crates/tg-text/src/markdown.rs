@@ -507,7 +507,7 @@ pub fn find_markdown_tags(text_with_tags: &TextWithTags) -> Vec<MarkdownTag> {
     let mut pos = 0usize;
     for tag in &text_with_tags.tags {
         let start = (tag.offset.max(0) as usize).min(total_u16);
-        let end = ((tag.offset + tag.length).max(0) as usize).min(total_u16);
+        let end = (tag.end().max(0) as usize).min(total_u16);
         if start > pos
             && let Some(chunk) = slice_utf16(&text_with_tags.text, pos, start - pos)
         {
@@ -564,11 +564,10 @@ pub fn apply_markdown_with_tags(
     let add_original_tags_up_till =
         |offset: i32, orig_tag_idx: &mut usize, removed: i32, result: &mut TextWithTags| {
             while *orig_tag_idx < original_tags.len()
-                && original_tags[*orig_tag_idx].offset + original_tags[*orig_tag_idx].length
-                    <= offset
+                && original_tags[*orig_tag_idx].end() <= offset
             {
                 let mut t = original_tags[*orig_tag_idx].clone();
-                t.offset -= removed;
+                t.offset = t.offset.saturating_sub(removed);
                 result.tags.push(t);
                 *orig_tag_idx += 1;
             }

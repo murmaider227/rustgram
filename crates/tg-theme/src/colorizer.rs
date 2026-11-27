@@ -192,7 +192,10 @@ pub fn colorize_named(name: &str, r: &mut u8, g: &mut u8, b: &mut u8, with: &Col
 /// Port of `style::colorize(QLatin1String hexColor, const colorizer &with)`.
 #[must_use]
 pub fn colorize_hex(hex_color: &str, with: &Colorizer) -> Option<String> {
-    if (hex_color.len() != 7 && hex_color.len() != 9) || !hex_color.starts_with('#') {
+    if (hex_color.len() != 7 && hex_color.len() != 9)
+        || !hex_color.starts_with('#')
+        || !hex_color.is_ascii()
+    {
         return None;
     }
     let color = Color::from_hex(&hex_color[1..7])?;

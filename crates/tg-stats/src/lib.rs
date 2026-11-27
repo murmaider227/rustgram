@@ -64,3 +64,6 @@ pub use xlsx::{
     AnyStatistics, Cell, CellType, Sheet, XlsxError, serialize_xlsx, sheet_from_chart,
     sheets_from_statistics,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

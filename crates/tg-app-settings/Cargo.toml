@@ -25,6 +25,7 @@ tg-crypto = { path = "../tg-crypto" }
 tg-data = { path = "../tg-data" }
 tg-emoji = { path = "../tg-emoji" }
 tg-export = { path = "../tg-export" }
+tg-history = { path = "../tg-history" }
 tg-lang = { path = "../tg-lang" }
 tg-lottie = { path = "../tg-lottie" }
 tg-platform = { path = "../tg-platform" }
@@ -40,6 +41,7 @@ tracing = "0.1.44"
 zip = { version = "9.8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+tg-ui = { path = "../tg-ui", features = ["soft-raster"] }
 egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
 png = "0.18.1"
 tempfile = "3.27.0"

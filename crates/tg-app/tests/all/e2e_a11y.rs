@@ -602,7 +602,8 @@ fn a11y_delete_confirm_button_in_compose_boxes_by_label() {
     wait_for_menu_item(&mut harness, "Delete");
 
     harness.get_by_label("Delete").click();
-    wait_for_label_settled(&mut harness, "Delete Message");
+    // tdesktop's DeleteMessagesBox has no title: the question is its first label.
+    wait_for_label_settled(&mut harness, "Do you want to delete this message?");
 
     // Click the custom-painted red "Delete" confirm button directly by AccessKit label!
     let delete_btn = harness.get_by_label("Delete");

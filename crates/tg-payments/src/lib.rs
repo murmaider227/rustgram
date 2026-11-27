@@ -47,3 +47,6 @@ pub mod star_gift_auctions;
 pub mod star_gift_craft;
 pub mod star_gifts;
 pub mod starref;
+
+#[cfg(test)]
+mod fuzz_untrusted;

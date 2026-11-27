@@ -15,7 +15,7 @@ use crate::consts::{
 };
 use crate::geometry::{
     BubbleCornerRounding, BubbleRounding, BubbleSelectionInterval, Margins, Point, Rect, RectParts,
-    Size, get_corners_from_sides, safe_round,
+    Size, get_corners_from_sides, mul_div, safe_round,
 };
 use crate::selection::{TextSelection, is_group_item_selection};
 
@@ -50,7 +50,9 @@ pub enum GroupPointState {
 
 /// Computes the album mosaic layout for a list of media sizes.
 ///
-/// Exact port of `Ui::LayoutMediaGroup` in `Telegram/SourceFiles/ui/grouped_layout.cpp`.
+/// Exact port of `Ui::LayoutMediaGroup` in `Telegram/SourceFiles/ui/grouped_layout.cpp`. Every
+/// side is at least 1, as `Photo::sizeForGroupingOptimal` makes it (`history_view_photo.cpp:906`):
+/// a zero or negative side from the server would give tiles of negative size.
 #[must_use]
 pub fn layout_media_group(
     sizes: &[Size],
@@ -76,7 +78,7 @@ pub fn layout_playlist(sizes: &[Size]) -> Vec<GroupMediaLayout> {
             geometry: Rect::new(0, top, width, size.height),
             sides: RectParts::LEFT | RectParts::RIGHT,
         });
-        top += size.height;
+        top = top.saturating_add(size.height);
     }
     if let Some(first) = result.first_mut() {
         first.sides |= RectParts::TOP;
@@ -384,8 +386,26 @@ impl GroupedMediaLayout {
 // Internal Layouter & ComplexLayouter (exact port of ui/grouped_layout.cpp)
 // ---------------------------------------------------------------------------
 
-struct Layouter<'a> {
-    sizes: &'a [Size],
+/// Longest side the album layout computes with. Server sizes are untrusted: a hostile
+/// `i32::MAX` side made the i32 sums overflow (TGB-3082). No real photo or video reaches it, so
+/// real albums lay out exactly as in tdesktop.
+const MAX_MEDIA_SIDE: i64 = 1 << 14;
+
+/// Makes a server media size safe for the layout: every side is at least 1 (as
+/// `Photo::sizeForGroupingOptimal` makes it), and a side above [`MAX_MEDIA_SIDE`] scales both
+/// sides down keeping the ratio.
+fn normalized_media_size(size: Size) -> Size {
+    let (width, height) = (i64::from(size.width.max(1)), i64::from(size.height.max(1)));
+    let longest = width.max(height);
+    if longest <= MAX_MEDIA_SIDE {
+        return Size::new(size.width.max(1), size.height.max(1));
+    }
+    let scale = |side: i64| i32::try_from((side * MAX_MEDIA_SIDE / longest).max(1)).unwrap_or(1);
+    Size::new(scale(width), scale(height))
+}
+
+struct Layouter {
+    sizes: Vec<Size>,
     ratios: Vec<f64>,
     proportions: String,
     count: usize,
@@ -397,9 +417,10 @@ struct Layouter<'a> {
     max_size_ratio: f64,
 }
 
-impl<'a> Layouter<'a> {
-    fn new(sizes: &'a [Size], max_width: i32, min_width: i32, spacing: i32) -> Self {
-        let ratios = Self::count_ratios(sizes);
+impl Layouter {
+    fn new(sizes: &[Size], max_width: i32, min_width: i32, spacing: i32) -> Self {
+        let sizes: Vec<Size> = sizes.iter().copied().map(normalized_media_size).collect();
+        let ratios = Self::count_ratios(&sizes);
         let proportions = Self::count_proportions(&ratios);
         let count = ratios.len();
         // All apps currently use square max size first.
@@ -434,13 +455,7 @@ impl<'a> Layouter<'a> {
     fn count_ratios(sizes: &[Size]) -> Vec<f64> {
         sizes
             .iter()
-            .map(|size| {
-                if size.height == 0 {
-                    1.0
-                } else {
-                    f64::from(size.width) / f64::from(size.height)
-                }
-            })
+            .map(|size| f64::from(size.width) / f64::from(size.height))
             .collect()
     }
 
@@ -485,12 +500,8 @@ impl<'a> Layouter<'a> {
 
     fn layout_one(&self) -> Vec<GroupMediaLayout> {
         let width = self.max_width;
-        let height = if self.sizes[0].width != 0 {
-            ((i64::from(self.sizes[0].height) * i64::from(width)) / i64::from(self.sizes[0].width))
-                as i32
-        } else {
-            width
-        };
+        let first = self.sizes[0];
+        let height = mul_div(first.height, width, first.width);
         vec![GroupMediaLayout {
             geometry: Rect::new(0, 0, width, height),
             sides: RectParts::ALL_SIDES,

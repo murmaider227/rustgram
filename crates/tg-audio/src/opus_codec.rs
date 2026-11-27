@@ -175,7 +175,8 @@ impl<R: Read + Seek> OggOpusStreamDecoder<R> {
         let total_frames_48k = total_granule
             .saturating_sub(i64::from(head.pre_skip))
             .max(0);
-        let duration_ms = (total_frames_48k * 1000) / i64::from(DEFAULT_FREQUENCY);
+        // The granule is read from the file: saturate instead of overflowing on a bogus one.
+        let duration_ms = total_frames_48k.saturating_mul(1000) / i64::from(DEFAULT_FREQUENCY);
 
         let max_samples = MAX_PACKET_SAMPLES * usize::from(channels);
         Ok(Self {

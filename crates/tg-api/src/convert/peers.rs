@@ -173,11 +173,12 @@ pub fn input_user_for(session: &Session, user_id: UserId) -> tl_enums::InputUser
     let peer_id = PeerId::from_user(user_id);
     if !session.user_loaded(user_id)
         && let Some(full_id) = session.message_with_peer(peer_id)
+        && let Some(msg_id) = full_id.msg.server_i32()
         && (full_id.peer.is_chat() || session.peer_loaded(full_id.peer))
     {
         return tl_enums::InputUser::FromMessage(tl_types::InputUserFromMessage {
             peer: input_peer_for(session, full_id.peer),
-            msg_id: full_id.msg.0 as i32,
+            msg_id,
             user_id: user_id.to_tl(),
         });
     }
@@ -202,11 +203,12 @@ pub fn input_channel_for(session: &Session, channel_id: ChannelId) -> tl_enums::
     let peer_id = PeerId::from_channel(channel_id);
     if !session.channel_loaded(channel_id)
         && let Some(full_id) = session.message_with_peer(peer_id)
+        && let Some(msg_id) = full_id.msg.server_i32()
         && (full_id.peer.is_chat() || session.peer_loaded(full_id.peer))
     {
         return tl_enums::InputChannel::FromMessage(tl_types::InputChannelFromMessage {
             peer: input_peer_for(session, full_id.peer),
-            msg_id: full_id.msg.0 as i32,
+            msg_id,
             channel_id: channel_id.to_tl(),
         });
     }

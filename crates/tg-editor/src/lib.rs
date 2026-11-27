@@ -149,3 +149,6 @@ pub enum EditorError {
     #[error("failed to deserialize scene draft: {0}")]
     DraftDeserialization(String),
 }
+
+#[cfg(test)]
+mod fuzz_untrusted;

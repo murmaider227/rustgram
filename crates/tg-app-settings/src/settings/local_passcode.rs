@@ -158,7 +158,7 @@ impl LocalPasscodeHash {
     pub fn derive_with_salt(passcode: &str, salt: [u8; LOCAL_ENCRYPT_SALT_SIZE]) -> Self {
         let key = create_local_key(passcode.as_bytes(), &salt);
         let mut digest = [0u8; 32];
-        digest.copy_from_slice(&key.data[..32]);
+        digest.copy_from_slice(&key.data()[..32]);
         Self { salt, digest }
     }
 

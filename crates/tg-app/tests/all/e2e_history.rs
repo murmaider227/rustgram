@@ -330,13 +330,14 @@ fn history_delete_message_via_context_menu_and_confirm() {
     // Click the compact 7.4.6 menu's "Delete" row where it is painted.
     let delete_item_pos = harness.get_by_label("Delete").rect().center();
     click_at(&mut harness, delete_item_pos);
-    wait_for_label_settled(&mut harness, "Delete Message");
+    // tdesktop's DeleteMessagesBox has no title: the question is its first label.
+    wait_for_label_settled(&mut harness, "Do you want to delete this message?");
 
-    // Locate the standard egui "Cancel" button via AccessKit; the custom-painted 78x30 red "Delete"
-    // button sits immediately to its right (8px gap, `right_to_left` layout in `compose_boxes.rs`).
+    // The box's "Delete" button is the rightmost one, right of "Cancel" (`addButton` order).
     let cancel_rect = harness.get_by_label("Cancel").rect();
-    let confirm_delete_pos = Pos2::new(cancel_rect.max.x + 8.0 + 39.0, cancel_rect.center().y);
-    click_at(&mut harness, confirm_delete_pos);
+    let confirm_rect = harness.get_by_label("Delete").rect();
+    assert!(confirm_rect.left() > cancel_rect.right());
+    click_at(&mut harness, confirm_rect.center());
     wait_until(
         &mut harness,
         DEFAULT_MAX_FRAMES,

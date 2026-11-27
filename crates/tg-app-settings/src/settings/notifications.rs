@@ -17,7 +17,8 @@ use tg_ui::widgets::sliders::MediaSlider;
 
 use super::backend::{
     ActiveSession, DEFAULT_RINGTONE_MAX_SIZE, MAX_NOTIFICATIONS_COUNT, NotifyException,
-    NotifyScope, ReactionsNotifyFrom, ScopeNotifySettings, SettingsBackend, format_bytes,
+    NotifyScope, ReactionsNotifyFrom, ScopeNotifySettings, SettingsBackend, SettingsRead,
+    format_bytes,
 };
 use super::strings;
 use super::widgets::{
@@ -137,7 +138,14 @@ pub fn render_notifications_section(
     subsection_title(ui, &tr::lng_settings_notify_title(), colors);
     for scope in NotifyScope::ALL {
         let mut scope_cfg = backend.scope_notifications(scope);
-        let subtitle = scope_status(&scope_cfg);
+        // Until the scope's settings arrive the row shows no status and keeps its toggle, so
+        // the defaults shown meanwhile are never saved over the server's values.
+        let loading = backend.settings_read_pending(SettingsRead::ScopeNotifications(scope));
+        let subtitle = if loading {
+            String::new()
+        } else {
+            scope_status(&scope_cfg)
+        };
         let icon = match scope {
             NotifyScope::PrivateChats => SettingsIconKind::Account,
             NotifyScope::Groups => SettingsIconKind::Groups,
@@ -152,7 +160,7 @@ pub fn render_notifications_section(
             &mut scope_cfg.enabled,
             colors,
         );
-        if toggled {
+        if toggled && !loading {
             backend.set_scope_notifications(scope, scope_cfg);
         }
         if clicked {
@@ -901,7 +909,7 @@ fn render_scope_editor(
         }
     });
 
-    if changed {
+    if changed && !backend.settings_read_pending(SettingsRead::ScopeNotifications(scope)) {
         backend.set_scope_notifications(scope, cfg);
     }
 

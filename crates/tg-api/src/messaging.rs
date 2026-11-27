@@ -1017,6 +1017,19 @@ fn slice_tl_entities(
     out
 }
 
+/// An entity as [`tg_text::cut_part_len`] sees it: CutPart only tells `pre`, `code` and
+/// `blockquote` apart from the other kinds.
+fn cut_span(entity: &tl_enums::MessageEntity) -> (i32, i32, tg_text::EntityType) {
+    let (offset, length) = tl_entity_span(entity);
+    let entity_type = match entity {
+        tl_enums::MessageEntity::Pre(_) => tg_text::EntityType::Pre,
+        tl_enums::MessageEntity::Code(_) => tg_text::EntityType::Code,
+        tl_enums::MessageEntity::Blockquote(_) => tg_text::EntityType::Blockquote,
+        _ => tg_text::EntityType::Invalid,
+    };
+    (offset, length, entity_type)
+}
+
 /// Splits `text` and its UTF-16 `entities` into trimmed chunks of at most `max_chars` Unicode
 /// scalar values, adjusting entity offsets and lengths for every chunk (`apiwrap.cpp:4842-4918`,
 /// `ApiWrap::sendMessage` + `TextUtilities::CutPart`).
@@ -1045,10 +1058,6 @@ fn split_message_chunks_with_entities(
 
     let limit = max_chars.max(1);
     let mut chunks = Vec::new();
-    let mut chunk_start_byte = 0usize;
-    let mut chunk_start_u16 = 0i32;
-    let mut cur_u16 = 0i32;
-    let mut char_count = 0usize;
 
     let push_slice =
         |slice: &str,
@@ -1075,23 +1084,24 @@ fn split_message_chunks_with_entities(
             chunks.push((piece.to_owned(), piece_entities));
         };
 
-    for (byte_idx, ch) in trimmed.char_indices() {
-        cur_u16 += ch.len_utf16() as i32;
-        char_count += 1;
-        if char_count == limit {
-            let end_byte = byte_idx + ch.len_utf8();
-            push_slice(
-                &trimmed[chunk_start_byte..end_byte],
-                chunk_start_u16,
-                &mut chunks,
-            );
-            chunk_start_byte = end_byte;
-            chunk_start_u16 = cur_u16;
-            char_count = 0;
+    let mut rest = trimmed;
+    let mut rest_start_u16 = 0i32;
+    loop {
+        // `TextUtilities::Trim(left)` before every cut (`apiwrap.cpp:4844`).
+        let after_lead = rest.trim_start();
+        rest_start_u16 += rest[..rest.len() - after_lead.len()].encode_utf16().count() as i32;
+        rest = after_lead;
+        if rest.is_empty() {
+            break;
         }
-    }
-    if chunk_start_byte < trimmed.len() {
-        push_slice(&trimmed[chunk_start_byte..], chunk_start_u16, &mut chunks);
+        let rest_u16 = rest.encode_utf16().count() as i32;
+        let rest_entities =
+            slice_tl_entities(&base_entities, rest_start_u16, rest_start_u16 + rest_u16);
+        let cut_byte = tg_text::cut_part_len(rest, rest_entities.iter().map(cut_span), limit);
+        let (piece, tail) = rest.split_at(cut_byte);
+        push_slice(piece, rest_start_u16, &mut chunks);
+        rest_start_u16 += piece.encode_utf16().count() as i32;
+        rest = tail;
     }
     if chunks.is_empty() {
         chunks.push((String::new(), Vec::new()));

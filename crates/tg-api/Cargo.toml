@@ -9,6 +9,7 @@ rand = "0.8"
 tg-crypto = { path = "../tg-crypto" }
 tg-data = { path = "../tg-data" }
 tg-lang = { path = "../tg-lang" }
+tg-text = { path = "../tg-text" }
 tg-tl = { path = "../tg-tl" }
 thiserror = "2.0"
 tokio = { version = "1.54", features = ["macros", "sync", "time"] }

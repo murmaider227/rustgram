@@ -166,6 +166,14 @@ pub struct ShellSettings {
     /// `false` enables the custom frameless titlebar (`tg-platform::frameless`).
     #[serde(default)]
     pub native_window_frame: bool,
+    /// The chat-list search field's "Add Story" button was hidden from its menu
+    /// (tdesktop's `dialogs-add-story-hidden` pref).
+    #[serde(default)]
+    pub add_story_button_hidden: bool,
+    /// The stories strip's first-run "Click here to view updates" tooltip was dismissed
+    /// (`CoreSettings::storiesClickTooltipHidden`).
+    #[serde(default)]
+    pub stories_click_tooltip_hidden: bool,
 }
 
 impl Default for ShellSettings {
@@ -181,6 +189,8 @@ impl Default for ShellSettings {
             folders_sidebar_enabled: true,
             local_passcode: None,
             native_window_frame: false,
+            add_story_button_hidden: false,
+            stories_click_tooltip_hidden: false,
         }
     }
 }

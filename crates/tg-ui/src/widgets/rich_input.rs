@@ -21,6 +21,7 @@ use tg_text::{
     utf16_to_utf8_offset,
 };
 
+use crate::entity_bounds::entity_end;
 use crate::fonts::font_id_for_flags;
 
 /// Formatting shortcut / context-menu action supported by [`RichEditState`].
@@ -410,7 +411,7 @@ impl RichEditState {
         let mut updated = Vec::with_capacity(self.entities.len() + 4);
         for ent in &self.entities {
             let e_start = ent.offset();
-            let e_end = e_start + ent.length();
+            let e_end = entity_end(ent);
             let ty = ent.entity_type();
             let atomic = matches!(ty, EntityType::CustomEmoji | EntityType::MentionName);
 
@@ -431,7 +432,7 @@ impl RichEditState {
                     updated.push(EntityInText::with_data(
                         ty,
                         e_start,
-                        ent.length() + new_inserted_u16,
+                        ent.length().saturating_add(new_inserted_u16),
                         ent.data(),
                     ));
                 } else {
@@ -439,7 +440,7 @@ impl RichEditState {
                 }
             } else if e_start >= old_edit_end_u16 {
                 // Entirely after edit: shift by delta.
-                let new_off = (e_start + delta).max(0);
+                let new_off = e_start.saturating_add(delta).max(0);
                 updated.push(EntityInText::with_data(
                     ty,
                     new_off,
@@ -457,13 +458,13 @@ impl RichEditState {
                     edit_start_u16
                 };
                 let new_end = if e_end > old_edit_end_u16 {
-                    e_end + delta
+                    e_end.saturating_add(delta)
                 } else if e_start < edit_start_u16 {
                     edit_start_u16 + new_inserted_u16
                 } else {
                     edit_start_u16
                 };
-                let new_len = new_end - new_start;
+                let new_len = new_end.saturating_sub(new_start);
                 if new_len > 0 {
                     updated.push(EntityInText::with_data(ty, new_start, new_len, ent.data()));
                 }
@@ -630,7 +631,7 @@ impl RichEditState {
         for ent in &self.entities {
             if ent.entity_type() == EntityType::CustomUrl {
                 let s = ent.offset();
-                let e = s + ent.length();
+                let e = entity_end(ent);
                 if u16_start == u16_end {
                     if s <= u16_start && u16_start <= e {
                         return Some(ent.data().to_owned());
@@ -782,8 +783,10 @@ impl RichEditState {
 
         let mut base_entities = Vec::new();
         for ent in &self.entities {
-            let s = (ent.offset() - trim_start_u16).max(0);
-            let e = (ent.offset() + ent.length() - trim_start_u16).min(trimmed_u16_len);
+            let s = ent.offset().saturating_sub(trim_start_u16).max(0);
+            let e = entity_end(ent)
+                .saturating_sub(trim_start_u16)
+                .min(trimmed_u16_len);
             if e > s {
                 base_entities.push(EntityInText::with_data(
                     ent.entity_type(),
@@ -807,8 +810,9 @@ impl RichEditState {
             let mapping = build_subsequence_u16_map(trimmed_str, &final_text);
             for ent in base_entities {
                 let s = (ent.offset() as usize).min(mapping.len().saturating_sub(1));
-                let e =
-                    ((ent.offset() + ent.length()) as usize).min(mapping.len().saturating_sub(1));
+                let e = usize::try_from(entity_end(&ent))
+                    .unwrap_or(0)
+                    .min(mapping.len().saturating_sub(1));
                 let new_s = mapping[s];
                 let new_e = mapping[e];
                 if new_e > new_s {
@@ -887,13 +891,13 @@ impl RichEditState {
         let mut updated = Vec::with_capacity(self.entities.len());
         for ent in &self.entities {
             let s = ent.offset();
-            let e = s + ent.length();
+            let e = entity_end(ent);
             if e <= start_u16 {
                 updated.push(ent.clone());
             } else if s >= old_end_u16 {
                 updated.push(EntityInText::with_data(
                     ent.entity_type(),
-                    (s + delta).max(0),
+                    s.saturating_add(delta).max(0),
                     ent.length(),
                     ent.data(),
                 ));
@@ -909,7 +913,7 @@ impl RichEditState {
                 }
                 if e > old_end_u16 {
                     let right_start = start_u16 + inserted_u16;
-                    let right_len = e - old_end_u16;
+                    let right_len = e.saturating_sub(old_end_u16);
                     updated.push(EntityInText::with_data(
                         ent.entity_type(),
                         right_start,
@@ -929,7 +933,7 @@ impl RichEditState {
         let total_u16 = utf16_len(&self.text) as i32;
         self.entities.retain_mut(|e| {
             let s = e.offset().clamp(0, total_u16);
-            let end = (e.offset() + e.length()).clamp(0, total_u16);
+            let end = entity_end(e).clamp(0, total_u16);
             if end <= s {
                 return false;
             }
@@ -955,9 +959,9 @@ impl RichEditState {
                 && let Some(prev) = merged.last_mut()
                 && prev.entity_type() == ent.entity_type()
                 && prev.data() == ent.data()
-                && ent.offset() <= prev.offset() + prev.length()
+                && ent.offset() <= entity_end(prev)
             {
-                let new_end = (prev.offset() + prev.length()).max(ent.offset() + ent.length());
+                let new_end = entity_end(prev).max(entity_end(&ent));
                 *prev = EntityInText::with_data(
                     prev.entity_type(),
                     prev.offset(),
@@ -1052,7 +1056,7 @@ pub fn build_rich_edit_layout_job(
             continue;
         }
         let s_u16 = ent.offset() as usize;
-        let e_u16 = (ent.offset() + ent.length()) as usize;
+        let e_u16 = usize::try_from(entity_end(ent)).unwrap_or(0);
         let Some(range) = mapper.utf16_range_to_utf8(s_u16, e_u16.saturating_sub(s_u16)) else {
             continue;
         };
@@ -1615,7 +1619,7 @@ where
         .filter(|e| predicate(e.entity_type()))
         .filter_map(|e| {
             let s = e.offset().max(start);
-            let en = (e.offset() + e.length()).min(end);
+            let en = entity_end(e).min(end);
             (en > s).then_some((s, en))
         })
         .collect();
@@ -1644,7 +1648,7 @@ where
             continue;
         }
         let s = ent.offset();
-        let e = s + ent.length();
+        let e = entity_end(&ent);
         if e <= start || s >= end {
             out.push(ent);
             continue;
@@ -1653,7 +1657,7 @@ where
             out.push(EntityInText::with_data(
                 ent.entity_type(),
                 s,
-                start - s,
+                start.saturating_sub(s),
                 ent.data(),
             ));
         }
@@ -1661,7 +1665,7 @@ where
             out.push(EntityInText::with_data(
                 ent.entity_type(),
                 end,
-                e - end,
+                e.saturating_sub(end),
                 ent.data(),
             ));
         }
@@ -1838,5 +1842,64 @@ mod tests {
         let job = build_rich_edit_layout_job(&st.text, &st.entities, 13.5, 400.0, &pal);
         assert_eq!(job.text, st.text);
         assert!(job.sections.len() >= 5);
+    }
+}
+
+/// TGB-3083: entities written straight into the public `entities` field (a draft or an edited
+/// message from the server) may carry hostile bounds; no edit path may overflow on them.
+#[cfg(test)]
+mod hostile_entity_tests {
+    use super::*;
+
+    fn hostile_state() -> RichEditState {
+        let mut st =
+            RichEditState::from_text_with_entities(TextWithEntities::simple("Hello world"));
+        st.entities = vec![
+            EntityInText::new(EntityType::Bold, i32::MAX, 2),
+            EntityInText::new(EntityType::Italic, 2, i32::MAX),
+            EntityInText::with_data(EntityType::CustomUrl, i32::MAX - 1, i32::MAX, "https://x.y"),
+            EntityInText::new(EntityType::Underline, i32::MIN, -2),
+        ];
+        st
+    }
+
+    #[test]
+    fn send_text_and_layout_survive_hostile_entities() {
+        let st = hostile_state();
+        let sent = st.to_send_text_with_entities();
+        assert_eq!(sent.text, "Hello world");
+        assert!(
+            sent.entities
+                .iter()
+                .all(|e| e.valid_for_text(sent.utf16_len()))
+        );
+        let pal = RichInputPalette::from_colors(Color32::BLACK, Color32::BLUE, false);
+        let job = build_rich_edit_layout_job(&st.text, &st.entities, 13.5, 400.0, &pal);
+        assert_eq!(job.text, st.text);
+        let _ = st.existing_link_for_range((0, 3));
+    }
+
+    #[test]
+    fn edits_survive_hostile_entities() {
+        let mut st = hostile_state();
+        st.normalize_entities();
+        assert!(
+            st.entities
+                .iter()
+                .all(|e| e.valid_for_text(utf16_len(&st.text)))
+        );
+
+        let mut st = hostile_state();
+        let old = st.text.clone();
+        st.text = "Hello big world".to_owned();
+        st.apply_text_diff(&old);
+
+        let mut st = hostile_state();
+        st.paste_rich(&TextWithEntities::simple("pasted"), Some((1, 3)));
+
+        let mut st = hostile_state();
+        let _ = st.toggle_format(FormatAction::Bold, Some((0, 5)));
+        let _ = st.toggle_format(FormatAction::ClearFormatting, Some((0, 5)));
+        let _ = st.toggle_format(FormatAction::Monospace, Some((0, 5)));
     }
 }

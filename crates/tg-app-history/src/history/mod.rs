@@ -18,6 +18,7 @@ pub mod compose_extras;
 pub mod compose_search;
 pub mod compose_stash;
 pub mod copy_selection;
+pub mod delete_box;
 mod delete_collapse;
 mod delete_dissolve;
 pub mod edit_caption;
@@ -26,6 +27,7 @@ mod entity_clicks;
 pub mod factcheck;
 pub mod inline_media;
 pub mod inner;
+pub mod large_emoji;
 pub mod marking_read;
 pub mod media;
 pub mod message_text_state;
@@ -71,6 +73,8 @@ mod sections_screenshot;
 #[cfg(test)]
 mod sections_tests;
 #[cfg(test)]
+mod snap_w7_delete;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_album_tile_media;
@@ -86,6 +90,10 @@ mod tests_chat_search;
 mod tests_chat_search_snap;
 #[cfg(test)]
 mod tests_emoji_status_snap;
+#[cfg(test)]
+mod tests_hostile_entities;
+#[cfg(test)]
+mod tests_large_emoji_snap;
 #[cfg(test)]
 mod tests_local_and_unread;
 #[cfg(test)]
@@ -2468,11 +2476,13 @@ impl HistoryWidget {
                 TopBarEvent::DeleteSelected => {
                     let ids = self.inner.selected_msg_ids();
                     if !ids.is_empty() {
-                        let can_revoke = !peer_info.summary.is_saved_messages;
-                        self.delete_box = Some(DeleteConfirmBoxState::new(
+                        self.delete_box = Some(self.delete_box_for(
                             ids,
-                            peer_info.summary.title.clone(),
-                            can_revoke,
+                            &peer_info,
+                            bot_snapshot.is_some(),
+                            backend.current_unix_time().unwrap_or_else(|| {
+                                i64::from(DEFAULT_SECTION_NOW_UNIX) + now_secs.floor() as i64
+                            }),
                         ));
                     }
                 }
@@ -5326,11 +5336,13 @@ impl HistoryWidget {
                     }
                 }
                 InnerEvent::Delete(msg_ids) => {
-                    let can_revoke = !peer_info.summary.is_saved_messages;
-                    self.delete_box = Some(DeleteConfirmBoxState::new(
+                    self.delete_box = Some(self.delete_box_for(
                         msg_ids,
-                        peer_info.summary.title.clone(),
-                        can_revoke,
+                        peer_info,
+                        bot_snapshot.is_some(),
+                        backend.current_unix_time().unwrap_or_else(|| {
+                            i64::from(DEFAULT_SECTION_NOW_UNIX) + now_secs.floor() as i64
+                        }),
                     ));
                 }
                 InnerEvent::Moderate(msg_ids) => {
@@ -6615,7 +6627,8 @@ impl HistoryWidget {
                     .delete_messages(peer_id, &msg_ids, revoke_for_everyone)
                     .is_ok()
             {
-                // The messages turn to dust where they are painted (TGB-3011).
+                // The messages turn to dust where they are painted (TGB-3011); like
+                // `DeleteMessagesBox::deleteAndClear`, an ordinary delete shows no toast.
                 self.inner.clear_selection();
                 self.remove_messages_with_effect(
                     ui.ctx(),
@@ -6623,12 +6636,6 @@ impl HistoryWidget {
                     &msg_ids,
                     peer_info.summary.kind,
                 );
-                let toast = if revoke_for_everyone {
-                    format!("Deleted {} message(s) for everyone", msg_ids.len())
-                } else {
-                    format!("Deleted {} message(s) for you", msg_ids.len())
-                };
-                self.show_toast(toast, now_secs);
             }
             self.delete_box = None;
         }
@@ -7340,6 +7347,26 @@ impl HistoryWidget {
 
     fn find_loaded_message(&self, msg_id: MsgId) -> Option<&HistoryMessage> {
         self.inner.messages().iter().find(|m| m.id == msg_id)
+    }
+
+    /// `DeleteMessagesBox` for `msg_ids` of the open chat (TGB-3052).
+    fn delete_box_for(
+        &self,
+        msg_ids: Vec<MsgId>,
+        peer_info: &HistoryPeerInfo,
+        is_bot: bool,
+        now_unix: i64,
+    ) -> DeleteConfirmBoxState {
+        let summary = &peer_info.summary;
+        let chat = delete_box::DeleteChat::from_peer(
+            summary.id,
+            summary.kind,
+            &summary.title,
+            summary.is_saved_messages,
+            is_bot,
+            peer_info.can_delete,
+        );
+        DeleteConfirmBoxState::for_messages(msg_ids, &chat, self.inner.messages(), now_unix)
     }
 
     fn show_toast(&mut self, message: impl Into<String>, now_secs: f64) {

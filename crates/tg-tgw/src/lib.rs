@@ -658,3 +658,6 @@ mod tests {
         assert_eq!(store.height(key).map(|h| h.height), Some(240.0));
     }
 }
+
+#[cfg(test)]
+mod fuzz_untrusted;

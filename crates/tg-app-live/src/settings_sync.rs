@@ -35,13 +35,16 @@ use crate::convert::{
     notify_settings_to_tl, now_unix_i32, peer_to_settings_ref, to_data_peer,
 };
 use crate::media::{block_on_runtime, with_rpc_timeout};
-use crate::session::LiveSession;
+use crate::parallel_rpc::{joined, spawn_rpc};
+use crate::session::{LIVE_RPC_TIMEOUT, LiveSession};
+use crate::settings_reads::ReadTicket;
 use tg_app_core::notifications::settings::{
     DefaultNotify, NotifySettingsStore, NotifySound, PeerNotifySettingsValue,
 };
 use tg_app_core::settings::backend::{
     AutoDownloadSettings, AutoDownloadSource, AutoDownloadType, GlobalPrivacySettings,
     MAX_AUTO_DOWNLOAD_BYTES, NotifyException, NotifyScope, ProfilePhotoUpload, ScopeNotifySettings,
+    SettingsRead,
 };
 use tg_app_core::stand_in::settings::WindowPosition as ShellWindowPosition;
 use tg_app_core::stand_in::types::{MsgId, PeerId, PeerKind};
@@ -654,7 +657,33 @@ pub fn fetch_global_privacy_live(live: &LiveSession) -> GlobalPrivacySettings {
     let mut out = GlobalPrivacySettings::default();
     let mut extra = GlobalPrivacyExtra::default();
 
-    match live.invoke_rpc(tl_fns::account::GetGlobalPrivacySettings {}) {
+    // The three requests go out together: the Privacy section's first frame waits for one round
+    // trip instead of three.
+    let rpc = live.runtime().rpc().clone();
+    let (global, ttl, content) = block_on_runtime(live.runtime().tokio_handle(), async move {
+        let global = spawn_rpc(
+            &rpc,
+            tl_fns::account::GetGlobalPrivacySettings {},
+            LIVE_RPC_TIMEOUT,
+        );
+        let ttl = spawn_rpc(
+            &rpc,
+            tl_fns::messages::GetDefaultHistoryTTL {},
+            LIVE_RPC_TIMEOUT,
+        );
+        let content = spawn_rpc(
+            &rpc,
+            tl_fns::account::GetContentSettings {},
+            LIVE_RPC_TIMEOUT,
+        );
+        (
+            joined(global).await,
+            joined(ttl).await,
+            joined(content).await,
+        )
+    });
+
+    match global {
         Ok(tl_enums::GlobalPrivacySettings::GlobalPrivacySettings(resp)) => {
             out.archive_and_mute_new = resp.archive_and_mute_new_noncontact_peers;
             out.keep_archived_unmuted = resp.keep_archived_unmuted;
@@ -670,7 +699,7 @@ pub fn fetch_global_privacy_live(live: &LiveSession) -> GlobalPrivacySettings {
         }
     }
 
-    match live.invoke_rpc(tl_fns::messages::GetDefaultHistoryTTL {}) {
+    match ttl {
         Ok(tl_enums::DefaultHistoryTTL::DefaultHistoryTTL(resp)) => {
             out.global_ttl_seconds = resp.period.max(0);
         }
@@ -679,7 +708,7 @@ pub fn fetch_global_privacy_live(live: &LiveSession) -> GlobalPrivacySettings {
         }
     }
 
-    match live.invoke_rpc(tl_fns::account::GetContentSettings {}) {
+    match content {
         Ok(tl_enums::account::ContentSettings::ContentSettings(resp)) => {
             out.disable_sensitive_content_filtering = resp.sensitive_enabled;
             out.sensitive_can_change = resp.sensitive_can_change;
@@ -998,29 +1027,79 @@ fn collect_scope_exceptions(
     })
 }
 
-/// Fetches scope notification defaults (`account.getNotifySettings`) and per-chat
-/// notification exceptions (`account.getNotifyExceptions`), populating `tg_data::Session`.
+/// Scope notification defaults (`account.getNotifySettings`) and per-chat exceptions
+/// (`account.getNotifyExceptions`). The first read returns the last known value (or the
+/// defaults) at once and loads both in the background, together (TGB-3070).
 pub fn fetch_scope_notify_live(live: &LiveSession, scope: NotifyScope) -> ScopeNotifySettings {
-    let cached = live
-        .cache
-        .lock()
-        .ok()
-        .filter(|c| c.scope_notify_loaded.contains(&scope))
-        .and_then(|c| c.scope_notify.get(&scope).cloned());
-    if let Some(settings) = cached {
+    let (loaded, last) = live.cache.lock().map_or((false, None), |c| {
+        (
+            c.scope_notify_loaded.contains(&scope),
+            c.scope_notify.get(&scope).cloned(),
+        )
+    });
+    if loaded && let Some(settings) = last {
         return settings;
     }
+    live.spawn_settings_read(
+        SettingsRead::ScopeNotifications(scope),
+        move |live, ticket| {
+            load_scope_notify(live, scope, ticket);
+        },
+    );
+    last.unwrap_or_default()
+}
 
-    let mut parsed = match live.invoke_rpc(tl_fns::account::GetNotifySettings {
-        peer: notify_scope_to_tl(scope),
-    }) {
+/// The background part of [`fetch_scope_notify_live`]: both requests go out at once.
+fn load_scope_notify(live: &LiveSession, scope: NotifyScope, ticket: ReadTicket) {
+    let need_exceptions = live
+        .cache
+        .lock()
+        .is_ok_and(|c| !c.notify_exceptions_loaded.contains(&scope));
+    let rpc = live.runtime().rpc().clone();
+    let (settings, exceptions) = block_on_runtime(live.runtime().tokio_handle(), async move {
+        let settings = spawn_rpc(
+            &rpc,
+            tl_fns::account::GetNotifySettings {
+                peer: notify_scope_to_tl(scope),
+            },
+            LIVE_RPC_TIMEOUT,
+        );
+        // Match `NotifySettings::loadExceptions` (`data/notify/data_notify_settings.cpp:663-678`):
+        // only sets `Flag::f_peer` (`compare_sound: false, compare_stories: false`).
+        let exceptions = need_exceptions.then(|| {
+            spawn_rpc(
+                &rpc,
+                tl_fns::account::GetNotifyExceptions {
+                    compare_sound: false,
+                    compare_stories: false,
+                    peer: Some(notify_scope_to_tl(scope)),
+                },
+                LIVE_RPC_TIMEOUT,
+            )
+        });
+        let settings = joined(settings).await;
+        let exceptions = match exceptions {
+            Some(request) => Some(joined(request).await),
+            None => None,
+        };
+        (settings, exceptions)
+    });
+    // A save or a reset made after the requests went out wins over their answers.
+    let current = live.cache.lock().is_ok_and(|c| {
+        c.settings_reads.is_current(ticket) && !c.scope_notify_loaded.contains(&scope)
+    });
+    if !current {
+        return;
+    }
+
+    let now = now_unix_i32();
+    let mut parsed = match settings {
         Ok(tl_enums::PeerNotifySettings::PeerNotifySettings(resp)) => {
             let parsed = notify_settings_from_tl(&resp);
             let data = peer_notify_settings_from_tl(
                 &tl_enums::PeerNotifySettings::PeerNotifySettings(resp),
             );
             let data_scope = notify_scope_to_data_scope(scope);
-            let now = now_unix_i32();
             live.write_session(|session| session.set_notify_default(data_scope, Some(data), now));
             parsed
         }
@@ -1029,38 +1108,22 @@ pub fn fetch_scope_notify_live(live: &LiveSession, scope: NotifyScope) -> ScopeN
             ScopeNotifySettings::default()
         }
     };
-
-    let now = now_unix_i32();
-    let exceptions_already_loaded = live
-        .cache
-        .lock()
-        .map(|c| c.notify_exceptions_loaded.contains(&scope))
-        .unwrap_or(true);
-    if !exceptions_already_loaded {
-        // Match `NotifySettings::loadExceptions` (`data/notify/data_notify_settings.cpp:663-678`):
-        // only sets `Flag::f_peer` (`compare_sound: false, compare_stories: false`).
-        match live.invoke_rpc(tl_fns::account::GetNotifyExceptions {
-            compare_sound: false,
-            compare_stories: false,
-            peer: Some(notify_scope_to_tl(scope)),
-        }) {
-            Ok(updates) => {
-                apply_notify_exceptions_updates(live, updates, now);
-            }
-            Err(err) => {
-                debug!(?scope, error = %err, "account.getNotifyExceptions failed");
-            }
-        }
+    match exceptions {
+        Some(Ok(updates)) => apply_notify_exceptions_updates(live, updates, now),
+        Some(Err(err)) => debug!(?scope, error = %err, "account.getNotifyExceptions failed"),
+        None => {}
     }
 
     parsed.exceptions = collect_scope_exceptions(live, scope, now);
-    if let Ok(mut c) = live.cache.lock() {
+    if let Ok(mut c) = live.cache.lock()
+        && c.settings_reads.is_current(ticket)
+        && !c.scope_notify_loaded.contains(&scope)
+    {
         c.scope_notify_loaded.insert(scope);
         c.notify_exceptions_loaded.insert(scope);
-        c.scope_notify.insert(scope, parsed.clone());
+        c.scope_notify.insert(scope, parsed);
         c.notify_settings_version = c.notify_settings_version.wrapping_add(1);
     }
-    parsed
 }
 
 /// Saves scope notification defaults and diffs per-peer notification exceptions via

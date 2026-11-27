@@ -21,12 +21,13 @@ pub use media::{
     webpage_from_tl,
 };
 pub use messages::{
-    apply_tl_existing_message, apply_tl_message, entities_from_tl, entities_from_tl_with_self,
-    entities_to_tl, entities_to_tl_for_sending, forward_info_from_tl, inline_button_from_tl,
-    inline_query_peer_types_from_tl, input_reply_to_from_reply_info, keyboard_button_from_tl,
-    message_from_short_chat_message, message_from_short_message, message_from_tl,
-    message_peer_loaded, reply_info_from_tl, reply_markup_from_tl, short_chat_message_data_loaded,
-    short_message_data_loaded, text_with_entities_from_tl, text_with_entities_to_tl,
+    apply_tl_existing_message, apply_tl_message, entities_from_tl, entities_from_tl_for_text,
+    entities_from_tl_with_self, entities_to_tl, entities_to_tl_for_sending, forward_info_from_tl,
+    inline_button_from_tl, inline_query_peer_types_from_tl, input_reply_to_from_reply_info,
+    keyboard_button_from_tl, message_from_short_chat_message, message_from_short_message,
+    message_from_tl, message_peer_loaded, reply_info_from_tl, reply_markup_from_tl,
+    short_chat_message_data_loaded, short_message_data_loaded, text_with_entities_from_tl,
+    text_with_entities_to_tl,
 };
 pub use peers::{
     admin_rights_from_tl, admin_rights_to_tl, apply_tl_chat, apply_tl_chat_full, apply_tl_user,

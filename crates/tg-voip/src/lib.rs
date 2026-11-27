@@ -135,3 +135,6 @@ pub use video_rtp::{
     NAL_TYPE_IDR, NAL_TYPE_NON_IDR, NAL_TYPE_PPS, NAL_TYPE_SEI, NAL_TYPE_SPS, NAL_TYPE_STAP_A,
     join_annex_b_nalus, nal_unit_type, nalus_contain_keyframe, split_annex_b_nalus,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

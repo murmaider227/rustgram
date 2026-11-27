@@ -101,3 +101,6 @@ pub use signaling::{
     compute_msg_key, counter_from_seq, decrypt_ctr_envelope, decrypt_raw_mtproto2,
     derive_aes_key_iv, encrypt_ctr_envelope, encrypt_raw_mtproto2, prepare_aes_key_iv,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

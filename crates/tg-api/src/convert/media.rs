@@ -16,7 +16,7 @@ use tg_data::{
 use tg_tl::enums as tl_enums;
 use tg_tl::types as tl_types;
 
-use crate::convert::messages::{entities_from_tl, text_with_entities_from_tl};
+use crate::convert::messages::{entities_from_tl_for_text, text_with_entities_from_tl};
 use crate::convert::peers::peer_id_from_tl;
 
 /// Converts a TL `GeoPoint` into `Option<tg_data::GeoPoint>`.
@@ -585,7 +585,7 @@ pub fn message_media_from_tl(media: &tl_enums::MessageMedia) -> MessageMedia {
                         s.clone(),
                         res.solution_entities
                             .as_deref()
-                            .map(entities_from_tl)
+                            .map(|e| entities_from_tl_for_text(s, e, UserId::ZERO))
                             .unwrap_or_default(),
                     )
                 }),

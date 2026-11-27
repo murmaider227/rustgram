@@ -25,6 +25,14 @@ pub const GIVEAWAY_PERIOD_MAX_FALLBACK: i32 = 3600 * 24 * 7;
 /// Seconds in one 30-day boost month (`kMonthsDivider` in `api_statistics.cpp`).
 const BOOST_MONTH_SECS: i32 = 30 * 86_400;
 
+/// Whole months between a boost's `date` and `expires` (`expiresAfterMonths` in
+/// `api_statistics.cpp`). Computed in `i64`: server dates far apart would overflow `i32`.
+fn boost_months(date: i32, expires: i32) -> i32 {
+    let months = (i64::from(expires) - i64::from(date)) / i64::from(BOOST_MONTH_SECS);
+    // |expires - date| < 2^32, so the month count always fits.
+    i32::try_from(months).unwrap_or(0)
+}
+
 /// Formatted Telegram Premium subscription option (`Data::PremiumSubscriptionOption`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PremiumSubscriptionOption {
@@ -769,7 +777,7 @@ pub fn boosts_list_from_tl(
                 giveaway_message,
                 date: b.date,
                 expires_at: b.expires,
-                expires_after_months: (b.expires - b.date) / BOOST_MONTH_SECS,
+                expires_after_months: boost_months(b.date, b.expires),
                 gift_code_link,
                 multiplier: b.multiplier.unwrap_or(0),
                 credits: b.stars.unwrap_or(0).max(0) as u64,

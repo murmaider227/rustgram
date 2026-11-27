@@ -13,6 +13,12 @@ tg-style = { path = "../tg-style" }
 tg-text = { path = "../tg-text" }
 tg-theme = { path = "../tg-theme" }
 tg-video = { path = "../tg-video" }
+unicode-segmentation = "1.13"
+image = { version = "0.25.9", default-features = false, features = ["png"], optional = true }
+
+[features]
+# Software egui rasterizer for tests that write documentation screenshots (`soft_raster`).
+soft-raster = ["dep:image"]
 
 [dev-dependencies]
 image = { version = "0.25.9", default-features = false, features = ["png"] }

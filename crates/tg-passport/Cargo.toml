@@ -13,3 +13,6 @@ tg-tl = { path = "../tg-tl" }
 thiserror = "2.0"
 url = "2.5"
 zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }

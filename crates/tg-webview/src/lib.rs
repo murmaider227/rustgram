@@ -237,3 +237,6 @@ impl WebView {
         self.inner.close();
     }
 }
+
+#[cfg(test)]
+mod fuzz_untrusted;

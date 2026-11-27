@@ -851,6 +851,9 @@ fn live_session_peer_info_and_settings_rpcs() {
             ],
         }),
     );
+    // Settings reads answer at once and load in the background (TGB-3070).
+    let _ = h.live.active_sessions();
+    assert!(h.live.wait_settings_reads(Duration::from_secs(10)));
     let sessions = h.live.active_sessions();
     assert_eq!(sessions.len(), 2);
     assert_eq!(h.live.session_ttl_days(), 90);
@@ -877,6 +880,8 @@ fn live_session_peer_info_and_settings_rpcs() {
             stories_other_sound: None,
         }),
     );
+    let _ = h.live.scope_notifications(NotifyScope::PrivateChats);
+    assert!(h.live.wait_settings_reads(Duration::from_secs(10)));
     let scope = h.live.scope_notifications(NotifyScope::PrivateChats);
     assert!(scope.enabled);
     assert!(scope.show_preview);

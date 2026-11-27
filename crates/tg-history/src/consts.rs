@@ -23,6 +23,14 @@ use crate::geometry::{Margins, Point, Size};
 pub const FSIZE: i32 = 13;
 /// `emojiSize: 18px;` (`lib_ui/ui/basic.style:59`)
 pub const EMOJI_SIZE: i32 = 18;
+/// `st::largeEmojiSize` (`chat.style`): an emoji of an emoji-only message.
+pub const LARGE_EMOJI_SIZE: i32 = 36;
+/// `st::largeEmojiOutline`: the white outline around each large emoji.
+pub const LARGE_EMOJI_OUTLINE: i32 = 1;
+/// `st::largeEmojiSkip`: the step between large emoji, outlines included.
+pub const LARGE_EMOJI_SKIP: i32 = 4;
+/// `Ui::Text::kIsolatedEmojiLimit`: most emoji a message can have to be drawn large.
+pub const ISOLATED_EMOJI_LIMIT: usize = 3;
 /// `lineWidth: 1px;` (`lib_ui/ui/basic.style:62`)
 pub const LINE_WIDTH: i32 = 1;
 /// `roundRadiusLarge: 6px;` (`lib_ui/ui/basic.style:107`)

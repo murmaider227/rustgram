@@ -2,12 +2,14 @@
 //!
 //! Port of `Telegram/SourceFiles/_other/updater_win.cpp`.
 //! Waits for the main `rustgram.exe` process to exit, copies staged files from
-//! `tupdates/temp` into the installation directory (with automatic rollback on failure),
-//! cleans up `tupdates`, updates the Windows uninstall registry version, and relaunches
+//! `<working dir>/tupdates/temp` into the installation directory (with automatic rollback on
+//! failure), cleans up `tupdates`, updates the Windows uninstall registry version, and relaunches
 //! `rustgram.exe` with `-noupdate` plus forwarded flags (`-workdir`, `-key`, `-debug`,
 //! `-autostart`, `-startintray`).
 //! Release builds use the GUI subsystem (like tdesktop's `Updater.exe`), so applying an update
 //! never flashes a console window; `-debug` writes its log to a file instead.
+//! The working dir is `-workdir`, else the current directory (as in tdesktop, which the app sets to
+//! its working dir), else the app's default working dir when only that one holds a staged update.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -18,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tg_updater::apply::{SystemAppLauncher, SystemProcessWaiter, parse_args, run_updater};
+use tg_updater::apply::{
+    SystemAppLauncher, SystemProcessWaiter, parse_args, resolve_working_dir, run_updater,
+};
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().skip(1).collect();
@@ -42,10 +46,16 @@ fn main() -> ExitCode {
         .and_then(|p| p.parent().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let working_dir = parsed
-        .workdir
-        .clone()
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| exe_dir.clone()));
+    let current_dir = env::current_dir().unwrap_or_else(|_| exe_dir.clone());
+    let app_data = env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let (working_dir, working_dir_source) = resolve_working_dir(
+        parsed.workdir.as_deref(),
+        &current_dir,
+        &exe_dir,
+        app_data.as_deref(),
+    );
 
     let mut debug_log = if parsed.debug {
         open_debug_log(&working_dir)
@@ -55,8 +65,9 @@ fn main() -> ExitCode {
     write_debug_log(
         debug_log.as_mut(),
         &format!(
-            "rustgram-updater started: workdir='{}', install_dir='{}', need_update={}",
+            "rustgram-updater started: workdir='{}' ({working_dir_source:?}), current_dir='{}', install_dir='{}', need_update={}",
             working_dir.display(),
+            current_dir.display(),
             parsed
                 .write_protected_dir
                 .as_deref()

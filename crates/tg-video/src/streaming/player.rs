@@ -29,6 +29,11 @@ pub const LOAD_IN_ADVANCE_LOCAL_MS: i64 = 5_000;
 /// the network, before playback pauses for data (`Player::_pausedByWaitingForData`).
 pub const STARVE_GRACE_MS: i64 = 40;
 
+/// Most stale frames one [`StreamingPlayer::step_video`] skips to catch up with the clock. A
+/// synchronous decoder decodes each of them on the caller's thread, so the catch-up is bounded
+/// (about 2 s of 30 fps video).
+const MAX_CATCH_UP_FRAMES: usize = 64;
+
 /// Lifecycle stage of [`StreamingPlayer`] (mirrors `Player::Stage`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerStage {
@@ -52,7 +57,7 @@ pub struct StreamingPlayer<D: Decoder> {
     clock: SyncClock,
     video_queue: FrameQueue,
     audio_queue: VecDeque<AudioFrame>,
-    current_video_frame: Option<VideoFrame>,
+    current_video_frame: Option<Arc<VideoFrame>>,
     paused_by_user: bool,
     paused_by_waiting: bool,
     eof_reached: bool,
@@ -266,6 +271,15 @@ impl<D: Decoder> StreamingPlayer<D> {
     pub fn start(&mut self, world_now_ms: i64) {
         if self.stage == PlayerStage::Ready {
             self.stage = PlayerStage::Started;
+            // Like after a seek (tdesktop's seek restarts the `Player` the same way), hold the
+            // clock until the frame queue is full: a background decoder that has only the cover
+            // frame yet would otherwise see its next frames dropped as stale. On a busy PC its
+            // thread first ran ~0.5 s late and playback jumped from the cover to frame 9-16
+            // (TGB-3076). A synchronous decoder fills the queue in the first step.
+            if self.decoder.info().video.is_some() {
+                self.waiting_starved = true;
+                self.set_waiting_for_data(true, world_now_ms);
+            }
         }
         self.paused_by_user = false;
         if !self.paused_by_waiting {
@@ -427,14 +441,30 @@ impl<D: Decoder> StreamingPlayer<D> {
 
     /// Returns the most recently displayed video frame.
     #[must_use]
-    pub const fn current_video_frame(&self) -> Option<&VideoFrame> {
-        self.current_video_frame.as_ref()
+    pub fn current_video_frame(&self) -> Option<&VideoFrame> {
+        self.current_video_frame.as_deref()
+    }
+
+    /// Returns the most recently displayed video frame as a shared handle (no pixel copy).
+    #[must_use]
+    pub fn current_video_frame_shared(&self) -> Option<Arc<VideoFrame>> {
+        self.current_video_frame.clone()
     }
 
     /// Returns the current playback position on the media timeline at `world_now_ms`.
     #[must_use]
     pub fn position_ms(&self, world_now_ms: i64) -> i64 {
-        let raw = self.clock.track_time(world_now_ms).track_time_ms;
+        let mut raw = self.clock.track_time(world_now_ms).track_time_ms;
+        // While the frame queue is dry and a background decoder has nothing yet, the clock may
+        // run up to `STARVE_GRACE_MS` past the frame on screen before playback pauses, and it
+        // restarts at the next frame. Report no more than the end of the shown frame so the
+        // progress bar never steps back (tdesktop reports the presented frame's position).
+        if self.video_queue.is_empty()
+            && (self.decoder_pending || self.waiting_starved)
+            && self.current_video_frame.is_some()
+        {
+            raw = raw.min(self.video_position_ms + self.last_video_duration_ms.max(1));
+        }
         if self.options.loop_playback {
             let dur = self.total_duration_ms();
             if dur > 0 && dur != DURATION_UNAVAILABLE {
@@ -546,10 +576,14 @@ impl<D: Decoder> StreamingPlayer<D> {
             self.clock.sync_to_audio(point);
         }
         let track_now = self.clock.track_time(world_now_ms).track_time_ms;
-        let outcome = self.video_queue.pop_ready(track_now, self.options.speed);
+        let caught_up = self.catch_up(track_now)?;
+        let mut outcome = self.video_queue.pop_ready(track_now, self.options.speed);
+        if let FramePopOutcome::Ready { dropped, .. } = &mut outcome {
+            *dropped += caught_up;
+        }
         match &outcome {
             FramePopOutcome::Ready { frame, .. } => {
-                self.current_video_frame = Some(frame.clone());
+                self.current_video_frame = Some(Arc::clone(frame));
                 self.video_position_ms = frame.pts_ms;
                 self.last_video_duration_ms = frame.duration_ms;
                 let reported_pos = if self.options.loop_playback {
@@ -575,6 +609,24 @@ impl<D: Decoder> StreamingPlayer<D> {
         Ok(outcome)
     }
 
+    /// After the UI thread was late (a long layout, a busy machine), the whole frame queue can be
+    /// behind the clock. Drops stale frames and refills until the queue reaches the frame due at
+    /// `track_now`, so that frame is shown at once, as tdesktop's `prepareState` keeps reading
+    /// past stale frames; before, only one queue's worth (4 frames) was skipped per UI step and
+    /// the video ran visibly behind the clock for several steps. Returns the frames dropped.
+    fn catch_up(&mut self, track_now: i64) -> Result<usize> {
+        let mut dropped = 0;
+        while dropped < MAX_CATCH_UP_FRAMES && !self.eof_reached {
+            let step = self.video_queue.drop_stale(track_now);
+            if step == 0 {
+                break;
+            }
+            dropped += step;
+            self.fill_buffers()?;
+        }
+        Ok(dropped)
+    }
+
     /// Decodes and returns the next sequential video frame directly (ignoring wall-clock pacing).
     /// Useful for offline decoding, thumbnails, and the `play` CLI example.
     pub fn next_video_frame(&mut self) -> Result<Option<VideoFrame>> {
@@ -582,7 +634,7 @@ impl<D: Decoder> StreamingPlayer<D> {
             match self.decoder.next_frame()? {
                 DecodedPacket::Video(frame) => {
                     self.video_position_ms = frame.pts_ms;
-                    self.current_video_frame = Some(frame.clone());
+                    self.current_video_frame = Some(Arc::new(frame.clone()));
                     return Ok(Some(frame));
                 }
                 DecodedPacket::Audio(frame) => {
@@ -606,8 +658,13 @@ impl<D: Decoder> StreamingPlayer<D> {
     fn update_starvation(&mut self, world_now_ms: i64) {
         if self.waiting_starved {
             if !self.video_queue.needs_frame() || self.eof_reached {
-                if let Some(pts) = self.video_queue.front_pts() {
-                    self.clock.seek(pts, Some(world_now_ms));
+                // Restart half a frame into the first queued frame: it is due now and the next
+                // one half a frame later. Restarting exactly at its pts put every later UI
+                // step on a frame boundary, so +-1 ms of step jitter made one step show nothing
+                // and the next drop a frame (1080p60: a frame every 50 ms, TGB-3076).
+                if let Some(front) = self.video_queue.front() {
+                    let anchor = front.pts_ms + front.duration_ms.max(0) / 2;
+                    self.clock.seek(anchor, Some(world_now_ms));
                 }
                 self.waiting_starved = false;
                 self.set_waiting_for_data(false, world_now_ms);

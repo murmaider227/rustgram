@@ -31,6 +31,7 @@ mod tests_wp14;
 pub mod video_playback;
 pub mod video_sound;
 pub mod video_stream;
+pub mod video_volume;
 pub mod zoom;
 
 pub use backend::{AudioTrackMetadata, MediaBackend, MediaItem, MediaItemId, MediaItemKind};
@@ -69,6 +70,7 @@ pub use video_stream::{
     VideoStreamComment, VideoStreamDescriptor, VideoStreamDonor, VideoStreamQuality,
     VideoStreamStatus, VideoStreamViewer, is_theme_file, top_donor_places, top_video_stream_donors,
 };
+pub use video_volume::VideoVolumeSync;
 pub use zoom::{
     MAX_ZOOM_LEVEL, PINCH_ZOOM_STEP, ZOOM_TO_SCREEN_LEVEL, ZoomState, count_zoom_for,
     flip_size_by_rotation, normalize_rotation, zoom_value_to_scale,

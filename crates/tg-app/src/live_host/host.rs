@@ -624,6 +624,12 @@ impl LiveActiveWorkspace {
         self.update_and_render_live_overlays(ctx, &palette, theme_mode);
 
         // 9. Tick StoriesStore timers and render fullscreen StoryViewerOverlay when open.
+        self.stories_host.set_video_sound_output(Some(
+            self.controller
+                .main_widget()
+                .audio_player_bar()
+                .video_sound_output(),
+        ));
         self.stories_host.update_and_render(ctx, &palette);
         if let Some(mut stream_desc) = self.stories_host.viewer_mut().take_pending_video_stream() {
             let now_ms = self.controller.elapsed_ms();
@@ -2251,9 +2257,11 @@ impl LiveAppHost {
                     self.settings = bg.settings().clone();
                     drop(bg);
                 }
-                let _ = self.settings.save_to(&self.settings_path);
+                self.save_settings_on_exit();
                 with_manager(&intro_phase.manager, |mgr| {
-                    let _ = mgr.save_all_accounts();
+                    if let Err(err) = mgr.save_all_accounts() {
+                        warn!(error = %err, "failed to save accounts on exit");
+                    }
                     mgr.shutdown();
                 });
                 intro_phase.rt.shutdown_timeout(Duration::from_secs(2));
@@ -2261,13 +2269,20 @@ impl LiveAppHost {
             LivePhase::PasscodeRequired {
                 mut manager, rt, ..
             } => {
-                let _ = self.settings.save_to(&self.settings_path);
+                self.save_settings_on_exit();
                 manager.shutdown();
                 rt.shutdown_timeout(Duration::from_secs(2));
             }
             LivePhase::MissingCredentials { .. } | LivePhase::BootstrapError { .. } => {
-                let _ = self.settings.save_to(&self.settings_path);
+                self.save_settings_on_exit();
             }
+        }
+    }
+
+    /// Writes the shell settings on exit; a failed write is logged, not dropped.
+    fn save_settings_on_exit(&self) {
+        if let Err(err) = self.settings.save_to(&self.settings_path) {
+            warn!(error = %err, "failed to save settings on exit");
         }
     }
 

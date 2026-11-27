@@ -193,6 +193,12 @@ impl EntityInText {
         self.length
     }
 
+    /// Returns `offset + length`, saturating instead of overflowing on hostile values.
+    #[inline]
+    pub fn end(&self) -> i32 {
+        self.offset.saturating_add(self.length)
+    }
+
     /// Returns the entity payload (`data`), e.g. URL, code language, custom emoji ID, or `"1"` for collapsed blockquote.
     #[inline]
     pub fn data(&self) -> &str {
@@ -236,22 +242,22 @@ impl EntityInText {
     /// Extends the entity to the left by `extent` UTF-16 code units (`extendToLeft`).
     #[inline]
     pub fn extend_to_left(&mut self, extent: i32) {
-        self.offset -= extent;
-        self.length += extent;
+        self.offset = self.offset.saturating_sub(extent);
+        self.length = self.length.saturating_add(extent);
     }
 
     /// Shrinks the entity from the right by `shrink` UTF-16 code units (`shrinkFromRight`).
     #[inline]
     pub fn shrink_from_right(&mut self, shrink: i32) {
-        self.length -= shrink;
+        self.length = self.length.saturating_sub(shrink);
     }
 
     /// Shifts the entity left by `shift` UTF-16 code units, clamping at 0 (`shiftLeft`).
     #[inline]
     pub fn shift_left(&mut self, shift: i32) {
-        self.offset -= shift;
+        self.offset = self.offset.saturating_sub(shift);
         if self.offset < 0 {
-            self.length += self.offset;
+            self.length = self.length.saturating_add(self.offset);
             self.offset = 0;
             if self.length < 0 {
                 self.length = 0;
@@ -262,7 +268,7 @@ impl EntityInText {
     /// Shifts the entity right by `shift` UTF-16 code units (`shiftRight`).
     #[inline]
     pub fn shift_right(&mut self, shift: i32) {
-        self.offset += shift;
+        self.offset = self.offset.saturating_add(shift);
     }
 
     /// Clamps the entity's end to `text_end` UTF-16 code units (`updateTextEnd`).
@@ -271,8 +277,8 @@ impl EntityInText {
         if self.offset > text_end {
             self.offset = text_end;
             self.length = 0;
-        } else if self.offset + self.length > text_end {
-            self.length = text_end - self.offset;
+        } else if self.end() > text_end {
+            self.length = text_end.saturating_sub(self.offset);
         }
     }
 
@@ -543,10 +549,10 @@ pub fn merge_and_sort_entities(entities: EntitiesInText) -> EntitiesInText {
             && let Some(prev) = result.iter_mut().rev().find(|p| {
                 p.entity_type() == entity.entity_type()
                     && p.data() == entity.data()
-                    && p.offset() + p.length() >= entity.offset()
+                    && p.end() >= entity.offset()
             })
         {
-            let new_end = (prev.offset() + prev.length()).max(entity.offset() + entity.length());
+            let new_end = prev.end().max(entity.end());
             prev.length = new_end - prev.offset();
             continue;
         }
@@ -655,7 +661,7 @@ impl TextForMimeData {
             )
             .unwrap_or("");
             if !data.starts_with("internal:") && data != encode_for_opening(entity_slice) {
-                let till_u16 = (entity.offset() + entity.length()) as usize;
+                let till_u16 = entity.end().max(0) as usize;
                 if till_u16 > from_u16 {
                     if let Some(chunk) = slice_utf16(&text.text, from_u16, till_u16 - from_u16) {
                         result.expanded.push_str(chunk);

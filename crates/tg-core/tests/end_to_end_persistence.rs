@@ -535,7 +535,7 @@ fn legacy_no_passcode_key_datas_and_pre_multi_account_map_paths() {
         let salt = [0x3Au8; LOCAL_ENCRYPT_SALT_SIZE];
         let wrap_key = create_legacy_local_key(b"", &salt);
         let local_key = AuthKey::new([0x77u8; 256]);
-        let key_enc = prepare_encrypted(&local_key.data, &wrap_key).expect("wrap key");
+        let key_enc = prepare_encrypted(local_key.data(), &wrap_key).expect("wrap key");
 
         let map_payload = QDataStreamWriter::new();
         let map_enc = prepare_encrypted(map_payload.as_bytes(), &local_key).expect("enc map");

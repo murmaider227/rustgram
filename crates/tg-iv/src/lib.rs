@@ -76,3 +76,6 @@ pub use serve::{
     DEFAULT_IV_CSP, IvServer, MediaBlob, MediaProvider, MemoryMediaStore, RangeParse,
     ResourceResponse, parse_range_header,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

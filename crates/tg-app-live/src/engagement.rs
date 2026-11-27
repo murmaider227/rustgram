@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tg_api::RpcClient;
 use tg_api::convert::{
@@ -59,16 +59,18 @@ const ENGAGEMENT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`readMentions`, `readReactions`, `readPollVotes`).
 const MAX_AFFECTED_HISTORY_LOOPS: usize = 64;
 
+/// Milliseconds on a clock that never goes back (`crl::now()`): the debounce deadlines below
+/// must not move when the wall clock is changed.
 fn monotonic_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+    static START: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Per-peer pending `messages.getExtendedMedia` batch (`ViewsManager::PollExtendedMediaRequest`).
 #[derive(Debug, Default)]
 struct PendingExtendedMediaPoll {
-    when_ms: u64,
+    /// When the batch is due; `None` until it is scheduled.
+    when_ms: Option<u64>,
     ids: BTreeSet<MsgId>,
     forced: bool,
 }
@@ -158,6 +160,17 @@ fn state_for_live(live: &LiveSession) -> Arc<Mutex<LiveEngagementState>> {
     let state = state_for_session_arc(session);
     ensure_updates_listener(live, &state, Arc::downgrade(session));
     state
+}
+
+/// Test hook: gives every scope in `scopes` a cached unread-reactions count, as a loaded
+/// `messages.getUnreadReactions` page would.
+#[cfg(test)]
+pub(crate) fn seed_unread_reaction_scopes(live: &LiveSession, scopes: &[UnreadThingsScope]) {
+    let state = state_for_live(live);
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    for scope in scopes {
+        guard.unread_reactions.entry(*scope).or_default().count = Some(1);
+    }
 }
 
 /// Attaches the background `subscribe_updates()` listener for WP-53 engagement updates
@@ -601,9 +614,9 @@ pub(crate) fn poll_extended_media(
         }
         if force {
             req.forced = true;
-            req.when_ms = now;
-        } else if req.when_ms == 0 {
-            req.when_ms = now.saturating_add(POLL_EXTENDED_MEDIA_PERIOD_MS);
+            req.when_ms = Some(now);
+        } else if req.when_ms.is_none() {
+            req.when_ms = Some(now.saturating_add(POLL_EXTENDED_MEDIA_PERIOD_MS));
         }
     }
     if force {
@@ -628,7 +641,10 @@ pub(crate) fn flush_extended_media_polls(
         let peers: Vec<PeerId> = guard
             .extended_media_polls
             .iter()
-            .filter(|(_, req)| !req.ids.is_empty() && (force || req.forced || req.when_ms <= now))
+            .filter(|(_, req)| {
+                !req.ids.is_empty()
+                    && (force || req.forced || req.when_ms.is_none_or(|due| due <= now))
+            })
             .map(|(&pid, _)| pid)
             .collect();
         for pid in peers {
@@ -649,11 +665,11 @@ pub(crate) fn flush_extended_media_polls(
                 if req.ids.is_empty() {
                     guard.extended_media_polls.remove(&pid);
                 } else {
-                    req.when_ms = now.saturating_add(if req.forced {
+                    req.when_ms = Some(now.saturating_add(if req.forced {
                         1
                     } else {
                         POLL_EXTENDED_MEDIA_PERIOD_MS
-                    });
+                    }));
                 }
             }
         }
@@ -1233,64 +1249,94 @@ pub(crate) fn mark_visible_reactions_read(
     let marked_ui: Vec<MsgId> = marked_data.iter().copied().map(from_data_msg).collect();
 
     // Synchronize `LiveEngagementState`'s cached unread_reactions counters / loaded_ids so
-    // `unread_things_counts(scope)` immediately reflects the newly read reactions.
-    {
-        let state = state_for_live(live);
+    // `unread_things_counts(scope)` immediately reflects the newly read reactions. The state is
+    // locked inside the session read, the same order as the updates listener (session write lock,
+    // then state): waiting for the session while holding the state deadlocked with it.
+    let state = state_for_live(live);
+    live.read_session(|session| {
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        let matching_scopes: Vec<UnreadThingsScope> = guard
+        for (scope, entry) in guard
             .unread_reactions
-            .keys()
-            .copied()
-            .filter(|s| s.peer_id == peer_id)
-            .collect();
-        for scope in matching_scopes {
-            let new_session_count = live.read_session(|session| {
-                if let Some(top_id) = scope.top_msg_id {
-                    session
-                        .forum(data_peer)
-                        .and_then(|f| f.topic(to_data_msg(top_id)))
-                        .map_or(0, |t| t.unread_reactions_count)
-                } else if let Some(saved_peer) = scope.saved_peer_id {
-                    let saved_data = to_data_peer(saved_peer);
-                    if let Some(ch_id) = data_peer.to_channel() {
-                        session
-                            .monoforum(ch_id)
-                            .and_then(|m| m.sublist(saved_data))
-                            .map_or(0, |s| s.unread_reactions_count)
-                    } else {
-                        session
-                            .saved_messages()
-                            .sublist(saved_data)
-                            .map_or(0, |s| s.unread_reactions_count)
-                    }
-                } else {
-                    session
-                        .history(data_peer)
-                        .map_or(0, |h| h.unread_reactions_count)
-                }
-            });
-            if let Some(entry) = guard.unread_reactions.get_mut(&scope) {
-                for id in &marked_ui {
-                    entry.loaded_ids.remove(id);
-                }
-                if entry.count.is_some() {
-                    entry.count = Some(new_session_count.max(0));
-                }
+            .iter_mut()
+            .filter(|(scope, _)| scope.peer_id == peer_id)
+        {
+            for id in &marked_ui {
+                entry.loaded_ids.remove(id);
+            }
+            if entry.count.is_some() {
+                entry.count = Some(scope_unread_reactions(session, data_peer, scope).max(0));
             }
         }
-    }
+    });
     live.bridge_state().notify_ui();
 
-    if let Some(channel) = live.input_channel(peer_id) {
-        let req = tg_api::channels::build_read_channel_message_contents(channel, &marked_data);
-        let _ = invoke_rpc(live, req)?;
-    } else {
-        let req = tg_api::channels::build_read_common_message_contents(&marked_data);
-        let tl_enums::messages::AffectedMessages::AffectedMessages(aff) = invoke_rpc(live, req)?;
-        let _ = live.apply_affected_history(None, aff.pts, aff.pts_count);
-    }
+    // `ApiWrap::markContentsRead` (`apiwrap.cpp:1478-1508`): the local state changed above and
+    // the request goes out without the UI waiting for it, ordered with read receipts and typing.
+    let channel = live.input_channel(peer_id);
+    let runtime = Arc::clone(live.runtime());
+    live.ui_rpc.push(async move {
+        let rpc = runtime.rpc().clone();
+        let sent = if let Some(channel) = channel {
+            let req = tg_api::channels::build_read_channel_message_contents(channel, &marked_data);
+            with_rpc_timeout(
+                ENGAGEMENT_RPC_TIMEOUT,
+                async move { rpc.invoke(&req).await },
+            )
+            .await
+            .map(|_| ())
+        } else {
+            let req = tg_api::channels::build_read_common_message_contents(&marked_data);
+            match with_rpc_timeout(
+                ENGAGEMENT_RPC_TIMEOUT,
+                async move { rpc.invoke(&req).await },
+            )
+            .await
+            {
+                Ok(tl_enums::messages::AffectedMessages::AffectedMessages(aff)) => runtime
+                    .apply_affected_history(None, aff.pts, aff.pts_count)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(err) => Err(err),
+            }
+        };
+        if let Err(err) = sent {
+            debug!(peer = peer_id.0, error = %err, "readMessageContents failed");
+        }
+    });
 
     Ok(marked_ui)
+}
+
+/// Unread reactions of `scope` (a forum topic, a saved sublist or the main history) as the
+/// session counts them.
+fn scope_unread_reactions(
+    session: &Session,
+    data_peer: DataPeerId,
+    scope: &UnreadThingsScope,
+) -> i32 {
+    if let Some(top_id) = scope.top_msg_id {
+        session
+            .forum(data_peer)
+            .and_then(|f| f.topic(to_data_msg(top_id)))
+            .map_or(0, |t| t.unread_reactions_count)
+    } else if let Some(saved_peer) = scope.saved_peer_id {
+        let saved_data = to_data_peer(saved_peer);
+        if let Some(ch_id) = data_peer.to_channel() {
+            session
+                .monoforum(ch_id)
+                .and_then(|m| m.sublist(saved_data))
+                .map_or(0, |s| s.unread_reactions_count)
+        } else {
+            session
+                .saved_messages()
+                .sublist(saved_data)
+                .map_or(0, |s| s.unread_reactions_count)
+        }
+    } else {
+        session
+            .history(data_peer)
+            .map_or(0, |h| h.unread_reactions_count)
+    }
 }
 
 /// Marks all unread poll votes read via `messages.readPollVotes`, looping while

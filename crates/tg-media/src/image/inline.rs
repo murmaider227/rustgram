@@ -490,6 +490,7 @@ pub fn parse_svg_path(expanded: &str) -> Result<VectorPath> {
             let cmd = peek(pos);
             pos += 1;
             loop {
+                let coords_start = pos;
                 if cmd == b'm' {
                     x += get_number(&mut pos);
                     y += get_number(&mut pos);
@@ -501,6 +502,9 @@ pub fn parse_svg_path(expanded: &str) -> Result<VectorPath> {
                 let next = peek(pos);
                 if next == 0 || is_alpha(next) {
                     break;
+                }
+                if pos == coords_start {
+                    return Err(stuck_at(expanded, pos));
                 }
             }
         }
@@ -519,6 +523,7 @@ pub fn parse_svg_path(expanded: &str) -> Result<VectorPath> {
 
         while !is_closed {
             skip_commas(&mut pos);
+            let iteration_start = pos;
             let ch = peek(pos);
             if ch == 0 {
                 return Err(MediaError::InvalidInlineData(format!(
@@ -611,10 +616,21 @@ pub fn parse_svg_path(expanded: &str) -> Result<VectorPath> {
                     )));
                 }
             }
+            // A character outside the path alphabet repeats the last command without consuming
+            // anything; without this check the loop pushed commands forever (TGB-3085).
+            if !is_closed && pos == iteration_start {
+                return Err(stuck_at(expanded, pos));
+            }
         }
     }
 
     Ok(VectorPath { commands })
+}
+
+fn stuck_at(expanded: &str, pos: usize) -> MediaError {
+    MediaError::InvalidInlineData(format!(
+        "unexpected character at pos {pos} in SVG path: {expanded}"
+    ))
 }
 
 #[cfg(test)]
@@ -656,5 +672,59 @@ mod tests {
             bottom.iter().take(3).all(|&c| c > 200),
             "bottom band must stay white (no vertical flip): {bottom:?}"
         );
+    }
+
+    /// TGB-3085: a character outside the path alphabet used to repeat the last command without
+    /// consuming input, so `"M0l%"` pushed `LineTo` until the allocator aborted and `"M0%"`
+    /// spun in the move-to loop.
+    #[test]
+    fn svg_path_with_a_foreign_character_is_an_error_not_a_hang() {
+        for input in [
+            "M0l%",
+            "M0%",
+            "M1,2l3,4%",
+            "M0,0c1,1,2,2,3,3#",
+            "M0,0l,,,%",
+            "M0l-%",
+        ] {
+            assert!(
+                matches!(parse_svg_path(input), Err(MediaError::InvalidInlineData(_))),
+                "{input:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn svg_path_parses_valid_paths() {
+        let path = parse_svg_path("M1,2l3,4h1v-1z").expect("valid path");
+        assert_eq!(
+            path.commands,
+            vec![
+                PathCommand::MoveTo { x: 1.0, y: 2.0 },
+                PathCommand::LineTo { x: 4.0, y: 6.0 },
+                PathCommand::LineTo { x: 5.0, y: 6.0 },
+                PathCommand::LineTo { x: 5.0, y: 5.0 },
+                PathCommand::LineTo { x: 1.0, y: 2.0 },
+            ]
+        );
+        let two = parse_svg_path("M0,0l1,0zM5,5l0,1z").expect("two subpaths");
+        assert_eq!(
+            two.commands
+                .iter()
+                .filter(|c| matches!(c, PathCommand::MoveTo { .. }))
+                .count(),
+            2
+        );
+    }
+
+    /// Every path the inline-bytes expansion can produce still parses (it emits only letters,
+    /// digits, `.`, `-` and `,`).
+    #[test]
+    fn expanded_inline_bytes_still_parse() {
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let expanded = expand_path_inline_bytes(&bytes);
+        let _ = parse_svg_path(&expanded);
+        let sample = [0x80u8 + 12, 0x03, 0x05, 0xC0 + 3, 0x80 + 1, 0x2a];
+        let _ = parse_svg_path(&expand_path_inline_bytes(&sample));
     }
 }

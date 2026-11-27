@@ -1620,8 +1620,12 @@ pub fn text_with_entities_to_markdown(source: &TextWithEntities) -> String {
         if !ent.valid_for_text(text_u16_len) {
             continue;
         }
-        let s_u16 = ent.offset() as usize;
-        let e_u16 = (ent.offset() + ent.length()) as usize;
+        let (Ok(s_u16), Ok(len_u16)) =
+            (usize::try_from(ent.offset()), usize::try_from(ent.length()))
+        else {
+            continue;
+        };
+        let e_u16 = s_u16.saturating_add(len_u16);
         let (Some(start), Some(end)) = (
             utf16_to_utf8_offset(&source.text, s_u16),
             utf16_to_utf8_offset(&source.text, e_u16),
@@ -1767,3 +1771,8 @@ pub fn animated_reaction_lottie_json(emoji: &str) -> String {
         secondary[3],
     )
 }
+
+#[cfg(test)]
+#[path = "sections_model_tests.rs"]
+#[cfg(test)]
+mod tests;

@@ -28,7 +28,7 @@ pub fn round_ruler_max(max_value: ChartValue) -> ChartValue {
     if k % 10 == 0 {
         max_value
     } else {
-        (max_value / 10 + 1) * 10
+        (max_value / 10).saturating_add(1).saturating_mul(10)
     }
 }
 
@@ -125,12 +125,12 @@ impl ChartRulersData {
                 },
             );
             for (i, line) in lines.iter_mut().enumerate().take(n as usize).skip(1) {
-                let abs_val = (i as ChartValue) * step;
+                let abs_val = (i as ChartValue).saturating_mul(step);
                 line.absolute_value = abs_val as f64;
                 line.caption = format_count_to_short(abs_val, false).string;
             }
         } else {
-            let diff = new_max_height - new_min_height;
+            let diff = new_max_height.saturating_sub(new_min_height);
             let (n, step): (ChartValue, f64) = if diff == 0 {
                 new_min_height -= 1;
                 (MAX_LINES / 2, 1.0)
@@ -139,9 +139,9 @@ impl ChartRulersData {
             } else if diff / 2 < MAX_LINES {
                 (diff / 2 + diff % 2 + 1, 2.0)
             } else {
-                let s = (new_max_height - new_min_height) as f64 / STEP_DIVISOR;
+                let s = diff as f64 / STEP_DIVISOR;
                 if s <= 0.0 {
-                    ((new_max_height - new_min_height + 1).max(MIN_LINES), 1.0)
+                    (diff.saturating_add(1).max(MIN_LINES), 1.0)
                 } else {
                     (6, s)
                 }
@@ -153,7 +153,7 @@ impl ChartRulersData {
             lines.reserve(n as usize);
             for i in 0..(n as usize) {
                 let value = ((i as f64) * step) as ChartValue;
-                let abs_int = new_min_height + value;
+                let abs_int = new_min_height.saturating_add(value);
                 let abs_f = abs_int as f64;
                 let relative_value = if diff_absolute_value == 0 {
                     1.0

@@ -142,7 +142,7 @@ pub fn fill_auth_key_data(computed: &[u8]) -> Result<[u8; AUTH_KEY_SIZE], DhErro
     let key = AuthKey::from_bytes(computed).map_err(|_| DhError::AuthKeyTooLarge {
         actual: computed.len(),
     })?;
-    Ok(key.data)
+    Ok(*key.data())
 }
 
 /// Compute the 64-bit call key fingerprint: lower 64 bits (`hash[12..20]`, little-endian)

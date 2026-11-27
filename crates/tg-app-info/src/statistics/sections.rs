@@ -956,26 +956,5 @@ pub fn render_show_more_button(ui: &mut Ui, label: &str, palette: &ChartPalette)
 /// Elides text with `"…"` so it fits within `max_width` in `font`.
 #[must_use]
 pub fn elide_text(ui: &Ui, text: &str, font: FontId, max_width: f32) -> String {
-    let full_w = ui.fonts_mut(|f| {
-        f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
-            .size()
-            .x
-    });
-    if full_w <= max_width {
-        return text.to_owned();
-    }
-    let mut chars: Vec<char> = text.chars().collect();
-    while !chars.is_empty() {
-        chars.pop();
-        let candidate: String = chars.iter().collect::<String>() + "…";
-        let w = ui.fonts_mut(|f| {
-            f.layout_no_wrap(candidate.clone(), font.clone(), Color32::WHITE)
-                .size()
-                .x
-        });
-        if w <= max_width {
-            return candidate;
-        }
-    }
-    "…".to_owned()
+    crate::elide::elide_end(ui.painter(), text, &font, max_width)
 }

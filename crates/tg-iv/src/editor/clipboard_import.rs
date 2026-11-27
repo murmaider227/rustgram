@@ -213,7 +213,10 @@ pub fn resolve_local_media(source: &str, base_path: Option<&Path>) -> Option<Imp
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("file:") {
+    if trimmed
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
         let local = file_url_to_local_path(trimmed)?;
         if is_network_path(&local) {
             return None;
@@ -882,7 +885,10 @@ impl HtmlImportContext {
         if self.local_media.len() >= IMPORTED_MEDIA_PLACEHOLDER_LIMIT {
             return None;
         }
-        let media = if source.len() >= 5 && source[..5].eq_ignore_ascii_case("data:") {
+        let media = if source
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+        {
             let content = data_uri_image_content(source)?;
             ImportedLocalMedia {
                 path: String::new(),

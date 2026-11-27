@@ -1072,6 +1072,24 @@ fn paint_message_element_internal(
         }
     }
 
+    // 3b. A message of only 1-3 emoji: large emoji without a bubble (`LargeEmoji::draw`).
+    let large_emoji = (msg.media.is_none() && layout.unwrapped && !layout.media_rect.is_empty())
+        .then(|| crate::history::large_emoji::isolated_emoji(&msg.text))
+        .flatten();
+    if let Some(ref emoji) = large_emoji {
+        let row = tg_history::large_emoji_inner_rect(
+            layout.media_rect,
+            emoji.len(),
+            layout.has_right_layout,
+        );
+        crate::history::large_emoji::paint_large_emoji(
+            ui.ctx(),
+            ui.painter(),
+            emoji,
+            hist_rect_to_egui(row, origin.x, origin.y),
+        );
+    }
+
     // 4. Rich document message blocks + formulas OR standard formatted message body.
     if let Some(ref rich_payload) = msg.extra.rich_message
         && !layout.text_rect.is_empty()
@@ -1491,7 +1509,23 @@ fn paint_message_element_internal(
     }
 
     // 6. Bottom info bar (views, edited, time, outgoing sent/read ticks).
-    if !layout.bottom_info_rect.is_empty() {
+    // `UnwrappedMedia::needInfoDisplay`: the time of an incoming large emoji message shows on
+    // hover, a right-aligned one always (`LargeEmoji::alwaysShowOutTimestamp`).
+    let info_hidden = large_emoji.is_some()
+        && !layout.has_right_layout
+        && !msg.is_sending
+        && !msg.extra.send_failed
+        && !ui.ctx().pointer_hover_pos().is_some_and(|pos| {
+            Rect::from_min_size(
+                origin,
+                Vec2::new(
+                    layout.current_size.width as f32,
+                    layout.current_size.height as f32,
+                ),
+            )
+            .contains(pos)
+        });
+    if !layout.bottom_info_rect.is_empty() && !info_hidden {
         let info_rect = hist_rect_to_egui(layout.bottom_info_rect, origin.x, origin.y);
         crate::history::bubble_info::paint_bottom_info(
             ui.painter(),

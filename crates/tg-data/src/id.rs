@@ -705,6 +705,18 @@ impl MsgId {
         self.0 > SHORTCUT_MAX_MSG_ID.0 && self.0 < WELCOME_MAX_MSG_ID.0
     }
 
+    /// Converts a regular server message ID to the 32-bit TL `int` the API expects; `None` for
+    /// local, scheduled, story and other client-side IDs, whose low 32 bits would name an
+    /// unrelated server message (client index `k` truncates to server ID `k + 1`).
+    #[inline]
+    pub const fn server_i32(self) -> Option<i32> {
+        if self.is_server() && self.0 <= i32::MAX as i64 {
+            Some(self.0 as i32)
+        } else {
+            None
+        }
+    }
+
     /// Converts to a 32-bit TL `int` if in `i32` range.
     #[inline]
     pub const fn as_i32(self) -> Option<i32> {

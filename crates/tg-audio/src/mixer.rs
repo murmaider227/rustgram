@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::dsp::{Resampler, TimeStretcher, soft_clip, to_stereo_f32};
+use crate::dsp::{Resampler, TimeStretcher, soft_clip, to_stereo_into};
 use crate::error::AudioResult;
 use crate::sound_track::{SoundTrack, SoundTrackId};
 use crate::types::{
@@ -173,6 +173,11 @@ struct MixerTrack {
     pcm_queue: VecDeque<f32>,
     eof_reached: bool,
     stretcher_flushed: bool,
+    /// Per-chunk scratch: stereo fold, 48 kHz resample and time-stretch output. Reused so a
+    /// decoded chunk costs no allocation on the audio thread.
+    scratch_stereo: Vec<f32>,
+    scratch_48k: Vec<f32>,
+    scratch_stretched: Vec<f32>,
 }
 
 impl Default for MixerTrack {
@@ -190,6 +195,9 @@ impl Default for MixerTrack {
             pcm_queue: VecDeque::new(),
             eof_reached: false,
             stretcher_flushed: false,
+            scratch_stereo: Vec::new(),
+            scratch_48k: Vec::new(),
+            scratch_stretched: Vec::new(),
         }
     }
 }
@@ -250,9 +258,10 @@ impl MixerTrack {
                     if chunk.samples.is_empty() {
                         continue;
                     }
-                    let stereo = to_stereo_f32(&chunk.samples, chunk.channels);
-                    let at_48k = if chunk.sample_rate == DEFAULT_FREQUENCY {
-                        stereo
+                    self.scratch_stereo.clear();
+                    to_stereo_into(&chunk.samples, chunk.channels, &mut self.scratch_stereo);
+                    let at_48k: &[f32] = if chunk.sample_rate == DEFAULT_FREQUENCY {
+                        &self.scratch_stereo
                     } else {
                         let resampler = self.resampler.get_or_insert_with(|| {
                             Resampler::new(chunk.sample_rate, DEFAULT_FREQUENCY, 2)
@@ -260,17 +269,18 @@ impl MixerTrack {
                         if resampler.in_rate() != chunk.sample_rate {
                             *resampler = Resampler::new(chunk.sample_rate, DEFAULT_FREQUENCY, 2);
                         }
-                        let mut out = Vec::new();
-                        resampler.process(&stereo, &mut out);
-                        out
+                        self.scratch_48k.clear();
+                        resampler.process(&self.scratch_stereo, &mut self.scratch_48k);
+                        &self.scratch_48k
                     };
 
                     if equal_speeds(self.speed, 1.0) {
-                        self.pcm_queue.extend(at_48k);
+                        self.pcm_queue.extend(at_48k.iter().copied());
                     } else {
-                        let mut stretched = Vec::new();
-                        self.stretcher.process(&at_48k, &mut stretched);
-                        self.pcm_queue.extend(stretched);
+                        self.scratch_stretched.clear();
+                        self.stretcher.process(at_48k, &mut self.scratch_stretched);
+                        self.pcm_queue
+                            .extend(self.scratch_stretched.iter().copied());
                     }
                 }
                 Ok(None) => {

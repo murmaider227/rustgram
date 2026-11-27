@@ -447,6 +447,19 @@ pub fn safe_round(value: f64) -> i32 {
     }
 }
 
+/// `a * b / c` computed in 64 bits, saturated to the `i32` range (`0` when `c` is zero).
+///
+/// Ports `int(qint64(a) * b / c)`, whose cast wraps a large product around to a negative size
+/// (a 1×16777216 picture alone in an album gave a tile of height -1375731712).
+#[must_use]
+pub fn mul_div(a: i32, b: i32, c: i32) -> i32 {
+    if c == 0 {
+        return 0;
+    }
+    let value = i64::from(a) * i64::from(b) / i64::from(c);
+    i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
+}
+
 /// Clamps width and height to at least 1 pixel (`HistoryView::NonEmptySize`).
 #[must_use]
 pub fn non_empty_size(size: Size) -> Size {

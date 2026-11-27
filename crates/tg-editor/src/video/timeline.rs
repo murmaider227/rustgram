@@ -441,7 +441,8 @@ pub fn parse_stamp(text: &str) -> Option<i64> {
         return None;
     }
     let digits_len = frac_str.len().min(STAMP_PRECISION);
-    let digits = &frac_str[..digits_len];
+    // `get`: the field is free text, so the cut can fall inside a multibyte character.
+    let digits = frac_str.get(..digits_len)?;
     let mut ms: i64 = if digits.is_empty() {
         0
     } else {

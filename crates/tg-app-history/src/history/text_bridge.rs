@@ -17,12 +17,13 @@ pub fn entities_to_rich_text(source: &TextWithEntities) -> RichText {
         if !entity.valid_for_text(text_u16_len) {
             continue;
         }
-        let start_u16 = entity.offset() as usize;
-        let end_u16 = (entity.offset() + entity.length()) as usize;
-        let Some(start) = utf16_to_utf8_offset(&source.text, start_u16) else {
+        let Some(range) = tg_ui::entity_bounds::entity_utf16_range(entity, text_u16_len) else {
             continue;
         };
-        let Some(end) = utf16_to_utf8_offset(&source.text, end_u16) else {
+        let Some(start) = utf16_to_utf8_offset(&source.text, range.start) else {
+            continue;
+        };
+        let Some(end) = utf16_to_utf8_offset(&source.text, range.end) else {
             continue;
         };
         if end <= start {

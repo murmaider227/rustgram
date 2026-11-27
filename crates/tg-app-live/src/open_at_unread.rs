@@ -29,10 +29,18 @@ pub(crate) fn first_open_needs_load(
     already_opened: bool,
     unread_missing: bool,
 ) -> bool {
-    if ranges.is_empty() || unread_missing {
+    if unread_missing {
         return true;
     }
-    if already_opened || (ranges.loaded_at_top() && ranges.loaded_at_bottom()) {
+    // A complete history needs no page, also when the chat has no messages: tdesktop's
+    // `isReadyFor(ShowAtUnreadMsgId)` is `loadedAtBottom()` there (TGB-3079).
+    if ranges.loaded_at_top() && ranges.loaded_at_bottom() {
+        return false;
+    }
+    if ranges.is_empty() {
+        return true;
+    }
+    if already_opened {
         return false;
     }
     ranges
@@ -94,5 +102,32 @@ mod tests {
             Some(3),
         );
         assert!(!first_open_needs_load(&whole, false, false));
+    }
+
+    #[test]
+    fn a_complete_empty_history_needs_no_page() {
+        let mut empty = SparseIdsList::new();
+        empty.add_slice(
+            std::iter::empty(),
+            MsgRange::new(DataMsgId(0), SERVER_MAX_MSG_ID),
+            Some(0),
+        );
+        assert!(empty.is_empty());
+        assert!(!first_open_needs_load(&empty, false, false));
+        assert!(
+            first_open_needs_load(&empty, false, true),
+            "unread not loaded"
+        );
+
+        let mut bottom_only = SparseIdsList::new();
+        bottom_only.add_slice(
+            std::iter::empty(),
+            MsgRange::new(DataMsgId(50), SERVER_MAX_MSG_ID),
+            None,
+        );
+        assert!(
+            first_open_needs_load(&bottom_only, false, false),
+            "older messages may exist"
+        );
     }
 }

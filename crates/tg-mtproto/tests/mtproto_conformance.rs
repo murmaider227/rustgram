@@ -565,7 +565,7 @@ async fn dh_exchange_persistent_key_matches_independent_spec_server() {
 
     assert_eq!(managed.key_type, AuthKeyType::Generated);
     assert_eq!(managed.expires_at, None);
-    assert_eq!(managed.key.data, server_res.auth_key);
+    assert_eq!(*managed.key.data(), server_res.auth_key);
     assert_eq!(managed.key_id(), server_res.auth_key_id);
     assert_eq!(initial_salt, server_res.initial_salt);
     assert_eq!(server_res.observed_dc, 2);
@@ -611,7 +611,7 @@ async fn dh_exchange_temporary_key_and_dh_gen_retry_conform_to_spec() {
 
     assert_eq!(managed.key_type, AuthKeyType::Temporary);
     assert!(managed.expires_at.is_some());
-    assert_eq!(managed.key.data, server_res.auth_key);
+    assert_eq!(*managed.key.data(), server_res.auth_key);
     assert_eq!(managed.key_id(), server_res.auth_key_id);
     assert_eq!(initial_salt, server_res.initial_salt);
     assert_eq!(server_res.observed_dc, 10002);
@@ -745,11 +745,11 @@ fn encrypted_packet_both_directions_and_wrong_x_or_padding_rejected() {
         let mut padded = Vec::with_capacity(plain.len() + pad.len());
         padded.extend_from_slice(plain);
         padded.extend_from_slice(pad);
-        let large = spec_sha256(&[&key.data[88 + x..88 + x + 32], &padded]);
+        let large = spec_sha256(&[&key.data()[88 + x..88 + x + 32], &padded]);
         let mut msg_key = [0u8; 16];
         msg_key.copy_from_slice(&large[8..24]);
-        let sha_a = spec_sha256(&[&msg_key, &key.data[x..x + 36]]);
-        let sha_b = spec_sha256(&[&key.data[40 + x..40 + x + 36], &msg_key]);
+        let sha_a = spec_sha256(&[&msg_key, &key.data()[x..x + 36]]);
+        let sha_b = spec_sha256(&[&key.data()[40 + x..40 + x + 36], &msg_key]);
         let mut aes_key = [0u8; 32];
         aes_key[0..8].copy_from_slice(&sha_a[0..8]);
         aes_key[8..24].copy_from_slice(&sha_b[8..24]);

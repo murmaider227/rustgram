@@ -1314,32 +1314,7 @@ pub fn show_contact_photo_card(
 
 /// Truncates `text` with a trailing `…` if its single-line layout exceeds `max_width`.
 fn ellipsize_to_width(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> String {
-    let fits = |candidate: &str| {
-        ui.painter()
-            .layout_no_wrap(candidate.to_owned(), font.clone(), Color32::WHITE)
-            .size()
-            .x
-            <= max_width
-    };
-    if fits(text) {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut lo = 0usize;
-    let mut hi = chars.len();
-    while lo < hi {
-        let mid = lo.midpoint(hi + 1);
-        let mut s: String = chars[..mid].iter().collect();
-        s.push('…');
-        if fits(&s) {
-            lo = mid;
-        } else {
-            hi = mid.saturating_sub(1);
-        }
-    }
-    let mut out: String = chars[..lo].iter().collect();
-    out.push('…');
-    out
+    crate::elide::elide_end(ui.painter(), text, font, max_width)
 }
 
 #[cfg(test)]

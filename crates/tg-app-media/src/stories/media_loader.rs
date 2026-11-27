@@ -2,19 +2,26 @@
 //!
 //! Port origin: `Telegram/SourceFiles/media/stories/media_stories_sibling.cpp` and
 //! `Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp` (story media loaders).
+//!
+//! Story video decodes like the media viewer's: on a worker thread in the app, inline in tests
+//! ([`viewer_decoder`]), and plays its sound through the app's mixer ([`VideoSoundOutput`]).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 use tg_data::FullStoryId;
 use tg_media::image::prepare::blur;
 use tg_media::image::{ReadArgs, read_image};
 use tg_stories::{PlaybackStatus, TrackState};
+use tg_video::streaming::RangeLoader;
 use tg_video::{
-    DURATION_UNAVAILABLE, FfmpegStreamDecoder, FrameData, FramePopOutcome, OutputPixelFormat,
-    PlaybackMode, PlaybackOptions, PlayerStage, StreamingPlayer, VideoFrame,
+    DURATION_UNAVAILABLE, FfmpegStreamDecoder, FramePopOutcome, OutputPixelFormat, PlaybackMode,
+    PlaybackOptions, PlayerStage, SliceConfig, StreamingPlayer, VideoFrame,
 };
 
+use crate::media::VideoSoundOutput;
+use crate::media::video_playback::{ViewerPlayer, frame_color_image, viewer_decoder};
 use crate::stories::backend::StoryMediaAsset;
 
 /// Decoded RGBA image kept in CPU memory until uploaded to an `egui` texture.
@@ -74,7 +81,7 @@ pub fn decode_photo_via_tg_media(bytes: &[u8]) -> Result<(DecodedRgba, DecodedRg
 /// Active video story playback controller backed by `tg_video::StreamingPlayer`.
 pub struct StoryVideoPlayback {
     story_id: FullStoryId,
-    player: StreamingPlayer<FfmpegStreamDecoder>,
+    player: ViewerPlayer,
     texture: Option<TextureHandle>,
     last_frame_pts_ms: Option<i64>,
     duration_ms: i64,
@@ -114,6 +121,28 @@ impl StoryVideoPlayback {
         Self::from_decoder(story_id, decoder, options, volume, muted, now_ms)
     }
 
+    /// Opens a video story streamed through `loader` (tdesktop streams story video like any
+    /// document). Reads that wait for the network happen on the decoder thread, and playback
+    /// pauses for data instead of freezing the window (TGB-3042).
+    pub fn from_range_loader(
+        story_id: FullStoryId,
+        loader: Arc<dyn RangeLoader>,
+        silent: bool,
+        volume: f64,
+        muted: bool,
+        now_ms: i64,
+    ) -> Result<Self, String> {
+        let options = video_playback_options(silent, volume, muted);
+        let decoder = FfmpegStreamDecoder::from_range_loader(
+            loader,
+            None,
+            SliceConfig::default(),
+            options.clone(),
+        )
+        .map_err(|e| format!("tg-video streaming decoder open failed: {e}"))?;
+        Self::from_decoder(story_id, decoder, options, volume, muted, now_ms)
+    }
+
     fn from_decoder(
         story_id: FullStoryId,
         decoder: FfmpegStreamDecoder,
@@ -122,6 +151,8 @@ impl StoryVideoPlayback {
         muted: bool,
         now_ms: i64,
     ) -> Result<Self, String> {
+        let decoder =
+            viewer_decoder(decoder).map_err(|e| format!("tg-video decoder thread failed: {e}"))?;
         let mut player = StreamingPlayer::new(decoder, options)
             .map_err(|e| format!("StreamingPlayer::new failed: {e}"))?;
         let raw_dur = player.total_duration_ms();
@@ -162,6 +193,18 @@ impl StoryVideoPlayback {
         })
     }
 
+    /// Late frames the player skipped so far.
+    #[must_use]
+    pub const fn dropped_frames(&self) -> u64 {
+        self.player.dropped_frames()
+    }
+
+    /// `true` while playback waits for the decoder to get data from the network.
+    #[must_use]
+    pub const fn is_waiting_for_data(&self) -> bool {
+        self.player.is_waiting_for_data()
+    }
+
     /// Returns total video duration in milliseconds.
     #[must_use]
     pub const fn duration_ms(&self) -> i64 {
@@ -193,6 +236,21 @@ impl StoryVideoPlayback {
         }
     }
 
+    /// Plays the story's sound through `output` (the app's mixer), like the media viewer's
+    /// videos (tdesktop plays story sound through the same mixer video slot). Does nothing for
+    /// silent stories or when sound already plays.
+    pub fn attach_sound(&mut self, output: &VideoSoundOutput) {
+        if self.player.wants_audio_output() {
+            self.player.attach_audio(output.player_audio());
+        }
+    }
+
+    /// `true` when the story's sound plays through an attached output.
+    #[must_use]
+    pub const fn has_sound_output(&self) -> bool {
+        self.player.has_audio_output()
+    }
+
     /// Updates volume and mute flag.
     pub fn set_volume(&mut self, volume: f64, muted: bool) {
         self.volume = volume.clamp(0.0, 1.0);
@@ -206,18 +264,21 @@ impl StoryVideoPlayback {
     pub fn step(&mut self, ctx: Option<&Context>, now_ms: i64) -> TrackState {
         let outcome = self.player.step_video(now_ms);
         if let Ok(FramePopOutcome::Ready { frame, .. }) = outcome {
-            if let Some(egui_ctx) = ctx {
-                self.upload_frame(egui_ctx, &frame);
+            if let Some(egui_ctx) = ctx
+                && let Some(image) = frame_color_image(&frame, 0, false, false)
+            {
+                self.upload_image(egui_ctx, image);
             }
             self.last_frame_pts_ms = Some(frame.pts_ms);
         } else if self.texture.is_none()
             && let Some(egui_ctx) = ctx
-            && let Some(cover) = self.current_frame().cloned()
+            && let Some(image) = self.current_frame().and_then(video_frame_to_color_image)
         {
-            self.upload_frame(egui_ctx, &cover);
+            self.upload_image(egui_ctx, image);
         }
 
-        // Drain audio queue so buffers don't grow unbounded when audio output isn't attached.
+        // Without an attached output (no mixer, a test), drop the decoded sound so the queue
+        // does not grow for the whole video.
         while self.player.pop_audio_frame().is_some() {}
 
         let pos = self.player.position_ms(now_ms).clamp(0, self.duration_ms);
@@ -251,21 +312,19 @@ impl StoryVideoPlayback {
         self.texture.as_ref()
     }
 
-    fn upload_frame(&mut self, ctx: &Context, frame: &VideoFrame) {
-        if let Some(image) = video_frame_to_color_image(frame) {
-            if let Some(tex) = &mut self.texture {
-                tex.set(image, TextureOptions::LINEAR);
-            } else {
-                self.texture = Some(ctx.load_texture(
-                    format!(
-                        "story_video_{}_{}",
-                        self.story_id.peer.raw(),
-                        self.story_id.story
-                    ),
-                    image,
-                    TextureOptions::LINEAR,
-                ));
-            }
+    fn upload_image(&mut self, ctx: &Context, image: ColorImage) {
+        if let Some(tex) = &mut self.texture {
+            tex.set(image, TextureOptions::LINEAR);
+        } else {
+            self.texture = Some(ctx.load_texture(
+                format!(
+                    "story_video_{}_{}",
+                    self.story_id.peer.raw(),
+                    self.story_id.story
+                ),
+                image,
+                TextureOptions::LINEAR,
+            ));
         }
     }
 }
@@ -278,7 +337,8 @@ fn video_playback_options(silent: bool, volume: f64, muted: bool) -> PlaybackOpt
             PlaybackMode::Both
         },
         volume: if muted { 0.0 } else { volume.clamp(0.0, 1.0) },
-        sync_video_by_audio: false,
+        // With sound attached the picture follows the mixer's clock, as in the media viewer.
+        sync_video_by_audio: true,
         output_format: OutputPixelFormat::Rgba,
         apply_rotation: true,
         loop_playback: false,
@@ -286,27 +346,11 @@ fn video_playback_options(silent: bool, volume: f64, muted: bool) -> PlaybackOpt
     }
 }
 
-/// Converts a decoded `tg_video::VideoFrame` into an [`egui::ColorImage`].
+/// Converts a decoded `tg_video::VideoFrame` into an [`egui::ColorImage`] (see
+/// [`frame_color_image`]).
 #[must_use]
 pub fn video_frame_to_color_image(frame: &VideoFrame) -> Option<ColorImage> {
-    let w = frame.width as usize;
-    let h = frame.height as usize;
-    if w == 0 || h == 0 {
-        return None;
-    }
-    match &frame.data {
-        FrameData::Rgba(rgba) if rgba.len() >= w * h * 4 => Some(
-            ColorImage::from_rgba_unmultiplied([w, h], &rgba[..w * h * 4]),
-        ),
-        FrameData::Bgra(bgra) if bgra.len() >= w * h * 4 => {
-            let mut rgba = Vec::with_capacity(w * h * 4);
-            for &[b, g, r, a] in bgra[..w * h * 4].as_chunks::<4>().0 {
-                rgba.extend_from_slice(&[r, g, b, a]);
-            }
-            Some(ColorImage::from_rgba_unmultiplied([w, h], &rgba))
-        }
-        _ => None,
-    }
+    frame_color_image(frame, 0, false, false)
 }
 
 /// Texture and video-player cache shared across the story viewer and sibling previews.
@@ -317,6 +361,8 @@ pub struct StoryMediaCache {
     video_covers: HashMap<FullStoryId, TextureHandle>,
     active_video: Option<StoryVideoPlayback>,
     failed_ids: HashMap<FullStoryId, String>,
+    /// Where story videos play their sound (the app's mixer); `None` plays them silently.
+    video_sound: Option<VideoSoundOutput>,
 }
 
 impl StoryMediaCache {
@@ -324,6 +370,36 @@ impl StoryMediaCache {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets where story videos play their sound (the app's mixer and output device, shared
+    /// with the media viewer). A story video that is already playing starts its sound.
+    pub fn set_video_sound_output(&mut self, output: Option<VideoSoundOutput>) {
+        let same = match (&self.video_sound, &output) {
+            (Some(a), Some(b)) => a.same_as(b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.video_sound = output;
+        }
+        if let (Some(output), Some(video)) = (&self.video_sound, &mut self.active_video) {
+            video.attach_sound(output);
+        }
+    }
+
+    /// The shared video volume (the media viewer's too), when a sound output is set.
+    #[must_use]
+    pub fn video_volume(&self) -> Option<f64> {
+        self.video_sound.as_ref().map(VideoSoundOutput::volume)
+    }
+
+    /// Sets the shared video volume, also for a silent story (tdesktop's story volume button
+    /// sets `Core::Settings::videoVolume`).
+    pub fn set_video_volume(&self, volume: f64) {
+        if let Some(output) = &self.video_sound {
+            output.set_volume(volume);
+        }
     }
 
     /// Ensures a photo texture (and blurred sibling preview) is decoded via `tg-media`
@@ -392,6 +468,9 @@ impl StoryMediaCache {
             .as_ref()
             .is_some_and(|v| v.story_id() == story_id)
         {
+            if let (Some(output), Some(video)) = (&self.video_sound, &mut self.active_video) {
+                video.attach_sound(output);
+            }
             return self.active_video.as_mut();
         }
         if self.failed_ids.contains_key(&story_id) {
@@ -412,7 +491,10 @@ impl StoryMediaCache {
             StoryMediaAsset::PhotoBytes(_) => return None,
         };
         match created {
-            Ok(player) => {
+            Ok(mut player) => {
+                if let Some(output) = &self.video_sound {
+                    player.attach_sound(output);
+                }
                 if let Some(egui_ctx) = ctx
                     && let Some(cover) = player.current_frame()
                     && let Some(img) = video_frame_to_color_image(cover)

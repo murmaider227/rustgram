@@ -234,3 +234,6 @@ mod tests {
         assert!(!cfg.is_available());
     }
 }
+
+#[cfg(test)]
+mod fuzz_untrusted;

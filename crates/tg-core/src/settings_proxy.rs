@@ -443,7 +443,7 @@ impl SettingsProxy {
             if list_count < 0 {
                 return Err(ProxySettingsError::NegativeCount(list_count));
             }
-            list.reserve(list_count as usize);
+            list.reserve(r.capacity_for(list_count as usize, 4));
             for i in 0..list_count {
                 let entry_bytes = r.read_byte_array()?;
                 let proxy = ProxyData::deserialize(&entry_bytes)?;
@@ -473,7 +473,7 @@ impl SettingsProxy {
             if preferred_count < 0 {
                 return Err(ProxySettingsError::NegativeCount(preferred_count));
             }
-            preferred_indices.reserve(preferred_count as usize);
+            preferred_indices.reserve(r.capacity_for(preferred_count as usize, 4));
             for _ in 0..preferred_count {
                 preferred_indices.push(r.read_i32()?);
             }

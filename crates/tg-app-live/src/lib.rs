@@ -44,6 +44,7 @@ mod open_at_unread;
 mod open_chat_prefetch;
 mod optimistic_send;
 pub mod paid_messages;
+mod parallel_rpc;
 pub mod passkeys;
 pub mod passport_upload;
 pub mod payments;
@@ -62,6 +63,7 @@ pub mod search_and_info;
 pub mod sender_badge;
 pub mod session;
 pub mod settings_extra;
+mod settings_reads;
 pub mod settings_sync;
 pub mod star_gifts;
 pub mod stats;
@@ -104,15 +106,21 @@ mod tests_chat_helpers;
 #[cfg(test)]
 mod tests_communities;
 #[cfg(test)]
+mod tests_connection_status;
+#[cfg(test)]
 mod tests_contacts_extras;
 #[cfg(test)]
 mod tests_custom_emoji_loader;
 #[cfg(test)]
 mod tests_dialogs_paging;
 #[cfg(test)]
+mod tests_dropped_rpc_errors;
+#[cfg(test)]
 mod tests_engagement;
 #[cfg(test)]
 mod tests_existing_pages;
+#[cfg(test)]
+mod tests_first_open;
 #[cfg(test)]
 mod tests_fu7a_pts_pagination;
 #[cfg(test)]
@@ -123,6 +131,8 @@ mod tests_history_sections;
 mod tests_layer233_extras;
 #[cfg(test)]
 mod tests_live_wiring_gaps;
+#[cfg(test)]
+mod tests_lock_order;
 #[cfg(test)]
 mod tests_media_cache;
 #[cfg(test)]
@@ -135,6 +145,8 @@ mod tests_optimistic_send;
 mod tests_payments_passport;
 #[cfg(test)]
 mod tests_peer_management;
+#[cfg(test)]
+mod tests_privacy_rules;
 #[cfg(test)]
 mod tests_profile_extras;
 #[cfg(test)]
@@ -165,6 +177,8 @@ mod tests_search_topics_conformance;
 mod tests_seca;
 #[cfg(test)]
 mod tests_settings_extra;
+#[cfg(test)]
+mod tests_settings_reads;
 #[cfg(test)]
 mod tests_spoiler_entities;
 #[cfg(test)]

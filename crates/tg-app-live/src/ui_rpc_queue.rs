@@ -10,9 +10,9 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -23,7 +23,17 @@ type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Debug, Default)]
 struct Progress {
     queued: AtomicU64,
-    finished: AtomicU64,
+    finished: Mutex<u64>,
+    job_done: Condvar,
+}
+
+impl Progress {
+    fn finish_one(&self) {
+        if let Ok(mut finished) = self.finished.lock() {
+            *finished += 1;
+        }
+        self.job_done.notify_all();
+    }
 }
 
 /// Handle to one session's ordered request queue; clones share the worker.
@@ -43,7 +53,7 @@ impl UiRpcQueue {
         handle.spawn(async move {
             while let Some(job) = rx.recv().await {
                 job.await;
-                worker_progress.finished.fetch_add(1, Ordering::AcqRel);
+                worker_progress.finish_one();
             }
         });
         Self { tx, progress }
@@ -56,7 +66,7 @@ impl UiRpcQueue {
         if self.tx.send(Box::pin(job)).is_ok() {
             true
         } else {
-            self.progress.finished.fetch_add(1, Ordering::AcqRel);
+            self.progress.finish_one();
             false
         }
     }
@@ -64,29 +74,31 @@ impl UiRpcQueue {
     /// `true` when every queued job has run.
     #[cfg(test)]
     pub(crate) fn is_idle(&self) -> bool {
-        self.progress.finished.load(Ordering::Acquire)
-            >= self.progress.queued.load(Ordering::Acquire)
+        let queued = self.progress.queued.load(Ordering::Acquire);
+        self.progress
+            .finished
+            .lock()
+            .is_ok_and(|finished| *finished >= queued)
     }
 
     /// Waits (blocking, with a time limit) until every job queued so far has run. Only for tests
     /// and shutdown paths: the UI never waits for the queue.
     pub(crate) fn wait_idle(&self, limit: Duration) -> bool {
         let target = self.progress.queued.load(Ordering::Acquire);
-        let start = Instant::now();
-        while self.progress.finished.load(Ordering::Acquire) < target {
-            if start.elapsed() >= limit {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        true
+        let Ok(finished) = self.progress.finished.lock() else {
+            return false;
+        };
+        self.progress
+            .job_done
+            .wait_timeout_while(finished, limit, |finished| *finished < target)
+            .is_ok_and(|(finished, _)| *finished >= target)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::time::Instant;
 
     #[test]
     fn jobs_run_in_the_order_they_were_queued_even_when_earlier_ones_are_slower() {

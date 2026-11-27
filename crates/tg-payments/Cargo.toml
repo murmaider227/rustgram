@@ -10,3 +10,6 @@ tg-data = { path = "../tg-data" }
 tg-tl = { path = "../tg-tl" }
 thiserror = "2.0"
 url = "2.5"
+
+[dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }

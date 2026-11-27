@@ -82,6 +82,12 @@ impl TextTag {
             id: id.into(),
         }
     }
+
+    /// Returns `offset + length`, saturating instead of overflowing on hostile values.
+    #[inline]
+    pub fn end(&self) -> i32 {
+        self.offset.saturating_add(self.length)
+    }
 }
 
 /// Ordered list of non-overlapping `TextTag` spans (`TextWithTags::Tags`).
@@ -340,7 +346,7 @@ pub fn simplify_tags(mut tags: TextTags) -> TextTags {
     let mut i = 0;
     while i + 1 < tags.len() {
         let j = i + 1;
-        if tags[j].offset > tags[i].offset + tags[i].length {
+        if tags[j].offset > tags[i].end() {
             i += 1;
             continue;
         }
@@ -349,7 +355,7 @@ pub fn simplify_tags(mut tags: TextTags) -> TextTags {
         let mut jl = split_tags(&tags[j].id);
         jl.sort_unstable();
         if join_tag(&il) == join_tag(&jl) {
-            tags[i].length = tags[j].offset + tags[j].length - tags[i].offset;
+            tags[i].length = tags[j].end().saturating_sub(tags[i].offset);
             tags.remove(j);
         } else {
             i += 1;
@@ -631,7 +637,7 @@ pub fn expand_custom_links(text: &TextWithTags) -> String {
     let mut result = String::new();
     let mut offset = 0usize;
     for entity in urls {
-        let till = (entity.offset() + entity.length()).max(0) as usize;
+        let till = entity.end().max(0) as usize;
         if till > offset
             && let Some(chunk) = slice_utf16(&text.text, offset, till - offset)
         {
@@ -673,7 +679,11 @@ impl ParsedLinkTag {
 
 fn parse_link_tag(tag: &str) -> ParsedLinkTag {
     let trimmed = tag.trim();
-    if trimmed.len() >= 9 && trimmed[..9].eq_ignore_ascii_case("internal:") {
+    if trimmed
+        .as_bytes()
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"internal:"))
+    {
         return ParsedLinkTag::default();
     }
     if is_mention_link(tag) {
@@ -785,7 +795,7 @@ pub fn convert_text_tags_to_entities(tags: &[TextTag]) -> EntitiesInText {
             let t = result[idx].entity_type();
             let start = result[idx].offset();
             let data = result[idx].data().to_string();
-            result[idx] = EntityInText::with_data(t, start, offset - start, data);
+            result[idx] = EntityInText::with_data(t, start, offset.saturating_sub(start), data);
             if IN_MASK_INLINE.contains(&t) || IN_MASK_BLOCK.contains(&t) {
                 state.remove(t);
             } else {
@@ -965,7 +975,7 @@ pub fn convert_text_tags_to_entities(tags: &[TextTag]) -> EntitiesInText {
         offset = tag.offset;
         let next = state_for_tag(&tag.id);
         process_state(&mut result, &mut state, &mut not_closed, offset, next);
-        offset += tag.length;
+        offset = offset.saturating_add(tag.length);
     }
     process_state(
         &mut result,
@@ -1040,7 +1050,7 @@ pub fn convert_entities_to_text_tags(entities: &[EntityInText]) -> TextTags {
         remove_till(result, offset, current, to_remove, entity.offset());
         let next = tag_with_added(current, &tag);
         update_current(result, offset, current, entity.offset(), next);
-        to_remove.push((*offset + entity.length(), tag));
+        to_remove.push((offset.saturating_add(entity.length()), tag));
         to_remove.sort();
     };
 

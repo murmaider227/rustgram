@@ -5,6 +5,7 @@
 //! `Telegram/SourceFiles/window/window_main_menu.cpp` (wallet entry gated on `walletAvailable`).
 
 pub use tg_app_core::wallet::backend;
+pub mod address_text;
 pub mod backup;
 pub mod card_editor;
 pub mod collectibles;

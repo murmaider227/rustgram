@@ -205,14 +205,14 @@ pub fn mid(text: &TextWithEntities, position: usize, n: Option<usize>) -> TextWi
         .iter()
         .filter(|e| {
             let l1 = e.offset();
-            let r1 = e.offset() + e.length() - 1;
+            let r1 = e.end().saturating_sub(1);
             let l2 = start_i32;
             let r2 = end_i32 - 1;
             !(l1 > r2 || l2 > r1)
         })
         .map(|e| {
             let s = e.offset().max(start_i32);
-            let end = (e.offset() + e.length()).min(end_i32);
+            let end = e.end().min(end_i32);
             EntityInText::with_data(e.entity_type(), s - start_i32, end - s, e.data())
         })
         .collect();

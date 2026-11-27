@@ -229,6 +229,32 @@ pub fn aligned_frame_stride(width: u32, height: u32, min_bytes_per_line: usize) 
     }
 }
 
+/// Packs `height` rows of `row_bytes` each, stored `stride` bytes apart, into a tight buffer.
+/// Rows missing from a short `buf` are dropped.
+#[must_use]
+pub fn strip_row_padding(
+    mut buf: Vec<u8>,
+    stride: usize,
+    row_bytes: usize,
+    height: usize,
+) -> Vec<u8> {
+    if stride == row_bytes {
+        return buf;
+    }
+    let rows = if stride < row_bytes || buf.len() < row_bytes {
+        0
+    } else {
+        height.min((buf.len() - row_bytes) / stride + 1)
+    };
+    // Rows only move towards the start, so compacting in place never overwrites a row that is
+    // still to be read; no second frame-sized buffer is needed.
+    for y in 1..rows {
+        buf.copy_within(y * stride..y * stride + row_bytes, y * row_bytes);
+    }
+    buf.truncate(rows * row_bytes);
+    buf
+}
+
 /// Premultiplies straight RGBA8 pixels in place (`PremultiplyInplace`).
 pub fn premultiply_rgba_inplace(rgba: &mut [u8]) {
     for px in rgba.as_chunks_mut::<4>().0 {
@@ -278,6 +304,8 @@ pub fn unpremultiply_rgba(src: &[u8]) -> Vec<u8> {
 }
 
 /// Rotates a tightly-packed 4-bytes-per-pixel image clockwise by `rotation`.
+///
+/// A buffer shorter than `width * height * 4` is returned unrotated.
 #[must_use]
 pub fn rotate_pixels_4bpp(
     src: &[u8],
@@ -291,52 +319,36 @@ pub fn rotate_pixels_4bpp(
     if rotation == Rotation::Deg0 || src.len() < expected || w == 0 || h == 0 {
         return (src.to_vec(), width, height);
     }
-    match rotation {
-        Rotation::Deg0 => (src.to_vec(), width, height),
-        Rotation::Deg90 => {
-            let dst_w = h;
-            let dst_h = w;
-            let mut dst = vec![0u8; expected];
-            for y in 0..h {
-                for x in 0..w {
-                    let s = (y * w + x) * 4;
-                    let dx = h - 1 - y;
-                    let dy = x;
-                    let d = (dy * dst_w + dx) * 4;
-                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
-                }
-            }
-            (dst, dst_w as u32, dst_h as u32)
-        }
-        Rotation::Deg180 => {
-            let mut dst = vec![0u8; expected];
-            for y in 0..h {
-                for x in 0..w {
-                    let s = (y * w + x) * 4;
-                    let dx = w - 1 - x;
-                    let dy = h - 1 - y;
-                    let d = (dy * w + dx) * 4;
-                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
-                }
-            }
-            (dst, width, height)
-        }
-        Rotation::Deg270 => {
-            let dst_w = h;
-            let dst_h = w;
-            let mut dst = vec![0u8; expected];
-            for y in 0..h {
-                for x in 0..w {
-                    let s = (y * w + x) * 4;
-                    let dx = y;
-                    let dy = w - 1 - x;
-                    let d = (dy * dst_w + dx) * 4;
-                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
-                }
-            }
-            (dst, dst_w as u32, dst_h as u32)
+    let pixels = src[..expected].as_chunks::<4>().0;
+    let rotated = match rotation {
+        Rotation::Deg0 => pixels.to_vec(),
+        Rotation::Deg180 => pixels.iter().rev().copied().collect(),
+        Rotation::Deg90 => rotate_quarter(pixels, w, h, true),
+        Rotation::Deg270 => rotate_quarter(pixels, w, h, false),
+    };
+    let (out_w, out_h) = if rotation.swaps_width_height() {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    (rotated.into_flattened(), out_w, out_h)
+}
+
+/// Turns a `w` x `h` image by a quarter, clockwise or counter-clockwise, into an `h` x `w` one.
+fn rotate_quarter(pixels: &[[u8; 4]], w: usize, h: usize, clockwise: bool) -> Vec<[u8; 4]> {
+    let mut dst = vec![[0u8; 4]; w * h];
+    // Destination row `dy` is source column `dy`, `h` pixels long. Clockwise: dst (dx, dy) comes
+    // from src (dy, h-1-dx); counter-clockwise: from src (w-1-dy, dx).
+    for (dy, row) in dst.chunks_exact_mut(h).enumerate() {
+        for (dx, d) in row.iter_mut().enumerate() {
+            *d = if clockwise {
+                pixels[(h - 1 - dx) * w + dy]
+            } else {
+                pixels[dx * w + (w - 1 - dy)]
+            };
         }
     }
+    dst
 }
 
 /// Custom I/O data source fed into FFmpeg's `AVIOContext` (`RestrictToCustomIO`).
@@ -1059,19 +1071,8 @@ impl FfmpegMedia {
             });
         }
 
-        // Pack into tight `width * 4` stride.
         let row_bytes = (target.width as usize) * PIXEL_BYTES_SIZE;
-        let mut tight = if stride == row_bytes {
-            aligned_buf
-        } else {
-            let mut out = vec![0u8; row_bytes * (target.height as usize)];
-            for y in 0..target.height as usize {
-                let s = y * stride;
-                let d = y * row_bytes;
-                out[d..d + row_bytes].copy_from_slice(&aligned_buf[s..s + row_bytes]);
-            }
-            out
-        };
+        let mut tight = strip_row_padding(aligned_buf, stride, row_bytes, target.height as usize);
 
         let (final_buf, out_w, out_h) = if apply_rotation && rotation != Rotation::Deg0 {
             rotate_pixels_4bpp(&tight, target.width, target.height, rotation)

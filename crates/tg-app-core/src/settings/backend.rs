@@ -1861,6 +1861,23 @@ impl ProxyCheckStatus {
     }
 }
 
+/// A Settings read that a live backend answers in the background (TGB-3070): until the first
+/// answer arrives the getter returns a placeholder and the screen shows tdesktop's loading
+/// state (an empty label, "Loading...") instead of the placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingsRead {
+    /// [`SettingsBackend::active_sessions`] and [`SettingsBackend::session_ttl_days`].
+    ActiveSessions,
+    /// [`SettingsBackend::blocked_users`].
+    BlockedUsers,
+    /// [`SettingsBackend::account_ttl_days`].
+    AccountTtl,
+    /// [`SettingsBackend::cloud_password_state`].
+    CloudPassword,
+    /// [`SettingsBackend::scope_notifications`] of one scope.
+    ScopeNotifications(NotifyScope),
+}
+
 /// Trait abstracting all server-side Telegram settings operations.
 ///
 /// Local desktop settings live directly in [`tg_core::CoreSettings`]; all account/cloud
@@ -1965,6 +1982,11 @@ pub trait SettingsBackend: Send {
 
     /// Returns current 2FA cloud password state.
     fn cloud_password_state(&self) -> CloudPasswordState;
+    /// `true` while the first answer of `read` is on its way and its getter returned a
+    /// placeholder (TGB-3070). Backends that answer at once never report a pending read.
+    fn settings_read_pending(&self, _read: SettingsRead) -> bool {
+        false
+    }
     /// Verifies the current 2FA cloud password.
     fn verify_cloud_password(&self, password: &str) -> Result<(), CloudPasswordError>;
     /// Enables or changes the 2FA cloud password.

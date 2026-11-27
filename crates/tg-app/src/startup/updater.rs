@@ -20,7 +20,6 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -29,14 +28,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tg_core::launcher::ParsedArgs;
 use tg_core::update_checker::UPDATE_DELAY_CONST_SECS;
 use tg_updater::checker::{
-    StagedUpdate, UpdateChecker, UpdateConfig, UpdaterLaunchOptions, build_updater_launch_args,
-    has_ready_update,
+    StagedUpdate, UpdateChecker, UpdateConfig, UpdaterLaunchOptions, has_ready_update,
 };
 use tg_updater::github::HttpClient;
+pub use tg_updater::launch::UpdaterLaunchPlan;
+use tg_updater::launch::{plan_updater_launch, spawn_updater};
 use tg_updater::package::read_version_file;
 use tg_updater::version::{Target, Version};
 use tg_updater::{
-    DEFAULT_GITHUB_REPO, TUPDATES_DIR_NAME, UPDATER_EXE_NAME, UpdateError, release_verifying_key,
+    DEFAULT_GITHUB_REPO, TUPDATES_DIR_NAME, UpdateError, release_verifying_key,
     verifying_key_from_hex,
 };
 
@@ -377,18 +377,10 @@ enum WorkerCommand {
     Stop,
 }
 
-/// Parameters required to spawn `rustgram-updater.exe` and exit cleanly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdaterLaunchPlan {
-    /// Absolute path to `rustgram-updater.exe`.
-    pub updater_exe: PathBuf,
-    /// Working directory (`install_dir`) for the updater process.
-    pub install_dir: PathBuf,
-    /// Command-line arguments produced by [`build_updater_launch_args`].
-    pub args: Vec<String>,
-}
-
 /// Builds the exact `rustgram-updater.exe` invocation plan for restarting and installing a staged update.
+///
+/// The updater runs with `working_dir` as its current directory, where the update is staged in
+/// `tupdates`; `-workdir` is passed only for a custom working dir (tdesktop `launcher_win.cpp`).
 #[must_use]
 pub fn build_updater_launch_plan(
     exe_path: &Path,
@@ -398,33 +390,18 @@ pub fn build_updater_launch_plan(
     parent_pid: Option<u32>,
     parent_created: Option<u64>,
 ) -> UpdaterLaunchPlan {
-    let install_dir = exe_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let exe_name = exe_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(ToOwned::to_owned);
-    let updater_exe = install_dir.join(UPDATER_EXE_NAME);
-
     let opts = UpdaterLaunchOptions {
         parent_pid,
         parent_created,
-        workdir: is_custom_workdir.then(|| working_dir.to_path_buf()),
+        workdir: None,
         key: (!parsed_args.key.is_empty()).then(|| parsed_args.key.clone()),
-        exe_name,
+        exe_name: None,
         autostart: parsed_args.launch_mode == tg_core::LaunchMode::AutoStart,
         debug: parsed_args.debug,
         start_in_tray: parsed_args.start_in_tray,
         just_update: false,
     };
-
-    UpdaterLaunchPlan {
-        updater_exe,
-        install_dir,
-        args: build_updater_launch_args(&opts),
-    }
+    plan_updater_launch(exe_path, working_dir, is_custom_workdir, opts)
 }
 
 /// Queries the current process creation timestamp (Windows `FILETIME` 100ns ticks) so
@@ -464,20 +441,9 @@ pub fn current_process_creation_time() -> Option<u64> {
     }
 }
 
-/// Spawns `rustgram-updater.exe` according to `plan`.
+/// Spawns `rustgram-updater.exe` according to `plan` (current directory = the working dir).
 pub fn spawn_updater_process(plan: &UpdaterLaunchPlan) -> Result<(), String> {
-    if !plan.updater_exe.is_file() {
-        return Err(format!(
-            "updater executable not found at '{}'",
-            plan.updater_exe.display()
-        ));
-    }
-    Command::new(&plan.updater_exe)
-        .args(&plan.args)
-        .current_dir(&plan.install_dir)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("failed to launch {}: {e}", plan.updater_exe.display()))
+    spawn_updater(plan).map(|_| ())
 }
 
 /// Thread-safe handle driving periodic background update checks and exposing a live
@@ -874,6 +840,53 @@ mod tests {
     }
 
     use super::*;
+
+    /// TGB-3113: the updater must run in the working dir (where `tupdates` is staged), not in the
+    /// install dir, and get `-workdir` only for a custom working dir.
+    #[test]
+    fn updater_runs_in_the_working_dir_not_the_install_dir() {
+        let exe = std::env::temp_dir()
+            .join("tgb3113-install")
+            .join("rustgram.exe");
+        let install_dir = exe.parent().expect("parent").to_path_buf();
+        let working_dir = std::env::temp_dir()
+            .join("tgb3113-appdata")
+            .join("Rustgram");
+        let parsed = tg_core::launcher::parse_arguments(&["rustgram.exe".to_owned()]);
+
+        let plan = build_updater_launch_plan(&exe, &working_dir, false, &parsed, None, None);
+        assert_eq!(plan.current_dir, working_dir);
+        assert_ne!(plan.current_dir, install_dir);
+        assert_eq!(plan.install_dir, install_dir);
+        assert_eq!(
+            plan.updater_exe,
+            install_dir.join(tg_updater::UPDATER_EXE_NAME)
+        );
+        assert_eq!(plan.args, vec!["-update".to_owned()]);
+
+        let custom = std::env::temp_dir().join("tgb3113-custom");
+        let plan = build_updater_launch_plan(&exe, &custom, true, &parsed, None, None);
+        assert_eq!(plan.current_dir, custom);
+        assert_eq!(
+            plan.args,
+            vec![
+                "-update".to_owned(),
+                "-workdir".to_owned(),
+                custom.to_string_lossy().into_owned()
+            ]
+        );
+    }
+
+    /// The updater finds the app's default working dir by itself (rescue for broken releases);
+    /// its folder names must match the app's.
+    #[test]
+    fn updater_default_working_dir_names_match_the_app() {
+        assert_eq!(tg_updater::APP_DATA_DIR_NAME, tg_core::version::APP_NAME);
+        assert_eq!(
+            tg_updater::PORTABLE_FOLDER_NAME,
+            tg_core::version::PORTABLE_FOLDER_NAME
+        );
+    }
 
     #[test]
     fn update_status_ui_formatting_and_preferences_propagation() {

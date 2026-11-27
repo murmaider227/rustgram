@@ -51,3 +51,6 @@ pub mod widget_sandbox;
 pub mod windows_hello;
 
 pub use error::{PlatformError, Result};
+
+#[cfg(test)]
+mod fuzz_untrusted;

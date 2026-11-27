@@ -56,3 +56,6 @@ pub use tag::{
     format_credits_amount_to_short, format_double, format_exact_count_decimal, plural_with_rule,
     replace_tag_entities, replace_tag_numbers, replace_tag_str,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

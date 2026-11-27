@@ -935,35 +935,7 @@ fn truncate_single_line(
     font: FontId,
     max_width: f32,
 ) -> String {
-    if painter
-        .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
-        .size()
-        .x
-        <= max_width
-    {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut lo = 0usize;
-    let mut hi = chars.len();
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        let mut cand: String = chars[..mid].iter().collect();
-        cand.push('\u{2026}');
-        if painter
-            .layout_no_wrap(cand, font.clone(), Color32::WHITE)
-            .size()
-            .x
-            <= max_width
-        {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    let mut out: String = chars[..lo].iter().collect();
-    out.push('\u{2026}');
-    out
+    tg_ui::elide::elide_end(painter, text, &font, max_width)
 }
 
 fn paint_star_badge(painter: &egui::Painter, center: Pos2, outer_r: f32, color: Color32) {

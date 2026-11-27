@@ -597,6 +597,12 @@ fn notification_exceptions_sync_with_notify_settings_store() {
         }),
     );
 
+    // Settings reads answer at once and load in the background (TGB-3070).
+    let _ = h.live.scope_notifications(NotifyScope::PrivateChats);
+    assert!(
+        h.live
+            .wait_settings_reads(std::time::Duration::from_secs(10))
+    );
     let scope = h.live.scope_notifications(NotifyScope::PrivateChats);
     assert!(scope.enabled);
     assert_eq!(scope.exceptions.len(), 1);

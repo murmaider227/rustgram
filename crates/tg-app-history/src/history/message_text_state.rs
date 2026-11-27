@@ -9,6 +9,7 @@
 
 use egui::{Color32, Ui};
 use tg_text::{EntityType, TextWithEntities, utf16_len};
+use tg_ui::entity_bounds::entity_utf16_range;
 use tg_ui::stand_in::TextPalette;
 use tg_ui::text::{RichTextOptions, layout_text_with_entities_expanded, spoiler_reveal_progress};
 
@@ -103,10 +104,11 @@ pub fn measure_message_text(
 /// of its own below it (`String::updateSkipBlock`, `_endsWithQuoteOrOtherDirection`).
 #[must_use]
 pub fn ends_with_quote(text: &TextWithEntities) -> bool {
-    let end = utf16_len(text.text.trim_end()) as i32;
+    let end = utf16_len(text.text.trim_end());
+    let total = utf16_len(&text.text);
     end > 0
         && text.entities.iter().any(|e| {
             matches!(e.entity_type(), EntityType::Blockquote | EntityType::Pre)
-                && e.offset() + e.length() >= end
+                && entity_utf16_range(e, total).is_some_and(|range| range.end >= end)
         })
 }

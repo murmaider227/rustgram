@@ -1546,8 +1546,9 @@ pub fn extract_first_url(text: &str) -> Option<String> {
     let parsed = parse_entities(text, TextParseFlags::LINKS);
     for ent in &parsed.entities {
         if ent.entity_type() == EntityType::Url {
-            let start = tg_text::utf16_to_utf8_offset(text, ent.offset() as usize)?;
-            let end = tg_text::utf16_to_utf8_offset(text, (ent.offset() + ent.length()) as usize)?;
+            let range = tg_ui::entity_bounds::entity_utf16_range(ent, tg_text::utf16_len(text))?;
+            let start = tg_text::utf16_to_utf8_offset(text, range.start)?;
+            let end = tg_text::utf16_to_utf8_offset(text, range.end)?;
             let slice = &text[start..end];
             if slice.contains("://") {
                 return Some(slice.to_owned());

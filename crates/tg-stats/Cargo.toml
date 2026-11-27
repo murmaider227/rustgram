@@ -9,3 +9,6 @@ serde_json = "1.0.138"
 thiserror = "2.0.11"
 tiny-skia = "0.11.4"
 zip = { version = "9.8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }

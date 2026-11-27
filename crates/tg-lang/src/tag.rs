@@ -202,15 +202,9 @@ pub mod stand_in {
 
         /// Construct a normalized `whole + nano / 1e9` amount.
         pub fn new(mut whole: i64, mut nano: i64, kind: CreditsType) -> Self {
-            if nano < 0 {
-                let shifts = (-nano + ONE_STAR_IN_NANO - 1) / ONE_STAR_IN_NANO;
-                nano += shifts * ONE_STAR_IN_NANO;
-                whole -= shifts;
-            } else if nano >= ONE_STAR_IN_NANO {
-                let shifts = nano / ONE_STAR_IN_NANO;
-                nano -= shifts * ONE_STAR_IN_NANO;
-                whole += shifts;
-            }
+            // `div_euclid` / `rem_euclid` normalize without the `-nano` overflow on `i64::MIN`.
+            whole = whole.saturating_add(nano.div_euclid(ONE_STAR_IN_NANO));
+            nano = nano.rem_euclid(ONE_STAR_IN_NANO);
             Self { whole, nano, kind }
         }
 

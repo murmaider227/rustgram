@@ -178,13 +178,16 @@ impl AudioDecoder {
         let duration_ms = track
             .num_frames
             .and_then(|frames| {
+                // Read from the file header: clamp instead of wrapping into a negative count.
+                let frames = i64::try_from(frames).unwrap_or(i64::MAX);
                 track
                     .time_base
                     .and_then(|tb| {
-                        let ts = Timestamp::new(frames as i64);
-                        tb.calc_time(ts).map(|t| (t.as_nanos() / 1_000_000) as i64)
+                        let ts = Timestamp::new(frames);
+                        tb.calc_time(ts)
+                            .map(|t| i64::try_from(t.as_nanos() / 1_000_000).unwrap_or(i64::MAX))
                     })
-                    .or_else(|| Some(((frames as i64) * 1000) / i64::from(sample_rate.max(1))))
+                    .or_else(|| Some(frames.saturating_mul(1000) / i64::from(sample_rate.max(1))))
             })
             .unwrap_or(0);
 

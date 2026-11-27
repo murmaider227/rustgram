@@ -17,7 +17,7 @@ use crate::history::compose_boxes::DeleteConfirmBoxState;
 use crate::history::mock::MockHistoryStore;
 use tg_app_core::stand_in::strings::EnglishStrings;
 use tg_app_core::stand_in::theme::Palette;
-use tg_app_core::stand_in::types::{MsgId, PeerId};
+use tg_app_core::stand_in::types::{MsgId, PeerId, PeerKind};
 
 const SIZE: Vec2 = Vec2::new(900.0, 1000.0);
 const STEP_DT: f32 = 1.0 / 60.0;
@@ -114,10 +114,20 @@ pub(crate) fn bubble(harness: &DeleteHarness, id: MsgId) -> Option<Rect> {
 
 /// Opens the delete box for `ids` and presses its "Delete" button.
 pub(crate) fn delete_with_box(harness: &mut DeleteHarness, ids: &[MsgId]) {
+    let chat = crate::history::delete_box::DeleteChat::from_peer(
+        PeerId::from_user(7),
+        PeerKind::User,
+        "Rustgram Core Port",
+        false,
+        false,
+        true,
+    );
     harness.state_mut().widget.delete_box = Some(DeleteConfirmBoxState::new(
         ids.to_vec(),
-        "Rustgram Core Port",
-        true,
+        &chat,
+        None,
+        0,
+        crate::history::delete_box::RevokeLimits::default(),
     ));
     // The modal area measures itself on its first frame.
     harness.run_steps(2);

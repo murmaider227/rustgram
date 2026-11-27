@@ -142,7 +142,7 @@ impl CreditsAmount {
     /// Returns the absolute value (`CreditsAmount::abs`).
     pub fn abs(self) -> Self {
         if self.whole < 0 {
-            Self::new(-self.whole, -self.nano, self.credits_type)
+            Self::new(self.whole.saturating_neg(), -self.nano, self.credits_type)
         } else {
             self
         }
@@ -188,16 +188,16 @@ impl CreditsAmount {
         }
     }
 
+    /// Moves whole stars out of `nano` so that `0 <= nano < ONE_STAR_IN_NANO`.
+    ///
+    /// `div_euclid` / `rem_euclid` give the same result as tdesktop's shift loop without the
+    /// `-nano` overflow, and `whole` saturates at the ends of the `i64` range (server
+    /// `starsAmount` values are untrusted), like tg-lang's copy.
     fn normalize(&mut self) {
-        if self.nano < 0 {
-            let shifts = (-self.nano + ONE_STAR_IN_NANO - 1) / ONE_STAR_IN_NANO;
-            self.nano += shifts * ONE_STAR_IN_NANO;
-            self.whole -= shifts;
-        } else if self.nano >= ONE_STAR_IN_NANO {
-            let shifts = self.nano / ONE_STAR_IN_NANO;
-            self.nano -= shifts * ONE_STAR_IN_NANO;
-            self.whole += shifts;
-        }
+        self.whole = self
+            .whole
+            .saturating_add(self.nano.div_euclid(ONE_STAR_IN_NANO));
+        self.nano = self.nano.rem_euclid(ONE_STAR_IN_NANO);
     }
 }
 
@@ -243,8 +243,8 @@ impl Add for CreditsAmount {
 
 impl AddAssign for CreditsAmount {
     fn add_assign(&mut self, rhs: Self) {
-        self.whole += rhs.whole;
-        self.nano += rhs.nano;
+        self.whole = self.whole.saturating_add(rhs.whole);
+        self.nano = self.nano.saturating_add(rhs.nano);
         self.normalize();
     }
 }
@@ -259,8 +259,8 @@ impl Sub for CreditsAmount {
 
 impl SubAssign for CreditsAmount {
     fn sub_assign(&mut self, rhs: Self) {
-        self.whole -= rhs.whole;
-        self.nano -= rhs.nano;
+        self.whole = self.whole.saturating_sub(rhs.whole);
+        self.nano = self.nano.saturating_sub(rhs.nano);
         self.normalize();
     }
 }
@@ -275,8 +275,8 @@ impl Mul<i64> for CreditsAmount {
 
 impl MulAssign<i64> for CreditsAmount {
     fn mul_assign(&mut self, rhs: i64) {
-        self.whole *= rhs;
-        self.nano *= rhs;
+        self.whole = self.whole.saturating_mul(rhs);
+        self.nano = self.nano.saturating_mul(rhs);
         self.normalize();
     }
 }

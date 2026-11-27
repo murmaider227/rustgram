@@ -55,7 +55,7 @@ pub use settings_view::{
     apply_from_time, apply_till_date, apply_till_time, can_start_export, civil_to_unix,
     days_in_month, display_export_path, format_date_long, format_date_time_full,
     format_short_label, format_size_limit_label, format_time_short, index_by_size_limit,
-    is_default_export_path, is_leap_year, month_name, remove_time_of_day,
+    is_default_export_path, is_leap_year, local_civil_to_unix, month_name, remove_time_of_day,
     should_show_media_section, size_limit_by_index, today_civil_date, weekday_mon0,
 };
 pub use top_bar::{ExportTopBar, TOP_BAR_HEIGHT};
@@ -747,13 +747,11 @@ impl AppExportHost {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use egui::epaint::{Primitive, TextureId};
-    use egui::{Pos2, RawInput, Rect, Vec2};
+    use egui::{Pos2, Rect, Vec2};
     use tg_export::stand_in::InputPeer;
     use tg_export::{
         ApiError, EntityType, ExportState, ExportTypes, FinishedState, InMemoryExportSource,
@@ -960,7 +958,9 @@ mod tests {
 
     #[test]
     fn date_and_time_limit_pickers_roundtrip_and_clamp() {
-        let ts = civil_to_unix(2025, 3, 15, 14, 30, 0);
+        // The range is read in local time, so the times are built in local time.
+        let _zone = super::settings_view::tests_local_time::ZoneGuard::east(2 * 3600);
+        let ts = local_civil_to_unix(2025, 3, 15, 14, 30, 0);
         assert_eq!(format_date_long(ts), "March 15, 2025");
         assert_eq!(format_time_short(ts), "14:30");
         assert_eq!(format_date_time_full(ts), "March 15, 2025 at 14:30");
@@ -969,8 +969,8 @@ mod tests {
             single_peer: InputPeer::Self_,
             ..Default::default()
         };
-        let day1 = civil_to_unix(2025, 3, 10, 0, 0, 0);
-        let day2 = civil_to_unix(2025, 3, 20, 0, 0, 0);
+        let day1 = local_civil_to_unix(2025, 3, 10, 0, 0, 0);
+        let day2 = local_civil_to_unix(2025, 3, 20, 0, 0, 0);
 
         apply_from_date(&mut settings, day1);
         apply_till_date(&mut settings, day2);
@@ -1261,215 +1261,16 @@ mod tests {
     // 6. Offscreen egui screenshot generator (`crates/tg-app/docs/export_*.png`)
     // ========================================================================
 
-    struct SoftwareTexture {
-        width: usize,
-        height: usize,
-        pixels: Vec<[u8; 4]>,
-    }
-
     fn render_egui_to_png(
         logical_w: u32,
         logical_h: u32,
         ppp: f32,
-        mut draw: impl FnMut(&mut egui::Ui),
+        draw: impl FnMut(&mut egui::Ui),
     ) -> Vec<u8> {
         let ctx = egui::Context::default();
-        let palette = Palette::day();
-        ctx.set_visuals(palette.to_egui_visuals(ThemeMode::Day));
+        ctx.set_visuals(Palette::day().to_egui_visuals(ThemeMode::Day));
         tg_ui::fonts::register_tdesktop_fonts(&ctx);
-
-        let mut textures: HashMap<TextureId, SoftwareTexture> = HashMap::new();
-        let mut last_output = None;
-
-        for frame in 0..3 {
-            let raw_input = RawInput {
-                screen_rect: Some(Rect::from_min_size(
-                    Pos2::ZERO,
-                    Vec2::new(logical_w as f32, logical_h as f32),
-                )),
-                time: Some(frame as f64 * 0.016),
-                ..Default::default()
-            };
-            ctx.set_pixels_per_point(ppp);
-            let mut output = ctx.run_ui(raw_input, |ui| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ui, |ui| draw(ui));
-            });
-
-            for (id, deltas) in &output.textures_delta.set {
-                for delta in deltas {
-                    let egui::ImageData::Color(ref color_img) = delta.image;
-                    let [iw, ih] = color_img.size;
-                    if let Some([ox, oy]) = delta.pos {
-                        if let Some(tex) = textures.get_mut(id) {
-                            for y in 0..ih {
-                                for x in 0..iw {
-                                    let dst_x = ox + x;
-                                    let dst_y = oy + y;
-                                    if dst_x < tex.width && dst_y < tex.height {
-                                        tex.pixels[dst_y * tex.width + dst_x] =
-                                            color_img.pixels[y * iw + x].to_array();
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let pixels = color_img.pixels.iter().map(|c| c.to_array()).collect();
-                        textures.insert(
-                            *id,
-                            SoftwareTexture {
-                                width: iw,
-                                height: ih,
-                                pixels,
-                            },
-                        );
-                    }
-                }
-            }
-            for free_id in &output.textures_delta.free {
-                textures.remove(free_id);
-            }
-            output.textures_delta.clear();
-            last_output = Some(output);
-        }
-
-        let output = last_output.expect("egui output");
-        let clipped = ctx.tessellate(output.shapes, ppp);
-
-        let phys_w = ((logical_w as f32) * ppp).round() as usize;
-        let phys_h = ((logical_h as f32) * ppp).round() as usize;
-        let mut fb = vec![[242u8, 245u8, 248u8, 255u8]; phys_w * phys_h];
-
-        for prim in clipped {
-            let Primitive::Mesh(mesh) = prim.primitive else {
-                continue;
-            };
-            let tex = textures.get(&mesh.texture_id);
-            let clip_min_x = (prim.clip_rect.min.x * ppp).floor().max(0.0) as i32;
-            let clip_min_y = (prim.clip_rect.min.y * ppp).floor().max(0.0) as i32;
-            let clip_max_x = (prim.clip_rect.max.x * ppp).ceil().min(phys_w as f32) as i32;
-            let clip_max_y = (prim.clip_rect.max.y * ppp).ceil().min(phys_h as f32) as i32;
-
-            for tri in mesh.indices.as_chunks::<3>().0 {
-                let v0 = mesh.vertices[tri[0] as usize];
-                let v1 = mesh.vertices[tri[1] as usize];
-                let v2 = mesh.vertices[tri[2] as usize];
-
-                let x0 = v0.pos.x * ppp;
-                let y0 = v0.pos.y * ppp;
-                let x1 = v1.pos.x * ppp;
-                let y1 = v1.pos.y * ppp;
-                let x2 = v2.pos.x * ppp;
-                let y2 = v2.pos.y * ppp;
-
-                let area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
-                if area.abs() < 1e-6 {
-                    continue;
-                }
-                let inv_area = 1.0 / area;
-
-                let bx0 = (x0.min(x1).min(x2).floor() as i32).max(clip_min_x);
-                let bx1 = (x0.max(x1).max(x2).ceil() as i32).min(clip_max_x - 1);
-                let by0 = (y0.min(y1).min(y2).floor() as i32).max(clip_min_y);
-                let by1 = (y0.max(y1).max(y2).ceil() as i32).min(clip_max_y - 1);
-                if bx0 > bx1 || by0 > by1 {
-                    continue;
-                }
-
-                let c0 = v0.color.to_array();
-                let c1 = v1.color.to_array();
-                let c2 = v2.color.to_array();
-
-                for py in by0..=by1 {
-                    let cy = py as f32 + 0.5;
-                    for px in bx0..=bx1 {
-                        let cx = px as f32 + 0.5;
-                        let w0 = ((x1 - cx) * (y2 - cy) - (y1 - cy) * (x2 - cx)) * inv_area;
-                        let w1 = ((x2 - cx) * (y0 - cy) - (y2 - cy) * (x0 - cx)) * inv_area;
-                        let w2 = 1.0 - w0 - w1;
-                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
-                            continue;
-                        }
-
-                        let vr =
-                            (w0 * f32::from(c0[0]) + w1 * f32::from(c1[0]) + w2 * f32::from(c2[0]))
-                                .clamp(0.0, 255.0);
-                        let vg =
-                            (w0 * f32::from(c0[1]) + w1 * f32::from(c1[1]) + w2 * f32::from(c2[1]))
-                                .clamp(0.0, 255.0);
-                        let vb =
-                            (w0 * f32::from(c0[2]) + w1 * f32::from(c1[2]) + w2 * f32::from(c2[2]))
-                                .clamp(0.0, 255.0);
-                        let va =
-                            (w0 * f32::from(c0[3]) + w1 * f32::from(c1[3]) + w2 * f32::from(c2[3]))
-                                .clamp(0.0, 255.0);
-
-                        let (sr, sg, sb, sa) = if let Some(t) = tex {
-                            let u = (w0 * v0.uv.x + w1 * v1.uv.x + w2 * v2.uv.x).clamp(0.0, 1.0);
-                            let v = (w0 * v0.uv.y + w1 * v1.uv.y + w2 * v2.uv.y).clamp(0.0, 1.0);
-                            let [tr, tg, tb, ta] = sample_bilinear(t, u, v);
-                            (
-                                vr * tr / 255.0,
-                                vg * tg / 255.0,
-                                vb * tb / 255.0,
-                                va * ta / 255.0,
-                            )
-                        } else {
-                            (vr, vg, vb, va)
-                        };
-
-                        if sa <= 0.5 {
-                            continue;
-                        }
-                        let dst = &mut fb[(py as usize) * phys_w + (px as usize)];
-                        let inv_a = 1.0 - sa / 255.0;
-                        dst[0] = (sr + f32::from(dst[0]) * inv_a).round().clamp(0.0, 255.0) as u8;
-                        dst[1] = (sg + f32::from(dst[1]) * inv_a).round().clamp(0.0, 255.0) as u8;
-                        dst[2] = (sb + f32::from(dst[2]) * inv_a).round().clamp(0.0, 255.0) as u8;
-                        dst[3] = 255;
-                    }
-                }
-            }
-        }
-
-        let mut png_bytes = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut png_bytes, phys_w as u32, phys_h as u32);
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder.write_header().expect("png header");
-            let flat: Vec<u8> = fb.into_iter().flatten().collect();
-            writer.write_image_data(&flat).expect("png data");
-        }
-        png_bytes
-    }
-
-    fn sample_bilinear(tex: &SoftwareTexture, u: f32, v: f32) -> [f32; 4] {
-        if tex.width == 0 || tex.height == 0 {
-            return [255.0; 4];
-        }
-        let fx = (u * (tex.width as f32) - 0.5).clamp(0.0, (tex.width - 1) as f32);
-        let fy = (v * (tex.height as f32) - 0.5).clamp(0.0, (tex.height - 1) as f32);
-        let x0 = fx.floor() as usize;
-        let y0 = fy.floor() as usize;
-        let x1 = (x0 + 1).min(tex.width - 1);
-        let y1 = (y0 + 1).min(tex.height - 1);
-        let tx = fx - (x0 as f32);
-        let ty = fy - (y0 as f32);
-
-        let p00 = tex.pixels[y0 * tex.width + x0];
-        let p10 = tex.pixels[y0 * tex.width + x1];
-        let p01 = tex.pixels[y1 * tex.width + x0];
-        let p11 = tex.pixels[y1 * tex.width + x1];
-
-        let mut out = [0.0f32; 4];
-        for i in 0..4 {
-            let top = f32::from(p00[i]) * (1.0 - tx) + f32::from(p10[i]) * tx;
-            let bot = f32::from(p01[i]) * (1.0 - tx) + f32::from(p11[i]) * tx;
-            out[i] = top * (1.0 - ty) + bot * ty;
-        }
-        out
+        tg_ui::soft_raster::render_egui_to_png(&ctx, logical_w, logical_h, ppp, draw)
     }
 
     #[test]
@@ -1515,8 +1316,8 @@ mod tests {
         single_mgr.settings_mut().media.types |= MediaTypes::VIDEO | MediaTypes::VOICE_MESSAGE;
         single_mgr.settings_mut().media.size_limit = 16 * MEGABYTE;
         single_mgr.settings_mut().format = OutputFormat::HtmlAndJson;
-        single_mgr.settings_mut().single_peer_from = civil_to_unix(2025, 1, 1, 0, 0, 0);
-        single_mgr.settings_mut().single_peer_till = civil_to_unix(2026, 6, 15, 18, 30, 0);
+        single_mgr.settings_mut().single_peer_from = local_civil_to_unix(2025, 1, 1, 0, 0, 0);
+        single_mgr.settings_mut().single_peer_till = local_civil_to_unix(2026, 6, 15, 18, 30, 0);
 
         let settings_png = render_egui_to_png(790, 620, 1.5, |ui| {
             let rect = ui.max_rect();

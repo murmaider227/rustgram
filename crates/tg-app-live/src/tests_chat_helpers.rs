@@ -713,6 +713,8 @@ fn test_faved_and_recent_stickers_mutations() {
     // Record sticker used -> sends SaveRecentSticker & adds to Recent section
     fake.enqueue_ok(tl_fns::messages::SaveRecentSticker::CONSTRUCTOR_ID, &true);
     live.record_sticker_used(ChatDocId(2001));
+    // Sent without waiting (TGB-3071).
+    assert!(live.flush_background_rpcs(std::time::Duration::from_secs(10)));
     assert_eq!(
         fake.recorded_requests_of(tl_fns::messages::SaveRecentSticker::CONSTRUCTOR_ID)
             .len(),

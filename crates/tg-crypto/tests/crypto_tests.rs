@@ -324,8 +324,8 @@ fn auth_key_ids_and_mtproto_v2_kdf_kat() {
 
     // Left-padding in AuthKey::from_bytes
     let short_key = AuthKey::from_bytes(&[0xab, 0xcd]).unwrap();
-    assert_eq!(&short_key.data[..254], &[0u8; 254]);
-    assert_eq!(&short_key.data[254..], &[0xab, 0xcd]);
+    assert_eq!(&short_key.data()[..254], &[0u8; 254]);
+    assert_eq!(&short_key.data()[254..], &[0xab, 0xcd]);
     assert!(AuthKey::from_bytes(&[0u8; 257]).is_err());
 
     // Verify MTProto 2.0 key derivation matches https://core.telegram.org/mtproto/description
@@ -931,25 +931,25 @@ fn local_storage_keys_encryption_tdf_and_ctr() {
     let empty_prehash = sha512(&[&salt, b"", &salt]);
     let mut expected_empty = [0u8; 256];
     pbkdf2_hmac_sha512(&empty_prehash, &salt, 1, &mut expected_empty);
-    assert_eq!(empty_key.data, expected_empty);
+    assert_eq!(*empty_key.data(), expected_empty);
 
     // Modern local key (non-empty passcode -> 100_000 iterations)
     let pwd_key = create_local_key(b"local-passcode", &salt);
     let pwd_prehash = sha512(&[&salt, b"local-passcode", &salt]);
     let mut expected_pwd = [0u8; 256];
     pbkdf2_hmac_sha512(&pwd_prehash, &salt, 100_000, &mut expected_pwd);
-    assert_eq!(pwd_key.data, expected_pwd);
+    assert_eq!(*pwd_key.data(), expected_pwd);
 
     // 2. Legacy local key (empty -> 4 iters, non-empty -> 4000 iters)
     let legacy_empty = create_legacy_local_key(b"", &salt);
     let mut expected_leg_empty = [0u8; 256];
     pbkdf2_hmac_sha1(b"", &salt, 4, &mut expected_leg_empty);
-    assert_eq!(legacy_empty.data, expected_leg_empty);
+    assert_eq!(*legacy_empty.data(), expected_leg_empty);
 
     let legacy_pwd = create_legacy_local_key(b"old-passcode", &salt);
     let mut expected_leg_pwd = [0u8; 256];
     pbkdf2_hmac_sha1(b"old-passcode", &salt, 4_000, &mut expected_leg_pwd);
-    assert_eq!(legacy_pwd.data, expected_leg_pwd);
+    assert_eq!(*legacy_pwd.data(), expected_leg_pwd);
 
     // 3. Memory-hard PasscodeKdf (Argon2id and Scrypt with fast test costs + validation)
     let fast_argon2 = PasscodeKdf {

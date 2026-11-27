@@ -4,7 +4,7 @@
 //! `lottie/details/lottie_cache_frame_storage.h`, and
 //! `lottie/details/lottie_cache_frame_storage.cpp`.
 
-use lz4_flex::block::{compress, decompress};
+use lz4_flex::block::{compress, decompress_into};
 
 use crate::common::{
     FrameBuffer, FrameRenderResult, FrameRequest, MAX_FRAME_RATE, MAX_FRAMES_COUNT, MAX_SIZE,
@@ -52,11 +52,28 @@ fn a_size(width: usize, height: usize) -> usize {
 }
 
 /// Planar YUV420P + 4-bit packed alpha frame buffer (`Lottie::EncodedStorage`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct EncodedStorage {
     width: usize,
     height: usize,
     data: Vec<u8>,
+}
+
+impl Clone for EncodedStorage {
+    fn clone(&self) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            data: self.data.clone(),
+        }
+    }
+
+    /// Reuses `self`'s buffer (the derived `clone_from` would reallocate it).
+    fn clone_from(&mut self, source: &Self) {
+        self.width = source.width;
+        self.height = source.height;
+        self.data.clone_from(&source.data);
+    }
 }
 
 impl EncodedStorage {
@@ -307,6 +324,20 @@ fn compress_and_swap_frame(
     xored
 }
 
+/// Cached frame size for `original` under `request`: the request's rounded size, or the rounded
+/// original when there is no request.
+fn cached_size_for(original: Size, request: FrameRequest) -> Size {
+    if request.is_empty() {
+        let r = CACHE_SIZE_ROUNDING;
+        Size::new(
+            original.width.saturating_sub(original.width % r).max(r),
+            original.height.saturating_sub(original.height % r).max(r),
+        )
+    } else {
+        request.size(original, CACHE_SIZE_ROUNDING)
+    }
+}
+
 /// Decompresses a payload into `to` (`UncompressToRaw`).
 fn uncompress_to_raw(to: &mut EncodedStorage, from: &[u8]) -> bool {
     let expected = to.size();
@@ -317,13 +348,7 @@ fn uncompress_to_raw(to: &mut EncodedStorage, from: &[u8]) -> bool {
         to.as_bytes_mut().copy_from_slice(from);
         return true;
     }
-    match decompress(from, expected) {
-        Ok(decoded) if decoded.len() == expected => {
-            to.as_bytes_mut().copy_from_slice(&decoded);
-            true
-        }
-        _ => false,
-    }
+    matches!(decompress_into(from, to.as_bytes_mut()), Ok(n) if n == expected)
 }
 
 /// Per-reader streaming decode state for `Cache` (`Lottie::CacheReadContext`).
@@ -400,15 +425,7 @@ impl Cache {
         frames_count: u32,
         request: FrameRequest,
     ) {
-        self.size = if request.is_empty() {
-            let r = self.size_rounding();
-            Size::new(
-                original.width.saturating_sub(original.width % r).max(r),
-                original.height.saturating_sub(original.height % r).max(r),
-            )
-        } else {
-            request.size(original, self.size_rounding())
-        };
+        self.size = cached_size_for(original, request);
         self.original = original;
         self.frame_rate = frame_rate;
         self.frames_count = frames_count;
@@ -478,8 +495,11 @@ impl Cache {
         }
         context.offset = self.read_context.offset;
         context.offset_frame_index = self.read_context.offset_frame_index;
-        context.previous = self.read_context.previous.clone();
-        context.uncompressed = self.read_context.uncompressed.clone();
+        // `clone_from` reuses the context's buffers (tdesktop: memcpy) instead of reallocating.
+        context.previous.clone_from(&self.read_context.previous);
+        context
+            .uncompressed
+            .clone_from(&self.read_context.uncompressed);
     }
 
     /// Renders frame `index` from the cache into `to` using the cache's internal context.
@@ -530,26 +550,13 @@ impl Cache {
             context.offset_frame_index = 0;
             context.offset = HEADER_SIZE;
             for step in 0..index {
-                let (ok, xored) = self.read_compressed_frame(context);
-                if !ok || (xored && step == 0) {
+                if !self.advance_frame(context, step == 0) {
                     return FrameRenderResult::Failed;
-                }
-                if xored {
-                    xor_storage(&mut context.previous, &context.uncompressed);
-                } else {
-                    std::mem::swap(&mut context.uncompressed, &mut context.previous);
                 }
             }
         }
-
-        let (ok, xored) = self.read_compressed_frame(context);
-        if !ok || (xored && index == 0) {
+        if !self.advance_frame(context, index == 0) {
             return FrameRenderResult::Failed;
-        }
-        if xored {
-            xor_storage(&mut context.previous, &context.uncompressed);
-        } else {
-            std::mem::swap(&mut context.uncompressed, &mut context.previous);
         }
         decode_frame(to, &context.previous, self.size);
         FrameRenderResult::Ok
@@ -698,7 +705,10 @@ impl Cache {
 
         let size = Size::new(w as u32, h as u32);
         let original = Size::new(orig_w as u32, orig_h as u32);
-        if !request.is_empty() && request.size(original, self.size_rounding()) != size {
+        // As in tdesktop, the stored size must be the one this request derives from the original.
+        // Without a request the port used to accept any size, so a corrupt header could make
+        // `prepare_own_buffers` allocate gigabytes.
+        if cached_size_for(original, request) != size {
             return false;
         }
         if !size.width.is_multiple_of(2) || !size.height.is_multiple_of(2) {
@@ -747,38 +757,45 @@ impl Cache {
         }
     }
 
-    fn read_compressed_frame(&self, context: &mut CacheReadContext) -> (bool, bool) {
+    /// Reads the next frame into `context.previous`, applying its XOR delta. The first frame of
+    /// the blob must be a key frame. Returns `false` on a missing or corrupt frame.
+    fn advance_frame(&self, context: &mut CacheReadContext, first: bool) -> bool {
+        match self.read_compressed_frame(context) {
+            Some(false) => std::mem::swap(&mut context.uncompressed, &mut context.previous),
+            Some(true) if !first => xor_storage(&mut context.previous, &context.uncompressed),
+            Some(true) | None => return false,
+        }
+        true
+    }
+
+    /// Decompresses the next frame into `context.uncompressed`; `Some(xored)` on success, where
+    /// `xored` says the frame is a delta against the previous one.
+    fn read_compressed_frame(&self, context: &mut CacheReadContext) -> Option<bool> {
         let part: &[u8] = if context.offset_frame_index >= self.frames_in_data {
             let ready_idx = (context.offset_frame_index - self.frames_in_data) as usize;
-            match self.compressed_frames.get(ready_idx) {
-                Some(b) => b.as_slice(),
-                None => return (false, false),
-            }
+            self.compressed_frames.get(ready_idx)?.as_slice()
         } else if self.data.len() > context.offset {
             &self.data[context.offset..]
         } else {
-            return (false, false);
+            return None;
         };
 
         if part.len() < 4 {
-            return (false, false);
+            return None;
         }
         let raw_len = i32::from_le_bytes([part[0], part[1], part[2], part[3]]);
         let xored = raw_len < 0;
-        let len = match raw_len.checked_abs() {
-            Some(v) if v >= 0 => v as usize,
-            _ => return (false, false),
-        };
+        let len = usize::try_from(raw_len.checked_abs()?).ok()?;
         let payload = &part[4..];
         if len > payload.len() {
-            return (false, false);
+            return None;
         }
-        let ok = uncompress_to_raw(&mut context.uncompressed, &payload[..len]);
-        if ok {
-            context.offset += 4 + len;
-            context.offset_frame_index += 1;
+        if !uncompress_to_raw(&mut context.uncompressed, &payload[..len]) {
+            return None;
         }
-        (ok, xored)
+        context.offset += 4 + len;
+        context.offset_frame_index += 1;
+        Some(xored)
     }
 }
 

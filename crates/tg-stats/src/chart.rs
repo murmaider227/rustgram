@@ -12,6 +12,9 @@ use crate::color::{ChartPalette, Color};
 use crate::format::{CREDITS_CURRENCY, EM_DASH, UtcDateTime, lang_day_month};
 use crate::segment_tree::{ChartValue, SegmentTree};
 
+/// Upper bound on precomputed X-axis labels (65536 days is ~179 years; hourly, ~7 years).
+const MAX_DAY_LABELS: usize = 1 << 16;
+
 /// Opacity applied to horizontal and vertical ruler hairlines (`kRulerLineAlpha`).
 pub const RULER_LINE_ALPHA: f64 = 0.06;
 
@@ -476,7 +479,11 @@ impl StatisticalChart {
 
         self.days_lookup.clear();
         let safe_step = self.time_step.max(1.0);
-        let date_count = (((end - start) / safe_step) as usize).saturating_add(10);
+        // Bounded: out-of-order or hostile timestamps would otherwise ask for billions of labels
+        // (the C++ allocates them all). Real graphs stay far below the cap.
+        let date_count = (((end - start) / safe_step) as usize)
+            .saturating_add(10)
+            .min(MAX_DAY_LABELS);
         self.days_lookup.reserve(date_count);
 
         // Approximate 10px font glyph advance (6px per character), matching

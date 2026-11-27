@@ -634,19 +634,18 @@ pub fn parse_bot_deep_link(url: &str, start_ref_prefixes: &[&str]) -> Option<Bot
 }
 
 fn strip_http_scheme(url: &str) -> (&str, &str) {
-    if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
-        (&url[..8], &url[8..])
-    } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
-        (&url[..7], &url[7..])
-    } else {
-        ("", url)
-    }
+    ["https://", "http://"]
+        .into_iter()
+        .find_map(|scheme| {
+            let head = url.get(..scheme.len())?;
+            head.eq_ignore_ascii_case(scheme)
+                .then(|| (head, &url[scheme.len()..]))
+        })
+        .unwrap_or(("", url))
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
 }

@@ -282,28 +282,14 @@ pub(crate) fn ellipsize_to_width(
         return (text.to_owned(), false);
     }
     let ellipsis = "…";
-    let chars: Vec<char> = text.chars().collect();
-    let mut lo = 0usize;
-    let mut hi = chars.len();
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        let mut candidate: String = chars[..mid].iter().collect();
-        candidate.push_str(ellipsis);
-        let w = painter
-            .layout_no_wrap(candidate, font.clone(), Color32::WHITE)
+    let kept = tg_history::text_cut::longest_fitting_prefix(text, |prefix| {
+        painter
+            .layout_no_wrap(format!("{prefix}{ellipsis}"), font.clone(), Color32::WHITE)
             .size()
-            .x;
-        if w <= max_width {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    let mut out: String = chars[..lo].iter().collect();
-    let trimmed = out.trim_end().to_owned();
-    out = trimmed;
-    out.push_str(ellipsis);
-    (out, true)
+            .x
+            <= max_width
+    });
+    (format!("{}{ellipsis}", text[..kept].trim_end()), true)
 }
 
 #[allow(clippy::too_many_arguments)]

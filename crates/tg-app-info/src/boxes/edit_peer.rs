@@ -1912,22 +1912,7 @@ fn nav_setting_row(ui: &mut Ui, icon: Icon, label: &str, value: &str, colors: &d
                 .size()
                 .x
         };
-        let shown = if measure(value) <= max_w {
-            value.to_owned()
-        } else {
-            let chars: Vec<char> = value.chars().collect();
-            let (mut lo, mut hi) = (0usize, chars.len());
-            while lo < hi {
-                let mid = (lo + hi).div_ceil(2);
-                let candidate: String = chars[..mid].iter().collect::<String>() + "…";
-                if measure(&candidate) <= max_w {
-                    lo = mid;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            chars[..lo].iter().collect::<String>() + "…"
-        };
+        let shown = crate::elide::elide_end_by(value, |s| measure(s) <= max_w);
         ui.painter().text(
             Pos2::new(rect.max.x - 16.0, rect.center().y),
             Align2::RIGHT_CENTER,

@@ -6,7 +6,10 @@
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::aes::{AES_BLOCK_SIZE, try_aes_ige_decrypt, try_aes_ige_encrypt};
+use crate::aes::{
+    AES_BLOCK_SIZE, aes_ige_decrypt_in_place, aes_ige_encrypt_in_place, try_aes_ige_decrypt,
+    try_aes_ige_encrypt,
+};
 use crate::error::CryptoError;
 use crate::hash::{const_time_eq, sha1, sha256};
 use crate::random::{random_array, random_bytes};
@@ -41,11 +44,14 @@ impl Side {
 
 /// A 256-byte (2048-bit) MTProto authorization key (or local storage key).
 ///
-/// Port of `MTP::AuthKey` in `mtproto/mtproto_auth_key.h/.cpp`.
+/// Port of `MTP::AuthKey` in `mtproto/mtproto_auth_key.h/.cpp`. Like tdesktop's
+/// `AuthKey::countKeyId`, the `auth_key_id` is computed once when the key is built: every
+/// encrypted packet carries it, so it must not cost a SHA-1 of the key per packet. The key
+/// bytes are read-only after construction so the cached id cannot go stale.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct AuthKey {
-    /// Raw 256-byte key material.
-    pub data: [u8; AUTH_KEY_SIZE],
+    data: [u8; AUTH_KEY_SIZE],
+    key_id: [u8; 8],
 }
 
 impl std::fmt::Debug for AuthKey {
@@ -58,8 +64,16 @@ impl std::fmt::Debug for AuthKey {
 
 impl AuthKey {
     /// Construct an `AuthKey` from an exact 256-byte array.
-    pub const fn new(data: [u8; AUTH_KEY_SIZE]) -> Self {
-        Self { data }
+    pub fn new(data: [u8; AUTH_KEY_SIZE]) -> Self {
+        let hash = sha1(&[&data]);
+        let mut key_id = [0u8; 8];
+        key_id.copy_from_slice(&hash[12..20]);
+        Self { data, key_id }
+    }
+
+    /// Raw 256-byte key material.
+    pub const fn data(&self) -> &[u8; AUTH_KEY_SIZE] {
+        &self.data
     }
 
     /// Construct an `AuthKey` from big-endian DH key bytes, left-padding with zero bytes
@@ -73,20 +87,19 @@ impl AuthKey {
         let mut data = [0u8; AUTH_KEY_SIZE];
         let offset = AUTH_KEY_SIZE - bytes.len();
         data[offset..].copy_from_slice(bytes);
-        Ok(Self { data })
+        let key = Self::new(data);
+        data.zeroize();
+        Ok(key)
     }
 
     /// Return the 8-byte `auth_key_id` (lower 64 bits of `SHA1(auth_key)`, i.e. bytes `12..20`).
-    pub fn key_id(&self) -> [u8; 8] {
-        let hash = sha1(&[&self.data]);
-        let mut id = [0u8; 8];
-        id.copy_from_slice(&hash[12..20]);
-        id
+    pub const fn key_id(&self) -> [u8; 8] {
+        self.key_id
     }
 
     /// Return `auth_key_id` as a little-endian `u64` (matching `MTP::AuthKey::keyId()`).
-    pub fn key_id_u64(&self) -> u64 {
-        u64::from_le_bytes(self.key_id())
+    pub const fn key_id_u64(&self) -> u64 {
+        u64::from_le_bytes(self.key_id)
     }
 
     /// Return the 8-byte `auth_key_aux_hash` (first 64 bits of `SHA1(auth_key)`, i.e. bytes `0..8`).
@@ -206,23 +219,85 @@ pub fn encrypt_data_v2_with_padding(
         return Err(CryptoError::InvalidBlockLength { len: total_len });
     }
 
-    let mut padded = Vec::with_capacity(total_len);
-    padded.extend_from_slice(plaintext);
-    padded.extend_from_slice(padding);
+    let mut packet = Vec::with_capacity(PACKET_HEADER_SIZE + total_len);
+    packet.resize(PACKET_HEADER_SIZE, 0);
+    packet.extend_from_slice(plaintext);
+    packet.extend_from_slice(padding);
+    encrypt_packet_v2_in_place(&mut packet, auth_key, side)?;
+    Ok(packet)
+}
 
-    let msg_key = compute_msg_key_v2(auth_key, side, &padded);
+/// Size of the unencrypted MTProto 2.0 packet header: `auth_key_id (8) || msg_key (16)`.
+pub const PACKET_HEADER_SIZE: usize = 8 + 16;
+
+/// Largest random padding [`encrypt_reserved_v2`] appends (`27 + 15 * 16` bytes).
+pub const MAX_RANDOM_PADDING_V2: usize = MIN_PADDING_V2 + AES_BLOCK_SIZE - 1 + 15 * AES_BLOCK_SIZE;
+
+/// Encrypt an MTProto 2.0 packet in place.
+///
+/// `packet[24..]` holds `plaintext || padding` and must be a multiple of 16 bytes; the caller
+/// chooses the padding (12..=1024 bytes per the protocol). The plaintext is replaced by the
+/// AES-256-IGE ciphertext and `packet[..24]` is overwritten with `auth_key_id || msg_key`, so the
+/// buffer becomes the wire packet without further copies.
+pub fn encrypt_packet_v2_in_place(
+    packet: &mut [u8],
+    auth_key: &AuthKey,
+    side: Side,
+) -> Result<(), CryptoError> {
+    let Some((header, padded)) = packet.split_at_mut_checked(PACKET_HEADER_SIZE) else {
+        return Err(CryptoError::InvalidLength(
+            "MTProto 2.0 packet shorter than its 24-byte header",
+        ));
+    };
+    if !padded.len().is_multiple_of(AES_BLOCK_SIZE) {
+        return Err(CryptoError::InvalidBlockLength { len: padded.len() });
+    }
+    let msg_key = compute_msg_key_v2(auth_key, side, padded);
     let (mut aes_key, mut aes_iv) = auth_key.prepare_aes_v2(&msg_key, side);
-    let encrypted = try_aes_ige_encrypt(&padded, &aes_key, &aes_iv)?;
-
-    padded.zeroize();
+    let encrypted = aes_ige_encrypt_in_place(padded, &aes_key, &aes_iv);
     aes_key.zeroize();
     aes_iv.zeroize();
+    encrypted?;
+    header[..8].copy_from_slice(&auth_key.key_id());
+    header[8..].copy_from_slice(&msg_key);
+    Ok(())
+}
 
-    let mut out = Vec::with_capacity(8 + 16 + encrypted.len());
-    out.extend_from_slice(&auth_key.key_id());
-    out.extend_from_slice(&msg_key);
-    out.extend_from_slice(&encrypted);
-    Ok(out)
+/// Encrypt a buffer laid out as `24 reserved bytes || plaintext` using MTProto 2.0.
+///
+/// Appends 12..=267 random padding bytes so the encrypted payload length is a multiple of 16
+/// bytes (matching `CountPaddingPrimesCount` in `mtproto_serialized_request.cpp`), encrypts in
+/// place and returns the same buffer as `auth_key_id (8) || msg_key (16) || ciphertext`.
+/// Reserve [`MAX_RANDOM_PADDING_V2`] extra capacity to avoid a reallocation.
+pub fn encrypt_reserved_v2(
+    mut packet: Vec<u8>,
+    auth_key: &AuthKey,
+    side: Side,
+) -> Result<Vec<u8>, CryptoError> {
+    let Some(plain_len) = packet.len().checked_sub(PACKET_HEADER_SIZE) else {
+        return Err(CryptoError::InvalidLength(
+            "MTProto 2.0 packet shorter than its 24-byte header",
+        ));
+    };
+    let pad_len = random_padding_len_v2(plain_len);
+    let start = packet.len();
+    packet.resize(start + pad_len, 0);
+    random_bytes(&mut packet[start..]);
+    encrypt_packet_v2_in_place(&mut packet, auth_key, side)?;
+    Ok(packet)
+}
+
+/// Random MTProto 2.0 padding length for `plain_len` plaintext bytes: the 12..=27 bytes that
+/// align to 16, plus 0..=15 extra 16-byte blocks (same distribution as tdesktop:
+/// `(RandomValue<uchar>() & 0x0F) << 2` primes = 0..=240 bytes).
+fn random_padding_len_v2(plain_len: usize) -> usize {
+    let rem = plain_len % AES_BLOCK_SIZE;
+    let mut pad_len = if rem == 0 { 0 } else { AES_BLOCK_SIZE - rem };
+    if pad_len < MIN_PADDING_V2 {
+        pad_len += AES_BLOCK_SIZE;
+    }
+    let extra_blocks = (random_array::<1>()[0] & 0x0F) as usize;
+    pad_len + extra_blocks * AES_BLOCK_SIZE
 }
 
 /// Encrypt `plaintext` using MTProto 2.0, adding 12..=267 random padding bytes so the
@@ -231,23 +306,55 @@ pub fn encrypt_data_v2_with_padding(
 ///
 /// Returns `auth_key_id (8) || msg_key (16) || aes_ige_encrypted_data`.
 pub fn encrypt_data_v2(plaintext: &[u8], auth_key: &AuthKey, side: Side) -> Vec<u8> {
-    let rem = plaintext.len() % AES_BLOCK_SIZE;
-    let mut pad_len = if rem == 0 { 0 } else { AES_BLOCK_SIZE - rem };
-    if pad_len < MIN_PADDING_V2 {
-        pad_len += AES_BLOCK_SIZE;
-    }
-    // Add 0..=15 extra 16-byte blocks of random padding (same distribution as tdesktop:
-    // `(RandomValue<uchar>() & 0x0F) << 2` primes = 0..=240 bytes).
-    let extra_blocks = (random_array::<1>()[0] & 0x0F) as usize;
-    pad_len += extra_blocks * AES_BLOCK_SIZE;
-
-    let mut padding = vec![0u8; pad_len];
-    random_bytes(&mut padding);
-
-    match encrypt_data_v2_with_padding(plaintext, &padding, auth_key, side) {
+    let mut packet =
+        Vec::with_capacity(PACKET_HEADER_SIZE + plaintext.len() + MAX_RANDOM_PADDING_V2);
+    packet.resize(PACKET_HEADER_SIZE, 0);
+    packet.extend_from_slice(plaintext);
+    match encrypt_reserved_v2(packet, auth_key, side) {
         Ok(out) => out,
-        Err(_) => unreachable!("padding length is guaranteed 12..=267 and block-aligned"),
+        Err(_) => unreachable!("the 24-byte header is reserved and the padding block-aligns"),
     }
+}
+
+/// Validate the outer MTProto 2.0 packet framing and `auth_key_id` (constant time) and return
+/// the packet's `msg_key`.
+fn check_packet_v2(encrypted: &[u8], auth_key: &AuthKey) -> Result<[u8; 16], CryptoError> {
+    if encrypted.len() < PACKET_HEADER_SIZE + AES_BLOCK_SIZE {
+        return Err(CryptoError::InvalidLength(
+            "MTProto 2.0 packet shorter than 40 bytes",
+        ));
+    }
+    let ciphertext_len = encrypted.len() - PACKET_HEADER_SIZE;
+    if !ciphertext_len.is_multiple_of(AES_BLOCK_SIZE) {
+        return Err(CryptoError::InvalidBlockLength {
+            len: ciphertext_len,
+        });
+    }
+    if !const_time_eq(&encrypted[0..8], &auth_key.key_id()) {
+        return Err(CryptoError::AuthKeyIdMismatch);
+    }
+    let mut msg_key = [0u8; 16];
+    msg_key.copy_from_slice(&encrypted[8..PACKET_HEADER_SIZE]);
+    Ok(msg_key)
+}
+
+/// Decrypt `ciphertext` in place and verify `msg_key` over the result (constant time).
+fn open_in_place_v2(
+    ciphertext: &mut [u8],
+    msg_key: &[u8; 16],
+    auth_key: &AuthKey,
+    side: Side,
+) -> Result<(), CryptoError> {
+    let (mut aes_key, mut aes_iv) = auth_key.prepare_aes_v2(msg_key, side);
+    let decrypted = aes_ige_decrypt_in_place(ciphertext, &aes_key, &aes_iv);
+    aes_key.zeroize();
+    aes_iv.zeroize();
+    decrypted?;
+    let expected_msg_key = compute_msg_key_v2(auth_key, side, ciphertext);
+    if !const_time_eq(msg_key, &expected_msg_key) {
+        return Err(CryptoError::MsgKeyMismatch);
+    }
+    Ok(())
 }
 
 /// Decrypt an MTProto 2.0 encrypted packet (`auth_key_id (8) || msg_key (16) || ciphertext`),
@@ -262,36 +369,9 @@ pub fn decrypt_data_v2(
     auth_key: &AuthKey,
     side: Side,
 ) -> Result<Vec<u8>, CryptoError> {
-    const HEADER_LEN: usize = 8 + 16;
-    if encrypted.len() < HEADER_LEN + AES_BLOCK_SIZE {
-        return Err(CryptoError::InvalidLength(
-            "MTProto 2.0 packet shorter than 40 bytes",
-        ));
-    }
-    let ciphertext = &encrypted[HEADER_LEN..];
-    if !ciphertext.len().is_multiple_of(AES_BLOCK_SIZE) {
-        return Err(CryptoError::InvalidBlockLength {
-            len: ciphertext.len(),
-        });
-    }
-
-    if !const_time_eq(&encrypted[0..8], &auth_key.key_id()) {
-        return Err(CryptoError::AuthKeyIdMismatch);
-    }
-
-    let mut msg_key = [0u8; 16];
-    msg_key.copy_from_slice(&encrypted[8..24]);
-
-    let (mut aes_key, mut aes_iv) = auth_key.prepare_aes_v2(&msg_key, side);
-    let decrypted = try_aes_ige_decrypt(ciphertext, &aes_key, &aes_iv)?;
-    aes_key.zeroize();
-    aes_iv.zeroize();
-
-    let expected_msg_key = compute_msg_key_v2(auth_key, side, &decrypted);
-    if !const_time_eq(&msg_key, &expected_msg_key) {
-        return Err(CryptoError::MsgKeyMismatch);
-    }
-
+    let msg_key = check_packet_v2(encrypted, auth_key)?;
+    let mut decrypted = encrypted[PACKET_HEADER_SIZE..].to_vec();
+    open_in_place_v2(&mut decrypted, &msg_key, auth_key, side)?;
     Ok(decrypted)
 }
 
@@ -307,39 +387,37 @@ pub fn decrypt_message_v2(
     auth_key: &AuthKey,
     side: Side,
 ) -> Result<DecryptedMessage, CryptoError> {
-    const INNER_HEADER_LEN: usize = 32;
     let decrypted = decrypt_data_v2(encrypted, auth_key, side)?;
+    parse_inner_message_v2(decrypted)
+}
+
+/// Parse the 32-byte inner header of the decrypted payload, validate the payload length and
+/// padding, and turn the buffer into the message body in place.
+fn parse_inner_message_v2(mut decrypted: Vec<u8>) -> Result<DecryptedMessage, CryptoError> {
+    const INNER_HEADER_LEN: usize = 32;
     if decrypted.len() < INNER_HEADER_LEN + 4 + MIN_PADDING_V2 {
         return Err(CryptoError::InvalidMessageFraming(
             "decrypted payload too short for MTProto inner header + padding",
         ));
     }
-
-    let salt = i64::from_le_bytes(
-        decrypted[0..8]
-            .try_into()
-            .map_err(|_| CryptoError::InvalidMessageFraming("salt slice"))?,
-    );
-    let session_id = i64::from_le_bytes(
-        decrypted[8..16]
-            .try_into()
-            .map_err(|_| CryptoError::InvalidMessageFraming("session_id slice"))?,
-    );
-    let msg_id = i64::from_le_bytes(
-        decrypted[16..24]
-            .try_into()
-            .map_err(|_| CryptoError::InvalidMessageFraming("msg_id slice"))?,
-    );
-    let seq_no = i32::from_le_bytes(
-        decrypted[24..28]
-            .try_into()
-            .map_err(|_| CryptoError::InvalidMessageFraming("seq_no slice"))?,
-    );
-    let msg_len = u32::from_le_bytes(
-        decrypted[28..32]
-            .try_into()
-            .map_err(|_| CryptoError::InvalidMessageFraming("message_data_length slice"))?,
-    ) as usize;
+    let header: &[u8; INNER_HEADER_LEN] = decrypted
+        .first_chunk()
+        .ok_or(CryptoError::InvalidMessageFraming("inner header slice"))?;
+    let le_i64 = |at: usize| {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&header[at..at + 8]);
+        i64::from_le_bytes(bytes)
+    };
+    let le_u32 = |at: usize| {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&header[at..at + 4]);
+        u32::from_le_bytes(bytes)
+    };
+    let salt = le_i64(0);
+    let session_id = le_i64(8);
+    let msg_id = le_i64(16);
+    let seq_no = le_u32(24).cast_signed();
+    let msg_len = le_u32(28) as usize;
 
     if msg_len < 4 || !msg_len.is_multiple_of(4) {
         return Err(CryptoError::InvalidMessageFraming(
@@ -365,12 +443,14 @@ pub fn decrypt_message_v2(
         ));
     }
 
+    decrypted.truncate(full_data_len);
+    decrypted.drain(..INNER_HEADER_LEN);
     Ok(DecryptedMessage {
         salt,
         session_id,
         msg_id,
         seq_no,
-        body: decrypted[INNER_HEADER_LEN..full_data_len].to_vec(),
+        body: decrypted,
     })
 }
 

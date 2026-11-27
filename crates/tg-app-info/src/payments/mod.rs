@@ -92,7 +92,7 @@ pub fn parse_invoice_deep_link(uri: &str) -> Option<String> {
             if let Some((k, v)) = pair.split_once('=')
                 && k == "slug"
             {
-                let decoded = percent_decode(v);
+                let decoded = tg_text::url::url_decode(v);
                 if !decoded.is_empty() {
                     return Some(decoded);
                 }
@@ -139,7 +139,7 @@ pub fn parse_passport_deep_link(uri: &str) -> Option<PassportDeepLink> {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
         };
-        let val = percent_decode(v);
+        let val = tg_text::url::url_decode(v);
         match k {
             "bot_id" => bot_id = val.parse::<i64>().ok(),
             "bot" | "domain" => bot_username = val.trim_start_matches('@').to_owned(),
@@ -164,35 +164,6 @@ pub fn parse_passport_deep_link(uri: &str) -> Option<PassportDeepLink> {
         nonce: effective_nonce,
         callback_url,
     })
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hex = &input[i + 1..i + 3];
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b);
-                    i += 3;
-                } else {
-                    out.push(b'%');
-                    i += 1;
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub use tg_app_core::core_types::window_types::PaymentsScreen;
@@ -1256,11 +1227,10 @@ impl AppPaymentsHost {
 mod tests_tgb2892;
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
+mod tests_link_decode;
 
-    use egui::epaint::{Primitive, TextureId};
-    use egui::{Pos2, RawInput, Rect, Vec2};
+#[cfg(test)]
+mod tests {
     use tg_passport::types::{ScopeType, ValueMap, ValueType};
     use tg_payments::card::{
         CardBrand, CardField, NativeMethodDetails, ValidationState, YearMonth,
@@ -1557,224 +1527,17 @@ mod tests {
         assert!(view.identity_draft.errors.contains_key("first_name"));
     }
 
-    // -------------------------------------------------------------------------
-    // Software egui PNG renderer for deterministic documentation screenshots
-    // -------------------------------------------------------------------------
-
-    struct SoftwareTexture {
-        width: usize,
-        height: usize,
-        pixels: Vec<[u8; 4]>,
-    }
+    // Documentation screenshots through the shared software rasterizer (tg_ui::soft_raster).
 
     fn render_egui_to_png(
         logical_w: u32,
         logical_h: u32,
         ppp: f32,
-        mut draw: impl FnMut(&mut egui::Ui),
+        draw: impl FnMut(&mut egui::Ui),
     ) -> Vec<u8> {
         let ctx = egui::Context::default();
-        let palette = Palette::day();
-        ctx.set_visuals(palette.to_egui_visuals(ThemeMode::Day));
-
-        let mut textures: HashMap<TextureId, SoftwareTexture> = HashMap::new();
-        let mut last_output = None;
-
-        for frame in 0..3 {
-            let raw_input = RawInput {
-                screen_rect: Some(Rect::from_min_size(
-                    Pos2::ZERO,
-                    Vec2::new(logical_w as f32, logical_h as f32),
-                )),
-                time: Some(frame as f64 * 0.016),
-                ..Default::default()
-            };
-            ctx.set_pixels_per_point(ppp);
-            let mut output = ctx.run_ui(raw_input, |ui| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ui, |ui| draw(ui));
-            });
-
-            for (id, deltas) in &output.textures_delta.set {
-                for delta in deltas {
-                    let egui::ImageData::Color(ref color_img) = delta.image;
-                    let [iw, ih] = color_img.size;
-                    if let Some([ox, oy]) = delta.pos {
-                        if let Some(tex) = textures.get_mut(id) {
-                            for y in 0..ih {
-                                for x in 0..iw {
-                                    let dst_x = ox + x;
-                                    let dst_y = oy + y;
-                                    if dst_x < tex.width && dst_y < tex.height {
-                                        tex.pixels[dst_y * tex.width + dst_x] =
-                                            color_img.pixels[y * iw + x].to_array();
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let pixels = color_img.pixels.iter().map(|c| c.to_array()).collect();
-                        textures.insert(
-                            *id,
-                            SoftwareTexture {
-                                width: iw,
-                                height: ih,
-                                pixels,
-                            },
-                        );
-                    }
-                }
-            }
-            for free_id in &output.textures_delta.free {
-                textures.remove(free_id);
-            }
-            output.textures_delta.clear();
-            last_output = Some(output);
-        }
-
-        let output = last_output.expect("egui produced output");
-        let clipped = ctx.tessellate(output.shapes, ppp);
-
-        let phys_w = ((logical_w as f32) * ppp).round() as usize;
-        let phys_h = ((logical_h as f32) * ppp).round() as usize;
-        let mut fb = vec![[255u8, 255u8, 255u8, 255u8]; phys_w * phys_h];
-
-        for prim in clipped {
-            let Primitive::Mesh(mesh) = prim.primitive else {
-                continue;
-            };
-            let tex = textures.get(&mesh.texture_id);
-            let clip_min_x = (prim.clip_rect.min.x * ppp).floor().max(0.0) as i32;
-            let clip_min_y = (prim.clip_rect.min.y * ppp).floor().max(0.0) as i32;
-            let clip_max_x = (prim.clip_rect.max.x * ppp).ceil().min(phys_w as f32) as i32;
-            let clip_max_y = (prim.clip_rect.max.y * ppp).ceil().min(phys_h as f32) as i32;
-
-            for tri in mesh.indices.as_chunks::<3>().0 {
-                let v0 = mesh.vertices[tri[0] as usize];
-                let v1 = mesh.vertices[tri[1] as usize];
-                let v2 = mesh.vertices[tri[2] as usize];
-
-                let x0 = v0.pos.x * ppp;
-                let y0 = v0.pos.y * ppp;
-                let x1 = v1.pos.x * ppp;
-                let y1 = v1.pos.y * ppp;
-                let x2 = v2.pos.x * ppp;
-                let y2 = v2.pos.y * ppp;
-
-                let area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
-                if area.abs() < 1e-6 {
-                    continue;
-                }
-                let inv_area = 1.0 / area;
-
-                let min_x = x0.min(x1).min(x2).floor() as i32;
-                let max_x = x0.max(x1).max(x2).ceil() as i32;
-                let min_y = y0.min(y1).min(y2).floor() as i32;
-                let max_y = y0.max(y1).max(y2).ceil() as i32;
-
-                let bx0 = min_x.max(clip_min_x);
-                let bx1 = max_x.min(clip_max_x - 1);
-                let by0 = min_y.max(clip_min_y);
-                let by1 = max_y.min(clip_max_y - 1);
-                if bx0 > bx1 || by0 > by1 {
-                    continue;
-                }
-
-                let c0 = v0.color.to_array();
-                let c1 = v1.color.to_array();
-                let c2 = v2.color.to_array();
-
-                for py in by0..=by1 {
-                    let cy = py as f32 + 0.5;
-                    for px in bx0..=bx1 {
-                        let cx = px as f32 + 0.5;
-                        let w0 = ((x1 - cx) * (y2 - cy) - (y1 - cy) * (x2 - cx)) * inv_area;
-                        let w1 = ((x2 - cx) * (y0 - cy) - (y2 - cy) * (x0 - cx)) * inv_area;
-                        let w2 = 1.0 - w0 - w1;
-                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
-                            continue;
-                        }
-
-                        let vr =
-                            (w0 * f32::from(c0[0]) + w1 * f32::from(c1[0]) + w2 * f32::from(c2[0]))
-                                .clamp(0.0, 255.0);
-                        let vg =
-                            (w0 * f32::from(c0[1]) + w1 * f32::from(c1[1]) + w2 * f32::from(c2[1]))
-                                .clamp(0.0, 255.0);
-                        let vb =
-                            (w0 * f32::from(c0[2]) + w1 * f32::from(c1[2]) + w2 * f32::from(c2[2]))
-                                .clamp(0.0, 255.0);
-                        let va =
-                            (w0 * f32::from(c0[3]) + w1 * f32::from(c1[3]) + w2 * f32::from(c2[3]))
-                                .clamp(0.0, 255.0);
-
-                        let (sr, sg, sb, sa) = if let Some(t) = tex {
-                            let u = (w0 * v0.uv.x + w1 * v1.uv.x + w2 * v2.uv.x).clamp(0.0, 1.0);
-                            let v = (w0 * v0.uv.y + w1 * v1.uv.y + w2 * v2.uv.y).clamp(0.0, 1.0);
-                            let [tr, tg, tb, ta] = sample_bilinear(t, u, v);
-                            (
-                                vr * tr / 255.0,
-                                vg * tg / 255.0,
-                                vb * tb / 255.0,
-                                va * ta / 255.0,
-                            )
-                        } else {
-                            (vr, vg, vb, va)
-                        };
-
-                        if sa <= 0.5 {
-                            continue;
-                        }
-                        let dst = &mut fb[(py as usize) * phys_w + (px as usize)];
-                        let inv_a = 1.0 - sa / 255.0;
-                        dst[0] = (sr + f32::from(dst[0]) * inv_a).round().clamp(0.0, 255.0) as u8;
-                        dst[1] = (sg + f32::from(dst[1]) * inv_a).round().clamp(0.0, 255.0) as u8;
-                        dst[2] = (sb + f32::from(dst[2]) * inv_a).round().clamp(0.0, 255.0) as u8;
-                        dst[3] = 255;
-                    }
-                }
-            }
-        }
-
-        let mut raw = Vec::with_capacity(phys_w * phys_h * 4);
-        for px in &fb {
-            raw.extend_from_slice(px);
-        }
-        let img = image::RgbaImage::from_raw(phys_w as u32, phys_h as u32, raw)
-            .expect("valid RGBA image");
-        let mut png_bytes = Vec::new();
-        let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        img.write_to(&mut cursor, image::ImageFormat::Png)
-            .expect("encode PNG");
-        png_bytes
-    }
-
-    fn sample_bilinear(tex: &SoftwareTexture, u: f32, v: f32) -> [f32; 4] {
-        if tex.width == 0 || tex.height == 0 {
-            return [255.0, 255.0, 255.0, 255.0];
-        }
-        let fx = (u * (tex.width as f32) - 0.5).clamp(0.0, (tex.width - 1) as f32);
-        let fy = (v * (tex.height as f32) - 0.5).clamp(0.0, (tex.height - 1) as f32);
-        let x0 = fx.floor() as usize;
-        let y0 = fy.floor() as usize;
-        let x1 = (x0 + 1).min(tex.width - 1);
-        let y1 = (y0 + 1).min(tex.height - 1);
-        let tx = fx - (x0 as f32);
-        let ty = fy - (y0 as f32);
-
-        let p00 = tex.pixels[y0 * tex.width + x0];
-        let p10 = tex.pixels[y0 * tex.width + x1];
-        let p01 = tex.pixels[y1 * tex.width + x0];
-        let p11 = tex.pixels[y1 * tex.width + x1];
-
-        let mut out = [0.0f32; 4];
-        for i in 0..4 {
-            let top = f32::from(p00[i]) * (1.0 - tx) + f32::from(p10[i]) * tx;
-            let bot = f32::from(p01[i]) * (1.0 - tx) + f32::from(p11[i]) * tx;
-            out[i] = top * (1.0 - ty) + bot * ty;
-        }
-        out
+        ctx.set_visuals(Palette::day().to_egui_visuals(ThemeMode::Day));
+        tg_ui::soft_raster::render_egui_to_png(&ctx, logical_w, logical_h, ppp, draw)
     }
 
     #[test]

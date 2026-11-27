@@ -52,3 +52,6 @@ pub use tls::{
     default_client_hello_rules, generate_client_hello, generate_client_hello_with_rules,
     generate_x25519_public_key, prepare_greases, verify_server_hello,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

@@ -205,38 +205,10 @@ fn elide_middle_to_fit(
         return text.to_owned();
     }
 
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= 3 {
+    if text.chars().count() <= 3 {
         return "\u{2026}".to_owned();
     }
-
-    let mut best = "\u{2026}".to_owned();
-    let mut lo = 1usize;
-    let mut hi = chars.len() - 1;
-    while lo <= hi {
-        let mid = (lo + hi) / 2;
-        let head = mid.div_ceil(2);
-        let tail = mid / 2;
-        let mut candidate = String::with_capacity(mid + 3);
-        for &c in &chars[..head] {
-            candidate.push(c);
-        }
-        candidate.push('\u{2026}');
-        for &c in &chars[chars.len() - tail..] {
-            candidate.push(c);
-        }
-        let w = painter
-            .layout_no_wrap(candidate.clone(), font.clone(), Color32::WHITE)
-            .size()
-            .x;
-        if w <= max_width {
-            best = candidate;
-            lo = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    best
+    tg_ui::elide::elide_middle_by(text, |s| {
+        tg_ui::elide::fits_width(painter, s, &font, max_width)
+    })
 }

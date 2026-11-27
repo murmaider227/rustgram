@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 tg-data = { path = "../tg-data" }
 tg-text = { path = "../tg-text" }
+
+[dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }

@@ -13,7 +13,7 @@ use tg_data::{
 use tg_tl::{enums as tl_enums, functions as tl_fns, types as tl_types};
 
 use crate::convert::messages::{
-    apply_tl_message, entities_from_tl, entities_to_tl, input_reply_to_from_reply_info,
+    apply_tl_message, entities_from_tl_for_text, entities_to_tl, input_reply_to_from_reply_info,
     text_with_entities_from_tl,
 };
 use crate::convert::peers::{
@@ -47,7 +47,7 @@ pub fn draft_from_tl(draft: &tl_enums::DraftMessage) -> Option<Draft> {
             let entities = d
                 .entities
                 .as_deref()
-                .map(entities_from_tl)
+                .map(|e| entities_from_tl_for_text(&d.message, e, UserId::ZERO))
                 .unwrap_or_default();
             let reply = d.reply_to.as_ref().map(|r| match r {
                 tl_enums::InputReplyTo::Message(m) => ReplyInfo {
@@ -64,7 +64,7 @@ pub fn draft_from_tl(draft: &tl_enums::DraftMessage) -> Option<Draft> {
                             q.clone(),
                             m.quote_entities
                                 .as_deref()
-                                .map(entities_from_tl)
+                                .map(|e| entities_from_tl_for_text(q, e, UserId::ZERO))
                                 .unwrap_or_default(),
                         )
                     }),

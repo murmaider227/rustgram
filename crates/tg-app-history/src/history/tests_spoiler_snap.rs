@@ -28,6 +28,39 @@ pub(crate) struct SnapState {
     colors: HistoryColors,
 }
 
+impl SnapState {
+    pub(crate) fn new(
+        inner: HistoryInnerWidget,
+        store: MockHistoryStore,
+        peer_info: HistoryPeerInfo,
+        list_rect: Rect,
+        colors: HistoryColors,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            peer_info,
+            list_rect,
+            colors,
+        }
+    }
+
+    /// One frame of the history list over the chat background.
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
+        ui.painter()
+            .rect_filled(self.list_rect, 0.0, self.colors.canvas_bg);
+        let _ = self.inner.show(
+            ui,
+            self.list_rect,
+            &self.peer_info,
+            false,
+            "",
+            &self.colors,
+            &mut self.store,
+        );
+    }
+}
+
 fn peer_info(peer: PeerId) -> HistoryPeerInfo {
     HistoryPeerInfo {
         summary: PeerSummary {

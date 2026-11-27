@@ -18,6 +18,8 @@ pub mod anim;
 pub mod clipboard;
 pub mod custom_emoji;
 pub mod effects;
+pub mod elide;
+pub mod entity_bounds;
 pub mod entity_link;
 pub mod fonts;
 pub mod icons;
@@ -25,6 +27,8 @@ pub mod layers;
 pub mod painter;
 pub mod peer_color;
 pub mod platform;
+#[cfg(any(test, feature = "soft-raster"))]
+pub mod soft_raster;
 pub mod stand_in;
 pub mod style;
 pub mod text;
@@ -44,6 +48,12 @@ pub fn apply_tdesktop_visuals(ctx: &egui::Context, colors: &dyn theme::Colors) {
 
 #[cfg(test)]
 mod text_weight_tests;
+
+#[cfg(test)]
+mod custom_emoji_tests;
+
+#[cfg(test)]
+mod custom_emoji_lru_tests;
 
 #[cfg(test)]
 mod tests {

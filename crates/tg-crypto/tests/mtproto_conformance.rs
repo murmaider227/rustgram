@@ -540,10 +540,10 @@ fn conformance_dh_tmp_aes_key_iv_and_auth_key_derivation() {
     let mut short_secret = vec![0x42u8; 255]; // 255 bytes -> must left-pad with one 0x00 byte
     short_secret[0] = 0x7F;
     let auth_key = AuthKey::from_bytes(&short_secret).unwrap();
-    assert_eq!(auth_key.data[0], 0x00);
-    assert_eq!(&auth_key.data[1..256], &short_secret[..]);
+    assert_eq!(auth_key.data()[0], 0x00);
+    assert_eq!(&auth_key.data()[1..256], &short_secret[..]);
 
-    let key_sha1 = spec_sha1(&[&auth_key.data]);
+    let key_sha1 = spec_sha1(&[auth_key.data()]);
     assert_eq!(auth_key.aux_hash(), key_sha1[0..8]);
     assert_eq!(auth_key.key_id(), key_sha1[12..20]);
     assert_eq!(

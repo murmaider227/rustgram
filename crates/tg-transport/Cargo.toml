@@ -20,4 +20,5 @@ url = "2.5.4"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 
 [dev-dependencies]
+tg-fuzz = { path = "../tg-fuzz" }
 tokio = { version = "1.44.2", features = ["rt-multi-thread", "macros"] }

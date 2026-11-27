@@ -1958,7 +1958,7 @@ impl CoreSettings {
             if dictionaries_count < 0 {
                 return Err(SettingsError::InvalidCount(dictionaries_count));
             }
-            dictionaries_enabled.reserve(dictionaries_count as usize);
+            dictionaries_enabled.reserve(r.capacity_for(dictionaries_count as usize, 8));
             for _ in 0..dictionaries_count {
                 let lang_id = r.read_i64()?;
                 dictionaries_enabled.push(lang_id as i32);
@@ -2069,7 +2069,7 @@ impl CoreSettings {
             if count < 0 {
                 return Err(SettingsError::InvalidCount(count));
             }
-            accounts_order.reserve(count as usize);
+            accounts_order.reserve(r.capacity_for(count as usize, 8));
             for _ in 0..count {
                 accounts_order.push(r.read_u64()?);
             }
@@ -2097,7 +2097,7 @@ impl CoreSettings {
             if count < 0 {
                 return Err(SettingsError::InvalidCount(count));
             }
-            skip_translation_languages_raw.reserve(count as usize);
+            skip_translation_languages_raw.reserve(r.capacity_for(count as usize, 8));
             for _ in 0..count {
                 skip_translation_languages_raw.push(r.read_u64()?);
             }

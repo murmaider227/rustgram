@@ -34,3 +34,6 @@ pub mod mosaic;
 pub mod protocol;
 pub mod stand_in;
 pub mod tl_convert;
+
+#[cfg(test)]
+mod fuzz_untrusted;

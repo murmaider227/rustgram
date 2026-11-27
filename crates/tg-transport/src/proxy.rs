@@ -658,11 +658,9 @@ fn parse_proxy_link_parts(link: &str) -> Option<(ProxyType, &str)> {
 }
 
 fn strip_prefix_ascii_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
 }
 
 fn parse_query_params_lowercase(query: &str) -> HashMap<String, String> {

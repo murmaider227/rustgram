@@ -748,6 +748,9 @@ fn notify_settings_silent_flag_sounds_and_get_exceptions_wire_format() {
         }),
     );
 
+    // The first read answers at once and loads in the background (TGB-3070).
+    let _ = live.scope_notifications(NotifyScope::PrivateChats);
+    assert!(live.wait_settings_reads(std::time::Duration::from_secs(10)));
     let scope = live.scope_notifications(NotifyScope::PrivateChats);
     assert!(scope.enabled);
     assert_eq!(scope.exceptions.len(), 1);
@@ -817,6 +820,8 @@ fn authorization_date_fallback_single_flag_change_review_and_personal_channel() 
             authorizations: vec![tl_enums::Authorization::Authorization(auth_zero_active)],
         }),
     );
+    let _ = live.active_sessions();
+    assert!(live.wait_settings_reads(std::time::Duration::from_secs(10)));
     let sessions = live.active_sessions();
     assert_eq!(sessions.len(), 1);
     assert!(sessions[0].accept_calls);

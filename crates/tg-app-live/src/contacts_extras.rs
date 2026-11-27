@@ -596,7 +596,7 @@ pub(crate) fn set_blocked_peers(
                 }
             });
             if let Ok(mut c) = live.cache.lock() {
-                c.blocked_loaded = false;
+                c.invalidate_blocked_users();
             }
         }
         live.bridge_state().notify_ui();

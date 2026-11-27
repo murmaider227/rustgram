@@ -31,3 +31,6 @@ pub use types::{
     StickerSetId, TimeId, UserId, UserInfo, is_diacritic, remove_accents, sort_by_online_value,
     utf16_len,
 };
+
+#[cfg(test)]
+mod fuzz_untrusted;

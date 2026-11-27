@@ -589,6 +589,9 @@ impl Color {
     #[must_use]
     pub fn from_hex_argb(s: &str) -> Option<Self> {
         let hex = s.strip_prefix('#').unwrap_or(s);
+        if !hex.is_ascii() {
+            return None;
+        }
         match hex.len() {
             6 => {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
