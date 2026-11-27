@@ -339,6 +339,7 @@ fn spawn_startup_integration(plan: StartupPlan, exe_path: PathBuf, mut prefs: St
     let spawned = std::thread::Builder::new()
         .name("startup-integration".to_owned())
         .spawn(move || {
+            updater::remove_obsolete_install_files(&exe_path);
             let mut hooks = RealWindowsPlatform;
             let report =
                 platform::apply_startup_integration(&plan, &exe_path, &mut prefs, &mut hooks);

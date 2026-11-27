@@ -680,6 +680,12 @@ impl HistoryInnerWidget {
         &self.painted_msg_ids
     }
 
+    /// Voice playback state, to put a message into a playing state (tests).
+    #[cfg(test)]
+    pub(crate) fn voice_state_mut(&mut self) -> &mut VoicePlaybackState {
+        &mut self.voice_state
+    }
+
     /// How many messages hold prepared text (tests).
     #[cfg(test)]
     pub(crate) fn prepared_message_count(&self) -> usize {

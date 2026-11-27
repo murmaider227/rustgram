@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{
-    Color32, ColorImage, Context, Id, Mesh, Painter, Pos2, Rect, Shape, TextureHandle,
-    TextureOptions, Vec2, pos2,
+    Color32, ColorImage, Context, CornerRadius, Id, Mesh, Painter, Pos2, Rect, Shape,
+    TextureHandle, TextureOptions, Vec2, pos2,
 };
 
 use crate::anim::disabled;
@@ -25,20 +25,51 @@ use crate::anim::disabled;
 pub const TEXT_SPOILER_FRAMES: usize = 60;
 /// `kDefaultFrameDuration`, in milliseconds.
 pub const TEXT_SPOILER_FRAME_MS: u64 = 33;
-/// `particlesCount` of `DefaultDescriptorText`.
-const PARTICLES: usize = 9000;
-/// `canvasSize` of `DefaultDescriptorText` before scaling.
+/// `canvasSize` of both default descriptors before scaling.
 const CANVAS: f32 = 128.0;
-const FADE_IN_MS: i64 = 200;
-const SHOWN_MS: i64 = 200;
-const FADE_OUT_MS: i64 = 200;
-const LIFETIME_MS: i64 = FADE_IN_MS + SHOWN_MS + FADE_OUT_MS;
 const FULL_MS: i64 = TEXT_SPOILER_FRAMES as i64 * TEXT_SPOILER_FRAME_MS as i64;
 const SIZE_MIN: f32 = 1.5;
 const SIZE_MAX: f32 = 2.0;
-const SPEED_MIN: f64 = 4.0;
-const SPEED_MAX: f64 = 8.0;
 const SPRITES: usize = 5;
+/// `kImageSpoilerDarkenAlpha`: the image cover is laid over black at this alpha.
+pub const IMAGE_SPOILER_DARKEN_ALPHA: u8 = 32;
+
+/// The parts of a `SpoilerMessDescriptor` in which the text and the image covers differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Descriptor {
+    particles: usize,
+    fade_in_ms: i64,
+    shown_ms: i64,
+    fade_out_ms: i64,
+    speed_min: i64,
+    speed_max: i64,
+}
+
+impl Descriptor {
+    const fn lifetime_ms(self) -> i64 {
+        self.fade_in_ms + self.shown_ms + self.fade_out_ms
+    }
+}
+
+/// `DefaultDescriptorText`.
+const TEXT: Descriptor = Descriptor {
+    particles: 9000,
+    fade_in_ms: 200,
+    shown_ms: 200,
+    fade_out_ms: 200,
+    speed_min: 4,
+    speed_max: 8,
+};
+
+/// `DefaultDescriptorImage`.
+const IMAGE: Descriptor = Descriptor {
+    particles: 3000,
+    fade_in_ms: 300,
+    shown_ms: 0,
+    fade_out_ms: 300,
+    speed_min: 10,
+    speed_max: 20,
+};
 
 /// One particle drawn in one frame: its sprite's top-left in device pixels of the canvas
 /// (wrapped copies can start left of or above it) and its opacity.
@@ -99,15 +130,15 @@ struct Particle {
 
 /// `RandomSpeed`: a direction on the unit circle and a speed in `speedMin..=speedMax` per
 /// lifetime, as device pixels per millisecond.
-fn random_speed(random: &mut Random, scale: f64) -> (f64, f64) {
-    let count = PARTICLES;
+fn random_speed(random: &mut Random, scale: f64, desc: Descriptor) -> (f64, f64) {
+    let count = desc.particles;
     let value = random.index(2 * count + 2);
     let negative = value < count + 1;
     let module = if negative { value } else { value - count - 1 };
-    let speed_min = SPEED_MIN * scale;
-    let speed_max = SPEED_MAX * scale;
+    let speed_min = desc.speed_min as f64 * scale;
+    let speed_max = desc.speed_max as f64 * scale;
     let speed = speed_min + (speed_max - speed_min) * module as f64 / count as f64;
-    let lifetime = LIFETIME_MS as f64;
+    let lifetime = desc.lifetime_ms() as f64;
     let max = (speed_max * lifetime).ceil() as usize;
     let k = speed / lifetime;
     let x = (random.index(2 * max + 1) as f64 - max as f64) / max as f64;
@@ -164,15 +195,26 @@ impl TextSpoilerMess {
     /// (device pixels per logical pixel).
     #[must_use]
     pub fn generate(scale: f32) -> Self {
+        Self::generate_with(TEXT, scale)
+    }
+
+    /// `GenerateSpoilerMess(DefaultDescriptorImage())`: the cover of a media spoiler.
+    #[must_use]
+    pub fn generate_image(scale: f32) -> Self {
+        Self::generate_with(IMAGE, scale)
+    }
+
+    fn generate_with(desc: Descriptor, scale: f32) -> Self {
         let scale = scale.clamp(0.5, 8.0);
         let canvas = (CANVAS * scale).round().max(16.0) as i64;
         let sprite = 2 + (SIZE_MAX * scale).ceil() as i64;
+        let lifetime = desc.lifetime_ms();
         let mut random = Random(0x5350_4F49_4C45_5221);
-        let particles: Vec<Particle> = (0..PARTICLES)
+        let particles: Vec<Particle> = (0..desc.particles)
             .map(|index| {
-                let (dx, dy) = random_speed(&mut random, f64::from(scale));
+                let (dx, dy) = random_speed(&mut random, f64::from(scale), desc);
                 Particle {
-                    start: index as i64 * FULL_MS / PARTICLES as i64,
+                    start: index as i64 * FULL_MS / desc.particles as i64,
                     sprite: random.index(SPRITES) as u8,
                     x: random.index(canvas as usize) as i64,
                     y: random.index(canvas as usize) as i64,
@@ -187,15 +229,15 @@ impl TextSpoilerMess {
             let time = frame as i64 * TEXT_SPOILER_FRAME_MS as i64;
             let mut dots = Vec::new();
             let mut paint_at = |p: &Particle, now: i64| {
-                if now <= 0 || now >= LIFETIME_MS {
+                if now <= 0 || now >= lifetime {
                     return;
                 }
                 let x = wrap(p.x + (now as f64 * p.dx).round() as i64);
                 let y = wrap(p.y + (now as f64 * p.dy).round() as i64);
-                let opacity = if now < FADE_IN_MS {
-                    now as f64 / FADE_IN_MS as f64
-                } else if now > LIFETIME_MS - FADE_OUT_MS {
-                    (LIFETIME_MS - now) as f64 / FADE_OUT_MS as f64
+                let opacity = if now < desc.fade_in_ms {
+                    now as f64 / desc.fade_in_ms as f64
+                } else if now > lifetime - desc.fade_out_ms {
+                    (lifetime - now) as f64 / desc.fade_out_ms as f64
                 } else {
                     1.0
                 };
@@ -263,13 +305,17 @@ impl TextSpoilerMess {
 }
 
 /// The cover for the scale of `ctx`, generated and uploaded on first use.
-fn mess_for(ctx: &Context) -> Arc<TextSpoilerMess> {
+fn mess_for(ctx: &Context, desc: Descriptor) -> Arc<TextSpoilerMess> {
     let scale = ctx.pixels_per_point();
-    let id = Id::unique(("tg_text_spoiler_mess", (scale * 100.0).round() as i32));
+    let id = Id::unique((
+        "tg_text_spoiler_mess",
+        desc.particles,
+        (scale * 100.0).round() as i32,
+    ));
     if let Some(mess) = ctx.data(|d| d.get_temp::<Arc<TextSpoilerMess>>(id)) {
         return mess;
     }
-    let mut mess = TextSpoilerMess::generate(scale);
+    let mut mess = TextSpoilerMess::generate_with(desc, scale);
     let image = mess.sprite_image(scale);
     mess.texture = Some(ctx.load_texture("tg_text_spoiler_sprites", image, TextureOptions::LINEAR));
     let mess = Arc::new(mess);
@@ -355,16 +401,93 @@ pub fn paint_text_spoiler(
     if rects.is_empty() || opacity <= 0.0 {
         return;
     }
+    let animate = !text_spoilers_paused(ctx);
+    fill_mess(
+        ctx,
+        painter,
+        TEXT,
+        rects,
+        anchor,
+        color.gamma_multiply(opacity.clamp(0.0, 1.0)),
+        animate,
+        CornerRadius::ZERO,
+    );
+}
+
+/// The media spoiler cover over `rect` (`Media::fillImageSpoiler`: `Ui::FillSpoilerRect` with
+/// `DefaultImageSpoiler()` and the media rounding mask): black at `kImageSpoilerDarkenAlpha`
+/// under white particles of `DefaultDescriptorImage`, the canvas tiled from the media's
+/// top-left, nothing outside the rounded corners. `opacity` is `1 - revealAnimation`. With
+/// `animate` false (`context.paused` or `PowerSaving::kChatSpoiler`) the frame stays.
+pub fn paint_image_spoiler(
+    ctx: &Context,
+    painter: &Painter,
+    rect: Rect,
+    rounding: CornerRadius,
+    opacity: f32,
+    animate: bool,
+) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    if !rect.is_positive() || opacity <= 0.0 || !rect.intersects(painter.clip_rect()) {
+        return;
+    }
+    painter.rect_filled(
+        rect,
+        rounding,
+        Color32::from_black_alpha(IMAGE_SPOILER_DARKEN_ALPHA).gamma_multiply(opacity),
+    );
+    fill_mess(
+        ctx,
+        painter,
+        IMAGE,
+        &[rect],
+        rect.min,
+        Color32::WHITE.gamma_multiply(opacity),
+        animate && !text_spoilers_paused(ctx),
+        rounding,
+    );
+}
+
+/// Whether `point` lies inside `rect` with its corners rounded by `rounding`.
+fn inside_rounded(rect: Rect, rounding: CornerRadius, point: Pos2) -> bool {
+    let corner = |radius: u8, cx: f32, cy: f32, dx: f32, dy: f32| {
+        let r = f32::from(radius);
+        if r <= 0.0 {
+            return true;
+        }
+        let center = pos2(cx + dx * r, cy + dy * r);
+        let beyond_x = (point.x - center.x) * dx < 0.0;
+        let beyond_y = (point.y - center.y) * dy < 0.0;
+        !(beyond_x && beyond_y) || point.distance(center) <= r
+    };
+    corner(rounding.nw, rect.min.x, rect.min.y, 1.0, 1.0)
+        && corner(rounding.ne, rect.max.x, rect.min.y, -1.0, 1.0)
+        && corner(rounding.sw, rect.min.x, rect.max.y, 1.0, -1.0)
+        && corner(rounding.se, rect.max.x, rect.max.y, -1.0, -1.0)
+}
+
+/// `FillSpoilerRect`: the current frame of the `desc` cover, tiled from `anchor`, over `rects`.
+#[allow(clippy::too_many_arguments)]
+fn fill_mess(
+    ctx: &Context,
+    painter: &Painter,
+    desc: Descriptor,
+    rects: &[Rect],
+    anchor: Pos2,
+    tint: Color32,
+    animate: bool,
+    rounding: CornerRadius,
+) {
     let clip = painter.clip_rect();
     if !rects.iter().any(|r| r.intersects(clip)) {
         return;
     }
-    let mess = mess_for(ctx);
+    let mess = mess_for(ctx, desc);
     let Some(texture) = mess.texture.as_ref() else {
         return;
     };
     let (frame, next) = text_spoiler_frame_at(ctx.input(|i| i.time));
-    if next != Duration::MAX && !text_spoilers_paused(ctx) {
+    if next != Duration::MAX && animate {
         ctx.request_repaint_after(next);
     }
     let Some(dots) = mess.frames.get(frame) else {
@@ -376,7 +499,7 @@ pub fn paint_text_spoiler(
     let sprite = f32::from(mess.sprite) * inv;
     let atlas_w = f32::from(mess.sprite) * SPRITES as f32;
     let atlas_h = f32::from(mess.sprite);
-    let tint = color.gamma_multiply(opacity.clamp(0.0, 1.0));
+    let rounded = rounding != CornerRadius::ZERO;
 
     let mut mesh = Mesh::with_texture(texture.id());
     for rect in rects {
@@ -399,7 +522,9 @@ pub fn paint_text_spoiler(
                     let min = cell_min + Vec2::new(f32::from(dot.x), f32::from(dot.y)) * inv;
                     let quad = Rect::from_min_size(min, Vec2::splat(sprite));
                     let shown = quad.intersect(cell);
-                    if !shown.is_positive() {
+                    if !shown.is_positive()
+                        || (rounded && !inside_rounded(*rect, rounding, shown.center()))
+                    {
                         continue;
                     }
                     let u0 = f32::from(dot.sprite) * f32::from(mess.sprite);
@@ -523,6 +648,31 @@ mod tests {
                 assert!(usize::from(dot.sprite) < SPRITES);
             }
         }
+    }
+
+    #[test]
+    fn the_image_cover_follows_the_image_descriptor() {
+        let mess = TextSpoilerMess::generate_image(1.0);
+        assert_eq!(mess.canvas_px(), 128);
+        for frame in [0, 17, 59] {
+            let count = mess.frame_particle_count(frame);
+            // 3000 particles, each alive 600 of 1980 ms: about 909 per frame.
+            assert!((850..1100).contains(&count), "frame {frame}: {count}");
+        }
+        // Faster than the text cover: up to 20 px per lifetime instead of 8.
+        assert_ne!(mess.frames, TextSpoilerMess::generate(1.0).frames);
+    }
+
+    #[test]
+    fn no_particle_outside_the_rounded_corners() {
+        let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 80.0));
+        let r = CornerRadius::same(10);
+        assert!(!inside_rounded(rect, r, pos2(1.0, 1.0)));
+        assert!(!inside_rounded(rect, r, pos2(99.0, 79.0)));
+        assert!(inside_rounded(rect, r, pos2(5.0, 40.0)));
+        assert!(inside_rounded(rect, r, pos2(50.0, 1.0)));
+        assert!(inside_rounded(rect, r, pos2(4.0, 4.0)));
+        assert!(inside_rounded(rect, CornerRadius::ZERO, pos2(0.5, 0.5)));
     }
 
     #[test]

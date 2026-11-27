@@ -11,6 +11,7 @@ use tg_updater::version::{UpdateChannel, Version};
 use tg_xtask::XtaskError;
 use tg_xtask::dist::{DistOptions, find_workspace_root, resolve_target_dir, run_dist};
 use tg_xtask::icon::render_svg_to_ico;
+use tg_xtask::update_path::{UpdatePathCheck, download_previous_release, run_update_path_check};
 use tg_xtask::winrc::resolve_release_version;
 
 fn main() -> ExitCode {
@@ -34,12 +35,13 @@ fn run() -> Result<(), XtaskError> {
         "dist" => run_dist_cli(&args[1..]),
         "icon" => run_icon_cli(&args[1..]),
         "keygen" => run_keygen_cli(),
+        "update-path-check" => run_update_path_check_cli(&args[1..]),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
         }
         other => Err(XtaskError::InvalidArgument(format!(
-            "unknown subcommand '{other}' (expected dist, icon, or keygen)"
+            "unknown subcommand '{other}' (expected dist, icon, keygen, or update-path-check)"
         ))),
     }
 }
@@ -72,6 +74,24 @@ SUBCOMMANDS:
   icon     Render assets/icon.svg into a multi-size Windows .ico file.
     --svg <PATH>             Input SVG path (default: <workspace>/assets/icon.svg)
     --out <PATH>             Output .ico path (default: <CARGO_TARGET_DIR>/dist/rustgram.ico)
+
+  update-path-check
+           Apply a new .tupdate to an older published release's portable copy the way that
+           release's client does (stage, then its own rustgram-updater.exe), then run
+           rustgram.exe --smoke-test on the result. Fails if the updated copy does not start,
+           fails the smoke test or reports another version than the package (Windows only).
+    --old-zip <ZIP>          Portable zip of the older release
+    --old-version <SEMVER>   Version of that release
+    --from-github <OWNER/REPO>
+                             Instead of --old-zip/--old-version: download (with `gh`) the
+                             portable zip of the highest published release below the package
+    --skip-if-no-previous    With --from-github: succeed with a notice when no published
+                             release is older than the package (test builds)
+    --package <TUPDATE>      The new signed update package
+    --public-key <HEX>       Release public key (default: env RUSTGRAM_UPDATE_PUBKEY)
+    --profile <DIR>          Profile to copy into the working dir first (optional)
+    --scratch <DIR>          Empty or missing scratch dir for the copy and the working dir
+    --timeout-secs <N>       Time limit for each process (default 180)
 
   keygen   Generate a new Ed25519 release signing keypair (prints public key for
            RUSTGRAM_UPDATE_PUBKEY build env var and private seed for GitHub Actions secret)."
@@ -253,6 +273,83 @@ fn run_keygen_cli() -> Result<(), XtaskError> {
         "2) Private key seed (NEVER commit — store in GitHub secret RUSTGRAM_UPDATER_SIGNING_KEY):"
     );
     println!("   {seed_hex}");
+    Ok(())
+}
+
+fn run_update_path_check_cli(args: &[String]) -> Result<(), XtaskError> {
+    let mut old_zip = None;
+    let mut old_version = None;
+    let mut package = None;
+    let mut public_key = std::env::var("RUSTGRAM_UPDATE_PUBKEY").ok();
+    let mut profile = None;
+    let mut scratch = None;
+    let mut timeout_secs = 180u64;
+    let mut from_github = None;
+    let mut skip_if_no_previous = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        if flag == "--skip-if-no-previous" {
+            skip_if_no_previous = true;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let value = next_value(args, i, flag)?;
+        match flag {
+            "--old-zip" => old_zip = Some(PathBuf::from(value)),
+            "--from-github" => from_github = Some(value),
+            "--old-version" => old_version = Some(Version::parse(&value)?),
+            "--package" => package = Some(PathBuf::from(value)),
+            "--public-key" => public_key = Some(value),
+            "--profile" => profile = Some(PathBuf::from(value)),
+            "--scratch" => scratch = Some(PathBuf::from(value)),
+            "--timeout-secs" => {
+                timeout_secs = value.parse().map_err(|_| {
+                    XtaskError::InvalidArgument(format!("bad --timeout-secs '{value}'"))
+                })?;
+            }
+            other => {
+                return Err(XtaskError::InvalidArgument(format!(
+                    "unknown update-path-check option '{other}'"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let required = |name: &str| XtaskError::InvalidArgument(format!("{name} is required"));
+    let package = package.ok_or_else(|| required("--package"))?;
+    let scratch = scratch.ok_or_else(|| required("--scratch"))?;
+    if let Some(repo) = from_github {
+        match download_previous_release(&repo, &package, &scratch.join("download"))? {
+            Some((zip, version)) => {
+                old_zip = Some(zip);
+                old_version = Some(version);
+            }
+            None if skip_if_no_previous => {
+                println!(
+                    "update-path-check: SKIPPED: no published release of {repo} is older than                      the package, so there is no update path to test"
+                );
+                return Ok(());
+            }
+            None => {
+                return Err(XtaskError::InvalidArgument(format!(
+                    "no published release of {repo} is older than the package"
+                )));
+            }
+        }
+    }
+    run_update_path_check(&UpdatePathCheck {
+        old_portable_zip: old_zip.ok_or_else(|| required("--old-zip"))?,
+        old_version: old_version.ok_or_else(|| required("--old-version"))?,
+        package,
+        public_key_hex: public_key
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| required("--public-key or RUSTGRAM_UPDATE_PUBKEY"))?,
+        profile,
+        scratch,
+        timeout: std::time::Duration::from_secs(timeout_secs),
+    })?;
     Ok(())
 }
 

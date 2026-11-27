@@ -270,6 +270,7 @@ fn voice_texts(
             &colors,
             voice_state,
             Some(rt),
+            None,
         );
     });
     out.textures_delta.clear();

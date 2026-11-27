@@ -143,6 +143,8 @@ mod tests_user_errors;
 #[cfg(test)]
 mod tests_video_editor_wire2;
 #[cfg(test)]
+mod tests_voice_bubble_tgb3181;
+#[cfg(test)]
 mod tests_voice_send;
 #[cfg(test)]
 mod tests_w4_text;

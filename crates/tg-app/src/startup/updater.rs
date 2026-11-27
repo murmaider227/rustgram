@@ -386,6 +386,18 @@ enum WorkerCommand {
     Stop,
 }
 
+/// Deletes the runtime files earlier releases shipped next to `exe_path` that this release no
+/// longer ships (the FFmpeg DLLs replaced in v0.2.0-alpha.5), since the updater only copies files
+/// (TGB-3180). Only the names in [`tg_updater::install_files::OBSOLETE_INSTALL_FILES`] are deleted.
+pub fn remove_obsolete_install_files(exe_path: &Path) {
+    let Some(install_dir) = exe_path.parent() else {
+        return;
+    };
+    for path in tg_updater::install_files::remove_obsolete_install_files(install_dir) {
+        tracing::info!(path = %path.display(), "Deleted a file an earlier version shipped");
+    }
+}
+
 /// Builds the exact `rustgram-updater.exe` invocation plan for restarting and installing a staged update.
 ///
 /// The updater runs with `working_dir` as its current directory, where the update is staged in

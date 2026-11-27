@@ -10,6 +10,8 @@
 # - The release body is `.github/release-notes/v<version>.md`, required for stable releases.
 # - A release (tag push, or a run dispatched on the tag) is refused unless the CI workflow succeeded for
 #   the tagged commit; a CI run still in progress is waited for (up to 90 minutes). Test builds skip it.
+# - Before the draft is created, the new update package is installed on the previous published
+#   release with that release's own updater, and the updated copy must pass the smoke test.
 name: Release
 
 on:
@@ -268,6 +270,9 @@ jobs:
           # Every per-user data dir stays inside the scratch folder.
           $env:APPDATA = Join-Path $root "AppData"
           $env:LOCALAPPDATA = Join-Path $root "LocalAppData"
+          # Windows also loads DLLs from PATH, where setup-ffmpeg put the FFmpeg bin folder: with it,
+          # a package that lacks a DLL still starts here (TGB-3180). System folders only.
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem"
           # A profile written by v0.1.0-alpha.2. Never regenerate it (see its README.md).
           $fixture = "crates/tg-app/tests/fixtures/smoke_profile_v0_1_0_alpha_2/profile"
           $cases = @(
@@ -294,6 +299,33 @@ jobs:
           }
           if (Test-Path (Join-Path $env:APPDATA "Rustgram")) { throw "The smoke test touched the default profile" }
           if ($failed) { throw "Release smoke test failed" }
+
+      # TGB-3180: v0.2.0-alpha.4's update package lacked its new FFmpeg DLLs, so copies that updated
+      # to it did not start. Install this package on the previous published release the way that
+      # release's client does (stage it, then run that release's own rustgram-updater.exe), then
+      # smoke-test the updated copy: it must start, open an old profile and report this version.
+      - name: Update the previous published release with this package and smoke-test it
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          PUBLISH: ${{ steps.meta.outputs.publish }}
+          RUSTGRAM_UPDATE_PUBKEY: ${{ vars.RUSTGRAM_UPDATE_PUBKEY }}
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "update-path"
+          $checkArgs = @(
+            "--from-github", $env:REPO,
+            "--package", "dist/rustgram-$env:RELEASE_VERSION-win-x64.tupdate",
+            "--profile", "crates/tg-app/tests/fixtures/smoke_profile_v0_1_0_alpha_2/profile",
+            "--scratch", $scratch
+          )
+          # A test build numbered below every release (0.0.0-test.1) has no update path to test.
+          if ($env:PUBLISH -ne "true") { $checkArgs += "--skip-if-no-previous" }
+          cargo run --release -p tg-xtask -- update-path-check @checkArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "An install of the previous release that takes this update does not start (log above, docs/RELEASING.md)"
+          }
 
       - name: Upload test build files
         if: steps.meta.outputs.publish != 'true'

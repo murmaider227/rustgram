@@ -15,7 +15,8 @@ use egui::{
 use tg_history::consts::{
     HISTORY_POLL_ANSWERS_SKIP, HISTORY_POLL_QUESTION_TOP, HISTORY_POLL_SUBTITLE_SKIP,
     HISTORY_POLL_TOTAL_VOTES_SKIP, HISTORY_TRANSCRIBE_SIZE, HISTORY_TRANSCRIBE_SKIP,
-    MSG_FILE_LAYOUT, MSG_FILE_THUMB_LAYOUT, MSG_PADDING, MSG_WAVEFORM_MAX, MSG_WAVEFORM_MIN,
+    MSG_FILE_LAYOUT, MSG_FILE_THUMB_LAYOUT, MSG_FILE_TOP_MINUS, MSG_PADDING, MSG_WAVEFORM_MAX,
+    MSG_WAVEFORM_MIN,
 };
 use tg_history::{
     BubbleCornerRounding, BubbleRounding, GroupedMediaLayout, MediaLayout, apply_rounding_sides,
@@ -472,6 +473,7 @@ fn paint_history_media_internal(
             colors,
             voice_state,
             runtime,
+            media_layout,
         ),
         HistoryMedia::Sticker(sticker) => {
             paint_sticker(ui, msg_id, sticker, rect, assets, runtime, sticker_overlay)
@@ -663,6 +665,45 @@ pub(crate) fn blur_small_rgba(src: &image::RgbaImage) -> image::RgbaImage {
     cur
 }
 
+/// The cover of a media spoiler while `revealAnimation < 1` (`Photo::draw`, `Gif::draw`,
+/// `drawGrouped`): at `1 - revealAnimation` opacity, `_spoiler->background` (the blurred inline
+/// thumbnail from `PrepareWithBlurredBackground` without the large image, dimmed by
+/// `FillBlurredBackground`) over the picture, then `fillImageSpoiler`. Returns whether the
+/// media is still hidden, so a click reveals it instead of opening it.
+#[allow(clippy::too_many_arguments)]
+fn paint_media_spoiler(
+    ui: &Ui,
+    rt: &HistoryMediaRuntime,
+    assets: &mut MediaAssetCache,
+    msg_id: MsgId,
+    rect: Rect,
+    cr: CornerRadius,
+    cache_key: u64,
+    stripped_thumb: Option<&[u8]>,
+    fallback_rgb: ([u8; 3], [u8; 3]),
+    now_secs: f64,
+) -> bool {
+    let opacity = rt.spoiler_opacity(msg_id, now_secs);
+    if opacity > 0.0 {
+        let mut painter = ui.painter().clone();
+        painter.multiply_opacity(opacity);
+        paint_photo_surface(
+            ui.ctx(),
+            &painter,
+            rect,
+            cr,
+            cache_key,
+            stripped_thumb,
+            fallback_rgb,
+            assets,
+        );
+        if stripped_thumb.is_some() {
+            painter.rect_filled(rect, cr, Color32::from_black_alpha(BLURRED_BACKGROUND_DIM));
+        }
+    }
+    rt.paint_spoiler_overlay(ui.ctx(), ui.painter(), msg_id, rect, cr, now_secs)
+}
+
 fn paint_photo(
     ui: &mut Ui,
     msg_id: MsgId,
@@ -674,12 +715,13 @@ fn paint_photo(
 ) -> Option<MediaInteraction> {
     let cr = bubble_rounding_to_egui(rounding);
     let now_secs = ui.ctx().input(|i| i.time);
+    let cache_key = (msg_id.0 as u64).wrapping_mul(31) ^ 0x101;
     paint_photo_surface(
         ui.ctx(),
         ui.painter(),
         rect,
         cr,
-        (msg_id.0 as u64).wrapping_mul(31) ^ 0x101,
+        cache_key,
         photo.stripped_thumb.as_deref(),
         photo.fallback_rgb,
         assets,
@@ -710,8 +752,18 @@ fn paint_photo(
             now_secs,
             over,
         );
-        spoiler_hidden =
-            rt.paint_spoiler_overlay(ui.ctx(), ui.painter(), msg_id, rect, cr, now_secs);
+        spoiler_hidden = paint_media_spoiler(
+            ui,
+            rt,
+            assets,
+            msg_id,
+            rect,
+            cr,
+            cache_key,
+            photo.stripped_thumb.as_deref(),
+            photo.fallback_rgb,
+            now_secs,
+        );
     }
 
     if resp.hovered() {
@@ -801,11 +853,6 @@ fn paint_album(
                 assets,
             );
 
-            if let Some(dur) = item.video_duration_secs {
-                paint_video_badge(ui.painter(), tile_rect, &format_duration(dur));
-                paint_play_circle(ui.painter(), tile_rect.center(), 18.0);
-            }
-
             let resp = ui.interact(
                 tile_rect,
                 Id::unique(("tg_album_tile", msg_id.0, idx)),
@@ -828,14 +875,23 @@ fn paint_album(
                     now_secs,
                     over,
                 );
-                spoiler_hidden = rt.paint_spoiler_overlay(
-                    ui.ctx(),
-                    ui.painter(),
+                spoiler_hidden = paint_media_spoiler(
+                    ui,
+                    rt,
+                    assets,
                     item.msg_id,
                     tile_rect,
                     cr,
+                    cache_key,
+                    item.stripped_thumb.as_deref(),
+                    item.fallback_rgb,
                     now_secs,
                 );
+            }
+            // The duration and the play button stay over the spoiler (`paintInCenter`).
+            if let Some(dur) = item.video_duration_secs {
+                paint_video_badge(ui.painter(), tile_rect, &format_duration(dur));
+                paint_play_circle(ui.painter(), tile_rect.center(), 18.0);
             }
 
             if resp.hovered() {
@@ -948,18 +1004,34 @@ fn paint_video(
         }
     }
 
+    let cache_key = (msg_id.0 as u64).wrapping_mul(53) ^ 0x202;
     if !painted_live_or_thumb {
         paint_photo_surface(
             ui.ctx(),
             ui.painter(),
             rect,
             cr,
-            (msg_id.0 as u64).wrapping_mul(53) ^ 0x202,
+            cache_key,
             video.stripped_thumb.as_deref(),
             video.fallback_rgb,
             assets,
         );
     }
+
+    let spoiler_hidden = runtime.as_deref().is_some_and(|rt| {
+        paint_media_spoiler(
+            ui,
+            rt,
+            assets,
+            msg_id,
+            rect,
+            cr,
+            cache_key,
+            video.stripped_thumb.as_deref(),
+            video.fallback_rgb,
+            now_secs,
+        )
+    });
 
     let badge = if video.is_gif {
         if inline_playing {
@@ -977,12 +1049,6 @@ fn paint_video(
     paint_video_badge(ui.painter(), rect, &badge);
     if !inline_playing {
         paint_play_circle(ui.painter(), rect.center(), 24.0);
-    }
-
-    let mut spoiler_hidden = false;
-    if let Some(rt) = runtime.as_deref() {
-        spoiler_hidden =
-            rt.paint_spoiler_overlay(ui.ctx(), ui.painter(), msg_id, rect, cr, now_secs);
     }
 
     let resp = ui.interact(rect, Id::unique(("tg_video", msg_id.0)), Sense::click());
@@ -1156,13 +1222,21 @@ fn paint_voice(
     colors: &HistoryColors,
     voice_state: &mut VoicePlaybackState,
     mut runtime: Option<&mut HistoryMediaRuntime>,
+    media_layout: Option<&MediaLayout>,
 ) -> Option<MediaInteraction> {
     let st = MSG_FILE_LAYOUT;
+    // `Document::draw`: `topMinus = isBubbleTop() ? 0 : st::msgFileTopMinus`, under a sender
+    // name or a reply the whole file block starts 6 px higher (its height is 6 px less).
+    let top_minus = if media_layout.is_none_or(|l| l.is_bubble_top) {
+        0
+    } else {
+        MSG_FILE_TOP_MINUS
+    };
     let btn_size = st.thumb_size as f32;
     let btn_rect = Rect::from_min_size(
         Pos2::new(
             rect.left() + st.padding.left as f32,
-            rect.top() + st.padding.top as f32,
+            rect.top() + (st.padding.top - top_minus) as f32,
         ),
         Vec2::splat(btn_size),
     );
@@ -1178,15 +1252,14 @@ fn paint_voice(
         colors.wave_in_inactive
     };
 
-    let (is_active_audio, is_playing, progress, speed) = if let Some(rt) = runtime.as_deref() {
-        let (active, playing, prog, spd, _) =
-            rt.audio_item_state(msg_id, tg_audio::AudioType::Voice);
+    let (is_active_audio, is_playing, progress) = if let Some(rt) = runtime.as_deref() {
+        let (active, playing, prog, _, _) = rt.audio_item_state(msg_id, tg_audio::AudioType::Voice);
         if rt.voice_play_pending(msg_id) {
             // Started, its file is still downloading: shown like a playing message at 00:00
             // (tdesktop's streamed voice while it buffers).
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(40));
-            (true, true, 0.0, spd)
+            (true, true, 0.0)
         } else if active {
             voice_state.progress.insert(msg_id, prog);
             if playing {
@@ -1196,7 +1269,7 @@ fn paint_voice(
             } else if voice_state.playing_msg_id == Some(msg_id) {
                 voice_state.playing_msg_id = None;
             }
-            (true, playing, prog, spd)
+            (true, playing, prog)
         } else {
             let legacy_playing = voice_state.playing_msg_id == Some(msg_id);
             if legacy_playing {
@@ -1206,7 +1279,7 @@ fn paint_voice(
                 }
             }
             let prog = voice_state.progress.get(&msg_id).copied().unwrap_or(0.0);
-            (legacy_playing, legacy_playing, prog, rt.policy.voice_speed)
+            (legacy_playing, legacy_playing, prog)
         }
     } else {
         let legacy_playing = voice_state.playing_msg_id == Some(msg_id);
@@ -1217,7 +1290,7 @@ fn paint_voice(
             }
         }
         let prog = voice_state.progress.get(&msg_id).copied().unwrap_or(0.0);
-        (legacy_playing, legacy_playing, prog, 1.0)
+        (legacy_playing, legacy_playing, prog)
     };
 
     // Play / Pause circle button
@@ -1327,7 +1400,7 @@ fn paint_voice(
 
     // Status line (`File::setStatusSize`): "00:04, 15.9 KB" until the voice message was
     // started, "00:01 / 00:04" while the player has it, "00:04" afterwards; then the unread
-    // dot and the inline playback speed button (`1x`/`1.5x`/`2x`).
+    // dot. The playback speed lives in the player bar, not in the bubble.
     let status = if has_playback {
         VoiceStatus::Played {
             position_secs: (progress * voice.duration_secs as f32).floor() as u32,
@@ -1357,7 +1430,7 @@ fn paint_voice(
         wave_left,
         btn_rect.top() + (st.status_top - st.padding.top) as f32,
     );
-    let mut dur_w = dur_galley.size().x;
+    let dur_w = dur_galley.size().x;
     ui.painter().galley(dur_pos, dur_galley, status_fg);
     if voice.is_unread && dur_w + MEDIA_UNREAD_SKIP + MEDIA_UNREAD_SIZE <= status_width as f32 {
         ui.painter().circle_filled(
@@ -1368,51 +1441,6 @@ fn paint_voice(
             MEDIA_UNREAD_SIZE / 2.0,
             active_color,
         );
-        dur_w += MEDIA_UNREAD_SKIP + MEDIA_UNREAD_SIZE;
-    }
-
-    if is_active_audio {
-        let spd_rect = Rect::from_min_size(
-            Pos2::new(dur_pos.x + dur_w + 10.0, dur_pos.y - 1.0),
-            Vec2::new(32.0, 17.0),
-        );
-        let spd_fast = (speed - 1.0).abs() > 0.05;
-        ui.painter().rect_filled(
-            spd_rect,
-            CornerRadius::same(5),
-            if spd_fast {
-                active_color
-            } else {
-                inactive_color
-            },
-        );
-        let spd_label = format!("{:.1}x", speed).replace(".0x", "x");
-        ui.painter().text(
-            spd_rect.center(),
-            Align2::CENTER_CENTER,
-            spd_label,
-            FontId::proportional(10.0),
-            if spd_fast {
-                Color32::WHITE
-            } else {
-                active_color
-            },
-        );
-        let spd_resp = ui.interact(
-            spd_rect,
-            Id::unique(("tg_voice_speed", msg_id.0)),
-            Sense::click(),
-        );
-        if spd_resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        if spd_resp
-            .on_hover_text("Cycle voice playback speed")
-            .clicked()
-            && let Some(rt) = runtime
-        {
-            rt.cycle_audio_speed(tg_audio::AudioType::Voice);
-        }
     }
 
     // Voice-to-text transcribe chip button ("→A") + pending spinner + expandable transcript
@@ -1441,64 +1469,16 @@ fn paint_voice(
         ),
     );
     let has_lock = limits.locked && live_entry.is_none() && voice.transcription.is_none();
-    ui.painter().rect_filled(
+    paint_voice_transcribe_button(
+        ui.painter(),
         chip_rect,
-        CornerRadius::same(4),
-        if expanded {
-            active_color
-        } else {
-            inactive_color
-        },
+        outgoing,
+        expanded,
+        has_lock,
+        active_color,
     );
     if is_pending {
         paint_transcribe_pending_ring(ui, chip_rect, active_color, false);
-    }
-    let chip_fg = if expanded {
-        Color32::WHITE
-    } else {
-        active_color
-    };
-    if expanded && !is_pending {
-        tg_app_core::ui_icons::paint_triangle(
-            ui.painter(),
-            chip_rect.center(),
-            9.0,
-            tg_app_core::ui_icons::ArrowDir::Up,
-            chip_fg,
-        );
-    } else if has_lock {
-        let c = chip_rect.center();
-        tg_app_core::ui_icons::paint_arrow(
-            ui.painter(),
-            Pos2::new(c.x - 9.0, c.y),
-            8.0,
-            tg_app_core::ui_icons::ArrowDir::Right,
-            chip_fg,
-        );
-        ui.painter().text(
-            Pos2::new(c.x - 1.0, c.y),
-            Align2::CENTER_CENTER,
-            "A",
-            FontId::proportional(10.0),
-            chip_fg,
-        );
-        tg_app_core::ui_icons::paint_lock(ui.painter(), Pos2::new(c.x + 8.5, c.y), 9.5, chip_fg);
-    } else {
-        let c = chip_rect.center();
-        tg_app_core::ui_icons::paint_arrow(
-            ui.painter(),
-            Pos2::new(c.x - 5.5, c.y),
-            9.0,
-            tg_app_core::ui_icons::ArrowDir::Right,
-            chip_fg,
-        );
-        ui.painter().text(
-            Pos2::new(c.x + 5.0, c.y),
-            Align2::CENTER_CENTER,
-            "A",
-            FontId::proportional(10.5),
-            chip_fg,
-        );
     }
     let hover_tip = if has_lock {
         "Voice-to-Text (Telegram Premium or wait for weekly trial reset)"
@@ -1546,6 +1526,60 @@ fn paint_voice(
     }
 
     None
+}
+
+/// `kInNonChosenOpacity` / `kOutNonChosenOpacity` of `history_view_transcribe_button.cpp`.
+const TRANSCRIBE_IN_BG_OPACITY: f32 = 0.12;
+const TRANSCRIBE_OUT_BG_OPACITY: f32 = 0.18;
+
+/// The voice message transcribe button (`TranscribeButton::paint`, not round): a
+/// `historyTranscribeRadius` rounded rect of `msgFileBg` at the non-chosen opacity, with
+/// `historyTranscribeIcon` ("→A"), `historyTranscribeHide` once the text is shown, and the
+/// mini lock at `historyTranscribeLockPos` while the trial is used up. `file_bg` is the
+/// bubble's `msgFileBg` (the active waveform colour).
+fn paint_voice_transcribe_button(
+    painter: &Painter,
+    rect: Rect,
+    outgoing: bool,
+    opened: bool,
+    locked: bool,
+    file_bg: Color32,
+) {
+    use tg_ui::tg_style::st;
+    let opacity = if outgoing {
+        TRANSCRIBE_OUT_BG_OPACITY
+    } else {
+        TRANSCRIBE_IN_BG_OPACITY
+    };
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(st::history_transcribe_radius.0.clamp(0, 255) as u8),
+        file_bg.gamma_multiply(opacity),
+    );
+    let (icon, hide, lock) = if outgoing {
+        (
+            st::history_transcribe_out_icon,
+            st::history_transcribe_out_hide,
+            st::history_transcribe_out_lock,
+        )
+    } else {
+        (
+            st::history_transcribe_in_icon,
+            st::history_transcribe_in_hide,
+            st::history_transcribe_in_lock,
+        )
+    };
+    if opened {
+        tg_app_core::ui_icons::paint_style_tinted(painter, rect, hide, file_bg);
+        return;
+    }
+    tg_app_core::ui_icons::paint_style_tinted(painter, rect, icon, file_bg);
+    if locked && let Ok(size) = lock.scaled_size() {
+        let pos = st::history_transcribe_lock_pos;
+        let min = rect.min + Vec2::new(pos.x.0 as f32, pos.y.0 as f32);
+        let lock_rect = Rect::from_min_size(min, Vec2::new(size.width as f32, size.height as f32));
+        tg_app_core::ui_icons::paint_style_tinted(painter, lock_rect, lock, file_bg);
+    }
 }
 
 fn paint_transcribe_pending_ring(ui: &Ui, rect: Rect, color: Color32, circular: bool) {
@@ -3274,6 +3308,9 @@ fn paint_video_stream_card(
 
 #[cfg(test)]
 mod tests_wave4_downloads;
+
+#[cfg(test)]
+mod tests_spoiler_tgb3185;
 
 #[cfg(test)]
 mod tests_round_on_demand;

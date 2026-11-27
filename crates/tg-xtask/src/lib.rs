@@ -6,6 +6,7 @@
 
 pub mod dist;
 pub mod icon;
+pub mod update_path;
 pub mod winrc;
 
 use thiserror::Error;
@@ -45,6 +46,11 @@ pub enum XtaskError {
     /// Expected build artifact was missing on disk.
     #[error("missing build artifact: {0}")]
     MissingArtifact(String),
+
+    /// The release files are inconsistent: the update package would install a copy that differs
+    /// from the portable folder, or a staged file is listed as obsolete.
+    #[error("release files are inconsistent: {0}")]
+    InconsistentRelease(String),
 
     /// ZIP archive creation error.
     #[error("ZIP error: {0}")]

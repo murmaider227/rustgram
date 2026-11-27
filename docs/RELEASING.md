@@ -42,7 +42,23 @@ published releases.
 4. **CI must be green.** A tag push, or a run dispatched on the tag, first checks the `CI` workflow
    runs of the tagged commit: it waits while one is still running (up to 90 minutes) and fails unless
    one of them succeeded. Tag only a commit whose CI on `main` is green. Test builds skip the check.
-5. **Test builds never become releases.** A run dispatched on a branch builds, smoke-tests and uploads
+5. **The update path is tested.** After the smoke test, the step "Update the previous published
+   release with this package and smoke-test it" runs `cargo run --release -p tg-xtask --
+   update-path-check --from-github <repo> --package dist/<.tupdate> ...`. It downloads the portable
+   zip of the highest published release below the new version, stages the new package the way that
+   release's app does (signature and version checks, unpack into `tupdates/temp`, copy the bundled
+   `rustgram-updater.exe` into the install folder), runs the install folder's `rustgram-updater.exe
+   -update -justupdate`, and then `rustgram.exe --smoke-test` on the updated copy with the
+   v0.1.0-alpha.2 profile. The run fails if the updater fails, if an installed file differs from the
+   package, or if the updated copy does not start (`0xC0000135` = a DLL it needs is missing), fails
+   the smoke test or reports another version. The child processes get a system-only `PATH`: Windows
+   also loads DLLs from `PATH`, and the runner has FFmpeg there. A test build numbered below every
+   release (`0.0.0-test.1`) skips this step with a notice; give a test build a version above the
+   latest published release (for example `0.2.0-alpha.5.test.1`) to run it. The same command runs
+   locally with `--old-zip <zip> --old-version <v>` and `--public-key <hex>` instead of
+   `--from-github` (TGB-3180: v0.2.0-alpha.4's package lacked its new FFmpeg DLLs, and copies that
+   updated to it did not start).
+6. **Test builds never become releases.** A run dispatched on a branch builds, smoke-tests and uploads
    the files as a 7-day workflow artifact. It creates no release (not even a draft) and no attestation.
    Only a tag push, or a run dispatched on the tag itself, creates the draft.
 
@@ -56,7 +72,11 @@ published releases.
    ids, no local paths, no account data. Delete the `RELEASE-NOTES-DRAFT` line once reviewed.
 3. Push the tag: `git tag v<version> <commit>` and `git push origin v<version>`.
 4. Watch the **Release** run. Check the "Smoke test the packaged app" step log: both cases end with
-   `result: PASS`. Check the "Check FFmpeg and dav1d build ids" step log: it prints the FFmpeg and
+   `result: PASS`. Check the "Update the previous published release" step log: it names the release
+   it updated from, lists the staged files (every `.exe` and `.dll` of the portable zip) and ends with
+   `PASS: v<old> updated to v<new> starts and opens the profile`. A release that changes runtime files
+   (an FFmpeg update renames its DLLs, a new helper exe) ships only with this step green; never
+   publish a draft whose run skipped or failed it. Check the "Check FFmpeg and dav1d build ids" step log: it prints the FFmpeg and
    dav1d build ids of the libraries that go into the package (pinned in
    `.github/actions/setup-ffmpeg/action.yml`) and fails the run if they are not the pinned build.
 5. Open the draft and check:
@@ -89,6 +109,20 @@ Dispatch the workflow on the tag, with the same version:
 
 `gh workflow run release.yml --ref <branch> -f version=0.0.0-test.1` builds and smoke-tests a branch.
 The files are in the run's artifacts; no release is created.
+
+## What the update package contains
+
+`tg-xtask dist` packs every file of the portable folder into the `.tupdate` except the documents
+(`LICENSE`, `LEGAL`, `THIRD_PARTY_NOTICES.txt`, `PRIVACY.txt`), and fails if the portable folder holds
+an `.exe` or `.dll` that the package lacks. It also fails when the FFmpeg folder holds two versions of
+a DLL (`avcodec-62.dll` and `avcodec-63.dll`): point `--ffmpeg-bin` at the build the app was linked
+against.
+
+The updater only copies files; it never deletes one. When a release stops shipping a runtime file,
+add its name to `OBSOLETE_INSTALL_FILES` in `crates/tg-updater/src/install_files.rs`: the app deletes
+those exact names next to `rustgram.exe` at startup, and the installer deletes them too
+(`[InstallDelete]`), like tdesktop's `DeleteMyModules`. Nothing else in the folder is touched. `dist`
+refuses to ship a file listed there.
 
 ## Pull a bad release
 
@@ -183,3 +217,19 @@ The steps for stuck users above were tested against the released v0.2.0-alpha.1
 `rustgram-updater.exe` with
 `crates/tg-updater/tests/e2e_tgb3113_workdir.rs`
 (`RUSTGRAM_E2E_RELEASED_UPDATER=<path to that exe> cargo test -p tg-updater --test e2e_tgb3113_workdir`).
+
+## A copy that updated to v0.2.0-alpha.4 does not start
+
+v0.2.0-alpha.4 was published for about 15 minutes on 2026-11-27. Its update package held only the
+three executables, while the new `rustgram.exe` needs the new FFmpeg DLLs (`avutil-61.dll` and the
+others), so a copy that installed it shows "avutil-61.dll was not found" and does not start.
+
+- **Broken copy:** unzip `rustgram-<newest>-win-x64-portable.zip` over the folder that holds
+  `rustgram.exe` (replace all files), or run the newest installer for a copy installed with it. The
+  profile is not touched. The new version deletes the old FFmpeg DLLs at its first start.
+- **v0.2.0-alpha.4 downloaded but not installed** (the menu says "New version is ready ·
+  v0.2.0-alpha.4"): do not restart for it. Quit Rustgram, delete the `tupdates` folder in the working
+  folder and start it again; it then downloads the newest release. A staged update is installed only
+  by "Restart to update" (TGB-3187), so it stays harmless until then.
+- Every other copy updates to v0.2.0-alpha.5 or later by itself: from v0.2.0-alpha.5 the package
+  carries every runtime file, and the release workflow tests the update from the previous release.

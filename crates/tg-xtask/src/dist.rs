@@ -7,9 +7,10 @@
 //! distribution, optionally signs a `.tupdate` package with Ed25519, invokes Inno Setup
 //! (`ISCC.exe`) if installed (skipping gracefully otherwise), and writes `SHA256SUMS.txt`.
 
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,8 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use tg_updater::install_files::OBSOLETE_INSTALL_FILES;
 use tg_updater::package::pack_update;
 use tg_updater::version::{Target, UpdateChannel, Version};
 use tg_updater::{APP_ID_GUID, DEFAULT_EXE_NAME, UPDATER_EXE_NAME};
@@ -51,6 +53,87 @@ pub const REQUIRED_FFMPEG_DLL_PREFIXES: &[&str] = &[
     "swresample-",
     "swscale-",
 ];
+
+/// Files of the portable folder that are documents, not needed to run the app. They are the only
+/// portable files left out of the `.tupdate`; every other file next to `rustgram.exe` is packed.
+pub const DOC_FILE_NAMES: &[&str] = &[
+    "LICENSE",
+    "LEGAL",
+    THIRD_PARTY_NOTICES_NAME,
+    PRIVACY_NOTICE_NAME,
+];
+
+/// The files of the update package: every file staged in the portable folder except
+/// [`DOC_FILE_NAMES`] (TGB-3180: v0.2.0-alpha.4 packed only the three executables, so an updated
+/// copy had the new `rustgram.exe` next to the old FFmpeg DLLs and did not start).
+#[must_use]
+pub fn update_package_files(staged_files: &[(String, PathBuf)]) -> Vec<(String, PathBuf)> {
+    staged_files
+        .iter()
+        .filter(|(name, _)| !DOC_FILE_NAMES.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Fails if `portable_dir` holds an `.exe` or `.dll` that the signed update package `package`
+/// does not contain, i.e. if an update would leave an install that differs from a fresh copy.
+pub fn check_update_package_covers_portable(
+    portable_dir: &Path,
+    package: &[u8],
+) -> Result<(), XtaskError> {
+    let envelope = tg_updater::package::parse_envelope(package)?;
+    let mut archive = ZipArchive::new(Cursor::new(&envelope.payload))
+        .map_err(|e| XtaskError::Zip(e.to_string()))?;
+    let mut packed = HashSet::new();
+    for idx in 0..archive.len() {
+        let entry = archive
+            .by_index(idx)
+            .map_err(|e| XtaskError::Zip(e.to_string()))?;
+        let name = entry.name().map_err(|e| XtaskError::Zip(e.to_string()))?;
+        packed.insert(name.to_ascii_lowercase());
+    }
+    let mut missing = Vec::new();
+    for entry in fs::read_dir(portable_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        let runtime = lower.ends_with(".exe") || lower.ends_with(".dll");
+        if runtime && !packed.contains(&lower) {
+            missing.push(name);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    Err(XtaskError::InconsistentRelease(format!(
+        "the update package lacks {} from the portable folder; an updated install would not match \
+         a fresh one",
+        missing.join(", ")
+    )))
+}
+
+/// Fails if a staged file has a name listed in
+/// [`tg_updater::install_files::OBSOLETE_INSTALL_FILES`]: the app would delete it at startup.
+pub fn check_no_obsolete_names(staged_files: &[(String, PathBuf)]) -> Result<(), XtaskError> {
+    let clashes: Vec<&str> = staged_files
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| {
+            OBSOLETE_INSTALL_FILES
+                .iter()
+                .any(|obsolete| obsolete.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    if clashes.is_empty() {
+        return Ok(());
+    }
+    Err(XtaskError::InconsistentRelease(format!(
+        "{} is shipped again but listed in tg_updater::install_files::OBSOLETE_INSTALL_FILES, so \
+         the app would delete it at startup; remove it from that list",
+        clashes.join(", ")
+    )))
+}
 
 /// Configuration for [`run_dist`].
 #[derive(Debug, Clone)]
@@ -208,16 +291,30 @@ pub fn collect_required_ffmpeg_dlls(
 
     let mut selected = Vec::with_capacity(REQUIRED_FFMPEG_DLL_PREFIXES.len());
     for &prefix in REQUIRED_FFMPEG_DLL_PREFIXES {
-        let matched = entries.iter().find(|(name, _)| {
-            let lower = name.to_ascii_lowercase();
-            lower.starts_with(prefix) && lower.ends_with(".dll")
-        });
-        match matched {
-            Some((name, path)) => selected.push((name.clone(), path.clone())),
-            None => {
+        let matched: Vec<&(String, PathBuf)> = entries
+            .iter()
+            .filter(|(name, _)| {
+                let lower = name.to_ascii_lowercase();
+                lower.starts_with(prefix) && lower.ends_with(".dll")
+            })
+            .collect();
+        match matched.as_slice() {
+            [(name, path)] => selected.push((name.clone(), path.clone())),
+            [] => {
                 return Err(XtaskError::MissingArtifact(format!(
                     "required FFmpeg DLL '{prefix}*.dll' not found in '{}'",
                     ffmpeg_bin_dir.display()
+                )));
+            }
+            // Two FFmpeg versions side by side: picking one by name could ship a DLL the exe was
+            // not linked against.
+            several => {
+                let names: Vec<&str> = several.iter().map(|(name, _)| name.as_str()).collect();
+                return Err(XtaskError::InconsistentRelease(format!(
+                    "more than one '{prefix}*.dll' in '{}' ({}); point --ffmpeg-bin at the FFmpeg \
+                     build the release was linked against",
+                    ffmpeg_bin_dir.display(),
+                    names.join(", ")
                 )));
             }
         }
@@ -282,6 +379,10 @@ governed by its respective license terms.
 #[must_use]
 pub fn generate_inno_setup_script() -> String {
     let bare_guid = APP_ID_GUID.trim_matches(|c| c == '{' || c == '}');
+    let install_delete: String = OBSOLETE_INSTALL_FILES
+        .iter()
+        .map(|name| format!("Type: files; Name: \"{{app}}\\{name}\"\n"))
+        .collect();
     format!(
         r#"; Rustgram Windows Installer Script (Inno Setup 6)
 ; Adapted from tdesktop's setup.iss (GPL-3.0)
@@ -389,6 +490,10 @@ Name: "desktopicon"; Description: "{{cm:CreateDesktopIcon}}"; GroupDescription: 
 Name: "autoupdate"; Description: "Check for updates automatically"; GroupDescription: "Updates:"; Flags: checkedonce
 Name: "registertg"; Description: "Register tg:// protocol handler"; GroupDescription: "Protocol associations:"; Flags: unchecked
 
+[InstallDelete]
+; Runtime files an earlier release installed and this one does not ship
+; (tg_updater::install_files::OBSOLETE_INSTALL_FILES; the app deletes the same names at startup).
+{install_delete}
 [Files]
 Source: "{{#DistDir}}\{{#MyAppExeName}}"; DestDir: "{{app}}"; Flags: ignoreversion
 Source: "{{#DistDir}}\{{#MyUpdaterExeName}}"; DestDir: "{{app}}"; Flags: ignoreversion
@@ -768,6 +873,7 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     // Prefix UTF-8 BOM so Inno Setup's InfoBeforeFile wizard page renders Unicode characters cleanly.
     fs::write(&staged_privacy, format!("\u{FEFF}{privacy_crlf}"))?;
     staged_files.push((PRIVACY_NOTICE_NAME.to_owned(), staged_privacy.clone()));
+    check_no_obsolete_names(&staged_files)?;
 
     let suffix = Target::WIN_X64.asset_suffix();
     let version_str = opts.version.to_string();
@@ -789,9 +895,13 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
     {
         let update_path = out_dir.join(format!("rustgram-{version_str}-{suffix}.tupdate"));
         println!("tg-xtask: packing signed update {}", update_path.display());
-        let app_bytes = fs::read(&app_exe)?;
-        let updater_bytes = fs::read(&updater_exe)?;
-        let widget_helper_bytes = fs::read(&widget_helper_exe)?;
+        // The same files as the portable folder (docs aside), read back from it, so a runtime
+        // file added to the portable folder is always in the update too (TGB-3180).
+        let mut package_files = Vec::new();
+        for (name, path) in update_package_files(&staged_files) {
+            println!("tg-xtask:   update file {name}");
+            package_files.push((name, fs::read(&path)?));
+        }
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -801,13 +911,12 @@ pub fn run_dist(opts: &DistOptions) -> Result<DistOutput, XtaskError> {
             Target::WIN_X64,
             &opts.version,
             now_unix,
-            [
-                (DEFAULT_EXE_NAME, app_bytes.as_slice()),
-                (UPDATER_EXE_NAME, updater_bytes.as_slice()),
-                (WIDGET_HELPER_EXE_NAME, widget_helper_bytes.as_slice()),
-            ],
+            package_files
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
             &signing_key,
         )?;
+        check_update_package_covers_portable(&portable_dir, &packed)?;
         fs::write(&update_path, packed)?;
         artifacts_to_hash.push(update_path.clone());
         Some(update_path)

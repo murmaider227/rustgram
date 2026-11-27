@@ -29,7 +29,7 @@ use tg_audio::{
 };
 use tg_core::settings::{CoreSettings, PowerSavingFlags};
 use tg_lottie::Composition;
-use tg_ui::effects::{InfiniteRadialAnimation, RadialAnimation, paint_spoiler_particles};
+use tg_ui::effects::{InfiniteRadialAnimation, RadialAnimation, paint_image_spoiler};
 use tg_ui::style::InfiniteRadialAnimationStyle;
 
 use crate::history::backend::{DocumentAttachment, HistoryMedia, HistoryMessage};
@@ -143,8 +143,8 @@ const PHOTO_RADIAL_SIZE: f32 = 44.0;
 const PHOTO_RADIAL_LINE: f32 = 3.0;
 /// `msgDateImgBg` (`#00000054`).
 const MSG_DATE_IMG_BG: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 0x54);
-/// Duration of the spoiler reveal fade-out transition (`220ms`).
-pub const SPOILER_REVEAL_FADE_SECS: f64 = 0.22;
+/// Duration of the spoiler reveal (`revealAnimation` over `st::fadeWrapDuration`, linear).
+pub const SPOILER_REVEAL_FADE_SECS: f64 = 0.2;
 /// Standard voice/music speed presets cycled by the inline speed button.
 pub const INLINE_AUDIO_SPEED_PRESETS: &[f64] = &[1.0, 1.5, 2.0];
 
@@ -2189,7 +2189,10 @@ impl HistoryMediaRuntime {
             .map(RadialAnimation::compute_state)
     }
 
-    /// Paints the shimmering spoiler particle veil over `rect` if `msg_id` has an active spoiler.
+    /// Paints the particle cover of a media spoiler over `rect` (`Media::fillImageSpoiler`) at
+    /// `1 - revealAnimation` opacity; the caller paints `_spoiler->background` under it. A
+    /// plain spoiler has no label: tdesktop draws a tag only for sensitive or paid media.
+    /// With `PowerSaving::kChatSpoiler` the particles stay still.
     ///
     /// Returns `true` if the spoiler is still obscuring the media (so clicking should reveal it).
     pub fn paint_spoiler_overlay(
@@ -2202,47 +2205,20 @@ impl HistoryMediaRuntime {
         now_secs: f64,
     ) -> bool {
         let opacity = self.spoiler_opacity(msg_id, now_secs);
-        if opacity <= 0.01 {
+        if opacity <= 0.0 {
             return false;
         }
-        if opacity < 0.99 {
+        if opacity < 1.0 {
             ctx.request_repaint();
         }
-        let veil_alpha = (opacity * 175.0).round().clamp(0.0, 255.0) as u8;
-        let bg = Color32::from_rgba_unmultiplied(24, 34, 46, veil_alpha);
-        let particle = Color32::from_rgba_unmultiplied(
-            255,
-            255,
-            255,
-            (opacity * 235.0).round().clamp(0.0, 255.0) as u8,
+        paint_image_spoiler(
+            ctx,
+            painter,
+            rect,
+            cr,
+            opacity,
+            self.policy.allows_spoiler_particles(),
         );
-        painter.rect_filled(rect, cr, bg);
-        if self.policy.allows_spoiler_particles() {
-            paint_spoiler_particles(
-                ctx,
-                painter,
-                rect,
-                particle,
-                Color32::TRANSPARENT,
-                (msg_id.0 as u64).wrapping_mul(0x9E37_79B9) ^ 0x5A5A,
-            );
-        }
-        // Centered subtle pill badge ("Spoiler") while unrevealed.
-        if self.is_spoiler_hidden(msg_id) {
-            let pill = Rect::from_center_size(rect.center(), Vec2::new(76.0, 26.0));
-            painter.rect_filled(
-                pill,
-                CornerRadius::same(13),
-                Color32::from_rgba_unmultiplied(0, 0, 0, 138),
-            );
-            painter.text(
-                pill.center(),
-                Align2::CENTER_CENTER,
-                "Spoiler",
-                FontId::proportional(12.0),
-                Color32::WHITE,
-            );
-        }
         self.is_spoiler_hidden(msg_id)
     }
 }

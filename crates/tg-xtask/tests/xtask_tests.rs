@@ -107,11 +107,11 @@ fn dist_stages_portable_folder_with_ffmpeg_and_licenses_zip_update_and_checksums
 
     // Seed dummy required FFmpeg DLLs matching `REQUIRED_FFMPEG_DLL_PREFIXES`.
     let mock_dlls = [
-        "avcodec-62.dll",
-        "avformat-62.dll",
-        "avutil-60.dll",
-        "swresample-6.dll",
-        "swscale-9.dll",
+        "avcodec-63.dll",
+        "avformat-63.dll",
+        "avutil-61.dll",
+        "swresample-7.dll",
+        "swscale-10.dll",
     ];
     for dll in mock_dlls {
         fs::write(ffmpeg_bin.join(dll), format!("mock-{dll}")).unwrap();

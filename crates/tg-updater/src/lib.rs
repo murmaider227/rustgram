@@ -9,6 +9,7 @@
 pub mod apply;
 pub mod checker;
 pub mod github;
+pub mod install_files;
 pub mod launch;
 pub mod package;
 pub mod version;

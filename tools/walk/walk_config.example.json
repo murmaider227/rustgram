@@ -1,0 +1,19 @@
+{
+  "official_exe": "<folder>/Telegram/Telegram.exe",
+  "official_workdir": "<official client's test-account working dir, logged in as account A>",
+  "rustgram_exe": "<target>/debug/rustgram.exe",
+  "rustgram_workdir": "<Rustgram -testmode working dir logged in as account A>",
+  "peer_workdir_a": "<Rustgram -testmode working dir of account A>",
+  "peer_workdir_b": "<Rustgram -testmode working dir of account B>",
+  "peer_exe": "<target>/debug/tg-walk-peer.exe",
+  "state": "<state.json written by tg-walk-peer fixture, outside the repo>",
+  "media": "<media dir from make_media.py>",
+  "tdesktop_dir": "<tdesktop checkout: docs/api_credentials.md holds the public TEST-only api pair>",
+  "ffmpeg_bin": "<FFmpeg bin dir for Rustgram's media>",
+  "scratch": "<scratch dir outside any git checkout: workdir copies, deleted by you after the run>",
+  "snap_root": "<output dir for pairs and results, outside the repo>",
+  "window": [1400, 900],
+  "official_pos": [-1910, 20],
+  "rustgram_pos": [1930, 20],
+  "startup_wait_s": 20
+}

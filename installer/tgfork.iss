@@ -104,6 +104,15 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "autoupdate"; Description: "Check for updates automatically"; GroupDescription: "Updates:"; Flags: checkedonce
 Name: "registertg"; Description: "Register tg:// protocol handler"; GroupDescription: "Protocol associations:"; Flags: unchecked
 
+[InstallDelete]
+; Runtime files an earlier release installed and this one does not ship
+; (tg_updater::install_files::OBSOLETE_INSTALL_FILES; the app deletes the same names at startup).
+Type: files; Name: "{app}\avcodec-62.dll"
+Type: files; Name: "{app}\avformat-62.dll"
+Type: files; Name: "{app}\avutil-60.dll"
+Type: files; Name: "{app}\swresample-6.dll"
+Type: files; Name: "{app}\swscale-9.dll"
+
 [Files]
 Source: "{#DistDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistDir}\{#MyUpdaterExeName}"; DestDir: "{app}"; Flags: ignoreversion

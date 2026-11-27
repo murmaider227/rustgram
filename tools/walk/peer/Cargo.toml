@@ -1,0 +1,22 @@
+[package]
+name = "tg-walk-peer"
+description = "Scenario-walk helper: fills two Telegram TEST-server accounts with realistic data and acts as the second account during the walk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+parking_lot = "0.12.5"
+rqrr = "0.10"
+serde_json = "1.0.154"
+tg-api = { path = "../../../crates/tg-api" }
+tg-core = { path = "../../../crates/tg-core" }
+tg-mtproto = { path = "../../../crates/tg-mtproto" }
+tg-session = { path = "../../../crates/tg-session" }
+tg-tl = { path = "../../../crates/tg-tl" }
+tg-transport = { path = "../../../crates/tg-transport" }
+tokio = { version = "1.44.2", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+qrcode = { version = "0.14", default-features = false }

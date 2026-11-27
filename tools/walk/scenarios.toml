@@ -1,0 +1,1447 @@
+# Everyday scenarios of the walk. docs/SCENARIOS.md is generated from this file
+# (python -I tools/walk/gen_docs.py). ONE step list per scenario, played by both clients; a line
+# starting with [official] or [rustgram] runs on that client only. Step language: engine.py.
+#
+# Fixture chats (tools/walk/peer): Walk Supergroup, Walk Basic Group, Walk Channel, the private
+# chat A <-> B (320+ messages; its title is ${peer}), Walk Archived Group, Saved Messages, folder
+# "Walk". ${...} names come from the config's "vars": they depend on which account the clients run
+# as ("main" a or b).
+# Messages the clients send carry the marker "walk tmp" and are deleted after the run.
+
+# ------------------------------------------------------------------------------------------------
+# Owner-reported bugs (each one stays here so it cannot come back unnoticed)
+# ------------------------------------------------------------------------------------------------
+
+[[scenario]]
+id = "OB-01"
+title = 'Stories tooltip closes on its x'
+bug = "TGB-3127"
+source = "dialogs/dialogs_widget.cpp: Widget::setupStoriesToggle / Ui::ShowStoriesTooltip (dialogs/ui/dialogs_stories_list.cpp)"
+expect = 'With an unseen story of B, the tooltip "Click here to view from ..." shows next to the stories userpics; a click on its x closes it and it stays closed.'
+steps = '''
+expect text list Click here to view
+shot tooltip
+click right_of:Click here to view:17:7
+wait 1.5
+shot closed
+expect notext list Click here to view
+'''
+
+[[scenario]]
+id = "OB-02"
+title = '"is typing" appears when B types and goes away 6 s after B stops'
+bug = "TGB-3128"
+source = "data/data_send_action.cpp: SendActionManager::registerFor (kStatusShowClientsideTyping 6000 ms); history/view/history_view_top_bar_widget.cpp"
+expect = "Header and chat-list row of Walk Peer B say \"typing\" while B types; both are back to normal about 6 s after B's last typing update."
+steps = '''
+open ${peer}
+scroll history -150
+peer {"op":"typing","chat":"pm"}
+wait 1.5
+shot typing
+expect text header typing(\.|…|\s*$)
+wait 8
+shot stopped
+expect notext header typing(\.|…|\s*$)
+expect notext list typing(\.|…|\s*$)
+'''
+
+[[scenario]]
+id = "OB-03"
+title = '"is typing" goes away at once when B cancels typing'
+bug = "TGB-3128"
+source = "data/data_send_action.cpp: SendActionManager::registerFor (sendMessageCancelAction clears the action)"
+expect = "After B's cancel the header shows the normal status within 2 s, no 6 s wait."
+steps = '''
+open ${peer}
+scroll history -150
+peer {"op":"typing","chat":"pm"}
+wait 1.5
+expect text header typing(\.|…|\s*$)
+peer {"op":"cancel_typing","chat":"pm"}
+wait 2
+shot cancelled
+expect notext header typing(\.|…|\s*$)
+'''
+
+[[scenario]]
+id = "OB-04"
+title = "\"is typing\" goes away when B's message arrives"
+bug = "TGB-3128"
+source = "history/history.cpp: History::clearSendAction on a new message from the typing user"
+expect = 'B types, then sends: the message is shown and "typing" is gone from the header at once.'
+steps = '''
+open ${peer}
+scroll history -150
+peer {"op":"typing","chat":"pm"}
+wait 1.5
+expect text header typing(\.|…|\s*$)
+peer {"op":"send","chat":"pm","text":"Walk check: typing ends with this message"}
+wait 2
+shot after_message
+expect notext header typing(\.|…|\s*$)
+expect text history typing ends with this message
+'''
+
+[[scenario]]
+id = "OB-05"
+title = "Own userpic next to own messages in a group at a wide window"
+bug = "TGB-3124"
+source = "history/history_widget.cpp: HistoryWidget::recountChatWidth (wide at >= 880 px, window.style adaptiveChatWideWidth); history/view/history_view_message.cpp: Message::hasFromPhoto"
+expect = "With a history column of 880 px or more the chat is wide: A's own messages sit on the left like B's, with A's userpic at the last message of a run. Narrower, they move right and the userpic goes."
+steps = '''
+size 1700 900
+open Walk Supergroup
+seek ${pair_seek}
+shot wide
+expect samecol "${own_run}" "${other_run}"
+look the walk account's own messages sit on the left with its userpic at the last one of a run
+size 1200 900
+seek ${pair_seek}
+shot narrow
+expect rightof "${own_run}" "${other_run}"
+'''
+
+[[scenario]]
+id = "OB-06"
+title = 'The "@" mentions button and its counter go away after the mention is read'
+bug = "TGB-3125"
+source = "history/view/history_view_corner_buttons.cpp: CornerButtons::updateUnreadThingsVisibility; history/history_unread_things.cpp"
+expect = 'While scrolled up, a new mention shows the "@" corner button with a counter; after scrolling to the bottom (mention seen) the server count is 0 and no counter is left in the corner.'
+steps = '''
+open Walk Supergroup
+peer {"op":"send","chat":"super","text":"walk filler one"}
+peer {"op":"send","chat":"super","text":"walk filler two"}
+wait 2
+scroll history 25
+peer {"op":"send","chat":"super","text":"Walker, a mention for the walk check","mention":true}
+wait 3
+shot with_button
+expect badge corner
+scroll history -300
+wait 3
+shot after_read
+expect server {"op":"dialog","who":"a","chat":"super"} unread_mentions == 0
+expect nobadge corner
+'''
+
+[[scenario]]
+id = "OB-07"
+title = "The reactions corner button and its counter go away after the reaction is seen"
+bug = "TGB-3125"
+source = "history/view/history_view_corner_buttons.cpp: CornerButtons (reactions button, unreadReactions)"
+expect = "B reacts to A's message while A is scrolled away: a heart corner button with a counter shows; once the reacted message was on screen the counter is gone."
+steps = '''
+open Walk Supergroup
+peer {"op":"send","chat":"super","text":"walk filler three"}
+peer:mine {"op":"send","who":"a","chat":"super","text":"walk tmp react to this"}
+peer {"op":"send","chat":"super","text":"walk filler four"}
+wait 2
+scroll history 25
+peer {"op":"react","chat":"super","id":${mine.id},"emoji":"👍"}
+wait 3
+shot with_button
+expect badge corner
+scroll history -300
+wait 3
+shot after_seen
+expect server {"op":"dialog","who":"a","chat":"super"} unread_reactions == 0
+expect nobadge corner
+'''
+
+[[scenario]]
+id = "OB-08"
+title = "A custom sticker shows, fills its box, and a click opens its set"
+bug = "TGB-3126"
+source = "history/view/media/history_view_sticker.cpp: Sticker::draw / Sticker::countOptimalSize; boxes/sticker_set_box.cpp: StickerSetBox"
+expect = "The sticker from the user-made set Walk Stickers (static PNG/WebP) and the one from a server set are drawn (no blue placeholder circle), fill their box with no empty band, the userpic sits at the sticker's bottom edge; a click on the custom sticker opens the Walk Stickers set box."
+steps = '''
+open Walk Supergroup
+seek ^That is all for now
+wait 3
+shot stickers
+expect nobadge history 2500
+look both stickers are drawn, fill their box with no empty band under them, and B's userpic sits at the custom sticker's bottom edge
+click below:^That is all for now:60:100
+wait 2.5
+shot set_box
+expect text whole Walk Stickers
+key escape
+'''
+
+[[scenario]]
+id = "OB-09"
+title = "Closing the main window keeps the app in the tray; a tray click brings it back"
+bug = "TGB-3122, TGB-3123"
+source = "window/main_window.cpp: MainWindow::closeEvent (WorkMode WindowAndTray hides the window); platform/win/tray_win.cpp: Tray::createIcon (the app icon)"
+expect = "x hides the window, the process keeps running, the tray icon is the app's own icon, a tray click shows the window again, the tray menu offers Quit, and Ctrl+Q quits the app. The official client is only checked for hide + still running (its tray icon cannot be told apart from the user's own Telegram)."
+steps = '''
+close
+wait 2
+expect alive
+expect hidden
+[rustgram] tray find
+[rustgram] look the tray icon is the Rustgram app icon, not a generated chat bubble
+[rustgram] tray click
+[rustgram] wait 2
+[rustgram] expect visible
+[rustgram] shot back_from_tray
+[rustgram] tray menu
+[rustgram] look the tray menu matches tdesktop's (Minimize to Tray / Disable notifications / Quit)
+[rustgram] key ctrl+q
+[rustgram] expect exited
+[official] stop
+'''
+
+[[scenario]]
+id = "OB-10"
+title = '"Restart to update" never offers an older or equal version'
+bug = "TGB-3117"
+only = ["rustgram"]
+source = "core/update_checker.cpp: checkReadyUpdate (a staged update not newer than AppVersion is deleted)"
+expect = "With a staged update package older than the running build in the working dir, Rustgram starts without any update bar or 'New version is ready', and deletes the package."
+steps = '''
+stop
+stage_update 0.0.1
+restart 20
+shot started
+expect notext whole New version is ready
+expect notext whole Restart to update
+expect nostaged
+'''
+
+[[scenario]]
+id = "OB-11"
+title = "Stories sit as userpics inside the search field, not in a separate row"
+bug = "TGB-3008"
+source = "dialogs/dialogs_widget.cpp: Widget::setupStories (Dialogs::Stories::List in the search field area)"
+expect = "B's unseen story shows as a small userpic at the right end of the search field; there is no extra 'N stories' or 'Add Story' row in the chat list."
+steps = '''
+shot list
+expect notext list \d+ stor(y|ies)
+expect notext list Add Story
+look B's story is a ringed userpic inside the search field
+'''
+
+[[scenario]]
+id = "OB-12"
+title = "Spoiler text stays hidden until clicked"
+bug = "TGB-3009, TGB-3027"
+source = "ui/text/text.cpp (spoiler) / history/view/history_view_message.cpp: Message::clickHandlerPressedChanged"
+expect = "The spoiler in B's style test message is covered (its words are not readable) until a click reveals them."
+steps = '''
+open Walk Supergroup
+seek ^Styles
+shot hidden
+expect notext history spoiler text here
+click right_of:and a hidden:40:0
+wait 1.5
+shot revealed
+expect text history spoiler text here
+'''
+
+[[scenario]]
+id = "OB-13"
+title = "Text styles and emoji look like tdesktop"
+bug = "TGB-3010, TGB-3014"
+source = "ui/text/text.cpp; ui/emoji_config.cpp (tdesktop emoji sheets)"
+expect = "Bold, italic, underline, strikethrough, monospace, link, quote and code block render like tdesktop; emoji are tdesktop's emoji set; text weight is the same as tdesktop's."
+steps = '''
+open Walk Supergroup
+seek ^Styles
+shot styles
+expect text history bold
+expect text history fn main
+look text weight, styles and code block match the official pair
+open ${peer}
+seek History line 274
+shot emoji
+look the thumbs-up emoji is tdesktop's emoji image
+'''
+
+[[scenario]]
+id = "OB-14"
+title = "Deleting a message plays the delete effect and removes it"
+bug = "TGB-3011"
+source = "history/view/history_view_list_widget.cpp / ui/effects/ (dust effect on delete, HistoryView::ListWidget::deleteItems)"
+expect = "A sends a message in Saved Messages, deletes it from the context menu; the message disappears (with tdesktop's dust effect)."
+steps = '''
+open Saved Messages
+click text:Write a message@compose
+type walk tmp delete me
+key enter
+wait 2
+expect text history walk tmp delete me
+rclick text:walk tmp delete me@history
+wait 1
+click text:^Delete$
+wait 1
+click text:^Delete$
+wait 0.3
+shot effect
+wait 2
+shot gone
+expect notext history walk tmp delete me
+look the delete effect in the 'effect' pair
+'''
+
+[[scenario]]
+id = "OB-15"
+title = "Sender name colours in a group match tdesktop"
+bug = "TGB-3012"
+source = "ui/chat/chat_style.cpp: ChatStyle::peerColor / Data::DecideColorIndex"
+expect = "B's name above B's messages in Walk Supergroup has the same colour as in the official client (same theme)."
+steps = '''
+open Walk Supergroup
+seek ^Styles
+shot names
+look ${peer}'s name colour equals the official pair
+'''
+
+[[scenario]]
+id = "OB-16"
+title = "Reactions show on old messages deep in a long chat"
+bug = "TGB-3013"
+source = "history/view/reactions/history_view_reactions.cpp: InlineList; data/data_message_reactions.cpp"
+expect = "History lines 003 and 040 of the private chat (300+ messages back) show their reactions."
+steps = '''
+open ${peer}
+seek History line 040
+shot line040
+look line 040 carries its reaction (thumbs up)
+seek History line 003
+shot line003
+look line 003 carries its reaction (fire)
+'''
+
+[[scenario]]
+id = "OB-17"
+title = "Saved Messages bubble looks like tdesktop"
+bug = "owner report (Saved Messages bubble)"
+source = "history/view/history_view_message.cpp: Message::draw (Saved Messages shows own messages as outgoing bubbles)"
+expect = "The saved note is shown as a normal outgoing bubble with the time, like the official client."
+steps = '''
+open Saved Messages
+expect text history shopping list
+shot saved
+look the saved note's bubble matches the official pair
+'''
+
+[[scenario]]
+id = "OB-18"
+title = "Recording and sending a voice message"
+bug = "TGB-3015, TGB-3034"
+source = "history/view/controls/history_view_voice_record_bar.cpp: VoiceRecordBar (hold the mic button, release to send)"
+expect = "Holding the microphone button for 3 s records and releasing sends a voice message to Saved Messages (on a PC without a microphone tdesktop shows an error instead)."
+steps = '''
+open Saved Messages
+hold br:30,26 3
+wait 3
+shot after
+look a voice message was sent, or the client says there is no microphone (same as the official pair)
+'''
+
+[[scenario]]
+id = "OB-19"
+title = "Copy Text from the context menu puts the message text on the clipboard"
+bug = "TGB-3016"
+source = "history/history_inner_widget.cpp: HistoryInner::showContextMenu (Copy Text) / TextForMimeData"
+expect = "Right click on B's message -> Copy Text -> the clipboard holds the message text."
+steps = '''
+open ${peer}
+scroll history -300
+seek Latest message from Peer B
+clipboard_clear
+rclick text:Latest message from Peer B@history
+wait 1
+shot menu
+click text:^Copy Text
+wait 1
+expect clipboard Latest message from Peer B
+'''
+
+[[scenario]]
+id = "OB-20"
+title = "Selected text is copied with Ctrl+C"
+bug = "TGB-3016"
+source = "history/history_inner_widget.cpp: HistoryInner::keyPressEvent (Copy) / getSelectedText"
+expect = "Drag-selecting the text of B's message and pressing Ctrl+C copies it."
+steps = '''
+open ${peer}
+scroll history -300
+seek Latest message from Peer B
+clipboard_clear
+select "Latest message from Peer B" "Latest message from Peer B"
+key ctrl+c
+wait 1
+expect clipboard Latest message
+'''
+
+[[scenario]]
+id = "OB-21"
+title = "Channel post reactions are emoji, never raw ids"
+bug = "TGB-3017"
+source = "history/view/reactions/history_view_reactions.cpp: InlineList::layoutButtons"
+expect = "Posts in Walk Channel show reaction chips with emoji and counts; no long numbers (document ids) are drawn over the posts."
+steps = '''
+open Walk Channel
+wait 2
+shot posts
+expect notext history \d{9,}
+look reaction chips under the posts match the official pair
+'''
+
+[[scenario]]
+id = "OB-22"
+title = "Video plays without glitches"
+bug = "TGB-3017 (video part)"
+source = "media/view/media_view_overlay_widget.cpp: OverlayWidget (streaming player)"
+expect = "B's short video opens in the media viewer and plays smoothly."
+steps = '''
+open Walk Supergroup
+seek ^A short video
+click below:^A short video:60:-120
+wait 1
+shot play1
+wait 1.5
+shot play2
+expect changed play1 play2 whole
+look the video frames in play1/play2 have no glitches
+key escape
+'''
+
+[[scenario]]
+id = "OB-23"
+title = "Voice message bubble: waveform and duration"
+bug = "TGB-2954"
+source = "history/view/media/history_view_document.cpp: Document::draw (voice waveform, status text)"
+expect = "B's voice message shows a play button, a waveform and 0:04."
+steps = '''
+open Walk Supergroup
+seek ^Notes as a file
+scroll history 3
+shot voice
+expect text history 0:0[0-9]
+look the voice bubble's waveform and status text match the official pair
+'''
+
+[[scenario]]
+id = "OB-24"
+title = "Gaps between grouped messages and the admin rank"
+bug = "TGB-2953"
+source = "history/view/history_view_message.cpp: Message::countGeometry (attach-to-previous margins); Message::rightBadge"
+expect = "A's three messages in a row are attached (small gaps, one tail); B's name shows the owner rank."
+steps = '''
+open Walk Supergroup
+seek ^And a third one
+shot run
+look the gaps between A's three messages match the official pair; the owner badge shows next to B's name
+'''
+
+[[scenario]]
+id = "OB-25"
+title = "The scrollbar thumb is at the bottom when the history is at the bottom"
+bug = "TGB-2952"
+source = "ui/widgets/scroll_area.cpp: ScrollBar::updateBar"
+expect = "Right after opening the long private chat and jumping to the bottom, the scrollbar thumb (when shown) is at the bottom."
+steps = '''
+open ${peer}
+scroll history -120
+wait 1
+scroll history 1
+shot thumb
+look the scrollbar thumb sits at the bottom of the track
+'''
+
+[[scenario]]
+id = "OB-26"
+title = "Photo viewer is full screen over the taskbar"
+bug = "TGB-2970"
+source = "media/view/media_view_overlay_widget.cpp: OverlayWidget::showAndActivate (full-screen window)"
+expect = "A click on an album photo opens the viewer covering the whole monitor, taskbar included; Escape closes it."
+steps = '''
+open Walk Supergroup
+seek ^Three photos from the trip
+click below:^Three photos from the trip:40:-140
+wait 2
+shot viewer
+expect fullscreen
+key escape
+wait 1
+'''
+
+[[scenario]]
+id = "OB-27"
+title = "A tall photo keeps its aspect ratio"
+bug = "TGB-2970"
+source = "history/view/media/history_view_photo.cpp: Photo::countOptimalSize"
+expect = "A's 600x1800 photo is drawn tall (not squashed or cropped to a square)."
+steps = '''
+open Walk Supergroup
+seek ^Three photos from the trip
+scroll history -4
+shot tall
+look the tall photo keeps its 1:3 shape like the official pair
+'''
+
+[[scenario]]
+id = "OB-28"
+title = "Userpic circles are smooth"
+bug = "TGB-2971"
+source = "ui/image/image_prepare.cpp: Images::Circle (antialiased)"
+expect = "Chat-list userpics are round with smooth edges."
+steps = '''
+shot list
+look userpic edges in the chat list are smooth like the official pair
+'''
+
+[[scenario]]
+id = "OB-29"
+title = "No link preview card for an internal t.me/c link"
+bug = "TGB-2954"
+source = "data/data_web_page.cpp / history/view/media/history_view_web_page.cpp (internal links have no webpage)"
+expect = "A message with a t.me/c/... link to a message of the supergroup shows no 'Link' preview card."
+steps = '''
+open Walk Supergroup
+peer {"op":"send","who":"a","chat":"super","text":"walk tmp see https://t.me/c/1/2"}
+wait 3
+shot link
+look no extra 'Link' preview card under the t.me/c message (same as the official pair)
+'''
+
+# ------------------------------------------------------------------------------------------------
+# Everyday flows
+# ------------------------------------------------------------------------------------------------
+
+[[scenario]]
+id = "EV-01"
+title = "Start: the chat list shows the account's chats"
+source = "dialogs/dialogs_inner_widget.cpp: InnerWidget::paintEvent"
+expect = "After start the chat list shows the fixture chats with their last messages."
+steps = '''
+shot list
+expect text list Walk Supergroup
+expect text list Walk Basic Group
+expect text list Saved Messages
+expect text list Walk Channel
+'''
+
+[[scenario]]
+id = "EV-02"
+title = "Pinned chat stays on top of the list"
+source = "dialogs/dialogs_main_list.cpp: MainList::pinned"
+expect = "Walk Supergroup (pinned) is above every unpinned chat."
+steps = '''
+shot list
+expect above "Walk Supergroup" "Saved Messages"
+expect above "Walk Supergroup" "${peer}"
+'''
+
+[[scenario]]
+id = "EV-03"
+title = "Folders: the Walk folder shows only its chats"
+source = "window/window_filters_menu.cpp: FiltersMenu; dialogs/dialogs_widget.cpp"
+expect = "A click on the Walk folder in the left rail lists the two groups and the channel only; All chats brings everything back."
+steps = '''
+click text:^Walk$@list
+wait 1.5
+shot folder
+expect text list Walk Supergroup
+expect notext list Saved Messages
+click text:^All chats@list
+wait 1.5
+expect text list Saved Messages
+'''
+
+[[scenario]]
+id = "EV-04"
+title = "Archive: the archived chat lives in Archived chats"
+source = "dialogs/dialogs_inner_widget.cpp (folder row); data/data_folder.cpp"
+expect = "Walk Archived Group is not in the main list; opening Archived chats shows it."
+steps = '''
+expect text list Archived chats
+click text:^Archived chats@list
+wait 1.5
+shot archive
+expect text list Walk Archived Group
+key escape
+'''
+
+[[scenario]]
+id = "EV-05"
+title = "Open the private chat"
+source = "history/history_widget.cpp: HistoryWidget::showHistory; history/view/history_view_top_bar_widget.cpp"
+expect = "The header shows Walk Peer B and a last-seen or online status; the history shows the latest messages."
+steps = '''
+open ${peer}
+shot chat
+expect text header last seen|online|recently
+expect text history History line|Latest message
+'''
+
+[[scenario]]
+id = "EV-06"
+title = "Open the basic group"
+source = "history/view/history_view_top_bar_widget.cpp: TopBarWidget::updateOnlineDisplay"
+expect = "The header shows Walk Basic Group and its member count."
+steps = '''
+open Walk Basic Group
+shot chat
+expect text header members
+expect text history Count me in
+'''
+
+[[scenario]]
+id = "EV-07"
+title = "Open the supergroup: pinned message bar"
+source = "history/view/history_view_pinned_bar.cpp: PinnedBar"
+expect = "The supergroup shows the pinned message bar with B's welcome text."
+steps = '''
+open Walk Supergroup
+shot chat
+expect text whole Pinned Message
+expect text whole Hello everyone
+'''
+
+[[scenario]]
+id = "EV-08"
+title = "Pinned bar click jumps to the pinned message"
+source = "history/history_widget.cpp: HistoryWidget::pinnedBarClicked"
+expect = "A click on the pinned bar scrolls the history to B's welcome message."
+steps = '''
+open Walk Supergroup
+click text:^Pinned Message
+wait 2
+shot jumped
+expect text history Hello everyone! This is the walk
+'''
+
+[[scenario]]
+id = "EV-09"
+title = "Open the channel as a subscriber"
+source = "history/history_widget.cpp: HistoryWidget::updateControlsVisibility (channel: mute button instead of the field)"
+expect = "Walk Channel shows its posts with views; the bottom bar has the Unmute button (the channel is muted) instead of a message field."
+steps = '''
+open Walk Channel
+shot channel
+expect text history Welcome to the Walk Channel
+expect text compose ${channel_bar}
+'''
+
+[[scenario]]
+id = "EV-10"
+title = "Open Saved Messages"
+source = "history/history_widget.cpp; data/data_saved_messages.cpp"
+expect = "Saved Messages opens with the saved note."
+steps = '''
+open Saved Messages
+shot saved
+expect text history shopping list, milk
+'''
+
+[[scenario]]
+id = "EV-11"
+title = "A new message from B appears in the open chat and is read"
+source = "history/history_widget.cpp: HistoryWidget::newItemAdded / readServerHistory"
+expect = "With the private chat open at the bottom, B's new message appears within 3 s and the server marks it read."
+steps = '''
+open ${peer}
+scroll history -150
+peer {"op":"send","chat":"pm","text":"Walk check: a fresh message from B"}
+wait 3
+shot arrived
+expect text history a fresh message from B
+expect server {"op":"dialog","who":"a","chat":"pm"} unread == 0
+'''
+
+[[scenario]]
+id = "EV-12"
+title = "Send a text message"
+source = "history/history_widget.cpp: HistoryWidget::send"
+expect = "Typing a message and pressing Enter sends it: it shows in the history with a tick, and B's side has it."
+steps = '''
+open Saved Messages
+click text:Write a message@compose
+type walk tmp hello from the walk
+key enter
+wait 3
+shot sent
+expect text history walk tmp hello from the walk
+expect server {"op":"last","who":"a","chat":"saved","n":1} ok == true
+'''
+
+[[scenario]]
+id = "EV-13"
+title = "Edit a sent message"
+source = "history/history_widget.cpp: HistoryWidget::editMessage / saveEditMsg"
+expect = "Context menu -> Edit, change the text, Enter: the message shows the new text and 'edited'."
+steps = '''
+open Saved Messages
+click text:Write a message@compose
+type walk tmp edit me
+key enter
+wait 2
+rclick text:walk tmp edit me@history
+wait 1
+click text:^Edit$
+wait 1
+key ctrl+a
+type walk tmp edited text
+key enter
+wait 3
+shot edited
+expect text history walk tmp edited text
+expect text history edited
+'''
+
+[[scenario]]
+id = "EV-14"
+title = "Reply to a message"
+source = "history/history_widget.cpp: HistoryWidget::replyToMessage"
+expect = "Context menu -> Reply on B's message, type, Enter: A's message is sent with a reply header quoting B."
+steps = '''
+open ${peer}
+scroll history -300
+seek Latest message from Peer B
+rclick text:Latest message from Peer B@history
+wait 1
+click text:^Reply$
+wait 1
+type walk tmp a reply
+key enter
+wait 3
+shot reply
+expect text history walk tmp a reply
+look the sent message has a reply header quoting B's message
+'''
+
+[[scenario]]
+id = "EV-15"
+title = "Forward a message to Saved Messages"
+source = "boxes/share_box.cpp: ShareBox; history/history_widget.cpp: forwardSelected"
+expect = "Context menu -> Forward on B's message, choose Saved Messages: the forwarded copy is in Saved Messages with 'Forwarded from'."
+steps = '''
+open ${peer}
+scroll history -300
+seek Latest message from Peer B
+rclick text:Latest message from Peer B@history
+wait 1
+click text:^Forward
+wait 1.5
+shot box
+click text:^Saved Messages
+wait 2
+key enter
+wait 3
+open Saved Messages
+shot saved
+expect text history Forwarded from
+expect text history Latest message from Peer B
+'''
+
+[[scenario]]
+id = "EV-16"
+title = "Global search finds a message deep in history"
+source = "dialogs/dialogs_widget.cpp: Widget::searchMessages; dialogs/dialogs_inner_widget.cpp (search results)"
+expect = "Typing 'History line 123' in the search field lists the message from the private chat."
+steps = '''
+click text:^Search@list
+type History line 123
+wait 3
+shot results
+expect text list History line 123
+'''
+
+[[scenario]]
+id = "EV-17"
+title = "Opening a search result jumps to the message"
+source = "dialogs/dialogs_widget.cpp: Widget::onChooseByEnter / Window::SessionController::showMessage"
+expect = "A click on the found message opens the private chat at that message."
+steps = '''
+click text:^Search@list
+type History line 123
+wait 3
+click text:History line 123@list
+wait 3
+shot jumped
+expect text history History line 123
+'''
+
+[[scenario]]
+id = "EV-18"
+title = "Search inside a chat"
+source = "history/view/history_view_top_bar_widget.cpp (search button); dialogs search in chat (ChatSearchIn)"
+expect = "Ctrl+F in the private chat searches only there; typing 'line 2' shows matching messages."
+steps = '''
+open ${peer}
+key ctrl+f
+wait 1
+type line 250
+wait 3
+shot search
+expect text whole History line 250
+'''
+
+[[scenario]]
+id = "EV-19"
+title = "Open the group profile"
+source = "info/profile/info_profile_widget.cpp; info/info_wrap_widget.cpp"
+expect = "A click on the group name in the header opens its profile with the member list."
+steps = '''
+open Walk Supergroup
+click text:Walk Supergroup@header
+wait 2
+shot profile
+expect text whole Members|members
+expect text whole ${peer}
+key escape
+'''
+
+[[scenario]]
+id = "EV-20"
+title = "Shared media of the group"
+source = "info/media/info_media_widget.cpp; info/profile/info_profile_actions.cpp (shared media buttons)"
+expect = "The group profile lists shared media (photos, videos, files, voice, links)."
+steps = '''
+open Walk Supergroup
+click text:Walk Supergroup@header
+wait 2
+shot profile
+expect text whole photo|Photos
+expect text whole file|Files
+look the shared media counters match the official pair
+key escape
+'''
+
+[[scenario]]
+id = "EV-21"
+title = "Open the private chat's user profile"
+source = "info/profile/info_profile_cover.cpp; info/profile/info_profile_actions.cpp"
+expect = "A click on Walk Peer B in the header opens B's profile."
+steps = '''
+open ${peer}
+click text:${peer}@header
+wait 2
+shot profile
+expect text whole ${peer}
+look profile layout matches the official pair
+key escape
+'''
+
+[[scenario]]
+id = "EV-22"
+title = "Chat list context menu"
+source = "window/window_peer_menu.cpp: FillDialogsEntryMenu"
+expect = "Right click on Walk Basic Group in the list shows Pin/Unpin, Mute, Mark as read/unread, Archive and Delete entries."
+steps = '''
+rclick text:^Walk Basic Group@list
+wait 1
+shot menu
+expect text whole Pin|Unpin
+expect text whole Archive
+expect text whole Mute|Unmute
+key escape
+'''
+
+[[scenario]]
+id = "EV-23"
+title = "Message context menu"
+source = "history/history_inner_widget.cpp: HistoryInner::showContextMenu; history/view/history_view_context_menu.cpp"
+expect = "Right click on B's message shows the reaction strip and Reply, Copy Text, Forward entries."
+steps = '''
+open ${peer}
+scroll history -150
+rclick text:Latest message from Peer B@history
+wait 1
+shot menu
+expect text whole ^Reply
+expect text whole Copy Text
+expect text whole Forward
+key escape
+'''
+
+[[scenario]]
+id = "EV-24"
+title = "Draft is kept and shown in the chat list"
+source = "dialogs/ui/dialogs_layout.cpp: PaintRow (Draft: prefix); history/history_widget.cpp: applyDraft"
+expect = "Walk Basic Group's row says 'Draft:'; opening the chat puts the draft text in the field."
+steps = '''
+shot list
+expect text list Draft
+open Walk Basic Group
+wait 1
+shot field
+expect text compose remember to bring the charger
+'''
+
+[[scenario]]
+id = "EV-25"
+title = "Unread counter of a chat updates when B writes"
+source = "dialogs/ui/dialogs_layout.cpp: PaintUnreadBadge; data/data_histories.cpp"
+expect = "With Saved Messages open, a new message from B moves Walk Peer B's row up with the new text as preview."
+steps = '''
+open Saved Messages
+peer {"op":"send","chat":"pm","text":"Walk check: preview in the list"}
+wait 3
+shot list
+expect text list preview in the list
+'''
+
+[[scenario]]
+id = "EV-26"
+title = '"typing" in the chat list while another chat is open'
+source = "dialogs/ui/dialogs_layout.cpp: PaintRow (send action text)"
+expect = "With Saved Messages open, B typing in the private chat shows 'typing' in B's list row."
+steps = '''
+open Saved Messages
+peer {"op":"typing","chat":"pm"}
+wait 1.5
+shot typing
+expect text list typing(\.|…|\s*$)
+'''
+
+[[scenario]]
+id = "EV-27"
+title = "Scroll a long history up and back down"
+source = "history/history_inner_widget.cpp; history/history_widget.cpp: preloadHistoryIfNeeded"
+expect = "Scrolling up through the private chat loads older messages (line numbers go down); the scroll-down button brings it back to the latest message."
+steps = '''
+open ${peer}
+scroll history -150
+seek History line 2[0-4][0-9]
+shot older
+scroll history -400
+wait 2
+shot bottom
+expect text history Latest message from Peer B|fresh message|preview in the list
+'''
+
+[[scenario]]
+id = "EV-28"
+title = "Reaching the first messages of a group by scrolling"
+source = "history/history_widget.cpp: preloadHistoryIfNeeded (loads older slices until the start)"
+expect = "Scrolling up in Walk Supergroup reaches its first messages (the welcome and A's first message)."
+steps = '''
+open Walk Supergroup
+seek ^Hi! Glad to be here
+shot top
+'''
+
+[[scenario]]
+id = "EV-29"
+title = "Album of three photos"
+source = "history/view/media/history_view_media_grouped.cpp: GroupedMedia::countOptimalSize"
+expect = "The three trip photos are laid out as one album with the caption."
+steps = '''
+open Walk Supergroup
+seek ^Three photos from the trip
+scroll history 3
+shot album
+look the album layout matches the official pair
+'''
+
+[[scenario]]
+id = "EV-30"
+title = "Poll message"
+source = "history/view/media/history_view_poll.cpp: Poll::draw"
+expect = "The poll shows its question, 'Anonymous Poll' and three answers."
+steps = '''
+open Walk Supergroup
+seek What should we test next
+shot poll
+expect text history Anonymous Poll
+expect text history Media viewer
+'''
+
+[[scenario]]
+id = "EV-31"
+title = "Vote in the poll"
+source = "history/view/media/history_view_poll.cpp: Poll::handleClick / sendPollVotes"
+expect = "A click on an answer votes: the poll shows results (percentages)."
+steps = '''
+open Walk Supergroup
+seek What should we test next
+click text:^Search$@history
+wait 3
+shot voted
+expect text history %
+'''
+
+[[scenario]]
+id = "EV-32"
+title = "File message"
+source = "history/view/media/history_view_document.cpp: Document::draw (file name and size)"
+expect = "B's file shows its name walk-notes.txt and size."
+steps = '''
+open Walk Supergroup
+seek walk-notes
+shot file
+expect text history walk-notes.txt
+expect text history KB|B
+'''
+
+[[scenario]]
+id = "EV-33"
+title = "Link preview card"
+source = "history/view/media/history_view_web_page.cpp: WebPage::draw"
+expect = "A's message with telegram.org/blog shows a preview card with the site name and title."
+steps = '''
+open Walk Supergroup
+seek ^Link with a preview
+shot preview
+expect text history Telegram
+look the preview card matches the official pair
+'''
+
+[[scenario]]
+id = "EV-34"
+title = "Forwarded message header"
+source = "history/view/history_view_message.cpp: Message::paintForwardedInfo"
+expect = "B's forward from the channel shows 'Forwarded from Walk Channel'."
+steps = '''
+open Walk Supergroup
+seek Forwarded from
+shot forward
+expect text history Forwarded from
+'''
+
+[[scenario]]
+id = "EV-35"
+title = "Reply header in the history"
+source = "history/view/history_view_reply.cpp: Reply::paint"
+expect = "A's reply to the welcome shows a reply header with B's name and the quoted start of the welcome."
+steps = '''
+open Walk Supergroup
+seek ^Replying to the welcome message
+shot reply
+expect text history Replying to the welcome message
+look the reply header (bar, name colour, quoted text) matches the official pair
+'''
+
+[[scenario]]
+id = "EV-36"
+title = "GIF autoplays"
+source = "history/view/media/history_view_gif.cpp: Gif::draw (autoplay)"
+expect = "A's GIF plays in the history without a click."
+steps = '''
+open Walk Supergroup
+seek ^Notes as a file
+scroll history 6
+shot gif1
+wait 1.2
+shot gif2
+expect changed gif1 gif2 history
+'''
+
+[[scenario]]
+id = "EV-37"
+title = "Round video message"
+source = "history/view/media/history_view_gif.cpp (round video)"
+expect = "A's round video is drawn as a circle with its duration."
+steps = '''
+open Walk Supergroup
+seek ^Notes as a file
+scroll history 4
+shot round
+look the round video is a circle with its duration, like the official pair
+'''
+
+[[scenario]]
+id = "EV-38"
+title = "Play a voice message"
+source = "history/view/media/history_view_document.cpp: Document::handleClick / media/player/media_player_instance.cpp"
+expect = "A click on the voice message's play button starts playback (the time counts and the media player bar shows)."
+steps = '''
+open Walk Supergroup
+seek ^Notes as a file
+scroll history 3
+click left_of:0:0[0-9]:30:-14
+wait 2
+shot playing
+look playback started (player bar or progress) like the official pair
+'''
+
+[[scenario]]
+id = "EV-39"
+title = "Emoji panel"
+source = "chat_helpers/tabbed_selector.cpp: TabbedSelector; chat_helpers/emoji_list_widget.cpp"
+expect = "The emoji button in the message field opens the panel with emoji, stickers and GIF tabs."
+steps = '''
+open Saved Messages
+click br:68,26
+wait 1.5
+shot panel
+expect text whole Emoji|Stickers|GIFs
+look the emoji panel matches the official pair
+key escape
+'''
+
+[[scenario]]
+id = "EV-40"
+title = "Sticker panel"
+source = "chat_helpers/stickers_list_widget.cpp: StickersListWidget"
+expect = "The Stickers tab of the panel lists the installed or recent stickers."
+steps = '''
+open Saved Messages
+click br:68,26
+wait 1.5
+click text:^Stickers$
+wait 2
+shot stickers
+look the sticker panel matches the official pair
+key escape
+'''
+
+[[scenario]]
+id = "EV-41"
+title = "Main menu"
+source = "window/window_main_menu.cpp: MainMenu"
+expect = "The menu button opens the main menu with Settings, Saved Messages and Night Mode."
+steps = '''
+click xy:36,52
+wait 1.2
+shot menu
+expect text whole Settings
+expect text whole Night Mode
+key escape
+'''
+
+[[scenario]]
+id = "EV-42"
+title = "Settings opens"
+source = "settings/settings_main.cpp: Main::setupSections"
+expect = "Settings lists My Account, Notifications and Sounds, Privacy and Security, Chat Settings, Folders, Advanced."
+steps = '''
+click xy:36,52
+wait 1.2
+click text:^Settings$
+wait 2
+shot settings
+expect text whole Notifications and Sounds
+expect text whole Privacy and Security
+expect text whole Chat Settings
+key escape
+'''
+
+[[scenario]]
+id = "EV-43"
+title = "Settings: Notifications and Sounds"
+source = "settings/settings_notifications.cpp"
+expect = "The notifications page shows the desktop notification switches."
+steps = '''
+click xy:36,52
+wait 1.2
+click text:^Settings$
+wait 2
+click text:^Notifications and Sounds
+wait 2
+shot notifications
+expect text whole Desktop notifications|Notifications for
+key escape
+key escape
+'''
+
+[[scenario]]
+id = "EV-44"
+title = "Settings: Privacy and Security"
+source = "settings/settings_privacy_security.cpp"
+expect = "The privacy page lists Phone number, Last seen & online and the other privacy rules."
+steps = '''
+click xy:36,52
+wait 1.2
+click text:^Settings$
+wait 2
+click text:^Privacy and Security
+wait 2
+shot privacy
+expect text whole Last seen
+key escape
+key escape
+'''
+
+[[scenario]]
+id = "EV-45"
+title = "Settings: Chat Settings"
+source = "settings/settings_chat.cpp"
+expect = "Chat Settings shows the theme choices and text size options."
+steps = '''
+click xy:36,52
+wait 1.2
+click text:^Settings$
+wait 2
+click text:^Chat Settings
+wait 2
+shot chat_settings
+expect text whole Theme|Themes
+key escape
+key escape
+'''
+
+[[scenario]]
+id = "EV-46"
+title = "Settings: Folders"
+source = "settings/settings_folders.cpp"
+expect = "The Folders page lists the Walk folder."
+steps = '''
+click xy:36,52
+wait 1.2
+click text:^Settings$
+wait 2
+click text:^Folders
+wait 2
+shot folders
+expect text whole ^Walk
+key escape
+key escape
+'''
+
+[[scenario]]
+id = "EV-47"
+title = "Settings: Advanced"
+source = "settings/settings_advanced.cpp"
+expect = "Advanced shows the data and storage and window options."
+steps = '''
+click xy:36,52
+wait 1.2
+click text:^Settings$
+wait 2
+click text:^Advanced
+wait 2
+shot advanced
+expect text whole Data and storage|Storage|Window title bar|System integration
+key escape
+key escape
+'''
+
+[[scenario]]
+id = "EV-48"
+title = "Night mode toggles the theme"
+source = "window/window_main_menu.cpp (Night Mode toggle); window/themes/window_theme.cpp: ToggleNightMode"
+expect = "Night Mode in the main menu switches between the day and night themes; toggling twice returns to the start."
+steps = '''
+shot before
+click xy:36,52
+wait 1.2
+click text:^Night Mode
+wait 2.5
+key escape
+wait 1
+shot toggled
+expect changed before toggled list
+click xy:36,52
+wait 1.2
+click text:^Night Mode
+wait 2.5
+key escape
+wait 1
+shot back
+expect same before back list
+'''
+
+[[scenario]]
+id = "EV-49"
+title = "Narrow window: one-column layout"
+source = "window/window_adaptive.cpp; mainwidget.cpp: MainWidget::updateWindowAdaptiveLayout (OneColumn below dialogsWidth + chat min width)"
+expect = "At 600 px wide only the chat list shows; opening a chat shows it full width; Escape returns to the list."
+steps = '''
+size 600 800
+wait 1
+shot narrow_list
+expect text whole Walk Supergroup
+click text:^Walk Supergroup
+wait 2.5
+shot narrow_chat
+expect notext whole Saved Messages
+key escape
+wait 1.5
+expect text whole Saved Messages
+'''
+
+[[scenario]]
+id = "EV-50"
+title = "Window resize keeps the layout"
+source = "mainwidget.cpp: MainWidget::resizeEvent"
+expect = "Growing the window to 1600 px and back keeps the chat open with the history at the bottom."
+steps = '''
+open ${peer}
+size 1600 900
+wait 1.5
+shot wide
+expect text header ${peer}
+size 1000 700
+wait 1.5
+shot small
+expect text header ${peer}
+'''
+
+[[scenario]]
+id = "EV-51"
+title = "Escape closes the chat"
+source = "history/history_widget.cpp: HistoryWidget::keyPressEvent (Escape -> showBackFromStack)"
+expect = "Escape in an open chat returns to the empty 'Select a chat to start messaging' state."
+steps = '''
+open Walk Basic Group
+key escape
+key escape
+wait 1
+shot closed
+expect text whole Select a chat
+'''
+
+[[scenario]]
+id = "EV-52"
+title = "Restart keeps the session"
+source = "core/application.cpp; storage/storage_account.cpp (restore session)"
+expect = "After quitting and starting again the chat list is back without a login screen."
+steps = '''
+restart 20
+shot restarted
+expect text list Walk Supergroup
+expect notext whole Start Messaging|Log in
+'''
+
+[[scenario]]
+id = "EV-53"
+title = "Mention marker in the chat list"
+source = "dialogs/ui/dialogs_layout.cpp: PaintRow (unread mention badge)"
+expect = "B's mention of A in Walk Basic Group shows the @ marker in the list row (until read)."
+steps = '''
+peer {"op":"send","chat":"basic","text":"Walker, mention marker check","mention":true}
+wait 3
+shot list
+look Walk Basic Group's row shows the @ marker next to the unread counter
+'''
+
+[[scenario]]
+id = "EV-54"
+title = "Muted chat looks muted"
+source = "dialogs/ui/dialogs_layout.cpp: PaintRow (muted: grey badge, speaker icon)"
+expect = "Walk Channel (muted) has the muted icon and a grey unread badge."
+steps = '''
+shot list
+look Walk Channel's row has the muted icon and a grey badge like the official pair
+'''
+
+[[scenario]]
+id = "EV-55"
+title = "Mute and unmute a chat from its profile"
+source = "info/profile/info_profile_actions.cpp: notifications toggle; data/notify/data_notify_settings.cpp"
+expect = "Basic group profile -> Notifications switch off mutes the chat (muted icon in the list); switching it back on unmutes it."
+steps = '''
+open Walk Basic Group
+click text:Walk Basic Group@header
+wait 2
+shot profile
+expect text whole Notifications
+look the notifications switch is there and on (same as the official pair)
+key escape
+'''
+
+[[scenario]]
+id = "EV-56"
+title = "Channel post views"
+source = "history/view/history_view_bottom_info.cpp: BottomInfo (views counter)"
+expect = "Channel posts show a views counter and the time."
+steps = '''
+open Walk Channel
+shot views
+look each post shows its views counter (eye icon) and time like the official pair
+'''
+
+[[scenario]]
+id = "EV-57"
+title = "Chat header actions"
+source = "history/view/history_view_top_bar_widget.cpp: TopBarWidget (search, call, info, menu buttons)"
+expect = "The private chat header shows the search, call, side panel and menu buttons; the menu opens."
+steps = '''
+open ${peer}
+click br:20,0
+wait 0.2
+shot header
+look the header buttons match the official pair
+'''
+
+[[scenario]]
+id = "EV-58"
+title = "Scheduled messages"
+source = "history/view/history_view_scheduled_section.cpp: ScheduledWidget"
+expect = "The private chat has a scheduled-messages button in the field; it opens the list with the scheduled message."
+steps = '''
+open ${peer}
+shot field
+look the scheduled-messages (clock) button shows in the message field like the official pair
+'''
+
+[[scenario]]
+id = "EV-59"
+title = "Unread messages bar when opening a chat"
+source = "history/history_widget.cpp: HistoryWidget::showHistory (unread bar, scroll to first unread)"
+expect = "Opening a chat with unread messages shows the 'Unread messages' bar."
+steps = '''
+peer {"op":"send","chat":"basic","text":"Walk check: unread one"}
+peer {"op":"send","chat":"basic","text":"Walk check: unread two"}
+wait 2
+open Walk Basic Group
+shot unread
+expect text history Unread messages
+'''
+
+[[scenario]]
+id = "EV-60"
+title = "Archived chat opens"
+source = "dialogs/dialogs_widget.cpp (archive folder); history/history_widget.cpp"
+expect = "From Archived chats, Walk Archived Group opens with its messages."
+steps = '''
+click text:^Archived chats@list
+wait 1.5
+click text:^Walk Archived Group@list
+wait 2.5
+shot chat
+expect text history Archiving this one
+key escape
+key escape
+'''
+
+[[scenario]]
+id = "EV-61"
+title = "Jump to bottom button"
+source = "history/view/history_view_corner_buttons.cpp: CornerButtons (history down button)"
+expect = "After scrolling up, the down-arrow button appears; a click brings the history back to the latest message."
+steps = '''
+open ${peer}
+scroll history -150
+scroll history 20
+wait 1
+shot scrolled
+click br:30,95
+wait 2
+shot bottom
+expect text history Latest message from Peer B|fresh message|preview in the list
+'''
+
+[[scenario]]
+id = "EV-62"
+title = "Media viewer: next photo of an album"
+source = "media/view/media_view_overlay_widget.cpp: OverlayWidget::moveToNext"
+expect = "In the viewer, the right arrow key goes to the next photo of the album ('2 of 3')."
+steps = '''
+open Walk Supergroup
+seek ^Three photos from the trip
+click below:^Three photos from the trip:40:-140
+wait 2
+key right
+wait 1.5
+shot next
+look the viewer shows the next album photo like the official pair
+key escape
+'''
+
+[[scenario]]
+id = "EV-63"
+title = "The chat-list unread counter equals the server's unread count"
+source = "dialogs/ui/dialogs_layout.cpp: PaintUnreadBadge; data/data_history.cpp: History::setUnreadCount (from dialog.unread_count)"
+expect = "Walk Peer B's unread badge in the list shows the same number the server reports for the chat."
+steps = '''
+shot list
+expect listbadge "^${peer}" {"op":"dialog","who":"a","chat":"pm"}
+'''
