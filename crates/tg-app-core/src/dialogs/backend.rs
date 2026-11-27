@@ -806,6 +806,14 @@ pub trait DialogsBackend: Send {
         crate::history::backend::unversioned_backend_version()
     }
 
+    /// Version of [`Self::search_dialogs`]: it changes whenever the results for an unchanged
+    /// request may have changed (local data, remote results that arrived), so the chat list
+    /// may keep the last results while it stays the same (TGB-2921). Read it *before* the
+    /// search. The default never repeats a value, so callers search again every frame.
+    fn search_version(&self) -> u64 {
+        crate::history::backend::unversioned_backend_version()
+    }
+
     /// Looks up a single dialog item by `peer_id`.
     fn dialog_by_peer(&self, peer_id: PeerId) -> Option<DialogItem>;
 

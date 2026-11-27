@@ -179,6 +179,29 @@ pub fn pointer_to_char_index(galley: &Galley, origin: Pos2, pointer: Pos2) -> (u
     (idx, false)
 }
 
+/// UTF-16 offset of the char at `char_index` in `text`; past the end gives the text's length.
+/// The list keeps text selections in chars, the block text widget hit-tests in UTF-16.
+#[must_use]
+pub fn char_to_utf16(text: &str, char_index: usize) -> usize {
+    text.chars().take(char_index).map(char::len_utf16).sum()
+}
+
+/// The char index at UTF-16 `offset` in `text`, saturated to `u16` like
+/// [`pointer_to_char_index`]. An offset inside a surrogate pair gives the char after it.
+#[must_use]
+pub fn utf16_to_char(text: &str, offset: usize) -> u16 {
+    let mut units = 0usize;
+    let mut chars = 0usize;
+    for ch in text.chars() {
+        if units >= offset {
+            break;
+        }
+        units += ch.len_utf16();
+        chars += 1;
+    }
+    chars.min(usize::from(u16::MAX)) as u16
+}
+
 /// Extracts a character-indexed slice `[from..to)` from `text` safely.
 #[must_use]
 pub fn slice_by_char_range(text: &str, from: u16, to: u16) -> String {

@@ -124,10 +124,20 @@ fn settings_change_interface_scale_and_open_privacy_and_notifications() {
     // Click along the MediaSlider to the left of the "100%" label to change scale (e.g. 200%/250%).
     let slider_click = Pos2::new(lbl_rect.min.x - 120.0, lbl_rect.center().y);
     click_at(&mut harness, slider_click);
+    // A scale that changes the evaluated scale asks "Restart now?" first (TGB-3111,
+    // `SetupInterfaceScale`'s `setScale`); "Restart" saves it and asks the app to restart.
     wait_until(
         &mut harness,
         DEFAULT_MAX_FRAMES,
-        "clicking the Default Interface Scale slider must change global_config.scale away from 100%",
+        "clicking the Default Interface Scale slider must ask to restart",
+        |h| h.query_by_label("Restart").is_some(),
+    );
+    let restart = harness.get_by_label("Restart").rect().center();
+    click_at(&mut harness, restart);
+    wait_until(
+        &mut harness,
+        DEFAULT_MAX_FRAMES,
+        "Restart must save a scale other than 100%",
         |h| {
             h.state_mut()
                 .controller
@@ -135,6 +145,10 @@ fn settings_change_interface_scale_and_open_privacy_and_notifications() {
                 .settings_mut()
                 .is_some_and(|s| s.global_config.scale != 100)
         },
+    );
+    assert!(
+        harness.state_mut().controller.take_app_restart_request(),
+        "Restart must ask the app to restart"
     );
 
     // 2. Open Privacy and Security via Settings Search: the header search icon (7.4.6 has no

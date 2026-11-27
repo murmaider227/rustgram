@@ -650,6 +650,20 @@ pub struct RichTextOptions {
     /// height it lays the text out with matches what is painted. `None`: the widget keeps it.
     /// Either way a click on a quote's toggle sets [`EntityTextResponse::blockquote_toggled`].
     pub expanded_blockquotes: Option<Vec<usize>>,
+    /// The caller keeps the selection, like a message list that selects across messages
+    /// (`HistoryInner::_selectedTextSelection`): with `selectable` the widget highlights only
+    /// `selection`, reports left-button drags in [`EntityTextResponse::drag`] and neither keeps
+    /// nor copies a selection of its own.
+    pub external_selection: bool,
+}
+
+/// A left-button text drag over a [`RichTextOptions::external_selection`] widget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextDrag {
+    /// The drag began this frame (else it moved on).
+    pub started: bool,
+    /// UTF-16 offset in the source text under the pointer.
+    pub utf16_offset: usize,
 }
 
 /// `fadeWrapDuration`: how long revealed spoiler text takes to fade in.
@@ -688,6 +702,7 @@ impl RichTextOptions {
             pause_custom_emoji: false,
             spoiler_reveal: None,
             expanded_blockquotes: None,
+            external_selection: false,
         }
     }
 
@@ -716,6 +731,13 @@ impl RichTextOptions {
     #[must_use]
     pub fn selection(mut self, selection: TextSelection) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// Let the caller keep the selection (see [`RichTextOptions::external_selection`]).
+    #[must_use]
+    pub fn external_selection(mut self, external: bool) -> Self {
+        self.external_selection = external;
         self
     }
 
@@ -1009,6 +1031,9 @@ pub struct EntityTextResponse {
     pub blockquote_toggled: Option<usize>,
     /// Current active UTF-16 text selection (when `selectable = true`).
     pub selection: TextSelection,
+    /// A left-button drag when the caller keeps the selection
+    /// ([`RichTextOptions::external_selection`]).
+    pub drag: Option<TextDrag>,
     /// Whether the text was elided due to `max_lines`.
     pub elided: bool,
     /// Bounding rect occupied by the rendered rich text in screen coordinates.
@@ -1024,6 +1049,7 @@ impl Default for EntityTextResponse {
             copied_pre_code: None,
             blockquote_toggled: None,
             selection: TextSelection::default(),
+            drag: None,
             elided: false,
             rect: Rect::NOTHING,
         }
@@ -1836,7 +1862,20 @@ fn render_entity_text_cached(
     }
 
     // Selection dragging and double-click word selection.
-    if options.selectable {
+    if options.selectable && options.external_selection {
+        // Only the left button selects: a right press on the selection opens the caller's
+        // context menu over it.
+        let started = response.drag_started_by(egui::PointerButton::Primary);
+        if (started || response.dragged_by(egui::PointerButton::Primary))
+            && let Some(pos) = ui.ctx().pointer_interact_pos()
+        {
+            out.drag = Some(TextDrag {
+                started,
+                utf16_offset: laid.hit_test((pos - origin).to_pos2()).utf16_offset,
+            });
+        }
+        out.selection = options.selection;
+    } else if options.selectable {
         if response.drag_started()
             && let Some(pos) = ui.ctx().pointer_interact_pos()
         {
@@ -1905,7 +1944,7 @@ fn render_entity_text_cached(
             ui.ctx().request_repaint();
         } else if let Some(link) = hit.link {
             out.clicked_link = Some(link);
-        } else if options.selectable {
+        } else if options.selectable && !options.external_selection {
             state.selection = TextSelection::default();
             out.selection = TextSelection::default();
         }

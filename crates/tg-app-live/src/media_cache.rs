@@ -1042,7 +1042,7 @@ impl LiveMediaCache {
 
     /// The file a click on `media` downloads or cancels: the photo, or a voice message's
     /// audio (`Photo::_savel` / `_cancell`, `DocumentOpenClickHandler` for voice).
-    fn download_target(
+    pub(crate) fn download_target(
         media: &MessageMedia,
     ) -> Option<(String, MediaCacheTag, ResolvedMediaLocation)> {
         let photo = |photo: &PhotoData| {

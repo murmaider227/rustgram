@@ -20,7 +20,7 @@ use super::SettingsSection;
 use super::backend::SettingsBackend;
 use super::faq_suggestions::FaqSuggestionsState;
 use super::recent_searches::RecentSettingsSearches;
-use super::scale::render_scale_controls;
+use super::scale::{ScaleChange, render_scale_controls};
 use super::strings;
 use super::widgets::{
     SETTINGS_LIST_SKIP, SettingsIconKind, paint_tinted_icon, settings_card, settings_divider,
@@ -244,6 +244,8 @@ pub struct MainPageOutput {
     pub open_business: bool,
     /// Toast message to show (e.g. username/phone copied).
     pub toast: Option<String>,
+    /// A new interface scale that needs tdesktop's "Restart now?" prompt before it is saved.
+    pub scale_restart: Option<i32>,
 }
 
 /// Renders the Main Settings root page (`settings_main.cpp`).
@@ -269,6 +271,7 @@ pub fn render_main_settings_page(
         &mut faq,
         &mut recent,
         active_language_name,
+        1,
         backend,
         colors,
     )
@@ -286,6 +289,7 @@ pub fn render_main_settings_page_with_extras(
     faq_suggestions: &mut FaqSuggestionsState,
     recent_searches: &mut RecentSettingsSearches,
     active_language_name: &str,
+    device_pixel_ratio: i32,
     backend: &dyn SettingsBackend,
     colors: &dyn Colors,
 ) -> MainPageOutput {
@@ -733,7 +737,11 @@ pub fn render_main_settings_page_with_extras(
     section_break(ui, colors);
 
     // 4. Default Interface Scale (`BuildInterfaceScale` in `settings_main.cpp`).
-    render_scale_controls(ui, global, false, colors);
+    if let ScaleChange::NeedsRestart(scale) =
+        render_scale_controls(ui, global, device_pixel_ratio, false, colors)
+    {
+        out.scale_restart = Some(scale);
+    }
 
     section_break(ui, colors);
 

@@ -49,6 +49,9 @@ pub enum MenuItem {
         style_icon: Option<Icon>,
         enabled: bool,
         attention: bool,
+        /// Painted in `boxTextFgGood` (label and icon), like the "Unmute" row of tdesktop's
+        /// mute menu (`MuteItem`, `menu/menu_mute.cpp`).
+        good: bool,
         has_submenu: bool,
     },
     /// Toggleable menu item with an inline tdesktop switch.
@@ -73,6 +76,7 @@ impl MenuItem {
             style_icon: None,
             enabled: true,
             attention: false,
+            good: false,
             has_submenu: false,
         }
     }
@@ -119,6 +123,14 @@ impl MenuItem {
     pub fn attention(mut self) -> Self {
         if let Self::Action { attention, .. } = &mut self {
             *attention = true;
+        }
+        self
+    }
+
+    /// Mark an action as positive (green `boxTextFgGood` label & icon, `MuteItem`'s "Unmute").
+    pub fn good(mut self) -> Self {
+        if let Self::Action { good, .. } = &mut self {
+            *good = true;
         }
         self
     }
@@ -341,6 +353,7 @@ impl PopupMenuState {
                             style_icon,
                             enabled,
                             attention,
+                            good,
                             has_submenu,
                         } => {
                             let item_rect = Rect::from_min_size(
@@ -384,6 +397,8 @@ impl PopupMenuState {
                                 menu_st.item_fg_disabled
                             } else if *attention {
                                 menu_st.item_fg_attention
+                            } else if *good {
+                                menu_st.item_fg_good
                             } else if selected {
                                 menu_st.item_fg_over
                             } else {
@@ -395,6 +410,8 @@ impl PopupMenuState {
                                 menu_st.item_fg_disabled
                             } else if *attention {
                                 menu_st.item_fg_attention
+                            } else if *good {
+                                menu_st.item_fg_good
                             } else if selected {
                                 menu_st.item_icon_fg_over
                             } else {

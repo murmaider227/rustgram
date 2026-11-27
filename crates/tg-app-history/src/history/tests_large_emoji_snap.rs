@@ -68,7 +68,17 @@ fn peer_info(peer: PeerId) -> crate::history::backend::HistoryPeerInfo {
 
 fn build(mode: ThemeMode, ppp: f32, large_emoji: bool) -> Harness<'static, SnapState> {
     let peer = PeerId::from_user(88_054);
-    let messages = messages(peer);
+    build_with(peer, messages(peer), mode, ppp, large_emoji)
+}
+
+/// A one-to-one chat with `peer` showing `messages`.
+pub(crate) fn build_with(
+    peer: PeerId,
+    messages: Vec<HistoryMessage>,
+    mode: ThemeMode,
+    ppp: f32,
+    large_emoji: bool,
+) -> Harness<'static, SnapState> {
     let mut inner = HistoryInnerWidget::new();
     inner.set_large_emoji(large_emoji);
     let total_count = messages.len();
@@ -167,6 +177,63 @@ fn large_emoji_snapshot() {
                     .save(dir.join(format!("large_emoji_{theme}_{scale}_{tag}.png")))
                     .expect("save snapshot");
             }
+        }
+    }
+}
+
+/// The screen point at the centre of the first large emoji of message `id`.
+fn emoji_centre(harness: &Harness<'static, SnapState>, id: i32) -> Pos2 {
+    let inner = &harness.state().inner;
+    let painted = inner.last_painted_bubble_rect(MsgId(id)).expect("painted");
+    let layout = inner.cached_message_layout(MsgId(id)).expect("laid out");
+    let row = tg_history::large_emoji_inner_rect(layout.media_rect, 1, layout.has_right_layout);
+    painted.min
+        + Vec2::new(
+            (row.x - layout.geometry.x) as f32 + 19.0,
+            (row.y - layout.geometry.y) as f32 + 19.0,
+        )
+}
+
+#[test]
+fn a_selected_large_emoji_is_coloured_with_the_sticker_overlay() {
+    // TGB-3100: `LargeEmoji::draw` colours the emoji of a selected message with
+    // `msgStickerOverlay`; the row tint alone leaves an opaque emoji as it was.
+    let mut harness = build(ThemeMode::Day, 1.0, true);
+    let at = emoji_centre(&harness, 2);
+    let pixel = |image: &image::RgbaImage| *image.get_pixel(at.x as u32, at.y as u32);
+    let plain = pixel(&harness.render().expect("render"));
+    harness.state_mut().inner.toggle_select_message(MsgId(2));
+    for _ in 0..3 {
+        harness.step();
+    }
+    let selected = pixel(&harness.render().expect("render"));
+    // The yellow face turns towards the overlay's blue: less red, more blue.
+    assert!(
+        i32::from(selected[0]) < i32::from(plain[0]) - 40
+            && i32::from(selected[2]) > i32::from(plain[2]) + 40,
+        "{plain:?} -> {selected:?}"
+    );
+}
+
+#[test]
+fn large_emoji_selected_snapshot() {
+    let Some(dir) = std::env::var_os("LARGE_EMOJI_SNAP_DIR").map(std::path::PathBuf::from) else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).expect("create snap dir");
+    for (theme, mode) in [("day", ThemeMode::Day), ("night", ThemeMode::Night)] {
+        for (scale, ppp) in [("100", 1.0), ("150", 1.5)] {
+            let mut harness = build(mode, ppp, true);
+            for id in [2, 4] {
+                harness.state_mut().inner.toggle_select_message(MsgId(id));
+            }
+            for _ in 0..3 {
+                harness.step();
+            }
+            let image = harness.render().expect("render");
+            image
+                .save(dir.join(format!("large_emoji_{theme}_{scale}_selected.png")))
+                .expect("save snapshot");
         }
     }
 }

@@ -47,6 +47,8 @@ use tg_app_media::media::inline::InlinePlaybackKind;
 /// Interaction emitted from clicking inside a media block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaInteraction {
+    /// A sticker was clicked: show its pack (`StickerSetBox`).
+    OpenStickerSet(crate::history::backend::StickerSetId),
     /// Open photo/video/album tile in media viewer.
     OpenMedia {
         /// Message id.
@@ -1827,6 +1829,20 @@ fn paint_sticker(
         .as_deref()
         .and_then(|rt| rt.descriptor(msg_id))
         .is_some_and(|d| d.is_video_sticker);
+    // A live sticker has a descriptor: while its file loads nothing is drawn, like tdesktop,
+    // never the demo placeholder circle (TGB-3126).
+    let live = runtime
+        .as_deref()
+        .is_some_and(|rt| rt.has_descriptor(msg_id));
+
+    // 0. Static WebP sticker (`DocumentKind::Sticker`): its file through the photo pipeline.
+    if !is_video_sticker
+        && sticker.lottie_json.is_empty()
+        && let Some(rt) = runtime.as_deref_mut()
+        && rt.paint_static_sticker(ui.ctx(), ui.painter(), msg_id, rect, time)
+    {
+        painted = true;
+    }
 
     // 1. WebM VP9 alpha video sticker via `tg-video` (`InlinePlaybackKind::VideoSticker`).
     if is_video_sticker
@@ -1880,7 +1896,7 @@ fn paint_sticker(
         }
     }
 
-    if !painted {
+    if !painted && !(live && sticker.lottie_json.is_empty()) {
         if let Some((tex, animated)) = assets.get_lottie_frame(ui.ctx(), sticker, time, render_px) {
             ui.painter().image(
                 tex.id(),
@@ -1917,10 +1933,9 @@ fn paint_sticker(
         {
             rt.restart_lottie(msg_id, time);
         }
-        return Some(MediaInteraction::OpenMedia {
-            msg_id,
-            album_index: None,
-        });
+        // `Sticker::link`: the pack of a sticker that has one; nothing for one without a set.
+        // The media viewer has no sticker view (it showed an error, TGB-3126).
+        return sticker.set.map(MediaInteraction::OpenStickerSet);
     }
     None
 }
@@ -3252,5 +3267,9 @@ mod tests_wave4_downloads;
 
 #[cfg(test)]
 mod tests_round_on_demand;
+#[cfg(test)]
+mod tests_round_stream;
+#[cfg(test)]
+mod tests_stream_loaded;
 #[cfg(test)]
 mod tests_voice_stream;

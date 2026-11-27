@@ -15,7 +15,9 @@ use tg_ui::theme::Colors;
 
 use std::sync::Arc;
 
-use crate::dialogs::backend::{ChatFolder, DialogListQuery, DialogsBackend};
+use crate::dialogs::backend::{
+    ChatFolder, DialogListQuery, DialogsBackend, SearchRequest, SearchResults,
+};
 use crate::dialogs::filters_menu::{
     FiltersMenuAction, FiltersMenuWidget, show_horizontal_folder_tabs,
 };
@@ -203,6 +205,14 @@ pub fn resolve_folder_slot(
     Some(folders[idx].id)
 }
 
+/// Search results kept between frames (TGB-2921).
+#[derive(Debug)]
+struct SearchCache {
+    request: SearchRequest,
+    version: u64,
+    results: Arc<SearchResults>,
+}
+
 /// Complete stateful dialogs widget (`Dialogs::Widget`) integrating search, folders, archive,
 /// virtualized rows, drag-and-drop pinned reorder, context menu, and keyboard shortcuts.
 #[derive(Debug)]
@@ -236,6 +246,10 @@ pub struct DialogsPanel {
     folders: VersionedRead<Vec<ChatFolder>>,
     /// The search field drawn this frame, `None` when the search bar is not shown.
     search_field_rect: Option<Rect>,
+    /// The last search results, by request and [`DialogsBackend::search_version`] (TGB-2921).
+    search_cache: Option<SearchCache>,
+    /// Times [`DialogsBackend::search_dialogs`] ran for the search view and its keys.
+    search_reads: u64,
 }
 
 /// The chat-list search row as drawn this frame, for what tdesktop places in it: the collapsed
@@ -287,6 +301,8 @@ impl DialogsPanel {
             request_search_focus: false,
             folders: VersionedRead::default(),
             search_field_rect: None,
+            search_cache: None,
+            search_reads: 0,
         }
     }
 
@@ -303,6 +319,33 @@ impl DialogsPanel {
     #[must_use]
     pub const fn folder_list_reads(&self) -> u64 {
         self.folders.reads()
+    }
+
+    /// Times the search ran for the search view and its keyboard navigation.
+    #[must_use]
+    pub const fn search_reads(&self) -> u64 {
+        self.search_reads
+    }
+
+    /// The results for the current query: searched again only when the request or the
+    /// backend's [`DialogsBackend::search_version`] changed (TGB-2921).
+    fn search_results(&mut self, backend: &dyn DialogsBackend) -> Arc<SearchResults> {
+        let request = self.search_state.build_request(&self.search_query);
+        let version = backend.search_version();
+        if let Some(cache) = &self.search_cache
+            && cache.version == version
+            && cache.request == request
+        {
+            return Arc::clone(&cache.results);
+        }
+        let results = Arc::new(backend.search_dialogs(&request));
+        self.search_reads += 1;
+        self.search_cache = Some(SearchCache {
+            request,
+            version,
+            results: Arc::clone(&results),
+        });
+        results
     }
 
     /// Forces a fresh `DialogsBackend::contact_birthdays` query on the next render frame.
@@ -423,8 +466,7 @@ impl DialogsPanel {
         shortcut: DialogsShortcut,
         backend: &mut dyn DialogsBackend,
     ) -> Option<DialogsPanelAction> {
-        let req = self.search_state.build_request(&self.search_query);
-        let results = backend.search_dialogs(&req);
+        let results = self.search_results(backend);
         let recent = backend.recent_search_peers();
         let items = collect_search_keyboard_items_with_sponsored(
             &self.search_query,
@@ -723,8 +765,7 @@ impl DialogsPanel {
                 self.handle_search_action(act, backend, &mut action);
             }
 
-            let req = self.search_state.build_request(&self.search_query);
-            let results = backend.search_dialogs(&req);
+            let results = self.search_results(backend);
             self.search_state
                 .sync_sponsored_peers(&self.search_query, backend);
             let now = backend.current_time();

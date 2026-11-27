@@ -71,6 +71,7 @@ pub mod stats;
 pub mod sticker_owner;
 pub mod stickers_reactions_extras;
 pub mod stories;
+mod stream_fill;
 pub mod suggestions;
 pub mod summary;
 pub mod themes;
@@ -147,6 +148,8 @@ mod tests_payments_passport;
 #[cfg(test)]
 mod tests_peer_management;
 #[cfg(test)]
+mod tests_preview_spoilers;
+#[cfg(test)]
 mod tests_privacy_rules;
 #[cfg(test)]
 mod tests_profile_extras;
@@ -184,6 +187,8 @@ mod tests_settings_reads;
 mod tests_spoiler_entities;
 #[cfg(test)]
 mod tests_sticker_owner;
+#[cfg(test)]
+mod tests_sticker_set_click;
 #[cfg(test)]
 mod tests_stickers_reactions_extras;
 #[cfg(test)]

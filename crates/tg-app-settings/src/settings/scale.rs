@@ -76,16 +76,53 @@ fn slider_to_scale_in(values: &[i32], pos: f64) -> i32 {
     values.get(index).copied().unwrap_or(SCALE_DEFAULT)
 }
 
+/// What a new interface scale chosen in Settings does (`setScale` in `SetupInterfaceScale`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleChange {
+    /// Same as the configured scale: nothing to do.
+    None,
+    /// The evaluated scale stays the same (e.g. "Auto" switched off at the screen's own
+    /// scale): the new value was written to the config and is saved without a restart.
+    Saved,
+    /// The evaluated scale changes: tdesktop asks "Restart now?" (`lng_settings_need_restart`)
+    /// and only on "Restart Now" writes the value and restarts. The config is left unchanged.
+    NeedsRestart(i32),
+}
+
+/// Applies a scale chosen with the slider or the "Auto" switch the way tdesktop's `setScale`
+/// does: a value that changes the evaluated scale is not applied but returned for the restart
+/// prompt ([`ScaleChange::NeedsRestart`]); any other new value is written at once.
+pub fn choose_scale(global: &mut GlobalConfig, scale: i32) -> ScaleChange {
+    if global.eval_scale(scale) != global.eval_scale(global.config_scale) {
+        ScaleChange::NeedsRestart(scale)
+    } else if scale != global.config_scale {
+        global.config_scale = scale;
+        global.validate_scale();
+        ScaleChange::Saved
+    } else {
+        ScaleChange::None
+    }
+}
+
+/// Writes a scale the user confirmed with "Restart Now" (`cSetConfigScale` before
+/// `Core::Restart`); the running window keeps its scale until the restart.
+pub fn confirm_scale(global: &mut GlobalConfig, scale: i32) {
+    global.config_scale = scale;
+    global.validate_scale();
+}
+
 /// Renders the Default Interface Scale controls (`Auto` toggle + scale slider + live preview bubble).
 ///
-/// Returns `true` if `global.config_scale` / `global.scale` changed.
+/// The slider label shows the evaluated scale times `device_pixel_ratio`, as tdesktop's
+/// `labelText` does on Windows. Returns what the user's change does (see [`choose_scale`]).
 pub fn render_scale_controls(
     ui: &mut Ui,
     global: &mut GlobalConfig,
+    device_pixel_ratio: i32,
     show_preview: bool,
     colors: &dyn Colors,
-) -> bool {
-    let mut changed = false;
+) -> ScaleChange {
+    let mut change = ScaleChange::None;
     // `st::settings_scale_padding`: the slider sits under the row text (60 px), 22 px on the right.
     let pad_x = st::settings_scale_padding
         .left
@@ -102,19 +139,22 @@ pub fn render_scale_controls(
         true,
         colors,
     ) {
-        if is_auto {
-            global.config_scale = SCALE_AUTO;
-            global.scale = global.screen_scale;
+        let scale = if is_auto {
+            SCALE_AUTO
         } else {
-            global.config_scale = snap_scale_stop(global.scale);
-            global.scale = global.config_scale;
-        }
-        changed = true;
+            global.eval_scale(global.config_scale)
+        };
+        change = choose_scale(global, scale);
     }
 
-    let effective_scale = global.eval_scale(global.config_scale);
+    // While the slider is dragged its value lives here; the config changes on release
+    // (`setPseudoDiscrete`: the label follows the drag, `setScale` runs on release).
+    let drag_id = ui.make_persistent_id("tg_settings_scale_drag");
+    let dragged_scale: Option<i32> = ui.data(|d| d.get_temp(drag_id));
     let values = scale_values(global.config_scale);
-    let mut slider_val = scale_to_slider_in(&values, effective_scale);
+    let shown_scale = dragged_scale.unwrap_or_else(|| global.eval_scale(global.config_scale));
+    let effective_scale = shown_scale;
+    let mut slider_val = scale_to_slider_in(&values, shown_scale);
 
     // Slider row (`MakeSliderWithLabel` inside `settingsScalePadding` = (60, 7, 22, 4)): the
     // `settingsScale` slider (15 px seek) under the row text, the `300%`-wide label at the right.
@@ -154,13 +194,19 @@ pub fn render_scale_controls(
             },
         )
         .inner;
-    if slider_resp.changed() {
+    if slider_resp.changed() || slider_resp.drag_stopped() {
         let new_scale = slider_to_scale_in(&values, slider_val);
-        global.config_scale = new_scale;
-        global.scale = new_scale;
-        changed = true;
+        if slider_resp.dragged() {
+            ui.data_mut(|d| d.insert_temp(drag_id, new_scale));
+        } else {
+            ui.data_mut(|d| d.remove::<i32>(drag_id));
+            change = choose_scale(global, new_scale);
+        }
     }
-    let value_text = format!("{effective_scale}%");
+    let value_text = format!(
+        "{}%",
+        effective_scale.saturating_mul(device_pixel_ratio.max(1))
+    );
     let value_rect = ui.painter().text(
         Pos2::new(row_rect.right() - pad_right, row_rect.center().y),
         Align2::RIGHT_CENTER,
@@ -181,7 +227,7 @@ pub fn render_scale_controls(
         render_scale_preview_bubble(ui, effective_scale, colors);
     }
 
-    changed
+    change
 }
 
 /// Paints a live scaled chat message preview matching `settings_scale_preview.cpp`.

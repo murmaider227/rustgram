@@ -669,6 +669,10 @@ pub struct MessageLayout {
     pub text_rect: Rect,
     /// Media rectangle in element coordinates (empty if no media).
     pub media_rect: Rect,
+    /// Where `UnwrappedMedia` draws its content (a sticker, large or custom emoji) inside
+    /// `media_rect`: at the top right of a right-aligned message, at the bottom left otherwise.
+    /// Empty for other media.
+    pub unwrapped_content_rect: Rect,
     /// Bottom info (date/views/ticks) placement rectangle and display style.
     pub bottom_info_rect: Rect,
     /// Display mode of the bottom info pill/text.
@@ -874,6 +878,7 @@ pub fn layout_message(
             header_heights: MessageHeaderHeights::default(),
             text_rect: Rect::ZERO,
             media_rect: Rect::ZERO,
+            unwrapped_content_rect: Rect::ZERO,
             bottom_info_rect: Rect::ZERO,
             bottom_info_display: InfoDisplayType::Default,
             bottom_info: BottomInfoLayout::default(),
@@ -1296,7 +1301,12 @@ pub fn layout_message(
         bubble_height = y - margin_top;
     } else if let Some(ref ml) = final_media {
         let mut height = ml.current_size.height;
-        if has_right_layout && let Some(MediaInput::LargeEmoji(e)) = &input.media {
+        if has_right_layout
+            && let Some((content, _)) = input
+                .media
+                .as_ref()
+                .and_then(|m| m.unwrapped_emoji_content(ml.current_size.width))
+        {
             // `UnwrappedMedia::countCurrentSize`: a right-aligned message keeps room for its
             // time below the emoji.
             let info_height = if input.hides_bottom_info {
@@ -1304,7 +1314,7 @@ pub fn layout_message(
             } else {
                 2 * MSG_DATE_IMG_PADDING.y + bottom_info.current_size.height
             };
-            let content = crate::media::large_emoji_size(e.count).height;
+            let content = content.height;
             let minimal = (LARGE_EMOJI_SIZE + 2 * LARGE_EMOJI_OUTLINE).min(content);
             if info_height > 0 {
                 height = height.max(minimal + MSG_DATE_IMG_DELTA + info_height);
@@ -1390,10 +1400,15 @@ pub fn layout_message(
             InfoDisplayType::Background,
             Rect::new(full_right - pill_w, y, pill_w, pill_h),
         )
-    } else if unwrapped && let Some(MediaInput::LargeEmoji(e)) = &input.media {
+    } else if unwrapped
+        && let Some((content, bottom_info_width)) = input
+            .media
+            .as_ref()
+            .and_then(|m| m.unwrapped_emoji_content(media_rect.width))
+    {
         let pill_w = bottom_info.current_size.width + 2 * MSG_DATE_IMG_PADDING.x;
         let pill_h = bottom_info.current_size.height + 2 * MSG_DATE_IMG_PADDING.y;
-        let inner = crate::media::large_emoji_inner_rect(media_rect, e.count, has_right_layout);
+        let inner = crate::media::unwrapped_content_rect(media_rect, content, has_right_layout);
         let right_skip = MSG_PADDING.left
             + if input.has_from_photo {
                 MSG_MARGIN.right
@@ -1407,7 +1422,7 @@ pub fn layout_message(
             + if has_right_layout {
                 0
             } else {
-                e.bottom_info_width
+                bottom_info_width
             };
         if full_right + right_skip > viewport_width {
             full_right = viewport_width - right_skip;
@@ -1485,6 +1500,14 @@ pub fn layout_message(
         header_heights: headers,
         text_rect,
         media_rect,
+        unwrapped_content_rect: input
+            .media
+            .as_ref()
+            .filter(|_| unwrapped)
+            .and_then(|m| m.unwrapped_emoji_content(media_rect.width))
+            .map_or(Rect::ZERO, |(content, _)| {
+                crate::media::unwrapped_content_rect(media_rect, content, has_right_layout)
+            }),
         bottom_info_rect,
         bottom_info_display,
         bottom_info,

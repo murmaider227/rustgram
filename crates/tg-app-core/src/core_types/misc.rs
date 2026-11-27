@@ -281,6 +281,27 @@ pub enum InlineDocumentData {
     Bytes(Vec<u8>),
     /// Path to a cached local document file on disk.
     File(PathBuf),
+    /// A file served part by part while it downloads: a round video message plays from it
+    /// (TGB-3116, `Gif::playAnimation` over a `Media::Streaming` loader).
+    Stream(StreamedDocument),
+}
+
+/// The loader of a document that plays while it downloads ([`InlineDocumentData::Stream`]).
+#[derive(Clone)]
+pub struct StreamedDocument(pub std::sync::Arc<dyn tg_video::RangeLoader>);
+
+impl StreamedDocument {
+    /// Whether both serve the same download.
+    #[must_use]
+    pub fn same_loader(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for StreamedDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StreamedDocument({} bytes)", self.0.size())
+    }
 }
 
 /// Descriptor for opening a live video stream inside [`crate::media::overlay::MediaOverlayWidget`]

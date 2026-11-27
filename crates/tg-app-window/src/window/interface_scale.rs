@@ -14,6 +14,8 @@
 
 use tg_core::{SCALE_AUTO, SCALE_MAX, SCALE_MIN};
 
+use crate::window::controller::WindowController;
+
 /// `style::kScaleAlwaysAllowMax`.
 const SCALE_ALWAYS_ALLOW_MAX: i32 = 200;
 
@@ -105,6 +107,27 @@ pub fn apply(ctx: &egui::Context, config_scale: i32) {
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
     if (ctx.zoom_factor() - zoom).abs() > 1e-4 {
         ctx.set_zoom_factor(zoom);
+    }
+}
+
+/// Gives Settings the screen's own scale (`cScreenScale`, what "Auto" evaluates to, so the
+/// restart prompt compares real scales) and the device pixel ratio for the slider label
+/// (TGB-3111). Cheap enough for every frame: nothing is written when nothing changed.
+pub fn sync_settings(ctx: &egui::Context, controller: &mut WindowController) {
+    let Some(native) = ctx
+        .native_pixels_per_point()
+        .filter(|n| n.is_finite() && *n > 0.0)
+    else {
+        return;
+    };
+    let screen = InterfaceScale::evaluate(native, SCALE_AUTO);
+    let Some(settings) = controller.main_widget_mut().settings_mut() else {
+        return;
+    };
+    settings.device_pixel_ratio = screen.device_pixel_ratio;
+    if settings.global_config.screen_scale != screen.scale {
+        settings.global_config.screen_scale = screen.scale;
+        settings.global_config.validate_scale();
     }
 }
 

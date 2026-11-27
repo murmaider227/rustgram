@@ -14,10 +14,16 @@
 //! # The studio's theme and the app's theme
 //!
 //! [`ThemesStudio`] previews and edits its own [`ThemeManager`]; the app's theme belongs to the
-//! window. The two are kept apart (TGB-2961, TGB-2962):
+//! window, which exchanges themes with the studio once per frame (TGB-2961, TGB-2962,
+//! TGB-2984):
 //! - The studio sets the `egui::Visuals` of its theme on its own panel `Ui` only
-//!   (`ThemesStudio::apply_panel_visuals`), never on the `egui::Context`. Nothing has to be
-//!   restored when the studio closes, because the window's colours are never replaced.
+//!   (`ThemesStudio::apply_panel_visuals`), never on the `egui::Context`.
+//! - The window hands its theme to the studio whenever it changes
+//!   ([`AppThemesHost::sync_window_theme`]), so the editor edits the applied theme.
+//! - The studio hands back what the user changed ([`AppThemesHost::take_app_theme_change`],
+//!   [`StudioThemeChange`]): editor edits live, theme files and cloud themes on trial with
+//!   "Keep this theme?", built-in themes and the Night Mode button through the window's own
+//!   theme rules.
 //! - [`AppThemesHost`] copies the studio's wallpaper into the shared
 //!   [`active_chat_background`] only when the wallpaper was changed in the studio, and never
 //!   copies the studio's dark-mode flag: the window sets that flag from the app's theme.
@@ -53,7 +59,7 @@ use egui::{
     Align2, Color32, Context, CornerRadius, CursorIcon, FontId, Frame, Id, Key, Margin, Modifiers,
     Order, Pos2, Rect, Role, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo,
 };
-use tg_theme::{EmbeddedType, ThemeInstance, embedded_themes, prepare_embedded_palette};
+use tg_theme::{EmbeddedType, Palette, ThemeInstance, embedded_themes, prepare_embedded_palette};
 use tg_ui::theme::{Colors, ThemeManager};
 
 pub use backend::{
@@ -130,8 +136,32 @@ impl ThemesTab {
     }
 }
 
+/// A theme change made in the Theme Studio for the window to apply (TGB-2984).
+///
+/// What stays of the studio and where it goes (tdesktop has no studio, only the theme editor,
+/// the theme files, the cloud theme list and the night-mode switch of the window):
+/// - the palette editor edits the applied theme live ([`Self::Live`], `Window::Theme::Editor`);
+/// - a theme file or a cloud theme is applied and kept only after "Keep this theme?"
+///   ([`Self::Test`], `Window::Theme::Apply` + `WarningWidget`);
+/// - a built-in theme from the previews is the window's theme choice ([`Self::Embedded`]);
+/// - the header's Night Mode button is the window's night-mode switch ([`Self::ToggleNight`]).
+///
+/// The studio's own night schedule is gone: following the system is the window's auto-night
+/// setting, and tdesktop has no time schedule.
+#[derive(Debug, Clone)]
+pub enum StudioThemeChange {
+    /// The editor changed the palette: the window shows it at once.
+    Live(Box<Palette>),
+    /// A theme file or cloud theme to test with tdesktop's "Keep this theme?" warning.
+    Test(Box<Palette>),
+    /// A built-in theme picked in the previews (`SetupDefaultThemes` apply).
+    Embedded(EmbeddedType),
+    /// The Night Mode button (`ToggleNightModeWithConfirmation`).
+    ToggleNight,
+}
+
 /// Complete Theme Studio panel uniting the live theme editor, background picker & preview,
-/// single-chat theme picker, theme preview gallery, and night-mode schedule.
+/// single-chat theme picker and theme preview gallery.
 pub struct ThemesStudio {
     /// Active UI tab.
     pub active_tab: ThemesTab,
@@ -140,8 +170,13 @@ pub struct ThemesStudio {
     pub theme_manager: ThemeManager,
     /// Live `ChatBackground` renderer shared with `history/`.
     pub chat_background: ChatBackground,
-    /// Night-mode auto-switch scheduler (`tg-platform` + time window).
+    /// Night-mode auto-switch scheduler (`tg-platform` + time window). Its schedule is not
+    /// shown any more (TGB-2984): night mode follows the window's own rules.
     pub night_scheduler: NightModeScheduler,
+    /// A theme change made in the studio, waiting for the window to apply it (TGB-2984).
+    app_theme: Option<StudioThemeChange>,
+    /// `theme_manager.generation()` the window last got from the studio (or gave to it).
+    handed_generation: u64,
     /// Live palette editor panel state.
     pub editor: ThemeEditorState,
     /// Chat background picker + preview state.
@@ -193,6 +228,7 @@ impl ThemesStudio {
         let theme_manager = ThemeManager::new();
         let editor = ThemeEditorState::from_theme_manager(&theme_manager);
         let bg_picker = BackgroundPickerState::new(false, Some((1001, "Eva Summer".to_owned())));
+        let handed_generation = theme_manager.generation();
         let chat_theme_picker = ChooseChatThemeState::new(1001, "Eva Summer");
         let share_theme_picker = ShareThemePickerState::new(1001, "Eva Summer");
         Self {
@@ -211,6 +247,8 @@ impl ThemesStudio {
             preview_show_custom: false,
             preview_cache: ThemePreviewCache::default(),
             pending_scroll_to_share_theme: false,
+            app_theme: None,
+            handed_generation,
             backend: None,
             cloud_themes: Vec::new(),
             saved_cloud_theme_ids: HashSet::new(),
@@ -222,6 +260,32 @@ impl ThemesStudio {
             started_at: Instant::now(),
             panel_visuals: None,
         }
+    }
+
+    /// Takes the theme change the user made in the studio, for the window to apply. Any
+    /// other change of the studio's palette since the last call is an editor edit, which
+    /// the window shows at once (`Window::Theme::Editor` edits the applied theme).
+    pub fn take_app_theme_change(&mut self) -> Option<StudioThemeChange> {
+        let generation = self.theme_manager.generation();
+        let edited = generation != self.handed_generation;
+        self.handed_generation = generation;
+        self.app_theme.take().or_else(|| {
+            edited.then(|| StudioThemeChange::Live(Box::new(self.theme_manager.palette().clone())))
+        })
+    }
+
+    /// Shows the window's theme in the studio: its editor then edits the applied theme, as
+    /// tdesktop's editor does. Undo history and unsaved edits of the old theme are dropped.
+    pub fn adopt_window_palette(&mut self, palette: Palette) {
+        let dark = palette.is_dark_palette();
+        self.theme_manager.set_palette(palette);
+        self.chat_background.set_dark_mode(dark);
+        self.bg_picker.preview.preview_dark_mode = dark;
+        self.editor = ThemeEditorState::from_theme_manager(&self.theme_manager);
+        self.editor.cloud_save.cloud_connected = self.backend.is_some();
+        self.preview_cache.invalidate("custom_live");
+        self.app_theme = None;
+        self.handed_generation = self.theme_manager.generation();
     }
 
     /// Attaches a live [`ThemesBackend`] (e.g. `live.themes_backend()`), enabling cloud themes,
@@ -663,7 +727,10 @@ impl ThemesStudio {
                                         now_ms,
                                     ),
                                     Err(err) => {
-                                        let _ = tg_app_core::user_error::theme_sync("account.getThemes", &err);
+                                        let _ = tg_app_core::user_error::theme_sync(
+                                            "account.getThemes",
+                                            &err,
+                                        );
                                     }
                                 }
                             }
@@ -679,29 +746,9 @@ impl ThemesStudio {
                                 "Night Mode: OFF"
                             };
                             if ui.button(dark_label).clicked() {
-                                match self.night_scheduler.request_manual_toggle() {
-                                    NightScheduleEvent::Switched { night_mode } => {
-                                        self.theme_manager.set_night_mode(night_mode);
-                                        self.chat_background.set_dark_mode(night_mode);
-                                        self.chat_theme_picker
-                                            .sync_dark_mode(&mut self.chat_background, night_mode);
-                                        self.bg_picker.preview.preview_dark_mode = night_mode;
-                                        self.editor = ThemeEditorState::from_theme_manager(
-                                            &self.theme_manager,
-                                        );
-                                        self.editor.cloud_save.cloud_connected =
-                                            self.backend.is_some();
-                                        ui.ctx().request_repaint();
-                                    }
-                                    NightScheduleEvent::NeedsConfirmDisableSystem => {
-                                        self.show_toast(
-                                            "System dark mode following is active. Confirm in Chat Themes & Night Mode to switch manually.".to_owned(),
-                                            now_ms,
-                                        );
-                                        self.active_tab = ThemesTab::ChatThemes;
-                                    }
-                                    NightScheduleEvent::Unchanged => {}
-                                }
+                                // The window's night-mode switch (`ToggleNightModeWithConfirmation`),
+                                // not the studio's own (TGB-2984).
+                                self.app_theme = Some(StudioThemeChange::ToggleNight);
                             }
                         });
                     });
@@ -819,6 +866,13 @@ impl ThemesStudio {
                     if ed_out.palette_changed {
                         needs_visual_sync = true;
                         self.preview_cache.invalidate("custom_live");
+                    }
+                    // A theme loaded from a file is tested with "Keep this theme?" first; other
+                    // editor changes reach the window in `take_app_theme_change`.
+                    if ed_out.imported {
+                        self.app_theme = Some(StudioThemeChange::Test(Box::new(
+                            self.theme_manager.palette().clone(),
+                        )));
                     }
                     if let Some(saved) = ed_out.saved_cloud_theme {
                         if let Some(slot) = self
@@ -974,15 +1028,6 @@ impl ThemesStudio {
                                 if pending_toast.is_none() && share_out.toast.is_some() {
                                     pending_toast = share_out.toast;
                                 }
-
-                                ui.add_space(16.0);
-                                ui.separator();
-                                ui.add_space(12.0);
-
-                                if let Some(msg) = self.show_night_schedule_section(ui, colors) {
-                                    needs_visual_sync = true;
-                                    pending_toast = Some(msg);
-                                }
                             });
                         });
                 }
@@ -1035,162 +1080,6 @@ impl ThemesStudio {
         }
 
         closed
-    }
-
-    fn show_night_schedule_section(&mut self, ui: &mut Ui, colors: &dyn Colors) -> Option<String> {
-        let mut toast = None;
-        let bold_fg = colors.color("windowBoldFg");
-        let sub_fg = colors.color("windowSubTextFg");
-        let bg_over = colors.color("windowBgOver");
-        let active_text = colors.color("windowActiveTextFg");
-
-        ui.label(
-            egui::RichText::new("Night Mode Schedule")
-                .size(15.0)
-                .strong()
-                .color(bold_fg),
-        );
-        let os_status = match tg_platform::system_info::is_dark_mode() {
-            Some(true) => "Windows system theme: Dark",
-            Some(false) => "Windows system theme: Light",
-            None => "Windows system theme: Unavailable",
-        };
-        ui.label(egui::RichText::new(os_status).size(12.0).color(sub_fg));
-        ui.add_space(6.0);
-
-        let cur_mode = self.night_scheduler.mode();
-        let (mut start_min, mut end_min) = self.night_scheduler.schedule_window();
-
-        ui.horizontal_wrapped(|ui| {
-            let sys_dark = tg_platform::system_info::is_dark_mode();
-            let now_min = night_schedule::current_local_minute_of_day();
-            if ui
-                .selectable_label(matches!(cur_mode, NightScheduleMode::Manual), "Manual")
-                .clicked()
-            {
-                self.night_scheduler
-                    .set_mode(NightScheduleMode::Manual, sys_dark, now_min);
-                toast = Some("Night mode set to Manual".to_owned());
-            }
-            if ui
-                .selectable_label(
-                    matches!(cur_mode, NightScheduleMode::System),
-                    "Follow System (Windows)",
-                )
-                .clicked()
-            {
-                if let NightScheduleEvent::Switched { night_mode } =
-                    self.night_scheduler
-                        .set_mode(NightScheduleMode::System, sys_dark, now_min)
-                {
-                    self.theme_manager.set_night_mode(night_mode);
-                    self.chat_background.set_dark_mode(night_mode);
-                    self.bg_picker.preview.preview_dark_mode = night_mode;
-                }
-                toast = Some("Auto-switching with Windows dark mode".to_owned());
-            }
-            if ui
-                .selectable_label(
-                    matches!(cur_mode, NightScheduleMode::Scheduled { .. }),
-                    "Scheduled Hours",
-                )
-                .clicked()
-            {
-                let sched = NightScheduleMode::Scheduled {
-                    start_minutes: start_min,
-                    end_minutes: end_min,
-                };
-                if let NightScheduleEvent::Switched { night_mode } =
-                    self.night_scheduler.set_mode(sched, sys_dark, now_min)
-                {
-                    self.theme_manager.set_night_mode(night_mode);
-                    self.chat_background.set_dark_mode(night_mode);
-                    self.bg_picker.preview.preview_dark_mode = night_mode;
-                }
-                toast = Some(format!(
-                    "Night mode scheduled {} – {}",
-                    format_minutes_hhmm(start_min),
-                    format_minutes_hhmm(end_min)
-                ));
-            }
-        });
-
-        if matches!(
-            self.night_scheduler.mode(),
-            NightScheduleMode::Scheduled { .. }
-        ) {
-            ui.add_space(6.0);
-            Frame::NONE
-                .fill(bg_over)
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::same(10))
-                .show(ui, |ui| {
-                    let mut start_hr = (start_min / 60) as i32;
-                    let mut end_hr = (end_min / 60) as i32;
-                    let mut changed = false;
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("From:").size(12.0).color(sub_fg));
-                        changed |= ui
-                            .add(egui::Slider::new(&mut start_hr, 0..=23).suffix(":00"))
-                            .changed();
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new("To:").size(12.0).color(sub_fg));
-                        changed |= ui
-                            .add(egui::Slider::new(&mut end_hr, 0..=23).suffix(":00"))
-                            .changed();
-                    });
-                    if changed {
-                        start_min = (start_hr.clamp(0, 23) as u16) * 60;
-                        end_min = (end_hr.clamp(0, 23) as u16) * 60;
-                        let sched = NightScheduleMode::Scheduled {
-                            start_minutes: start_min,
-                            end_minutes: end_min,
-                        };
-                        let now_min = night_schedule::current_local_minute_of_day();
-                        if let NightScheduleEvent::Switched { night_mode } =
-                            self.night_scheduler.set_mode(sched, None, now_min)
-                        {
-                            self.theme_manager.set_night_mode(night_mode);
-                            self.chat_background.set_dark_mode(night_mode);
-                        }
-                    }
-                });
-        }
-
-        if self.night_scheduler.pending_disable_system_confirm {
-            ui.add_space(8.0);
-            Frame::NONE
-                .fill(bg_over)
-                .stroke(Stroke::new(1.0, active_text))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::same(10))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "Automatic system dark mode following is active. Disable it and switch manually?",
-                        )
-                        .size(12.0)
-                        .color(bold_fg),
-                    );
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Disable System Follow & Switch").clicked()
-                            && let NightScheduleEvent::Switched { night_mode } =
-                                self.night_scheduler.confirm_disable_system_and_toggle()
-                        {
-                            self.theme_manager.set_night_mode(night_mode);
-                            self.chat_background.set_dark_mode(night_mode);
-                            self.bg_picker.preview.preview_dark_mode = night_mode;
-                            toast = Some("Switched manually; system follow disabled".to_owned());
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.night_scheduler.pending_disable_system_confirm = false;
-                        }
-                    });
-                });
-        }
-
-        toast
     }
 
     fn show_theme_previews_tab(&mut self, ui: &mut Ui, colors: &dyn Colors) -> Option<String> {
@@ -1357,7 +1246,10 @@ impl ThemesStudio {
             );
             if !self.preview_show_custom && ui.button("Apply This Theme").clicked() {
                 match self.install_embedded_theme(self.preview_embedded) {
-                    Ok(()) => toast = Some(format!("Applied {:?} theme", self.preview_embedded)),
+                    Ok(()) => {
+                        self.app_theme = Some(StudioThemeChange::Embedded(self.preview_embedded));
+                        toast = Some(format!("Applied {:?} theme", self.preview_embedded));
+                    }
                     Err(err) => {
                         toast = tg_app_core::user_error::theme_sync("account.installTheme", &err)
                             .into_text()
@@ -1432,6 +1324,9 @@ impl ThemesStudio {
             if let Some(rec) = install_candidate {
                 match self.install_cloud_theme(&rec) {
                     Ok(()) => {
+                        self.app_theme = Some(StudioThemeChange::Test(Box::new(
+                            self.theme_manager.palette().clone(),
+                        )));
                         toast = Some(format!("Installed cloud theme '{}'", rec.theme.title));
                     }
                     Err(err) => {
@@ -1454,7 +1349,11 @@ impl ThemesStudio {
                     }
                 }
             } else if let Some(rec) = edit_candidate {
-                let _ = self.install_cloud_theme(&rec);
+                if self.install_cloud_theme(&rec).is_ok() {
+                    self.app_theme = Some(StudioThemeChange::Test(Box::new(
+                        self.theme_manager.palette().clone(),
+                    )));
+                }
                 self.editor
                     .open_cloud_save_dialog(&self.theme_manager, rec.theme.id);
                 self.active_tab = ThemesTab::Editor;
@@ -1477,6 +1376,8 @@ pub struct AppThemesHost {
     studio: ThemesStudio,
     /// Generation of the studio's wallpaper last copied to [`active_chat_background`].
     pushed_background_generation: u64,
+    /// The window theme generation the studio last showed (`None`: not yet synced).
+    window_theme_generation: Option<u64>,
     bound_session_key: Option<usize>,
     last_deep_link_theme_slug: Option<String>,
     last_deep_link_background: Option<String>,
@@ -1490,6 +1391,7 @@ impl AppThemesHost {
                 Arc::new(Mutex::new(Self {
                     open: false,
                     pushed_background_generation: studio.chat_background.generation(),
+                    window_theme_generation: None,
                     studio,
                     bound_session_key: None,
                     last_deep_link_theme_slug: None,
@@ -1543,6 +1445,43 @@ impl AppThemesHost {
     pub fn is_open(ctx: &Context) -> bool {
         let host = Self::get_or_init(ctx);
         host.lock().map(|guard| guard.open).unwrap_or(false)
+    }
+
+    /// Runs `f` on the overlay's studio (tools and tests).
+    pub fn with_studio<R>(ctx: &Context, f: impl FnOnce(&mut ThemesStudio) -> R) -> Option<R> {
+        let host = Self::get_or_init(ctx);
+        host.lock().ok().map(|mut guard| f(&mut guard.studio))
+    }
+
+    /// Takes the theme change made in the studio for the window (TGB-2984).
+    #[must_use]
+    pub fn take_app_theme_change(ctx: &Context) -> Option<StudioThemeChange> {
+        let host = Self::get_or_init(ctx);
+        host.lock()
+            .ok()
+            .and_then(|mut guard| guard.studio.take_app_theme_change())
+    }
+
+    /// Keeps the studio on the window's theme: when the window's theme `generation` moved
+    /// since the last call (another theme, night mode), the studio adopts `palette()`. Call
+    /// [`Self::note_window_theme`] instead after applying a change from the studio, so the
+    /// studio keeps its editor state.
+    pub fn sync_window_theme(ctx: &Context, generation: u64, palette: impl FnOnce() -> Palette) {
+        let host = Self::get_or_init(ctx);
+        if let Ok(mut guard) = host.lock()
+            && guard.window_theme_generation != Some(generation)
+        {
+            guard.window_theme_generation = Some(generation);
+            guard.studio.adopt_window_palette(palette());
+        }
+    }
+
+    /// Records that the window's theme `generation` came from the studio's own change.
+    pub fn note_window_theme(ctx: &Context, generation: u64) {
+        let host = Self::get_or_init(ctx);
+        if let Ok(mut guard) = host.lock() {
+            guard.window_theme_generation = Some(generation);
+        }
     }
 
     /// Closes the Theme Studio overlay (passcode lock: `Application::closeAdditionalWindows`).

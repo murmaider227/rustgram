@@ -1457,6 +1457,8 @@ pub struct MenuStyle {
     pub item_fg_over: Color32,
     pub item_fg_disabled: Color32,
     pub item_fg_attention: Color32,
+    /// `boxTextFgGood`: the green "Unmute" row of the mute menu (`MuteItem`).
+    pub item_fg_good: Color32,
     pub item_fg_shortcut: Color32,
     pub item_fg_shortcut_over: Color32,
     pub item_fg_shortcut_disabled: Color32,
@@ -1483,6 +1485,7 @@ impl MenuStyle {
             item_fg_over: resolve_color(s.item_fg_over, c),
             item_fg_disabled: resolve_color(s.item_fg_disabled, c),
             item_fg_attention: resolve_color(st::menu_icon_attention_color, c),
+            item_fg_good: c.color("boxTextFgGood"),
             item_fg_shortcut: resolve_color(s.item_fg_shortcut, c),
             item_fg_shortcut_over: resolve_color(s.item_fg_shortcut_over, c),
             item_fg_shortcut_disabled: resolve_color(s.item_fg_shortcut_disabled, c),

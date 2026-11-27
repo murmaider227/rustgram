@@ -430,6 +430,7 @@ fn photo_sticker_and_round_video_sizing() {
         dimensions: Size::new(512, 512),
         custom_size: 0,
         option_sticker_size: None,
+        bottom_info_width: None,
     });
     assert_eq!(st_size, Size::new(224, 224));
     let emoji_size = count_sticker_optimal_size(&StickerInput {
@@ -437,6 +438,7 @@ fn photo_sticker_and_round_video_sizing() {
         dimensions: Size::new(512, 512),
         custom_size: 0,
         option_sticker_size: None,
+        bottom_info_width: None,
     });
     assert_eq!(emoji_size, Size::new(112, 112));
 
@@ -987,6 +989,7 @@ fn message_headers_media_overlay_and_service_line_smoothing() {
             dimensions: Size::new(512, 512),
             custom_size: 0,
             option_sticker_size: None,
+            bottom_info_width: None,
         })),
         bottom_info: BottomInfoInput {
             author_edited_date_width: 36,

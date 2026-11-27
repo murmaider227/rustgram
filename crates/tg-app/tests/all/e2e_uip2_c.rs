@@ -181,6 +181,7 @@ fn seed_one_to_one(state: &mut AppTestState) -> (PeerId, MsgId) {
         preview_thumb_rgb: None,
         preview_thumb: None,
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     });
     handle.push_history_message(peer, reply);
@@ -338,6 +339,7 @@ fn seed_saved(state: &mut AppTestState) -> PeerId {
         preview_thumb_rgb: None,
         preview_thumb: None,
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     });
     handle.push_history_message(peer, reply);

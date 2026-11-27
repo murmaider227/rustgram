@@ -153,6 +153,7 @@ fn reply_author_name_takes_the_author_accent() {
         preview_thumb_rgb: None,
         preview_thumb: None,
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     };
     let colors = day();

@@ -141,6 +141,8 @@ pub struct WindowController {
     pending_open_recent_calls: bool,
     pending_start_call: Option<(PeerId, bool)>,
     logout_requested: bool,
+    /// "Restart" was pressed in a box that needs the app restarted (`Core::Restart`).
+    app_restart_requested: bool,
     /// Background accounts whose forced-logout box was closed (`forced_logout.rs`).
     background_logouts: Vec<i32>,
     menu_accounts: Vec<MainMenuAccountItem>,
@@ -153,6 +155,8 @@ pub struct WindowController {
     external_passcode_verifier:
         Option<tg_app_settings::settings::local_passcode::PasscodeVerifierFn>,
     shell_extras: WindowShellExtras,
+    /// The whole chat list kept between frames for lookups by peer (TGB-2920).
+    dialogs_snapshot: crate::window::dialogs_snapshot::DialogsSnapshot,
     /// [`Self::elapsed_ms`] of the last chat-list keep-alive read (see `show_with_stories`).
     chats_list_keepalive_ms: Option<i64>,
     native_hwnd: isize,
@@ -265,6 +269,7 @@ impl WindowController {
             pending_open_recent_calls: false,
             pending_start_call: None,
             logout_requested: false,
+            app_restart_requested: false,
             background_logouts: Vec::new(),
             menu_accounts: Vec::new(),
             max_accounts: tg_session::MAX_ACCOUNTS,
@@ -275,6 +280,7 @@ impl WindowController {
             pending_update_prefs: None,
             external_passcode_verifier: None,
             shell_extras: WindowShellExtras::new(),
+            dialogs_snapshot: crate::window::dialogs_snapshot::DialogsSnapshot::default(),
             chats_list_keepalive_ms: None,
             native_hwnd: 0,
             fallback_shortcuts: tg_app_settings::settings::shortcuts::ShortcutManager::new(),
@@ -295,6 +301,25 @@ impl WindowController {
     #[must_use]
     pub fn session_backend(&self) -> &dyn AppSession {
         &*self.session_backend
+    }
+
+    /// The whole chat list as `Backend::dialogs(ALL, "")` returns it, read again only when the
+    /// list's version moves or after a second (TGB-2920).
+    pub fn all_dialogs(
+        &mut self,
+    ) -> std::sync::Arc<Vec<tg_app_core::stand_in::types::DialogEntry>> {
+        let backend = &self.session_backend;
+        let version = tg_app_info::dialogs::backend::DialogsBackend::dialogs_version(&**backend);
+        self.dialogs_snapshot
+            .get(version, tg_app_core::clock::now(), || {
+                backend.dialogs(FilterId::ALL, "")
+            })
+    }
+
+    /// How many times [`Self::all_dialogs`] read the whole list.
+    #[must_use]
+    pub const fn all_dialogs_reads(&self) -> u64 {
+        self.dialogs_snapshot.reads()
     }
 
     /// Returns a mutable reference to the underlying [`AppSession`].
@@ -326,6 +351,12 @@ impl WindowController {
     /// Returns `true` once when the user confirmed logout on a live session.
     pub fn take_logout_requested(&mut self) -> bool {
         std::mem::take(&mut self.logout_requested)
+    }
+
+    /// Returns `true` once after "Restart" in a restart box (`Core::Restart`): the app saves
+    /// its settings, quits and starts again.
+    pub fn take_app_restart_request(&mut self) -> bool {
+        std::mem::take(&mut self.app_restart_requested)
     }
 
     /// Updates the multi-account list and dynamic account limit rendered inside [`MainMenu`].
@@ -1831,7 +1862,7 @@ impl WindowController {
                 }
             }
             AppWebViewEvent::Toast { message } => self.layer_stack.show_toast(message),
-            AppWebViewEvent::QuitApp => ctx.send_viewport_cmd(ViewportCommand::Close),
+            AppWebViewEvent::QuitApp => tg_app_media::tray::window_close::request_quit(ctx),
             _ => {}
         }
     }
@@ -2197,11 +2228,16 @@ impl WindowController {
         if self.root_screen == RootScreen::Main {
             self.keep_chats_list_loading(now_ms);
             let backend = &self.session_backend;
+            let snapshot = &mut self.dialogs_snapshot;
+            let now = tg_app_core::clock::now();
+            let mut dialogs = || {
+                let version =
+                    tg_app_info::dialogs::backend::DialogsBackend::dialogs_version(&**backend);
+                snapshot.get(version, now, || backend.dialogs(FilterId::ALL, ""))
+            };
             if let Some(peer) =
                 self.shell_extras
-                    .show_overlays(&ctx, screen_rect, &palette, &|| {
-                        backend.dialogs(FilterId::ALL, "")
-                    })
+                    .show_overlays(&ctx, screen_rect, &palette, &mut dialogs)
                 && let Some(session) = self.session.as_mut()
             {
                 session.show_peer_history(peer, SectionShow::clear_stack(), MsgId::SHOW_AT_END);
@@ -2474,12 +2510,35 @@ impl WindowController {
             MainWidgetAction::RequestLogout => {
                 self.layer_stack.show_box(ModalBox::ConfirmLogout);
             }
+            MainWidgetAction::ConfirmScaleRestart(scale) => {
+                self.layer_stack
+                    .show_box(ModalBox::ConfirmScaleRestart { scale });
+            }
             MainWidgetAction::OpenHistoryMedia {
                 peer_id,
                 msg_id,
                 album_index,
             } => {
                 self.open_history_media(peer_id, msg_id, album_index);
+            }
+            // `Sticker::link`: the clicked sticker's pack (`StickerSetBox` for
+            // `inputStickerSetID`); a failed lookup is "Sticker set not found." (TGB-3126).
+            MainWidgetAction::OpenStickerSet(set) => {
+                match self
+                    .session_backend
+                    .resolve_sticker_set_by_id(set.id, set.access_hash)
+                {
+                    Ok(preview) => self.box_host.push(
+                        ctx,
+                        BoxKind::StickerSet(
+                            tg_app_info::boxes::sticker_set::StickerSetBoxState::from_preview(
+                                preview,
+                            ),
+                        ),
+                        &self.theme_manager,
+                    ),
+                    Err(err) => self.show_user_error(tg_app_core::user_error::sticker_set(&err)),
+                }
             }
             MainWidgetAction::OpenLink(url) => self.open_link(&url),
             MainWidgetAction::OpenHiddenLink { url, force_confirm } => {
@@ -2632,11 +2691,10 @@ impl WindowController {
             }
             MainWidgetAction::OpenInNewWindow(peer_id) => {
                 let title = self
-                    .session_backend
-                    .dialogs(FilterId::ALL, "")
-                    .into_iter()
+                    .all_dialogs()
+                    .iter()
                     .find(|d| d.peer.id == peer_id)
-                    .map_or_else(|| format!("Chat {}", peer_id.0), |d| d.peer.title);
+                    .map_or_else(|| format!("Chat {}", peer_id.0), |d| d.peer.title.clone());
                 self.shell_extras.saved_windows.open_window(
                     crate::window::chat_preview::SavedChatWindow::new(peer_id, title),
                 );
@@ -2663,6 +2721,8 @@ impl WindowController {
                 }
             }
             InfoWrapEvent::Toast(msg) => self.layer_stack.show_toast(msg),
+            // The button flips its label; tdesktop shows no toast (TGB-2875).
+            InfoWrapEvent::NotificationsToggled { .. } => {}
             InfoWrapEvent::OpenStatistics(pid) => self.open_statistics_for_peer(pid, false),
             InfoWrapEvent::OpenBoosts(pid) => self.open_statistics_for_peer(pid, true),
             InfoWrapEvent::OpenBotMiniApp(pid) => self.open_bot_mini_app(pid),
@@ -4020,6 +4080,17 @@ impl WindowController {
 
     fn handle_layer_action(&mut self, act: LayerAction) {
         match act {
+            LayerAction::KeepTheme => self.finish_theme_trial(true),
+            LayerAction::RevertTheme => self.finish_theme_trial(false),
+            LayerAction::RestartWithScale(scale) => {
+                if let Some(settings) = self.main_widget.settings_mut() {
+                    tg_app_settings::settings::scale::confirm_scale(
+                        &mut settings.global_config,
+                        scale,
+                    );
+                }
+                self.app_restart_requested = true;
+            }
             LayerAction::ConfirmLogout => {
                 if self.session_backend.is_live_session() {
                     self.layer_stack.hide_all();
@@ -4092,6 +4163,11 @@ mod user_errors_w4_shots;
 #[path = "user_errors_w4_tests.rs"]
 mod user_errors_w4_tests;
 pub use theme_apply::follow_platform_dark_mode;
+
+#[cfg(test)]
+#[path = "controller_tests_w8.rs"]
+#[cfg(test)]
+mod tests_w8;
 
 #[cfg(test)]
 #[path = "controller_tests_sec2a.rs"]

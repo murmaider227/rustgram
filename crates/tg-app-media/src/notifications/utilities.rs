@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tg_platform::system_info::RgbaColor;
-use tg_platform::tray::{RgbaImage, default_app_icon};
+use tg_platform::tray::{RgbaImage, app_icon};
 
 use crate::notifications::backend::NotifyPeerInfo;
 
@@ -99,7 +99,7 @@ impl UserpicKey {
 pub fn generate_userpic(peer: Option<&NotifyPeerInfo>, size: u32) -> RgbaImage {
     let dim = size.max(16);
     let Some(info) = peer else {
-        return default_app_icon(dim, false, false);
+        return app_icon(dim, false, false);
     };
 
     let bg = if info.is_self {
@@ -283,7 +283,7 @@ impl CachedUserpics {
         } else if key.first != 0 || key.second != 0 {
             generate_userpic(peer, NOTIFY_USERPIC_SIZE)
         } else {
-            default_app_icon(NOTIFY_USERPIC_SIZE, false, false)
+            app_icon(NOTIFY_USERPIC_SIZE, false, false)
         };
         let png_bytes = image
             .encode_png()

@@ -181,6 +181,8 @@ fn extract_video_thumb(
     let frame = match data {
         InlineDocumentData::File(path) => extract_thumbnail(&path, opts),
         InlineDocumentData::Bytes(bytes) => extract_thumbnail_from_bytes(bytes, opts),
+        // A file that is still downloading shows its document thumbnail instead.
+        InlineDocumentData::Stream(_) => return None,
     }
     .ok()?;
     let FrameData::Rgba(rgba) = frame.data else {

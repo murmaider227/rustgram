@@ -155,6 +155,8 @@ pub struct StoriesStrip {
     /// The first-run "Click here to view updates from ..." tooltip was closed or the strip was
     /// clicked (`CoreSettings::storiesClickTooltipHidden`).
     click_tooltip_hidden: bool,
+    /// Where the first-run tooltip's close button was last drawn (TGB-3127).
+    click_tooltip_close: Option<Rect>,
 }
 
 impl Default for StoriesStrip {
@@ -187,6 +189,7 @@ impl StoriesStrip {
             add_story_button_hidden: false,
             fail_fade: std::collections::HashMap::new(),
             click_tooltip_hidden: false,
+            click_tooltip_close: None,
         }
     }
 
@@ -225,6 +228,12 @@ impl StoriesStrip {
     #[must_use]
     pub const fn click_tooltip_hidden(&self) -> bool {
         self.click_tooltip_hidden
+    }
+
+    /// Where the first-run tooltip's close button was drawn in the last frame, if it was.
+    #[must_use]
+    pub const fn click_tooltip_close_rect(&self) -> Option<Rect> {
+        self.click_tooltip_close
     }
 
     /// Restores the persisted `storiesClickTooltipHidden` setting.
@@ -624,6 +633,7 @@ impl StoriesStrip {
             Pos2::new(bubble.right() - close_w, bubble.top()),
             bubble.max,
         );
+        self.click_tooltip_close = Some(close_rect);
         tg_ui::icons::paint_style_icon(
             &painter,
             close_rect.translate(Vec2::new(
@@ -634,15 +644,24 @@ impl StoriesStrip {
             &colors,
             None,
         );
-        let resp = ui
-            .interact(
-                close_rect,
-                ui.make_persistent_id(("stories_click_tooltip_close", self.instance_id)),
-                Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Close"));
-        if resp.clicked() {
+        // The button lives on the tooltip's own layer: on the strip's layer it lay outside the
+        // search row's clip and under the chat list registered after it, so it never got the
+        // click (TGB-3127).
+        let clicked = egui::Area::new(Id::unique((
+            "stories_click_tooltip_close",
+            self.instance_id,
+        )))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(close_rect.min)
+        .interactable(true)
+        .show(ui.ctx(), |ui| {
+            let (_, resp) = ui.allocate_exact_size(close_rect.size(), Sense::click());
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Close"));
+            resp.clicked()
+        })
+        .inner;
+        if clicked {
             self.hide_click_tooltip(actions);
         }
     }

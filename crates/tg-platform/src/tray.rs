@@ -291,8 +291,128 @@ fn draw_badge_text(
     }
 }
 
+/// The app's own icon at several sizes, registered by the app at startup (TGB-3123).
+static APP_ICON_IMAGES: std::sync::RwLock<Vec<RgbaImage>> = std::sync::RwLock::new(Vec::new());
+
+/// Registers the application icon (rendered from the same source as the executable's icon) at
+/// one or more square sizes. The tray, and anything else that asks [`app_icon`], uses it from
+/// then on; until then [`app_icon`] falls back to [`default_app_icon`].
+pub fn set_app_icon_images(images: Vec<RgbaImage>) {
+    let images: Vec<RgbaImage> = images
+        .into_iter()
+        .filter(|img| {
+            img.width > 0
+                && img.width == img.height
+                && img.pixels.len() == (img.width as usize) * (img.height as usize) * 4
+        })
+        .collect();
+    if let Ok(mut slot) = APP_ICON_IMAGES.write() {
+        *slot = images;
+    }
+}
+
+/// The registered application icon at `size` (`Window::Logo` / the tray icon of tdesktop):
+/// the registered image of that size, or the closest larger one scaled down (a smaller one
+/// scaled up when none is larger). With `monochrome` (the "monochrome icon" setting) the icon
+/// becomes a single-colour shape for the taskbar: white on a dark taskbar, black on a light
+/// one, with the logo's white glyph cut out. Without a registered icon this is
+/// [`default_app_icon`].
+pub fn app_icon(size: u32, monochrome: bool, dark_taskbar: bool) -> RgbaImage {
+    let size = size.max(1);
+    let base = APP_ICON_IMAGES.read().ok().and_then(|images| {
+        let exact = images.iter().find(|img| img.width == size);
+        let larger = images
+            .iter()
+            .filter(|img| img.width > size)
+            .min_by_key(|img| img.width);
+        let smaller = images.iter().max_by_key(|img| img.width);
+        exact
+            .or(larger)
+            .or(smaller)
+            .map(|img| resize_square(img, size))
+    });
+    match base {
+        Some(icon) if monochrome => monochrome_icon(&icon, dark_taskbar),
+        Some(icon) => icon,
+        None => default_app_icon(size, monochrome, dark_taskbar),
+    }
+}
+
+/// Area-average (box) resize of a square straight-alpha image to `size x size`.
+fn resize_square(img: &RgbaImage, size: u32) -> RgbaImage {
+    if img.width == size {
+        return img.clone();
+    }
+    let src = img.width as usize;
+    let dst = size as usize;
+    let mut out = RgbaImage::transparent(size, size);
+    for dy in 0..dst {
+        let y0 = dy * src / dst;
+        let y1 = ((dy + 1) * src).div_ceil(dst).clamp(y0 + 1, src);
+        for dx in 0..dst {
+            let x0 = dx * src / dst;
+            let x1 = ((dx + 1) * src).div_ceil(dst).clamp(x0 + 1, src);
+            // Premultiplied sums, so transparent pixels do not darken the edges.
+            let (mut r, mut g, mut b, mut a, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = (sy * src + sx) * 4;
+                    let pa = u64::from(img.pixels[i + 3]);
+                    r += u64::from(img.pixels[i]) * pa;
+                    g += u64::from(img.pixels[i + 1]) * pa;
+                    b += u64::from(img.pixels[i + 2]) * pa;
+                    a += pa;
+                    n += 1;
+                }
+            }
+            let o = (dy * dst + dx) * 4;
+            if let (Some(r), Some(g), Some(b), Some(alpha)) = (
+                r.checked_div(a),
+                g.checked_div(a),
+                b.checked_div(a),
+                a.checked_div(n),
+            ) {
+                out.pixels[o] = r as u8;
+                out.pixels[o + 1] = g as u8;
+                out.pixels[o + 2] = b as u8;
+                out.pixels[o + 3] = alpha as u8;
+            }
+        }
+    }
+    out
+}
+
+/// The monochrome tray variant of a colour icon: its shape in white (dark taskbar) or black
+/// (light taskbar), with its near-white glyph cut out.
+fn monochrome_icon(icon: &RgbaImage, dark_taskbar: bool) -> RgbaImage {
+    let (fg, max_alpha) = if dark_taskbar {
+        (255u8, 255u32)
+    } else {
+        (0u8, 228u32)
+    };
+    let mut out = RgbaImage::transparent(icon.width, icon.height);
+    for (src, dst) in icon
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.pixels.as_chunks_mut::<4>().0.iter_mut())
+    {
+        let min = u32::from(src[0].min(src[1]).min(src[2]));
+        // 0 for the logo's background colour, 1 for its white glyph.
+        let white = min.saturating_sub(110) * 255 / (255 - 110);
+        let alpha = u32::from(src[3]) * (255 - white.min(255)) / 255 * max_alpha / 255;
+        dst[0] = fg;
+        dst[1] = fg;
+        dst[2] = fg;
+        dst[3] = alpha as u8;
+    }
+    out
+}
+
 /// Render an original geometric Rustgram tray/app icon (rounded chat bubble with clean stripes;
-/// does not use Telegram's trademarked paper-plane logo).
+/// does not use Telegram's trademarked paper-plane logo). Only a fallback: the tray uses
+/// [`app_icon`], the app's own icon, once the app registered it.
 pub fn default_app_icon(size: u32, monochrome: bool, dark_taskbar: bool) -> RgbaImage {
     let mut img = RgbaImage::transparent(size, size);
     let s = size as f32;
@@ -602,7 +722,7 @@ pub struct TrayConfig {
     pub app_name: String,
     /// Optional custom tooltip override; defaults to `format_tray_tooltip(&app_name, unread_count)`.
     pub tooltip: Option<String>,
-    /// Optional custom base icon; defaults to [`default_app_icon`].
+    /// Optional custom base icon; defaults to [`app_icon`].
     pub base_icon: Option<RgbaImage>,
     /// Initial unread badge count (`0` hides the badge).
     pub unread_count: u32,
@@ -1020,7 +1140,7 @@ mod win_tray {
                 let base = c
                     .base_icon
                     .clone()
-                    .unwrap_or_else(|| default_app_icon(sm, c.monochrome, dark.unwrap_or(true)));
+                    .unwrap_or_else(|| app_icon(sm, c.monochrome, dark.unwrap_or(true)));
                 (base, c.unread_count, c.muted, c.monochrome, c.colors)
             };
             let dark = crate::system_info::is_dark_taskbar();

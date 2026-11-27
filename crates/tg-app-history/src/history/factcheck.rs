@@ -51,6 +51,35 @@ pub fn measure_factcheck_footer_height(
     28.0 + lines * 16.0 + toggle_h + 10.0
 }
 
+/// Space the history list reserves in a message's text block for its fact-check card: the card
+/// at the reference width, plus the gap above it.
+#[must_use]
+pub fn factcheck_reserved_height(factcheck: &FactCheckData, expanded: bool) -> i32 {
+    measure_factcheck_footer_height(factcheck, expanded, FACTCHECK_REFERENCE_WIDTH).ceil() as i32
+        + FACTCHECK_GAP
+}
+
+/// Width the reserved height is measured at.
+const FACTCHECK_REFERENCE_WIDTH: f32 = 320.0;
+
+/// Gap between the text above and the card.
+const FACTCHECK_GAP: i32 = 8;
+
+/// Where the fact-check card goes (`HistoryView::Factcheck`, a web-page-like block with its own
+/// height): at the bottom of the text block, above the line that holds the time, so the
+/// reactions and the bottom info come below it. `text_rect` is the message's text block in
+/// screen coordinates, `reserved` what [`factcheck_reserved_height`] gave, `date_line` the
+/// height of the time line reserved under the block.
+#[must_use]
+pub fn factcheck_rect(text_rect: Rect, reserved: i32, date_line: f32) -> Rect {
+    let card_h = (reserved - FACTCHECK_GAP).max(0) as f32;
+    let bottom = (text_rect.bottom() - date_line).max(text_rect.top() + card_h);
+    Rect::from_min_max(
+        Pos2::new(text_rect.left(), bottom - card_h),
+        Pos2::new(text_rect.right(), bottom),
+    )
+}
+
 /// Paints the fact-check footer card inside a message bubble with an expandable note.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_factcheck_footer(

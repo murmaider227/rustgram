@@ -4,6 +4,7 @@
 //! `Telegram/SourceFiles/chat_helpers/emoji_list_widget.cpp`, and `chat_helpers.style`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use egui::{
     Align2, Area, Color32, CornerRadius, FontId, Frame, Id, Key, Margin, Order, Pos2, Rect,
@@ -132,12 +133,28 @@ pub struct EmojiListWidget {
     focused_index: Option<usize>,
     press_hold: Option<(EmojiRef, Rect, f64)>,
     color_picker: Option<SkinTonePopup>,
-    section_cache: Vec<(Section, Vec<EmojiRef>)>,
+    /// The seven Unicode sections, shared by every panel and frame (TGB-2922).
+    section_cache: UnicodeSections,
     active_group: Option<usize>,
     mood_icons: MoodIconCache,
     mood_groups_polled_at: Option<f64>,
     mood_groups_from_server: bool,
     columns: usize,
+}
+
+/// The seven Unicode sections with their emoji, shared between panels and frames.
+type UnicodeSections = Arc<[(Section, Vec<EmojiRef>)]>;
+
+/// The seven static Unicode sections (`EmojiListWidget` sections 1..=7), built once per
+/// process: the panel paints them every frame and never changes them (TGB-2922).
+fn unicode_sections() -> UnicodeSections {
+    static SECTIONS: std::sync::OnceLock<UnicodeSections> = std::sync::OnceLock::new();
+    Arc::clone(SECTIONS.get_or_init(|| {
+        EMOJI_SECTIONS[1..]
+            .iter()
+            .map(|&sec| (sec, emoji::section(sec)))
+            .collect()
+    }))
 }
 
 impl Default for EmojiListWidget {
@@ -150,10 +167,7 @@ impl EmojiListWidget {
     /// Creates a new [`EmojiListWidget`] with static `tg-text` sections pre-indexed.
     #[must_use]
     pub fn new() -> Self {
-        let mut section_cache = Vec::with_capacity(7);
-        for &sec in &EMOJI_SECTIONS[1..] {
-            section_cache.push((sec, emoji::section(sec)));
-        }
+        let section_cache = unicode_sections();
         Self {
             search_query: String::new(),
             active_section: Section::Recent,
@@ -398,7 +412,7 @@ impl EmojiListWidget {
                 flat.push(e);
             }
         }
-        for (_, items) in &self.section_cache {
+        for (_, items) in self.section_cache.iter() {
             flat.extend_from_slice(items);
         }
         flat
@@ -587,8 +601,9 @@ impl EmojiListWidget {
                                     }
 
                                     // 7 static Unicode sections
-                                    let sections_clone = self.section_cache.clone();
-                                    for (sec, items) in sections_clone {
+                                    let sections = Arc::clone(&self.section_cache);
+                                    for (sec, items) in sections.iter() {
+                                        let sec = *sec;
                                         let hdr_rect = self.paint_section_header(
                                             ui,
                                             sec,
@@ -605,7 +620,7 @@ impl EmojiListWidget {
                                         }
                                         if let Some(ev) = self.paint_emoji_grid(
                                             ui,
-                                            &items,
+                                            items,
                                             &mut global_idx,
                                             now,
                                             backend,
@@ -765,8 +780,6 @@ impl EmojiListWidget {
         let base_global = *global_idx;
         *global_idx += items.len();
 
-        let variants = backend.emoji_variants().clone();
-
         for row in first_row..last_row {
             for col in 0..cols {
                 let local_i = row * cols + col;
@@ -786,7 +799,8 @@ impl EmojiListWidget {
 
                 // Apply saved skin-tone preference for display when this is an uncolored base emoji.
                 let display_ref = if !base_ref.colored() && base_ref.has_variants() {
-                    let tone = variants
+                    let tone = backend
+                        .emoji_variants()
                         .lookup_tone(base_ref.non_colored_id())
                         .unwrap_or(SkinTone::Default);
                     base_ref.variant(tone.index() as usize)
@@ -1660,5 +1674,46 @@ mod outline_tests {
         assert_eq!(out[12 * w + 4], 255, "left edge stays");
         assert_eq!(out[4 * w + 12], 255, "top edge stays");
         assert_eq!(out[0], 0, "outside stays empty");
+    }
+}
+
+#[cfg(test)]
+mod tests_w8_sections {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::{EmojiListWidget, unicode_sections};
+
+    /// TGB-2922: the Unicode sections are built once and shared; a panel frame copies a
+    /// pointer, not ~1,800 emoji.
+    #[test]
+    fn panels_share_one_section_list() {
+        let a = EmojiListWidget::new();
+        let b = EmojiListWidget::new();
+        assert!(Arc::ptr_eq(&a.section_cache, &b.section_cache));
+        assert_eq!(a.section_cache.len(), 7);
+        assert!(a.section_cache.iter().all(|(_, items)| !items.is_empty()));
+    }
+
+    /// Cost of the per-frame section copy before (a deep clone) and after (an `Arc` clone).
+    /// Prints numbers only; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "timing for TGB-2922; prints numbers"]
+    fn measure_section_copy_per_frame() {
+        let shared = unicode_sections();
+        let owned: Vec<_> = shared.iter().cloned().collect();
+        let emoji: usize = owned.iter().map(|(_, items)| items.len()).sum();
+        let frames = 2_000_u32;
+        let started = Instant::now();
+        for _ in 0..frames {
+            std::hint::black_box(owned.clone());
+        }
+        let before = started.elapsed() / frames;
+        let started = Instant::now();
+        for _ in 0..frames {
+            std::hint::black_box(Arc::clone(&shared));
+        }
+        let after = started.elapsed() / frames;
+        println!("TGB-2922 {emoji} emoji: deep clone {before:?} per frame, Arc clone {after:?}");
     }
 }

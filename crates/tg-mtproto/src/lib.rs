@@ -21,6 +21,7 @@ mod qdatastream;
 pub mod received_ids;
 pub mod salts;
 pub mod session;
+mod single_flight;
 pub mod special_config;
 pub mod time;
 pub mod transport_adapter;

@@ -52,7 +52,7 @@ fn message(text: &str, photo: Option<(i32, i32)>) -> HistoryMessage {
 
 fn layout_of(ui: &Ui, msg: &HistoryMessage) -> tg_history::MessageLayout {
     let colors = HistoryColors::from_palette(&Palette::day());
-    let item = build_list_item(msg, true, true);
+    let item = build_list_item(msg, true, true, false);
     match compute_item_layout_egui(
         ui,
         msg,

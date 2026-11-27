@@ -77,6 +77,8 @@ pub struct AppNotifyTrayHost {
     backend: NotifyBackendSlot,
     focus: WindowFocusState,
     window_hidden_to_tray: bool,
+    /// Settings > Advanced "Window close" (`Core::Settings::closeBehavior`).
+    close_behavior: tg_core::settings::CloseBehavior,
     pending_account_switches: Vec<i32>,
     account_unread_entries: Option<Vec<AccountUnreadEntry>>,
 }
@@ -133,6 +135,7 @@ impl AppNotifyTrayHost {
             backend: NotifyBackendSlot::Mock(backend),
             focus: WindowFocusState::with_defaults(1),
             window_hidden_to_tray: false,
+            close_behavior: tg_core::settings::CloseBehavior::Quit,
             pending_account_switches: Vec::new(),
             account_unread_entries: None,
         }
@@ -164,6 +167,7 @@ impl AppNotifyTrayHost {
             },
             focus: WindowFocusState::with_defaults(1),
             window_hidden_to_tray: false,
+            close_behavior: tg_core::settings::CloseBehavior::Quit,
             pending_account_switches: Vec::new(),
             account_unread_entries: None,
         }
@@ -197,6 +201,7 @@ impl AppNotifyTrayHost {
             },
             focus: WindowFocusState::with_defaults(1),
             window_hidden_to_tray: false,
+            close_behavior: tg_core::settings::CloseBehavior::Quit,
             pending_account_switches: Vec::new(),
             account_unread_entries: None,
         }
@@ -315,6 +320,46 @@ impl AppNotifyTrayHost {
         self.tray
             .set_work_mode(work_mode, &prefs_snapshot, now_unix);
         self.tray.set_monochrome(core.tray_icon_monochrome);
+        self.close_behavior = core.close_behavior;
+    }
+
+    /// Handles a close request of the main window (`MainWindow::closeEvent`, TGB-3122): hides
+    /// it to the tray, minimizes it, hides it in the background or lets the app quit, and
+    /// returns what it did. `has_auth`: an account is signed in.
+    pub fn on_main_window_close_requested(
+        &mut self,
+        ctx: &egui::Context,
+        has_auth: bool,
+    ) -> crate::tray::window_close::WindowCloseAction {
+        use crate::tray::window_close::{
+            WindowCloseAction, apply_window_close_action, is_quitting, window_close_action,
+        };
+        let action = window_close_action(
+            is_quitting(ctx),
+            has_auth,
+            self.tray.work_mode(),
+            self.tray.has_icon(),
+            self.close_behavior,
+        );
+        apply_window_close_action(ctx, action);
+        if matches!(
+            action,
+            WindowCloseAction::HideToTray | WindowCloseAction::HideInBackground
+        ) {
+            self.window_hidden_to_tray = true;
+        }
+        action
+    }
+
+    /// The main window was shown again from outside the tray menu (e.g. another launch).
+    pub fn note_window_shown(&mut self) {
+        self.window_hidden_to_tray = false;
+    }
+
+    /// Whether the main window is hidden (to the tray or in the background).
+    #[must_use]
+    pub const fn is_window_hidden(&self) -> bool {
+        self.window_hidden_to_tray
     }
 
     /// Triggers the `"simulate incoming message"` debug action.
@@ -370,6 +415,11 @@ impl AppNotifyTrayHost {
             self.simulate_incoming_message();
         }
 
+        // A hidden window gets no input events: keep polling the tray's clicks and menu.
+        if self.window_hidden_to_tray {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+
         // Sync tray menu & drain tray click / menu actions.
         let active_for_tray = !self.window_hidden_to_tray && !minimized;
         self.tray.sync_state(
@@ -411,9 +461,7 @@ impl AppNotifyTrayHost {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                     self.pending_account_switches.push(slot_index);
                 }
-                TrayAction::Quit => {
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
+                TrayAction::Quit => crate::tray::window_close::request_quit(ctx),
             }
         }
 
@@ -461,6 +509,8 @@ fn current_unix_secs() -> i64 {
 
 #[cfg(test)]
 mod tests_tgb2946;
+#[cfg(test)]
+mod tests_w8_close;
 
 #[cfg(test)]
 mod tests {

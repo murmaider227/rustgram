@@ -289,6 +289,29 @@ impl LiveSession {
         }
     }
 
+    /// Fetches the pack of a clicked sticker by id (`StickerSetBox` for `inputStickerSetID`).
+    pub(crate) fn deep_link_resolve_sticker_set_by_id(
+        &mut self,
+        set_id: u64,
+        access_hash: u64,
+    ) -> Result<StickerSetPreview, String> {
+        let resp = self.dl_invoke(tl_fns::messages::GetStickerSet {
+            stickerset: tl_enums::InputStickerSet::ID(tl_types::InputStickerSetID {
+                id: set_id as i64,
+                access_hash: access_hash as i64,
+            }),
+            hash: 0,
+        })?;
+        match resp {
+            tl_enums::messages::StickerSet::StickerSet(s) => {
+                Ok(self.ingest_sticker_set_preview(&s, false))
+            }
+            tl_enums::messages::StickerSet::NotModified => {
+                Err("STICKERSET_NOT_MODIFIED".to_owned())
+            }
+        }
+    }
+
     /// Fetches a cloud theme preview via `account.getTheme`.
     pub(crate) fn deep_link_resolve_cloud_theme(
         &mut self,

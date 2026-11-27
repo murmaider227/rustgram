@@ -818,6 +818,7 @@ impl MediaShowcaseScreenshotApp {
                         width: 160,
                         height: 160,
                         lottie_json: sample_lottie_star_json(),
+                        set: None,
                     })),
                     service: None,
                     reply: None,

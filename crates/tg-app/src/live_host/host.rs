@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use egui::{
     Align, CentralPanel, Color32, CornerRadius, Frame, Id, Key, Layout, Modifiers, Order, Pos2,
-    Rect, RichText, Sense, Stroke, Ui, UiBuilder, Vec2, ViewportCommand,
+    Rect, RichText, Sense, Stroke, Ui, UiBuilder, Vec2,
 };
 use tg_api::{ApiCredentials, LoginStep};
 use tg_core::domain::Environment;
@@ -969,6 +969,7 @@ impl LiveActiveWorkspace {
                 palette.layer_backdrop,
                 palette.divider,
             );
+            self.controller.exchange_studio_theme(ctx);
         }
     }
 }
@@ -1900,7 +1901,28 @@ impl LiveAppHost {
         }
     }
 
-    /// Drains any pending UI-originated updater action from the active live workspace.
+    /// The tray and notifications host of the signed-in workspaces (`None` before sign-in).
+    pub fn notify_tray_host_mut(&mut self) -> Option<&mut AppNotifyTrayHost> {
+        if let LivePhase::Active(active) = &mut self.phase {
+            active.host.notify_tray_mut()
+        } else {
+            None
+        }
+    }
+
+    /// The active live workspace's window controller (`None` before sign-in).
+    pub fn active_controller_mut(&mut self) -> Option<&mut WindowController> {
+        if let LivePhase::Active(active) = &mut self.phase {
+            active
+                .host
+                .active_workspace_mut()
+                .map(|ws| ws.controller_mut())
+        } else {
+            None
+        }
+    }
+
+    /// Drains a pending UI-originated updater action from the active live workspace.
     pub fn take_update_action(&mut self) -> Option<crate::startup::updater::UpdateUiAction> {
         if let LivePhase::Active(active) = &mut self.phase
             && let Some(ws) = active.host.active_workspace_mut()
@@ -3114,7 +3136,7 @@ fn render_status_screen(
                                 ui.add_space(18.0);
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui.button("Quit").clicked() {
-                                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                                        tg_app_media::tray::window_close::request_quit(ui.ctx());
                                     }
                                     if show_retry && ui.button("Retry").clicked() {
                                         *retry_clicked = true;

@@ -64,6 +64,8 @@ enum PendingNightSwitch {
 /// Follow-system state of one window.
 #[derive(Debug)]
 pub(super) struct ThemeFollow {
+    /// The theme before a Theme Studio theme went on trial ("Keep this theme?", TGB-2984).
+    trial_previous: Option<Box<tg_theme::Palette>>,
     source: SystemDarkSource,
     /// Last value read from the platform.
     platform_dark: Option<bool>,
@@ -76,6 +78,7 @@ pub(super) struct ThemeFollow {
 impl ThemeFollow {
     pub(super) const fn new() -> Self {
         Self {
+            trial_previous: None,
             source: SystemDarkSource::Auto,
             platform_dark: None,
             platform_read_at: None,
@@ -106,6 +109,52 @@ impl ThemeFollow {
 }
 
 impl WindowController {
+    /// Applies a theme change made in the Theme Studio and keeps the studio on the window's
+    /// theme (TGB-2984). Called once per frame after the studio was drawn.
+    pub fn exchange_studio_theme(&mut self, ctx: &egui::Context) {
+        use tg_app_settings::themes::{AppThemesHost, StudioThemeChange};
+        match AppThemesHost::take_app_theme_change(ctx) {
+            Some(StudioThemeChange::Live(palette)) => {
+                self.theme_manager.set_palette(*palette);
+                AppThemesHost::note_window_theme(ctx, self.theme_manager.generation());
+            }
+            Some(StudioThemeChange::Test(palette)) => {
+                self.start_theme_trial(*palette);
+                AppThemesHost::note_window_theme(ctx, self.theme_manager.generation());
+            }
+            Some(StudioThemeChange::Embedded(kind)) => self.choose_embedded_theme(kind, None),
+            Some(StudioThemeChange::ToggleNight) => self.request_night_mode_toggle(),
+            None => {
+                let theme = &self.theme_manager;
+                AppThemesHost::sync_window_theme(ctx, theme.generation(), || {
+                    theme.palette().clone()
+                });
+            }
+        }
+    }
+
+    /// Shows `palette` on trial with "Keep this theme?" (`Window::Theme::Apply` of a theme
+    /// file, then `WarningWidget`). A trial started during another one keeps the first
+    /// theme to revert to.
+    pub(super) fn start_theme_trial(&mut self, palette: tg_theme::Palette) {
+        if self.theme_follow.trial_previous.is_none() {
+            self.theme_follow.trial_previous = Some(Box::new(self.theme_manager.palette().clone()));
+        }
+        self.theme_manager.set_palette(palette);
+        self.layer_stack.show_box(ModalBox::KeepTheme {
+            started: tg_app_core::clock::now(),
+        });
+    }
+
+    /// "Keep changes" (`KeepApplied`) or "Revert" (`Revert`) for a theme on trial.
+    pub(super) fn finish_theme_trial(&mut self, keep: bool) {
+        if let Some(previous) = self.theme_follow.trial_previous.take()
+            && !keep
+        {
+            self.theme_manager.set_palette(*previous);
+        }
+    }
+
     /// A built-in theme or accent colour was picked in Chat settings (`SetupDefaultThemes`,
     /// `apply`): a theme of the current mode is applied at once; a theme of the other mode
     /// is a night-mode switch, which asks first while auto-night mode forbids it.

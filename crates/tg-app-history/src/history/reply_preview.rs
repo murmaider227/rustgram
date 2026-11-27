@@ -472,43 +472,220 @@ fn paint_reply_thumb_image(
     Some(ReplyThumbPaint::Tint)
 }
 
+/// One laid-out line of a reply header's text.
+pub struct ReplyTextLine {
+    /// The line, its spoiler glyphs transparent.
+    pub galley: Arc<egui::Galley>,
+    /// Where the hidden spoiler glyphs are, relative to the galley's top-left, one rectangle
+    /// per run; the particle cover is drawn over them.
+    pub spoilers: Vec<Rect>,
+}
+
 /// One elided line of the reply text: its first `colored_len` bytes in `colored`
-/// (`Ui::Text::Colorized`, drawn with the reply palette's link colour), the rest in `plain`.
-pub fn reply_text_galley(
+/// (`Ui::Text::Colorized`, drawn with the reply palette's link colour), the rest in `plain`,
+/// and the byte ranges in `spoilers` hidden. The header never reveals them (`Reply::paint`
+/// draws its text with `.spoiler` and no click handler: a click on the header jumps to the
+/// message).
+#[allow(clippy::too_many_arguments)]
+pub fn reply_text_line(
     ui: &Ui,
     text: &str,
     colored_len: usize,
+    spoilers: &[std::ops::Range<usize>],
     font: FontId,
     colored: Color32,
     plain: Color32,
     max_w: f32,
-) -> Arc<egui::Galley> {
+) -> ReplyTextLine {
     let text = text.replace('\n', " ");
-    let mut split = colored_len.min(text.len());
-    while !text.is_char_boundary(split) {
-        split -= 1;
-    }
+    let (job, hidden) = reply_text_job(&text, colored_len, spoilers, font, colored, plain, max_w);
+    let galley = ui.painter().layout_job(job);
+    let spoilers = if hidden.is_empty() {
+        Vec::new()
+    } else {
+        hidden_glyph_rects(&galley, &hidden)
+    };
+    ReplyTextLine { galley, spoilers }
+}
+
+/// The layout job of one reply line and, per char of `text`, whether it is hidden (a spoiler).
+fn reply_text_job(
+    text: &str,
+    colored_len: usize,
+    spoilers: &[std::ops::Range<usize>],
+    font: FontId,
+    colored: Color32,
+    plain: Color32,
+    max_w: f32,
+) -> (egui::text::LayoutJob, Vec<bool>) {
+    let floor = |mut at: usize| {
+        at = at.min(text.len());
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    };
+    let split = floor(colored_len);
+    let ranges: Vec<std::ops::Range<usize>> = spoilers
+        .iter()
+        .map(|r| floor(r.start)..floor(r.end))
+        .filter(|r| r.start < r.end)
+        .collect();
+    let mut cuts: Vec<usize> = vec![0, split, text.len()];
+    cuts.extend(ranges.iter().flat_map(|r| [r.start, r.end]));
+    cuts.sort_unstable();
+    cuts.dedup();
     let mut job = egui::text::LayoutJob::default();
-    if split > 0 {
+    let mut hidden = Vec::new();
+    let any_hidden = !ranges.is_empty();
+    for pair in cuts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end {
+            continue;
+        }
+        let spoiler = ranges.iter().any(|r| r.start <= start && end <= r.end);
+        let color = if spoiler {
+            Color32::TRANSPARENT
+        } else if start < split {
+            colored
+        } else {
+            plain
+        };
+        if any_hidden {
+            hidden.extend(std::iter::repeat_n(
+                spoiler,
+                text[start..end].chars().count(),
+            ));
+        }
         job.append(
-            &text[..split],
+            &text[start..end],
             0.0,
-            egui::TextFormat::simple(font.clone(), colored),
+            egui::TextFormat::simple(font.clone(), color),
         );
-    }
-    if split < text.len() {
-        job.append(&text[split..], 0.0, egui::TextFormat::simple(font, plain));
     }
     job.wrap.max_width = max_w.max(1.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
-    job.wrap.overflow_character = Some('…');
-    ui.painter().layout_job(job)
+    job.wrap.overflow_character = Some('\u{2026}');
+    (job, hidden)
+}
+
+/// Rectangles of the glyphs of the chars marked in `hidden`, one per run of neighbouring
+/// glyphs. The line has no line breaks, so its glyphs are its chars in order, then the
+/// elision mark of a cut line, which is past `hidden` and never covered.
+fn hidden_glyph_rects(galley: &egui::Galley, hidden: &[bool]) -> Vec<Rect> {
+    let mut rects: Vec<Rect> = Vec::new();
+    let mut char_index = 0usize;
+    for placed in &galley.rows {
+        let row = &placed.row;
+        let count = row.glyphs.len();
+        let mut run: Option<Rect> = None;
+        for (i, glyph) in row.glyphs.iter().enumerate() {
+            let elision = galley.elided && i + 1 == count;
+            let is_hidden = !elision && hidden.get(char_index).copied().unwrap_or(false);
+            char_index += 1;
+            if !is_hidden {
+                rects.extend(run.take());
+                continue;
+            }
+            let rect = Rect::from_min_max(
+                Pos2::new(placed.pos.x + glyph.pos.x, placed.pos.y),
+                Pos2::new(
+                    placed.pos.x + glyph.pos.x + glyph.advance_width,
+                    placed.pos.y + row.size.y,
+                ),
+            );
+            run = Some(run.map_or(rect, |r| r.union(rect)));
+        }
+        rects.extend(run);
+    }
+    rects
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(
+        text: &str,
+        colored_len: usize,
+        spoiler: Option<std::ops::Range<usize>>,
+        max_w: f32,
+    ) -> (Arc<egui::Galley>, Vec<Rect>) {
+        let ctx = egui::Context::default();
+        tg_ui::fonts::register_tdesktop_fonts(&ctx);
+        let mut out = None;
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (job, hidden) = reply_text_job(
+                text,
+                colored_len,
+                spoiler.as_slice(),
+                FontId::proportional(13.0),
+                Color32::BLUE,
+                Color32::BLACK,
+                max_w,
+            );
+            let galley = ui.painter().layout_job(job);
+            let rects = hidden_glyph_rects(&galley, &hidden);
+            out = Some((galley, rects));
+        });
+        frame.textures_delta.clear();
+        out.unwrap_or_else(|| panic!("the frame ran"))
+    }
+
+    /// Where the glyph of byte `at` starts in a reply line of `text`.
+    fn x_of(galley: &egui::Galley, text: &str, at: usize) -> f32 {
+        let index = text[..at].chars().count();
+        galley.rows[0].row.glyphs[index].pos.x
+    }
+
+    #[test]
+    fn a_reply_spoiler_is_transparent_and_covered_where_its_glyphs_are() {
+        // TGB-3027: "Photo, " coloured, "secret" hidden under the particle cover.
+        let text = "Photo, look secret here";
+        let at = text.find("secret").unwrap_or(0);
+        let (galley, rects) = layout(text, "Photo,".len(), Some(at..at + 6), 1000.0);
+        let colors: Vec<(String, Color32)> = galley
+            .job
+            .sections
+            .iter()
+            .map(|s| {
+                let range = s.byte_range.start.0..s.byte_range.end.0;
+                (text[range].to_owned(), s.format.color)
+            })
+            .collect();
+        assert_eq!(
+            colors,
+            [
+                ("Photo,".to_owned(), Color32::BLUE),
+                (" look ".to_owned(), Color32::BLACK),
+                ("secret".to_owned(), Color32::TRANSPARENT),
+                (" here".to_owned(), Color32::BLACK),
+            ]
+        );
+        assert_eq!(rects.len(), 1, "{rects:?}");
+        let left = x_of(&galley, text, at);
+        let right = x_of(&galley, text, at + 6);
+        assert!((rects[0].min.x - left).abs() < 0.5, "{rects:?} vs {left}");
+        assert!((rects[0].max.x - right).abs() < 1.0, "{rects:?} vs {right}");
+        assert!(rects[0].height() > 10.0);
+    }
+
+    #[test]
+    fn the_elision_mark_of_a_cut_spoiler_is_not_covered() {
+        let text = "a secret that is much longer than the reply header";
+        let (galley, rects) = layout(text, 0, Some(2..text.len()), 80.0);
+        assert!(galley.elided);
+        assert_eq!(rects.len(), 1);
+        let last = galley.rows[0].row.glyphs.last().map(|g| g.pos.x);
+        assert!(last.is_some_and(|x| rects[0].max.x <= x + 0.5), "{rects:?}");
+        // A spoiler that starts after the cut has nothing on screen to cover.
+        let (_, rects) = layout(text, 0, Some(text.len() - 6..text.len()), 80.0);
+        assert!(rects.is_empty(), "{rects:?}");
+        // Ranges off char boundaries or past the end are clamped, never panic.
+        let (_, rects) = layout("ü secret", 0, Some(1..500), 1000.0);
+        assert_eq!(rects.len(), 1);
+    }
 
     #[test]
     fn preview_geometry_matches_tdesktop() {

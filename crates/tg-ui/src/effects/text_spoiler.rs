@@ -277,6 +277,25 @@ fn mess_for(ctx: &Context) -> Arc<TextSpoilerMess> {
     mess
 }
 
+fn paused_pass_id() -> Id {
+    Id::unique("tg_text_spoiler_paused_pass")
+}
+
+/// Stops the text spoiler covers painted in the rest of this pass from asking for the next
+/// frame: the window is inactive or a layer covers the chat (`PaintContext::pausedSpoiler`).
+/// They keep the frame they show; call it every pass while that lasts.
+pub fn pause_text_spoilers_this_pass(ctx: &Context) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(paused_pass_id(), pass));
+}
+
+/// Whether [`pause_text_spoilers_this_pass`] was called in this pass.
+#[must_use]
+pub fn text_spoilers_paused(ctx: &Context) -> bool {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<u64>(paused_pass_id())) == Some(pass)
+}
+
 /// The frame shown at `time_secs` (`SpoilerAnimation::index`) and how long it stays.
 #[must_use]
 pub fn text_spoiler_frame_at(time_secs: f64) -> (usize, Duration) {
@@ -345,7 +364,7 @@ pub fn paint_text_spoiler(
         return;
     };
     let (frame, next) = text_spoiler_frame_at(ctx.input(|i| i.time));
-    if next != Duration::MAX {
+    if next != Duration::MAX && !text_spoilers_paused(ctx) {
         ctx.request_repaint_after(next);
     }
     let Some(dots) = mess.frames.get(frame) else {
@@ -514,5 +533,50 @@ mod tests {
         for v in &meshes[0].vertices {
             assert!(rect.expand(0.01).contains(v.pos), "{:?} outside", v.pos);
         }
+    }
+
+    /// How soon the pass that paints a cover asks for the next one, with or without the pause.
+    fn repaint_delay(paused: bool) -> Duration {
+        let ctx = Context::default();
+        let rect = Rect::from_min_size(pos2(10.0, 10.0), Vec2::new(80.0, 18.0));
+        // egui asks for two more passes after the first one by itself; the fourth shows what
+        // the cover asks for.
+        let mut output = None;
+        for _ in 0..4 {
+            let mut pass = ctx.run_ui(egui::RawInput::default(), |ui| {
+                if paused {
+                    pause_text_spoilers_this_pass(ui.ctx());
+                }
+                let painter = ui.painter().clone();
+                paint_text_spoiler(ui.ctx(), &painter, &[rect], rect.min, Color32::GRAY, 1.0);
+            });
+            pass.textures_delta.clear();
+            output = Some(pass);
+        }
+        let Some(output) = output else {
+            return Duration::ZERO;
+        };
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay)
+    }
+
+    #[test]
+    fn a_paused_cover_asks_for_no_next_frame() {
+        // TGB-3029: `pausedSpoiler` while the window is inactive or the chat is covered.
+        assert!(repaint_delay(false) <= Duration::from_millis(TEXT_SPOILER_FRAME_MS));
+        assert_eq!(repaint_delay(true), Duration::MAX);
+        // The pause lasts one pass: the next pass animates again unless paused again.
+        let ctx = Context::default();
+        let mut first = ctx.run_ui(egui::RawInput::default(), |ui| {
+            pause_text_spoilers_this_pass(ui.ctx());
+            assert!(text_spoilers_paused(ui.ctx()));
+        });
+        first.textures_delta.clear();
+        let mut second = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(!text_spoilers_paused(ui.ctx()));
+        });
+        second.textures_delta.clear();
     }
 }

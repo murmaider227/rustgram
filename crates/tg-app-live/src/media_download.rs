@@ -19,7 +19,9 @@ use tg_video::RangeLoader;
 
 use crate::convert::{to_data_msg, to_data_peer};
 use crate::media::{TelegramRangeLoader, message_media_to_location};
+use crate::media_cache::{LiveMediaCache, MAX_INLINE_AUTO_DOWNLOAD_BYTES};
 use crate::session::LiveSession;
+use crate::stream_fill::FillingLoader;
 
 fn message(live: &LiveSession, peer_id: PeerId, msg_id: MsgId) -> Option<tg_data::Message> {
     let id = FullMsgId::new(to_data_peer(peer_id), to_data_msg(msg_id));
@@ -48,6 +50,7 @@ pub fn stream(live: &LiveSession, peer_id: PeerId, msg_id: MsgId) -> Option<Arc<
     if resolved.size == 0 {
         return None;
     }
+    let resolved_size = resolved.size;
     let origin = FileOrigin {
         peer_id: Some(to_data_peer(peer_id).0),
         msg_id: Some(msg_id.0),
@@ -64,7 +67,25 @@ pub fn stream(live: &LiveSession, peer_id: PeerId, msg_id: MsgId) -> Option<Arc<
     if cache.is_persistent() {
         loader = loader.with_storage_dir(cache.root_dir().join("streamed"));
     }
-    Some(Arc::new(loader))
+    let size = resolved_size;
+    let loader: Arc<dyn RangeLoader> = Arc::new(loader);
+    // TGB-3115: once the stream has read the whole file it is kept in the media cache, so the
+    // message counts as loaded (no size in its status line) and the next play reads the file.
+    let Some((key, tag, _)) = LiveMediaCache::download_target(msg.media()?) else {
+        return Some(loader);
+    };
+    if size > MAX_INLINE_AUTO_DOWNLOAD_BYTES {
+        return Some(loader);
+    }
+    let cache = cache.clone();
+    let bridge = Arc::clone(live.bridge_state());
+    Some(Arc::new(FillingLoader::new(
+        loader,
+        move |bytes| match cache.put_blob(&key, tag, &bytes) {
+            Ok(()) => bridge.notify_ui(),
+            Err(err) => tracing::warn!("streamed file not cached: {err}"),
+        },
+    )))
 }
 
 /// Cancels the running download of the photo or voice file of `msg_id`.

@@ -8,9 +8,11 @@
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::error::{Result, StreamingError};
 use crate::ffmpeg::{DecodedMediaFrame, FfmpegMedia, FfmpegOpenOptions, MediaStreamInfo};
+use crate::streaming::{RangeLoader, StreamingReader};
 use crate::types::{
     DURATION_UNAVAILABLE, FrameData, MAX_FRAME_AREA, MAX_INLINE_AREA, OutputPixelFormat, Size,
     VideoFrame,
@@ -161,6 +163,29 @@ impl ClipReader {
                 video_max_area: mode.max_area(),
                 thread_count: 0,
             },
+        )?;
+        Self::finish_init(media, data_size, mode)
+    }
+
+    /// Opens a clip reader over a file that `loader` serves part by part while it downloads
+    /// (TGB-3116: a round video message plays before its last part arrives). Reads block until
+    /// the parts they need are there, so open and decode it off the UI thread
+    /// ([`crate::streaming::StreamedClip`]).
+    pub fn from_range_loader(loader: Arc<dyn RangeLoader>, mode: ClipMode) -> Result<Self> {
+        let data_size = loader.size();
+        let reader = StreamingReader::new(loader, None)?;
+        let media = FfmpegMedia::open(
+            Box::new(reader),
+            FfmpegOpenOptions {
+                seekable: true,
+                ignore_editlist: false,
+                hw_allowed: false,
+                open_video: true,
+                open_audio: false,
+                video_max_area: mode.max_area(),
+                thread_count: 0,
+            },
+            0,
         )?;
         Self::finish_init(media, data_size, mode)
     }

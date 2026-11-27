@@ -8,6 +8,7 @@
 
 pub mod accounts_menu;
 pub mod strings;
+pub mod window_close;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

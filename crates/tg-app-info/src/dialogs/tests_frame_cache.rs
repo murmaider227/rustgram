@@ -37,6 +37,7 @@ struct VersionedBackend {
     version: u64,
     list_reads: Cell<u64>,
     rows_converted: Cell<u64>,
+    search_runs: Cell<u64>,
 }
 
 impl VersionedBackend {
@@ -46,6 +47,7 @@ impl VersionedBackend {
             version: 1,
             list_reads: Cell::new(0),
             rows_converted: Cell::new(0),
+            search_runs: Cell::new(0),
         }
     }
 
@@ -158,7 +160,12 @@ impl DialogsBackend for VersionedBackend {
         self.change(|s| s.delete_dialog(peer_id));
     }
 
+    fn search_version(&self) -> u64 {
+        self.version
+    }
+
     fn search_dialogs(&self, request: &SearchRequest) -> SearchResults {
+        self.search_runs.set(self.search_runs.get() + 1);
         self.store.search_dialogs(request)
     }
 
@@ -747,4 +754,78 @@ fn chat_list_frame_timings() {
         let mut store = MockDialogsStore::with_total_dialogs(total);
         time_list_frames("unversioned mock store", &mut store, listed);
     }
+}
+
+/// TGB-2921: the search view searches once per query and backend version, not once per frame
+/// and per arrow key; a new version (e.g. remote results that arrived) searches on the next
+/// frame.
+#[test]
+fn search_view_searches_only_when_the_query_or_the_backend_changed() {
+    use crate::dialogs::DialogsShortcut;
+    use crate::dialogs::widget::DialogsPanel;
+    use tg_app_core::stand_in::strings::EnglishStrings;
+
+    let mut backend = VersionedBackend::new(600);
+    let harness = ListHarness::new();
+    let mut panel = DialogsPanel::new();
+    panel.search_active = true;
+    panel.search_query = "a".to_owned();
+    let palette = Palette::for_mode(ThemeMode::Day);
+    let mut time = 0.0_f64;
+    let mut frame = |panel: &mut DialogsPanel, backend: &mut VersionedBackend| {
+        time += FRAME_DT;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, COLUMN)),
+            time: Some(time),
+            ..Default::default()
+        };
+        harness
+            .ctx
+            .run_ui(input, |ui| {
+                ui.scope_builder(
+                    UiBuilder::new().max_rect(Rect::from_min_size(Pos2::ZERO, COLUMN)),
+                    |ui| {
+                        panel.show_column(
+                            ui,
+                            backend,
+                            PeerId::ZERO,
+                            true,
+                            false,
+                            true,
+                            false,
+                            &palette,
+                            &EnglishStrings,
+                        );
+                    },
+                );
+            })
+            .drop_without_applying_deltas();
+    };
+
+    frame(&mut panel, &mut backend);
+    let runs = backend.search_runs.get();
+    assert!(runs >= 1);
+    for _ in 0..60 {
+        frame(&mut panel, &mut backend);
+    }
+    let _ = panel.apply_shortcut(DialogsShortcut::MoveDown, &mut backend, PeerId::ZERO);
+    let _ = panel.apply_shortcut(DialogsShortcut::MoveUp, &mut backend, PeerId::ZERO);
+    assert_eq!(
+        backend.search_runs.get(),
+        runs,
+        "idle frames and arrow keys must not search again"
+    );
+
+    let peer = fifth_row_peer(&backend);
+    backend.mark_dialog_unread(peer);
+    frame(&mut panel, &mut backend);
+    assert_eq!(
+        backend.search_runs.get(),
+        runs + 1,
+        "a new backend version searches on the next frame"
+    );
+
+    panel.search_query.push('b');
+    frame(&mut panel, &mut backend);
+    assert_eq!(backend.search_runs.get(), runs + 2, "a new query searches");
 }

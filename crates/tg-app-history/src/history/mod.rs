@@ -17,6 +17,7 @@ pub mod compose_boxes;
 pub mod compose_extras;
 pub mod compose_search;
 pub mod compose_stash;
+pub mod copy_restriction;
 pub mod copy_selection;
 pub mod delete_box;
 mod delete_collapse;
@@ -148,6 +149,20 @@ mod tests_w5_copy;
 mod tests_w5_copy_snap;
 #[cfg(test)]
 mod tests_w5_delete;
+#[cfg(test)]
+mod tests_w8_block_selection;
+#[cfg(test)]
+mod tests_w8_copy_restriction;
+#[cfg(test)]
+mod tests_w8_custom_emoji_snap;
+#[cfg(test)]
+mod tests_w8_drag_select;
+#[cfg(test)]
+mod tests_w8_static_sticker;
+#[cfg(test)]
+mod tests_w8_sticker_time_snap;
+#[cfg(test)]
+mod tests_w8_wide_userpics;
 #[cfg(test)]
 mod tests_wave4_media;
 #[cfg(test)]
@@ -308,6 +323,8 @@ pub enum HistoryAction {
         /// Non-empty trimmed message body.
         text: String,
     },
+    /// User clicked a sticker of a set: show the pack (`StickerSetBox`).
+    OpenStickerSet(crate::history::backend::StickerSetId),
     /// User clicked a media attachment (photo, video, album tile, or voice note).
     OpenMedia {
         /// Peer owning the message.
@@ -2466,12 +2483,20 @@ impl HistoryWidget {
                     }
                 }
                 TopBarEvent::CopySelected => {
-                    let copied = self.inner.extract_selected_text();
-                    if !copied.is_empty() {
-                        ui.ctx().copy_text(copied);
-                        self.show_toast("Copied selected messages", now_secs);
+                    // `copySelectedText` refuses with a toast and keeps the selection.
+                    if let Some(toast) = self.inner.selection_copy_restriction(
+                        backend.peer_allows_forwarding(peer_id),
+                        peer_info.summary.kind,
+                    ) {
+                        self.show_toast(toast, now_secs);
+                    } else {
+                        let copied = self.inner.extract_selected_text();
+                        if !copied.is_empty() {
+                            ui.ctx().copy_text(copied);
+                            self.show_toast("Copied selected messages", now_secs);
+                        }
+                        self.inner.clear_selection();
                     }
-                    self.inner.clear_selection();
                 }
                 TopBarEvent::DeleteSelected => {
                     let ids = self.inner.selected_msg_ids();
@@ -5445,11 +5470,17 @@ impl HistoryWidget {
                         force_confirm: false,
                     });
                 }
+                InnerEvent::CopyRestricted(toast) => {
+                    self.show_toast(toast, now_secs);
+                }
                 InnerEvent::CopiedRich { summary, rich } => {
                     self.compose.copied_rich_buffer = Some(rich);
                     if !summary.is_empty() {
                         self.show_toast(summary, now_secs);
                     }
+                }
+                InnerEvent::OpenStickerSet(set) => {
+                    out_action = Some(HistoryAction::OpenStickerSet(set));
                 }
                 InnerEvent::OpenMedia {
                     msg_id,

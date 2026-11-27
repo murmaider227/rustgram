@@ -242,6 +242,8 @@ pub struct MockHistoryStore {
     hidden_settings_bars: Vec<PeerId>,
     blocked_from_replies:
         Vec<tg_app_core::core_types::dto::contacts_extras::BlockFromRepliesRequest>,
+    /// Chats with "Restrict saving content" (`peer_allows_forwarding` is false), for tests.
+    copy_restricted: HashSet<PeerId>,
 }
 
 impl Default for MockHistoryStore {
@@ -772,6 +774,7 @@ impl MockHistoryStore {
                     width: 512,
                     height: 512,
                     lottie_json: sample_lottie_star_json(),
+                    set: None,
                 })),
                 service: None,
                 reply: None,
@@ -858,6 +861,7 @@ impl MockHistoryStore {
                     preview_thumb_rgb: None,
                     preview_thumb: None,
                     preview_colored_len: 0,
+                    preview_spoilers: Vec::new(),
                     quote_text: None,
                 }),
                 forward: None,
@@ -966,6 +970,7 @@ impl MockHistoryStore {
                         preview_thumb_rgb: None,
                         preview_thumb: None,
                         preview_colored_len: 0,
+                        preview_spoilers: Vec::new(),
                         quote_text: None,
                     }),
                     forward: None,
@@ -1197,6 +1202,7 @@ impl MockHistoryStore {
             reported_spam_peers: Vec::new(),
             hidden_settings_bars: Vec::new(),
             blocked_from_replies: Vec::new(),
+            copy_restricted: HashSet::new(),
         }
     }
 
@@ -1342,6 +1348,10 @@ impl HistoryBackend for MockHistoryStore {
         (self.self_peer_id, self.self_name.clone())
     }
 
+    fn peer_allows_forwarding(&self, peer_id: PeerId) -> bool {
+        !self.copy_restricted.contains(&peer_id)
+    }
+
     fn try_load_slice_around(
         &self,
         peer_id: PeerId,
@@ -1476,6 +1486,7 @@ impl HistoryBackend for MockHistoryStore {
                     preview_thumb_rgb: None,
                     preview_thumb: None,
                     preview_colored_len: 0,
+                    preview_spoilers: Vec::new(),
                     quote_text: None,
                 })
         });
@@ -1946,6 +1957,7 @@ impl HistoryBackend for MockHistoryStore {
                 preview_thumb_rgb: None,
                 preview_thumb: None,
                 preview_colored_len: 0,
+                preview_spoilers: Vec::new(),
                 quote_text: request.reply_quote.as_ref().map(|q| q.text.clone()),
             }
         });
@@ -2799,6 +2811,15 @@ impl MockHistoryStore {
     /// Sets the thumbnail `reply_preview_thumb` serves for replies to `msg_id`.
     pub fn set_reply_preview_thumb(&mut self, peer_id: PeerId, msg_id: MsgId, bytes: Vec<u8>) {
         self.reply_preview_thumbs.insert((peer_id, msg_id), bytes);
+    }
+
+    /// Turns "Restrict saving content" on or off for `peer_id` (tests).
+    pub fn set_copy_restricted(&mut self, peer_id: PeerId, restricted: bool) {
+        if restricted {
+            self.copy_restricted.insert(peer_id);
+        } else {
+            self.copy_restricted.remove(&peer_id);
+        }
     }
 
     /// Appends a custom synthetic message directly to `peer_id` (used by tests & screenshots).

@@ -520,6 +520,11 @@ pub struct StickerInput {
     pub custom_size: i32,
     /// Optional user setting override (`sticker-size` option, clamped to `50..=max`).
     pub option_sticker_size: Option<i32>,
+    /// `UnwrappedMedia::bottomInfoWidth` of a sticker message: the media reserves it to the
+    /// right of the sticker, where an incoming message draws its time. `None` for content that
+    /// is laid out as a sticker but is not `UnwrappedMedia` (a video message with its
+    /// transcription).
+    pub bottom_info_width: Option<i32>,
 }
 
 /// Maximum bounding box for regular stickers (`Sticker::Size()`, `history_view_sticker.cpp:200-210`).
@@ -1315,6 +1320,8 @@ pub enum MediaInput {
     Grouped(GroupedMediaInput),
     /// A message of only 1-3 emoji drawn large without a bubble.
     LargeEmoji(LargeEmojiInput),
+    /// A message of only custom emoji drawn large without a bubble (`HistoryView::CustomEmoji`).
+    CustomEmoji(CustomEmojiInput),
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1338,121 @@ pub struct LargeEmojiInput {
     /// 2 * msgDateImgPadding.x`, `0` when the bottom info is hidden. The media reserves it to the
     /// right of the emoji, where an incoming message draws its time.
     pub bottom_info_width: i32,
+}
+
+/// A message of only custom emoji (`Ui::Text::OnlyCustomEmoji`): `UnwrappedMedia` around
+/// `HistoryView::CustomEmoji`, any number of lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomEmojiInput {
+    /// Custom emoji per line (a line may be empty).
+    pub lines: Vec<usize>,
+    /// See [`LargeEmojiInput::bottom_info_width`].
+    pub bottom_info_width: i32,
+}
+
+impl CustomEmojiInput {
+    /// The side of one emoji (`CustomEmoji::CustomEmoji`): by the larger of the line count and
+    /// the longest line, 1-3 as the emoji sticker at 100%, 70% or 52% of
+    /// `Sticker::EmojiSize()`; 4-5 at the `Isolated` and 6-7 at the `Large` custom emoji frame,
+    /// more at the `Normal` one (`AdjustCustomEmojiSize` of 38, 24 and 18 px).
+    #[must_use]
+    pub fn single_size(&self) -> i32 {
+        let widest = self.lines.iter().copied().max().unwrap_or(0);
+        match self.lines.len().max(widest) {
+            0 | 1 => MAX_ANIMATED_EMOJI_SIZE,
+            2 => scaled_round(MAX_ANIMATED_EMOJI_SIZE, 0.7),
+            3 => scaled_round(MAX_ANIMATED_EMOJI_SIZE, 0.52),
+            4 | 5 => adjust_custom_emoji_size(LARGE_EMOJI_SIZE + 2 * LARGE_EMOJI_OUTLINE),
+            6 | 7 => adjust_custom_emoji_size(EMOJI_SIZE * 4 / 3),
+            _ => adjust_custom_emoji_size(EMOJI_SIZE),
+        }
+    }
+
+    /// `CustomEmoji::countOptimalSize`: the longest line by the line count.
+    #[must_use]
+    pub fn optimal_size(&self) -> Size {
+        let single = self.single_size();
+        let widest = self.lines.iter().copied().max().unwrap_or(0);
+        Size::new(
+            single.saturating_mul(i32::try_from(widest).unwrap_or(i32::MAX)),
+            single.saturating_mul(i32::try_from(self.lines.len()).unwrap_or(i32::MAX)),
+        )
+    }
+
+    /// `CustomEmoji::countCurrentSize`: lines longer than `width` wrap.
+    #[must_use]
+    pub fn current_size(&self, width: i32) -> Size {
+        let single = self.single_size().max(1);
+        let per_row = (width / single).max(1) as usize;
+        let mut size = Size::new(0, 0);
+        for &count in &self.lines {
+            let shown = count.min(per_row) as i32;
+            size.width = size.width.max(shown * single);
+            let rows = count.div_ceil(per_row).max(1) as i32;
+            size.height = size.height.saturating_add(rows * single);
+        }
+        size
+    }
+
+    /// Where each emoji of line-major index order is drawn in `inner` (`CustomEmoji::draw`), as
+    /// `(line, index in line, rect)`.
+    #[must_use]
+    pub fn cells(&self, inner: Rect) -> Vec<(usize, usize, Rect)> {
+        let single = self.single_size().max(1);
+        let per_row = (inner.width / single).max(1) as usize;
+        let mut out = Vec::new();
+        let mut y = inner.y;
+        for (line, &count) in self.lines.iter().enumerate() {
+            let rows = count.div_ceil(per_row).max(1);
+            for row in 0..rows {
+                for column in 0..per_row {
+                    let index = row * per_row + column;
+                    if index >= count {
+                        break;
+                    }
+                    let x = inner.x + column as i32 * single;
+                    out.push((line, index, Rect::new(x, y, single, single)));
+                }
+                y += single;
+            }
+        }
+        out
+    }
+
+    /// `CustomEmoji::alwaysShowOutTimestamp`: one line of more than three emoji.
+    #[must_use]
+    pub fn always_show_out_timestamp(&self) -> bool {
+        self.lines.len() == 1 && self.lines[0] > 3
+    }
+}
+
+/// `base::SafeRound(value * factor)`.
+fn scaled_round(value: i32, factor: f64) -> i32 {
+    (f64::from(value) * factor).round() as i32
+}
+
+/// `Ui::Text::AdjustCustomEmojiSize`: a custom emoji frame is 12% larger than the emoji.
+#[must_use]
+pub fn adjust_custom_emoji_size(emoji_size: i32) -> i32 {
+    scaled_round(emoji_size, 1.12)
+}
+
+impl MediaInput {
+    /// For `UnwrappedMedia` (a sticker, large or custom emoji): the content's size in media
+    /// `width` and the info width the media reserves to its right
+    /// (`UnwrappedMedia::bottomInfoWidth`).
+    #[must_use]
+    pub fn unwrapped_emoji_content(&self, width: i32) -> Option<(Size, i32)> {
+        match self {
+            Self::LargeEmoji(e) => Some((large_emoji_size(e.count), e.bottom_info_width)),
+            Self::CustomEmoji(e) => Some((e.current_size(width), e.bottom_info_width)),
+            Self::Sticker(s) => s.bottom_info_width.map(|info| {
+                let content = count_sticker_optimal_size(s);
+                (Size::new(content.width.min(width), content.height), info)
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Size of the emoji row (`LargeEmoji::countOptimalSize`): each emoji with its outline, steps of
@@ -1351,7 +1473,13 @@ pub const fn large_emoji_inner_rect(
     count: usize,
     has_right_layout: bool,
 ) -> Rect {
-    let size = large_emoji_size(count);
+    unwrapped_content_rect(media_rect, large_emoji_size(count), has_right_layout)
+}
+
+/// Where unwrapped content of `size` sits in the media rectangle (`UnwrappedMedia::draw`): at
+/// the top right of a right-aligned message, at the bottom left otherwise.
+#[must_use]
+pub const fn unwrapped_content_rect(media_rect: Rect, size: Size, has_right_layout: bool) -> Rect {
     if has_right_layout {
         Rect::new(
             media_rect.x + media_rect.width - size.width,
@@ -1454,8 +1582,39 @@ impl MediaInput {
                     grouped: None,
                 }
             }
+            Self::CustomEmoji(e) => {
+                // `UnwrappedMedia::countOptimalSize` / `countCurrentSize` around
+                // `CustomEmoji`: the lines wrap when the message is narrower.
+                let content = e.optimal_size();
+                let min_height = EMOJI_SIZE.max(MSG_PHOTO_SIZE);
+                let optimal = Size::new(
+                    content.width + e.bottom_info_width,
+                    content.height.max(min_height),
+                );
+                let width = optimal.width.min(available_width);
+                let current = e.current_size(width);
+                MediaLayout {
+                    optimal_size: optimal,
+                    current_size: Size::new(width, current.height.max(min_height)),
+                    needs_bubble: false,
+                    unwrapped: true,
+                    enforce_bubble_width: false,
+                    skip_bubble_tail: true,
+                    is_bubble_top: true,
+                    is_bubble_bottom: true,
+                    grouped: None,
+                }
+            }
             Self::Sticker(s) => {
-                let optimal = count_sticker_optimal_size(s);
+                // `UnwrappedMedia::countOptimalSize`: the sticker plus the info width.
+                let content = count_sticker_optimal_size(s);
+                let optimal = match s.bottom_info_width {
+                    Some(info) => Size::new(
+                        content.width + info,
+                        content.height.max(EMOJI_SIZE.max(MSG_PHOTO_SIZE)),
+                    ),
+                    None => content,
+                };
                 MediaLayout {
                     optimal_size: optimal,
                     current_size: Size::new(optimal.width.min(available_width), optimal.height),
@@ -1584,5 +1743,61 @@ impl MediaInput {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod custom_emoji_tests {
+    use super::*;
+
+    fn input(lines: &[usize]) -> CustomEmojiInput {
+        CustomEmojiInput {
+            lines: lines.to_vec(),
+            bottom_info_width: 0,
+        }
+    }
+
+    #[test]
+    fn the_emoji_size_follows_the_larger_of_lines_and_widest_line() {
+        // TGB-3097: `SizesInfo` (1, 0.7, 0.52 of 112 px), then the `Isolated`, `Large` and
+        // `Normal` custom emoji frames.
+        let sides: Vec<i32> = [&[1][..], &[2], &[1, 1, 1], &[4], &[1, 5], &[6], &[7], &[8]]
+            .iter()
+            .map(|lines| input(lines).single_size())
+            .collect();
+        assert_eq!(sides, [112, 78, 58, 43, 43, 27, 27, 20]);
+        assert_eq!(input(&[2, 1]).optimal_size(), Size::new(156, 156));
+    }
+
+    #[test]
+    fn long_lines_wrap_to_the_width() {
+        // Eight `Normal` (20 px) emoji in 70 px: three per row, three rows.
+        let e = input(&[8]);
+        assert_eq!(e.current_size(70), Size::new(60, 60));
+        let cells = e.cells(Rect::new(10, 20, 70, 60));
+        assert_eq!(cells.len(), 8);
+        assert_eq!(cells[3], (0, 3, Rect::new(10, 40, 20, 20)));
+        assert_eq!(cells[7], (0, 7, Rect::new(30, 60, 20, 20)));
+        // An empty line still takes a row (`std::max(rows, 1)`).
+        assert_eq!(input(&[1, 0, 1]).current_size(500).height, 3 * 58);
+        assert!(input(&[4]).always_show_out_timestamp());
+        assert!(!input(&[3]).always_show_out_timestamp());
+        assert!(!input(&[4, 1]).always_show_out_timestamp());
+    }
+
+    #[test]
+    fn a_custom_emoji_message_is_unwrapped_media() {
+        let media = MediaInput::CustomEmoji(CustomEmojiInput {
+            lines: vec![2],
+            bottom_info_width: 50,
+        });
+        let fonts = FontMetrics::default();
+        let layout = media.layout(1000, false, false, &fonts);
+        assert!(layout.unwrapped && !layout.needs_bubble);
+        assert_eq!(layout.optimal_size, Size::new(2 * 78 + 50, 78));
+        assert_eq!(
+            media.unwrapped_emoji_content(206),
+            Some((Size::new(156, 78), 50))
+        );
     }
 }

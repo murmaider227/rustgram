@@ -3849,6 +3849,14 @@ impl HistoryBackend for LiveSession {
         crate::chat_l233::peer_no_forwards_enabled_live(self, peer_id)
     }
 
+    fn peer_allows_forwarding(&self, peer_id: PeerId) -> bool {
+        let data_peer = to_data_peer(peer_id);
+        self.read_session(|s| {
+            s.peer(data_peer)
+                .is_none_or(tg_data::Peer::allows_forwarding)
+        })
+    }
+
     fn is_no_forwards_request_acted(&self, peer_id: PeerId, msg_id: MsgId) -> bool {
         crate::chat_l233::is_no_forwards_request_acted_live(self, peer_id, msg_id)
     }
@@ -7472,6 +7480,14 @@ impl tg_app_core::session_api::AppSession for LiveSession {
         is_emoji: bool,
     ) -> Result<tg_app_core::session_api::StickerSetPreview, String> {
         self.deep_link_resolve_sticker_set(short_name, is_emoji)
+    }
+
+    fn resolve_sticker_set_by_id(
+        &mut self,
+        set_id: u64,
+        access_hash: u64,
+    ) -> Result<tg_app_core::session_api::StickerSetPreview, String> {
+        self.deep_link_resolve_sticker_set_by_id(set_id, access_hash)
     }
 
     fn resolve_cloud_theme(

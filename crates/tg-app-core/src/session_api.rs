@@ -541,6 +541,16 @@ pub trait AppSession:
         Ok(peers.len())
     }
 
+    /// Fetches the pack of a sticker by its set id and access hash (`messages.getStickerSet`
+    /// with `inputStickerSetID`), as `StickerSetBox` does for a clicked sticker.
+    fn resolve_sticker_set_by_id(
+        &mut self,
+        _set_id: u64,
+        _access_hash: u64,
+    ) -> Result<StickerSetPreview, String> {
+        Err("STICKERSET_INVALID".to_owned())
+    }
+
     /// Fetches sticker or custom-emoji pack metadata (`messages.getStickerSet`).
     fn resolve_sticker_set(
         &mut self,

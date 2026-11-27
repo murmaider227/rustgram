@@ -1805,7 +1805,7 @@ impl MediaOverlayWidget {
                 i.key_pressed(Key::Minus),
                 i.key_pressed(Key::Num0),
                 ctrl && i.key_pressed(Key::S),
-                ctrl && i.key_pressed(Key::C),
+                tg_ui::clipboard::copy_requested(i),
                 ctrl,
                 alt,
             )

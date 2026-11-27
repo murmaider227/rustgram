@@ -5,6 +5,7 @@
 //! `PasscodeLockWidget::suggestSystemUnlock`, `Platform::ResolveCurrentExactLocation`); here the
 //! UI polls [`PlatformCall::poll`] once per frame instead.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -29,12 +30,17 @@ pub enum PlatformCallState<T> {
 #[derive(Debug)]
 pub struct PlatformCall<T> {
     rx: Arc<Mutex<Receiver<T>>>,
+    /// The value was handed out: no other will come, whether or not the worker has finished
+    /// (TGB-3028: right after `Done` the worker may still hold its sender, which made the next
+    /// poll answer `Pending` instead of `Lost`).
+    delivered: Arc<AtomicBool>,
 }
 
 impl<T> Clone for PlatformCall<T> {
     fn clone(&self) -> Self {
         Self {
             rx: Arc::clone(&self.rx),
+            delivered: Arc::clone(&self.delivered),
         }
     }
 }
@@ -45,9 +51,7 @@ impl<T: Send + 'static> PlatformCall<T> {
     pub fn ready(value: T) -> Self {
         let (tx, rx) = sync_channel(1);
         let _ = tx.send(value);
-        Self {
-            rx: Arc::new(Mutex::new(rx)),
-        }
+        Self::from_receiver(rx)
     }
 
     /// Wraps an externally-driven single-shot [`Receiver`] (for example a `tokio` background task
@@ -56,6 +60,7 @@ impl<T: Send + 'static> PlatformCall<T> {
     pub fn from_receiver(rx: Receiver<T>) -> Self {
         Self {
             rx: Arc::new(Mutex::new(rx)),
+            delivered: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -79,26 +84,35 @@ impl<T: Send + 'static> PlatformCall<T> {
         if let Err(err) = spawned {
             tracing::warn!(%err, label, "Failed to start platform call thread");
         }
-        Self {
-            rx: Arc::new(Mutex::new(rx)),
-        }
+        Self::from_receiver(rx)
     }
 
     /// Returns the value once it is ready, without blocking.
     pub fn poll(&self) -> PlatformCallState<T> {
         let rx = self.rx.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.delivered.load(Ordering::Acquire) {
+            return PlatformCallState::Lost;
+        }
         match rx.try_recv() {
-            Ok(value) => PlatformCallState::Done(value),
+            Ok(value) => self.deliver(value),
             Err(TryRecvError::Empty) => PlatformCallState::Pending,
             Err(TryRecvError::Disconnected) => PlatformCallState::Lost,
         }
     }
 
+    fn deliver(&self, value: T) -> PlatformCallState<T> {
+        self.delivered.store(true, Ordering::Release);
+        PlatformCallState::Done(value)
+    }
+
     /// Blocks up to `timeout` for the value (tests and shutdown paths only, never a UI frame).
     pub fn wait(&self, timeout: Duration) -> PlatformCallState<T> {
         let rx = self.rx.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.delivered.load(Ordering::Acquire) {
+            return PlatformCallState::Lost;
+        }
         match rx.recv_timeout(timeout) {
-            Ok(value) => PlatformCallState::Done(value),
+            Ok(value) => self.deliver(value),
             Err(RecvTimeoutError::Timeout) => PlatformCallState::Pending,
             Err(RecvTimeoutError::Disconnected) => PlatformCallState::Lost,
         }
@@ -125,6 +139,25 @@ mod tests {
             PlatformCallState::Done(7)
         );
         assert_eq!(call.poll(), PlatformCallState::Lost);
+    }
+
+    /// The worker keeps its sender until its closure returns: a slow end (here a sleep after
+    /// the send, like the repaint request) must not turn the poll after `Done` into `Pending`.
+    #[test]
+    fn poll_after_done_is_lost_while_the_worker_still_holds_its_sender() {
+        let (tx, rx) = sync_channel(1);
+        let call = PlatformCall::from_receiver(rx);
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(9_u32);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        assert_eq!(
+            call.wait(Duration::from_secs(5)),
+            PlatformCallState::Done(9)
+        );
+        assert_eq!(call.poll(), PlatformCallState::Lost);
+        assert_eq!(call.clone().poll(), PlatformCallState::Lost);
+        let _ = worker.join();
     }
 
     #[test]

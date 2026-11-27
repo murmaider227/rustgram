@@ -1513,7 +1513,7 @@ impl WindowShellExtras {
         ctx: &egui::Context,
         viewport_rect: Rect,
         palette: &Palette,
-        dialogs: &dyn Fn() -> Vec<tg_app_core::stand_in::types::DialogEntry>,
+        dialogs: &mut dyn FnMut() -> std::sync::Arc<Vec<tg_app_core::stand_in::types::DialogEntry>>,
     ) -> Option<PeerId> {
         let mut open_peer = None;
 
@@ -1522,9 +1522,9 @@ impl WindowShellExtras {
                 ChatPreviewAction::OpenChat(peer) => open_peer = Some(peer),
                 ChatPreviewAction::OpenSeparateWindow(peer) => {
                     let title = dialogs()
-                        .into_iter()
+                        .iter()
                         .find(|d| d.peer.id == peer)
-                        .map_or_else(|| format!("Chat {}", peer.0), |d| d.peer.title);
+                        .map_or_else(|| format!("Chat {}", peer.0), |d| d.peer.title.clone());
                     self.saved_windows
                         .open_window(SavedChatWindow::new(peer, title));
                 }
@@ -1739,18 +1739,18 @@ mod tests {
         let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(1440.0, 900.0));
         let mut extras = WindowShellExtras::new();
         let built = Cell::new(0_u32);
-        let dialogs = || {
+        let mut dialogs = || {
             built.set(built.get() + 1);
-            Vec::new()
+            std::sync::Arc::new(Vec::new())
         };
-        let run_frames = |extras: &mut WindowShellExtras, frames: usize| {
+        let mut run_frames = |extras: &mut WindowShellExtras, frames: usize| {
             for _ in 0..frames {
                 let input = egui::RawInput {
                     screen_rect: Some(viewport),
                     ..Default::default()
                 };
                 ctx.run_ui(input, |ui| {
-                    let _ = extras.show_overlays(ui.ctx(), viewport, &palette, &dialogs);
+                    let _ = extras.show_overlays(ui.ctx(), viewport, &palette, &mut dialogs);
                 })
                 .drop_without_applying_deltas();
             }

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions, Vec2};
-use tg_video::{ClipMode, ClipReader, FrameData, Size};
+use tg_video::{ClipMode, ClipReader, FrameData, Size, StreamedClip, VideoFrame};
 
 use crate::media::backend::MediaItemId;
 
@@ -65,9 +65,76 @@ pub struct InlineFrameState {
     pub error: Option<String>,
 }
 
+/// The decoder of one inline clip: bytes or a local file decode on the UI thread
+/// (`Clip::Reader`), a file that is still downloading on its own thread (TGB-3116).
+enum ClipSource {
+    Local(Box<ClipReader>),
+    Streamed(StreamedClip),
+}
+
+impl ClipSource {
+    fn frame_presentation_time_ms(&self) -> i64 {
+        match self {
+            Self::Local(reader) => reader.frame_presentation_time_ms(),
+            Self::Streamed(clip) => clip.frame_presentation_time_ms(),
+        }
+    }
+
+    fn frame_real_time_ms(&self) -> i64 {
+        match self {
+            Self::Local(reader) => reader.frame_real_time_ms(),
+            Self::Streamed(clip) => clip.frame_real_time_ms(),
+        }
+    }
+
+    fn duration_ms(&self) -> i64 {
+        match self {
+            Self::Local(reader) => reader.duration_ms(),
+            Self::Streamed(clip) => clip.duration_ms(),
+        }
+    }
+
+    fn loop_count(&self) -> u64 {
+        match self {
+            Self::Local(reader) => reader.loop_count(),
+            Self::Streamed(clip) => clip.loop_count(),
+        }
+    }
+
+    /// The frame due at `target_ms`; `Ok(None)` while a streamed clip is still decoding it.
+    fn read_frames_till(&mut self, target_ms: i64) -> Result<Option<VideoFrame>, String> {
+        match self {
+            Self::Local(reader) => reader
+                .read_frames_till(target_ms)
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            Self::Streamed(clip) => {
+                clip.request_frames_till(target_ms);
+                match clip.error() {
+                    Some(err) => Err(err),
+                    None => Ok(clip.take_frame()),
+                }
+            }
+        }
+    }
+
+    fn inspect_at(&mut self, position_ms: i64) -> Result<(), String> {
+        match self {
+            Self::Local(reader) => reader
+                .inspect_at(position_ms)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Self::Streamed(clip) => {
+                clip.request_seek(position_ms);
+                Ok(())
+            }
+        }
+    }
+}
+
 struct InlineClipEntry {
     kind: InlinePlaybackKind,
-    reader: Option<ClipReader>,
+    reader: Option<ClipSource>,
     texture: Option<TextureHandle>,
     size: Vec2,
     start_ms: i64,
@@ -77,6 +144,23 @@ struct InlineClipEntry {
     last_error: Option<String>,
     /// Set by [`InlinePlayback::seek_item`] so a paused clip uploads the frame at the new spot.
     texture_stale: bool,
+}
+
+impl InlineClipEntry {
+    const fn new(kind: InlinePlaybackKind, reader: Option<ClipSource>, now_ms: i64) -> Self {
+        Self {
+            kind,
+            reader,
+            texture: None,
+            size: Vec2::ZERO,
+            start_ms: now_ms,
+            paused: false,
+            paused_at_ms: 0,
+            last_touched_ms: now_ms,
+            last_error: None,
+            texture_stale: false,
+        }
+    }
 }
 
 /// Manager for inline GIF autoplay and round-video previews in the chat history list.
@@ -172,7 +256,7 @@ impl InlinePlayback {
         if let Some(reader) = &mut entry.reader {
             match reader.inspect_at(position_ms) {
                 Ok(_) => entry.last_error = None,
-                Err(err) => entry.last_error = Some(err.to_string()),
+                Err(err) => entry.last_error = Some(err),
             }
         }
         entry.start_ms = now_ms - position_ms;
@@ -186,7 +270,7 @@ impl InlinePlayback {
         self.entries
             .get(&id)
             .and_then(|entry| entry.reader.as_ref())
-            .map(ClipReader::frame_real_time_ms)
+            .map(ClipSource::frame_real_time_ms)
     }
 
     /// Returns `true` if `id` is currently tracked and paused.
@@ -225,7 +309,7 @@ impl InlinePlayback {
     ) -> InlineFrameState {
         if !self.entries.contains_key(&source.id) {
             self.enforce_capacity();
-            let entry = self.create_entry(source, now_ms);
+            let entry = Self::create_entry(ctx, source, now_ms);
             self.entries.insert(source.id, entry);
         }
 
@@ -263,7 +347,8 @@ impl InlinePlayback {
             let frame_due = reader.frame_presentation_time_ms() <= target_ms;
             if need_first_frame || (is_playing && frame_due) {
                 match reader.read_frames_till(target_ms) {
-                    Ok(frame) => {
+                    Ok(None) => {}
+                    Ok(Some(frame)) => {
                         entry.size = Vec2::new(frame.width as f32, frame.height as f32);
                         if let FrameData::Rgba(bytes) = &frame.data {
                             let img = ColorImage::from_rgba_unmultiplied(
@@ -284,7 +369,7 @@ impl InlinePlayback {
                         entry.texture_stale = false;
                     }
                     Err(err) => {
-                        entry.last_error = Some(err.to_string());
+                        entry.last_error = Some(err);
                     }
                 }
             }
@@ -325,47 +410,51 @@ impl InlinePlayback {
         }
     }
 
-    fn create_entry(&self, source: &InlineMediaSource, now_ms: i64) -> InlineClipEntry {
+    fn create_entry(ctx: &Context, source: &InlineMediaSource, now_ms: i64) -> InlineClipEntry {
+        let resize = source
+            .target_size
+            .map(|(w, h)| Size::new(w.max(1), h.max(1)));
+        let round = source.kind == InlinePlaybackKind::RoundVideo;
         let open_res = match &source.data {
             InlineDocumentData::Bytes(bytes) => {
                 ClipReader::from_bytes(bytes.clone(), ClipMode::Normal)
             }
             InlineDocumentData::File(path) => ClipReader::from_file(path, ClipMode::Normal),
+            InlineDocumentData::Stream(doc) => {
+                // The frame size is known once the first frame is decoded.
+                let ctx = ctx.clone();
+                let clip = StreamedClip::spawn(
+                    std::sync::Arc::clone(&doc.0),
+                    ClipMode::Normal,
+                    resize,
+                    round,
+                    move || ctx.request_repaint(),
+                );
+                return InlineClipEntry::new(source.kind, Some(ClipSource::Streamed(clip)), now_ms);
+            }
         };
         match open_res {
             Ok(mut reader) => {
-                if let Some((w, h)) = source.target_size {
-                    reader.set_resize(Some(Size::new(w.max(1), h.max(1))));
+                if resize.is_some() {
+                    reader.set_resize(resize);
                 }
-                if source.kind == InlinePlaybackKind::RoundVideo {
+                if round {
                     reader.set_round_circle(true);
                 }
                 let info = reader.info();
                 let size = Vec2::new(info.video_width as f32, info.video_height as f32);
                 InlineClipEntry {
-                    kind: source.kind,
-                    reader: Some(reader),
-                    texture: None,
                     size,
-                    start_ms: now_ms,
-                    paused: false,
-                    paused_at_ms: 0,
-                    last_touched_ms: now_ms,
-                    last_error: None,
-                    texture_stale: false,
+                    ..InlineClipEntry::new(
+                        source.kind,
+                        Some(ClipSource::Local(Box::new(reader))),
+                        now_ms,
+                    )
                 }
             }
             Err(err) => InlineClipEntry {
-                kind: source.kind,
-                reader: None,
-                texture: None,
-                size: Vec2::ZERO,
-                start_ms: now_ms,
-                paused: false,
-                paused_at_ms: 0,
-                last_touched_ms: now_ms,
                 last_error: Some(err.to_string()),
-                texture_stale: false,
+                ..InlineClipEntry::new(source.kind, None, now_ms)
             },
         }
     }

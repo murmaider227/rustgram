@@ -227,6 +227,7 @@ impl MixerTrack {
         self.pcm_queue.clear();
         self.stream = None;
         self.eof_reached = true;
+        self.state.waiting_for_data = false;
     }
 
     fn reset_fade_start(&mut self) {
@@ -1060,6 +1061,7 @@ fn render_one_track(
 ) -> (bool, bool) {
     let st = track.state.state;
     if st.is_stopped() || st.is_paused() {
+        track.state.waiting_for_data = false;
         return (false, false);
     }
 
@@ -1071,6 +1073,33 @@ fn render_one_track(
         events.push(MixerEvent::Error(id));
         events.push(MixerEvent::Stopped(id, PlaybackState::StoppedAtError));
         return (false, true);
+    }
+    // `waitingForData`: the stream has not decoded what this buffer needs yet, so the track
+    // plays silence and holds its position (TGB-3115: the UI shows its waiting radial).
+    track.state.waiting_for_data = track.pcm_queue.len() < needed_samples
+        && track
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.waiting_for_data());
+    // A fade out advances with the samples it plays; with none buffered while the stream waits
+    // there is nothing to fade, so a pause or stop completes now instead of never.
+    if track.state.waiting_for_data && track.pcm_queue.is_empty() {
+        let id = track.state.id;
+        match track.state.state {
+            PlaybackState::Pausing => {
+                track.state.state = PlaybackState::Paused;
+                track.state.waiting_for_data = false;
+                track.update_state_position();
+                events.push(MixerEvent::StateChanged(id, PlaybackState::Paused));
+                return (true, false);
+            }
+            PlaybackState::Stopping => {
+                track.set_stopped(PlaybackState::Stopped);
+                events.push(MixerEvent::Stopped(id, PlaybackState::Stopped));
+                return (true, true);
+            }
+            _ => {}
+        }
     }
 
     let fade_total_samples = (FADE_DURATION_MS * i64::from(DEFAULT_FREQUENCY)) / 1000;

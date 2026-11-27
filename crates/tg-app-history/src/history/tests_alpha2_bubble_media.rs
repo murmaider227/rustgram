@@ -120,6 +120,7 @@ fn photo_reply(before: bool) -> ReplyHeader {
             key: 1,
         }),
         preview_colored_len: if before { 0 } else { "Photo".len() },
+        preview_spoilers: Vec::new(),
         quote_text: None,
     }
 }
@@ -136,6 +137,7 @@ fn messages(before: bool) -> Vec<HistoryMessage> {
         preview_thumb_rgb: None,
         preview_thumb: None,
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     });
 

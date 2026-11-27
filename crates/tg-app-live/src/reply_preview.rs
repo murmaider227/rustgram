@@ -11,7 +11,8 @@ use tg_data::{
 };
 
 use crate::preview_text::{
-    message_media_preview, one_line, peer_real_name, regular_preview, service_action_text,
+    caption_spoilers_in, message_media_preview, one_line_with_spoilers, peer_real_name,
+    regular_preview, service_action_text,
 };
 
 /// One-line text of a replied-to message (`HistoryItem::inReplyText`).
@@ -22,6 +23,9 @@ pub struct ReplyPreviewText {
     /// Leading bytes of `text` that tdesktop colours (`Ui::Text::Colorized`): the media type
     /// part, or the whole of a service action.
     pub colored_len: usize,
+    /// Byte ranges of `text` under a spoiler: the caption keeps its spoiler entities and the
+    /// header draws the particle cover over them (`Reply::paint`, `.spoiler`).
+    pub spoilers: Vec<std::ops::Range<usize>>,
 }
 
 /// Text a reply header shows for `msg`.
@@ -45,11 +49,13 @@ pub fn reply_preview_text(session: &Session, msg: &Message) -> ReplyPreviewText 
             ReplyPreviewText {
                 colored_len: text.len(),
                 text,
+                spoilers: Vec::new(),
             }
         }
         MessageContent::Regular { text, media } => {
-            let caption = one_line(&text.text);
+            let (caption, spoilers) = one_line_with_spoilers(text);
             let full = regular_preview(media, &caption, false);
+            let spoilers = caption_spoilers_in(&full, &caption, &spoilers);
             let colored_len = match message_media_preview(msg) {
                 None => 0,
                 Some(preview) if preview.use_service_color => full.len(),
@@ -63,6 +69,7 @@ pub fn reply_preview_text(session: &Session, msg: &Message) -> ReplyPreviewText 
             ReplyPreviewText {
                 text: full,
                 colored_len,
+                spoilers,
             }
         }
     }

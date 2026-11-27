@@ -79,6 +79,10 @@ pub enum MainWidgetAction {
     LockNow,
     /// Open Log Out confirmation modal.
     RequestLogout,
+    /// Ask "Restart now?" for a new interface scale (Settings > Default interface scale).
+    ConfirmScaleRestart(i32),
+    /// Show the pack of a clicked sticker (`StickerSetBox`).
+    OpenStickerSet(tg_app_core::history::backend::StickerSetId),
     /// Open media viewer (or audio player bar) for a history message attachment.
     OpenHistoryMedia {
         /// Owning peer id.
@@ -1434,9 +1438,14 @@ impl MainWidget {
                     } else {
                         self.main_info.set_peer(peer_id);
                     }
-                    let events = self
-                        .main_info
-                        .show(ui, session_backend, false, theme_colors);
+                    let events = show_info_with_sound_toggle(
+                        &mut self.main_info,
+                        peer_id,
+                        ui,
+                        session_backend,
+                        false,
+                        theme_colors,
+                    );
                     for ev in events {
                         match ev {
                             InfoWrapEvent::CloseOrBack => {
@@ -1572,6 +1581,9 @@ impl MainWidget {
                 }
                 SettingsAction::RequestLogout => {
                     actions.push(MainWidgetAction::RequestLogout);
+                }
+                SettingsAction::ConfirmScaleRestart(scale) => {
+                    actions.push(MainWidgetAction::ConfirmScaleRestart(scale));
                 }
             }
         }
@@ -1712,6 +1724,9 @@ impl MainWidget {
                 }
                 HistoryAction::SendMessage { peer_id, .. } => {
                     Backend::mark_read(session_backend, peer_id);
+                }
+                HistoryAction::OpenStickerSet(set) => {
+                    actions.push(MainWidgetAction::OpenStickerSet(set));
                 }
                 HistoryAction::OpenMedia {
                     peer_id,
@@ -2556,9 +2571,14 @@ impl MainWidget {
         self.third_info.set_peer(peer_id);
         let mut events = Vec::new();
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            events = self
-                .third_info
-                .show(ui, session_backend, true, theme_colors);
+            events = show_info_with_sound_toggle(
+                &mut self.third_info,
+                peer_id,
+                ui,
+                session_backend,
+                true,
+                theme_colors,
+            );
         });
         for ev in events {
             match ev {
@@ -2711,6 +2731,31 @@ fn send_target(peer_id: PeerId) -> tg_app_core::user_error::SendTarget {
         PeerKind::Group => SendTarget::Group,
         PeerKind::Channel => SendTarget::Channel,
     }
+}
+
+/// Shows a profile column and applies its Mute menu's "Disable sound / Enable sound"
+/// (`FillMuteMenu` toggles `NotifySound::none` at once, TGB-2873): the menu is told whether
+/// the chat is silent before the frame, and a toggle picked in it is saved after.
+pub(crate) fn show_info_with_sound_toggle(
+    info: &mut InfoWrapWidget,
+    peer_id: PeerId,
+    ui: &mut Ui,
+    session_backend: &mut dyn AppSession,
+    third_column: bool,
+    theme_colors: &dyn Colors,
+) -> Vec<InfoWrapEvent> {
+    use tg_app_info::dialogs::backend::DialogsBackend;
+    if peer_id != PeerId::ZERO {
+        let silent = DialogsBackend::dialog_notify_sound(session_backend, peer_id).none;
+        info.set_notify_sound_silent(peer_id, silent);
+    }
+    let mut events = info.show(ui, session_backend, third_column, theme_colors);
+    if let Some((peer, enable)) = info.take_sound_toggle_request()
+        && let Err(err) = DialogsBackend::set_dialog_sound_enabled(session_backend, peer, enable)
+    {
+        events.push(InfoWrapEvent::Toast(err));
+    }
+    events
 }
 
 #[cfg(test)]

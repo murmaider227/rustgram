@@ -118,6 +118,7 @@ fn message(peer: PeerId, id: i32, date_unix: i32, n: usize) -> HistoryMessage {
         preview_thumb_rgb: None,
         preview_thumb: None,
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     });
     let reactions = if n.is_multiple_of(4) {

@@ -5,6 +5,7 @@ pub mod chat_preview;
 pub mod connecting_widget;
 pub mod controller;
 pub mod deep_links;
+pub mod dialogs_snapshot;
 pub mod interface_scale;
 pub mod layer_stack;
 pub mod lock_widgets;
@@ -19,3 +20,5 @@ pub mod section;
 pub mod security_policy;
 pub mod session_controller;
 pub mod shortcuts_wiring;
+#[cfg(test)]
+mod tests_w8_screens;

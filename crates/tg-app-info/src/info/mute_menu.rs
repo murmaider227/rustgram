@@ -51,6 +51,7 @@ pub fn mute_menu_items(muted: bool, silent: bool) -> Vec<MenuItem> {
     let last = if muted {
         MenuItem::action(MUTE_FOREVER_OR_UNMUTE, tr::lng_mute_menu_duration_unmute())
             .with_style_icon(st::menu_icon_unmute)
+            .good()
     } else {
         MenuItem::action(MUTE_FOREVER_OR_UNMUTE, tr::lng_mute_menu_duration_forever())
             .with_style_icon(st::menu_icon_mute)

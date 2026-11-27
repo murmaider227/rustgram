@@ -114,6 +114,9 @@ pub enum SettingsAction {
     ToggleTopPeers(bool),
     /// Request Log Out confirmation box.
     RequestLogout,
+    /// A new interface scale was chosen that takes a restart: show tdesktop's "Restart now?"
+    /// box (`lng_settings_need_restart`); "Restart Now" saves it and restarts the app.
+    ConfirmScaleRestart(i32),
 }
 
 /// Complete set of Rustgram Settings sections matching `Telegram/SourceFiles/settings/sections/`.
@@ -231,6 +234,9 @@ pub struct SettingsController {
     pub core_settings: CoreSettings,
     /// Runtime global config (`tg_core::GlobalConfig`, scale, autostart, debug mode).
     pub global_config: GlobalConfig,
+    /// The window's integer device pixel ratio (`style::DevicePixelRatio`); the scale slider
+    /// label shows the evaluated scale times this ratio, as tdesktop does.
+    pub device_pixel_ratio: i32,
     /// Server-side settings backend (implemented for [`MockSettingsBackend`]).
     pub backend: Box<dyn SettingsBackend>,
     /// Live `tg-theme` embedded palette & accent colors.
@@ -304,6 +310,7 @@ impl SettingsController {
         Self {
             core_settings: CoreSettings::new(),
             global_config: GlobalConfig::default(),
+            device_pixel_ratio: 1,
             backend,
             live_theme: LiveThemeColors::default(),
             lang_instance,
@@ -671,12 +678,15 @@ impl SettingsController {
                                         &mut self.faq_suggestions,
                                         &mut self.recent_searches,
                                         &lang_name,
+                                        self.device_pixel_ratio,
                                         self.backend.as_ref(),
                                         &colors,
                                     );
                                     pending_nav = out.navigate;
                                     pending_toast = out.toast;
-                                    if let Some(screen) = out.open_payments {
+                                    if let Some(scale) = out.scale_restart {
+                                        action = Some(SettingsAction::ConfirmScaleRestart(scale));
+                                    } else if let Some(screen) = out.open_payments {
                                         action = Some(SettingsAction::OpenPayments(screen));
                                     } else if out.open_business {
                                         action = Some(SettingsAction::OpenBusiness);
@@ -1019,6 +1029,11 @@ impl SettingsWidget {
         ctrl.show(ui, connection_status, layout)
     }
 }
+
+#[cfg(test)]
+mod tests_w8_loading;
+#[cfg(test)]
+mod tests_w8_scale;
 
 #[cfg(test)]
 mod tests {

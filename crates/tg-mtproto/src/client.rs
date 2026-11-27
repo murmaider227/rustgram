@@ -12,7 +12,7 @@
 //!   5xx/negative server error retries, `CONNECTION_NOT_INITED` / `CONNECTION_LAYER_INVALID`,
 //!   and guest-DC `auth.exportAuthorization` / `auth.importAuthorization` coalescing.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +27,7 @@ use tg_tl::mtproto::{enums as mtp_enums, types as mtp_types};
 use tg_tl::types as tl_types;
 use tg_tl::{Deserializable, Identifiable, RemoteCall, Serializable};
 use tg_transport::ProxyData;
-use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::auth_key::{AuthKeyType, Dcenter, ManagedAuthKey, create_single_auth_key};
@@ -41,6 +41,7 @@ use crate::error::{InvocationError, MigrateKind, RpcError};
 use crate::keys_destroyer::{KeysDestroyResult, KeysDestroyer};
 use crate::message::{RequestId, next_request_id};
 use crate::session::{ConnectionState, QueuedRequest, SessionHandle, UpdatesMsg};
+use crate::single_flight::{Joined, SingleFlight};
 use crate::special_config::{SpecialConfigError, sync_http_unixtime};
 use crate::time::MtprotoClock;
 use crate::transport_adapter::{TgTransportFactory, TransportFactory};
@@ -122,11 +123,6 @@ impl Default for InvokeOptions {
     }
 }
 
-struct AuthTransferInFlight {
-    notify: Arc<Notify>,
-    result: Mutex<Option<Result<(), String>>>,
-}
-
 struct ClientInner {
     config: ClientConfig,
     dc_options: DcOptions,
@@ -146,7 +142,7 @@ struct ClientInner {
     main_dc_id: RwLock<DcId>,
     dcenters: RwLock<BTreeMap<DcId, Dcenter>>,
     sessions: RwLock<BTreeMap<ShiftedDcId, SessionHandle>>,
-    auth_transfers: Mutex<HashMap<DcId, Arc<AuthTransferInFlight>>>,
+    auth_transfers: SingleFlight<DcId, Result<(), String>>,
     authorized_dcs: RwLock<HashSet<DcId>>,
 }
 
@@ -202,7 +198,7 @@ impl Client {
             main_dc_id: RwLock::new(main_dc_id),
             dcenters: RwLock::new(BTreeMap::new()),
             sessions: RwLock::new(BTreeMap::new()),
-            auth_transfers: Mutex::new(HashMap::new()),
+            auth_transfers: SingleFlight::new(),
             authorized_dcs: RwLock::new(HashSet::new()),
         });
         (Self { inner }, updates_rx)
@@ -922,50 +918,27 @@ impl Client {
         target_bare_dc: DcId,
         target_shifted_dc: ShiftedDcId,
     ) -> Result<(), InvocationError> {
-        let (in_flight, is_leader) = {
-            let mut guard = self.inner.auth_transfers.lock().await;
-            if let Some(existing) = guard.get(&target_bare_dc) {
-                (existing.clone(), false)
-            } else {
-                let created = Arc::new(AuthTransferInFlight {
-                    notify: Arc::new(Notify::new()),
-                    result: Mutex::new(None),
-                });
-                guard.insert(target_bare_dc, created.clone());
-                (created, true)
-            }
-        };
-
-        if !is_leader {
-            in_flight.notify.notified().await;
-            let res = in_flight.result.lock().await;
-            return match res.as_ref() {
-                Some(Ok(())) => Ok(()),
-                Some(Err(msg)) => Err(InvocationError::Protocol(msg.clone())),
-                None => Err(InvocationError::Dropped),
+        loop {
+            let leader = match self.inner.auth_transfers.join(target_bare_dc) {
+                Joined::Leader(leader) => leader,
+                Joined::Waiter(waiter) => match waiter.result().await {
+                    Some(Ok(())) => return Ok(()),
+                    Some(Err(msg)) => return Err(InvocationError::Protocol(msg)),
+                    // The leading request was cancelled before the transfer finished: run it here.
+                    None => continue,
+                },
             };
+            let outcome = async {
+                let exported = self.export_authorization(target_bare_dc).await?;
+                let _ = self
+                    .import_authorization(target_shifted_dc, exported.id, exported.bytes)
+                    .await?;
+                Ok::<(), InvocationError>(())
+            }
+            .await;
+            leader.finish(outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
+            return outcome;
         }
-
-        let outcome = async {
-            let exported = self.export_authorization(target_bare_dc).await?;
-            let _ = self
-                .import_authorization(target_shifted_dc, exported.id, exported.bytes)
-                .await?;
-            Ok::<(), InvocationError>(())
-        }
-        .await;
-
-        {
-            let mut res = in_flight.result.lock().await;
-            *res = Some(outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
-        }
-        self.inner
-            .auth_transfers
-            .lock()
-            .await
-            .remove(&target_bare_dc);
-        in_flight.notify.notify_waiters();
-        outcome
     }
 
     fn resolve_shifted_dc(&self, shifted_dc_id: ShiftedDcId) -> ShiftedDcId {

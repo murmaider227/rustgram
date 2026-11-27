@@ -49,6 +49,8 @@ mod decode_pool;
 mod downloads;
 mod round_video;
 
+#[cfg(test)]
+pub(crate) use downloads::WaitingRadial;
 pub use downloads::{MSG_FILE_OVER_DURATION_SECS, MediaDownloadAction, PhotoLink};
 
 #[cfg(test)]
@@ -115,6 +117,7 @@ fn same_video_data(a: &InlineDocumentData, b: &InlineDocumentData) -> bool {
     match (a, b) {
         (InlineDocumentData::File(x), InlineDocumentData::File(y)) => x == y,
         (InlineDocumentData::Bytes(x), InlineDocumentData::Bytes(y)) => x == y,
+        (InlineDocumentData::Stream(x), InlineDocumentData::Stream(y)) => x.same_loader(y),
         _ => false,
     }
 }
@@ -1347,9 +1350,7 @@ impl HistoryMediaRuntime {
             }
             return existing;
         }
-        if !is_round {
-            self.remember_voice_meta(msg_id, sender_name, duration_secs);
-        }
+        self.remember_voice_meta(msg_id, sender_name, duration_secs);
         let dur_ms = i64::from(duration_secs.max(1)) * 1000;
         let doc_id = DocumentId(0x5000_0000 + msg_id.0.unsigned_abs() as u64);
         let full = AudioFullMsgId::new(AudioPeerId(peer_id.0), AudioMsgIdNum(i64::from(msg_id.0)));
@@ -1360,16 +1361,25 @@ impl HistoryMediaRuntime {
         };
         let audio_id = AudioMsgId::new(doc_id, full, kind, dur_ms, 0);
 
-        if !is_round && self.streams_voice(msg_id) {
-            // TGB-3000: not cached, so the track streams the file instead of a stand-in tone.
-            let open = self.voice_stream_opener(msg_id);
+        let subtitle = if is_round {
+            "Video message".to_owned()
+        } else {
+            "Voice message".to_owned()
+        };
+        if self.streams_voice(msg_id) {
+            // TGB-3000 / TGB-3116: not cached, so the track streams the file instead of a
+            // stand-in tone. A round video plays at once, so it asks for its loader now.
+            let open = self.voice_stream_opener(msg_id, is_round);
+            if is_round {
+                self.request_voice_stream(msg_id);
+            }
             self.audio_backend.register_streamed_track(
                 audio_id,
                 open,
                 AudioTrackMetadata {
                     id: audio_id,
                     title: sender_name.to_owned(),
-                    subtitle: "Voice message".to_owned(),
+                    subtitle,
                     duration_ms: dur_ms,
                 },
             );
@@ -1393,11 +1403,6 @@ impl HistoryMediaRuntime {
                 )
             });
 
-        let subtitle = if is_round {
-            "Video message".to_owned()
-        } else {
-            "Voice message".to_owned()
-        };
         self.audio_backend.register_track(
             audio_id,
             bytes,
@@ -1881,6 +1886,59 @@ impl HistoryMediaRuntime {
     /// Replays a non-looping animated sticker from frame 0 (e.g. on click).
     pub fn restart_lottie(&mut self, msg_id: MsgId, now_secs: f64) {
         self.lottie_started_at.insert(msg_id, now_secs);
+    }
+
+    /// Paints a static (WebP) sticker from its downloaded file, whole and centered in `rect`:
+    /// no blurred backdrop, no download button or loading arc (`Sticker::paintPixmap`).
+    /// Returns `false` when the message has no static sticker file to show.
+    pub fn paint_static_sticker(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &Painter,
+        msg_id: MsgId,
+        rect: Rect,
+        now_secs: f64,
+    ) -> bool {
+        self.pump_decoded(ctx);
+        let ready = match self
+            .descriptors
+            .get(&msg_id)
+            .and_then(|d| d.photo_load.as_ref())
+        {
+            None => return false,
+            Some(PhotoLoadState::Ready { .. }) => true,
+            Some(_) => false,
+        };
+        let corners = CornerRadius::ZERO;
+        if ready {
+            self.paint_full_photo(
+                ctx,
+                painter,
+                msg_id,
+                rect,
+                corners,
+                PhotoFit::Contain,
+                now_secs,
+            );
+        } else {
+            self.paint_full_photo_cached(
+                ctx,
+                painter,
+                msg_id,
+                rect,
+                corners,
+                PhotoFit::Contain,
+                now_secs,
+            );
+        }
+        true
+    }
+
+    /// Whether the message's media is a live sticker that has a descriptor (its file comes
+    /// from the session), as opposed to demo data drawn from its Lottie source alone.
+    #[must_use]
+    pub fn has_descriptor(&self, msg_id: MsgId) -> bool {
+        self.descriptors.contains_key(&msg_id)
     }
 
     /// Paints a photo's full picture over its blurred thumbnail once it is

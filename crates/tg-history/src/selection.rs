@@ -338,6 +338,31 @@ impl HistorySelection {
         }
     }
 
+    /// The item indices `(first, last)` a drag crossed, when it left the item it began in
+    /// (`_dragSelFrom` / `_dragSelTo` of `HistoryInner`).
+    #[must_use]
+    pub fn dragged_items(&self) -> Option<(usize, usize)> {
+        let (a, b) = (self.from?, self.to?);
+        (a.item_index != b.item_index).then(|| {
+            (
+                a.item_index.min(b.item_index),
+                a.item_index.max(b.item_index),
+            )
+        })
+    }
+
+    /// `HistoryInner::applyDragSelection` on release: the messages a drag crossed join the
+    /// selected items (which opens the selection bar) and the drag ends.
+    pub fn apply_drag_selection(&mut self, items: impl IntoIterator<Item = FullMsgId>) {
+        for item in items {
+            if !self.selected_items.contains(&item) {
+                self.selected_items.push(item);
+            }
+        }
+        self.from = None;
+        self.to = None;
+    }
+
     /// Returns a partial-text selection across message boundaries where the first item
     /// selects `[start..text_len)`, middle items select `[0..text_len)`, and the last item
     /// selects `[0..end)`.
@@ -369,5 +394,78 @@ impl HistorySelection {
         } else {
             TextSelection::new(0, text_len)
         }
+    }
+}
+
+/// `kMaxScrollSpeed` of `Ui::DraggingScrollManager`: at most 37 px per tick.
+pub const DRAG_SCROLL_MAX_SPEED: i32 = 37;
+
+/// How often `Ui::DraggingScrollManager` scrolls while a selection is dragged (`callEach(15)`).
+pub const DRAG_SCROLL_TICK_MS: u32 = 15;
+
+/// How far the pointer is outside `[top, bottom)` (`DraggingScrollManager::checkDeltaScroll`):
+/// negative above, positive below, zero inside.
+#[must_use]
+pub const fn drag_scroll_delta(y: i32, top: i32, bottom: i32) -> i32 {
+    if y < top {
+        y - top
+    } else if y >= bottom {
+        y - bottom + 1
+    } else {
+        0
+    }
+}
+
+/// The scroll of one tick for `delta` (`DraggingScrollManager::scrollByTimer`): faster the
+/// farther the pointer is, at most [`DRAG_SCROLL_MAX_SPEED`].
+#[must_use]
+pub fn drag_scroll_step(delta: i32) -> i32 {
+    if delta > 0 {
+        (delta.saturating_mul(3) / 20 + 1).min(DRAG_SCROLL_MAX_SPEED)
+    } else if delta < 0 {
+        (delta.saturating_mul(3) / 20 - 1).max(-DRAG_SCROLL_MAX_SPEED)
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+
+    fn endpoint(index: usize) -> ListSelectionEndpoint {
+        ListSelectionEndpoint {
+            item_id: FullMsgId::new(tg_data::PeerId(1), tg_data::MsgId(index as i64 + 10)),
+            item_index: index,
+            text: FlatSelectionEndpoint::new(0, false),
+        }
+    }
+
+    #[test]
+    fn the_drag_scroll_speed_matches_dragging_scroll_manager() {
+        assert_eq!(drag_scroll_delta(50, 100, 400), -50);
+        assert_eq!(drag_scroll_delta(100, 100, 400), 0);
+        assert_eq!(drag_scroll_delta(399, 100, 400), 0);
+        assert_eq!(drag_scroll_delta(400, 100, 400), 1);
+        assert_eq!(drag_scroll_step(0), 0);
+        assert_eq!(drag_scroll_step(1), 1);
+        assert_eq!(drag_scroll_step(-1), -1);
+        assert_eq!(drag_scroll_step(51), 8);
+        assert_eq!(drag_scroll_step(-51), -8);
+        assert_eq!(drag_scroll_step(1000), DRAG_SCROLL_MAX_SPEED);
+        assert_eq!(drag_scroll_step(i32::MIN), -DRAG_SCROLL_MAX_SPEED);
+    }
+
+    #[test]
+    fn a_drag_across_items_becomes_the_selected_items() {
+        let mut selection = HistorySelection::default();
+        selection.start_drag(endpoint(4));
+        assert_eq!(selection.dragged_items(), None);
+        selection.update_drag(endpoint(2));
+        assert_eq!(selection.dragged_items(), Some((2, 4)));
+        selection.apply_drag_selection([endpoint(2).item_id, endpoint(3).item_id]);
+        assert_eq!(selection.selected_items.len(), 2);
+        assert_eq!(selection.from, None);
+        assert!(selection.has_selected_items());
     }
 }

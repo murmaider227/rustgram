@@ -5,10 +5,12 @@
 //! (`data/data_media_types.cpp`) and `Ui::Text::FormatSongNameFor`
 //! (`ui/text/format_song_document_name.cpp`).
 
+use std::ops::Range;
+
 use tg_app_core::dialogs::backend::{DialogMediaPreview, DialogMediaPreviewKind};
 use tg_data::{
-    DocumentData, DocumentKind, ForwardInfo, Message, MessageContent, MessageMedia, Peer,
-    PeerId as DataPeerId, ServiceAction, Session,
+    DocumentData, DocumentKind, EntityKind, ForwardInfo, Message, MessageContent, MessageMedia,
+    Peer, PeerId as DataPeerId, ServiceAction, Session, TextWithEntities,
 };
 use tg_lang::tr;
 
@@ -110,6 +112,113 @@ pub(crate) fn one_line(text: &str) -> String {
         .filter(|s| !s.trim().is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// [`one_line`] of a text with entities, with the byte ranges of its spoilers in the result.
+///
+/// tdesktop keeps the entities of the caption in `toPreview` (only line breaks become
+/// spaces), so the previews draw the spoiler cover where the message has one. A spoiler that
+/// spans a line break keeps the space that replaces it.
+pub(crate) fn one_line_with_spoilers(text: &TextWithEntities) -> (String, Vec<Range<usize>>) {
+    let source = text.text.as_str();
+    let trimmed = source.trim();
+    let base = source.len() - source.trim_start().len();
+    // (start in `source`, start in the result, length) of each line that is kept.
+    let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut at = base;
+    for line in trimmed.split(['\r', '\n']) {
+        let start = at;
+        // Every separator is one byte.
+        at += line.len() + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        pieces.push((start, out.len(), line.len()));
+        out.push_str(line);
+    }
+    let utf16_len = i32::try_from(source.encode_utf16().count()).unwrap_or(i32::MAX);
+    let spoilers = text
+        .entities
+        .iter()
+        .filter(|e| matches!(e.kind, EntityKind::Spoiler))
+        .filter_map(|e| {
+            // `TextEntity::clamped_to_text`, without cloning the entity.
+            if e.offset < 0 || e.length <= 0 || e.offset >= utf16_len {
+                return None;
+            }
+            let offset = usize::try_from(e.offset).ok()?;
+            let length = usize::try_from(e.length.min(utf16_len - e.offset)).ok()?;
+            tg_text::utf16::utf16_range_to_utf8(source, offset, length)
+        })
+        .filter_map(|range| {
+            // The first kept byte at or after the start, the last kept byte before the end.
+            let start = pieces
+                .iter()
+                .find(|(src, _, len)| src + len > range.start)
+                .map(|&(src, dst, _)| dst + range.start.saturating_sub(src))?;
+            let end = pieces
+                .iter()
+                .rev()
+                .find(|(src, _, _)| *src < range.end)
+                .map(|&(src, dst, len)| dst + (range.end - src).min(len))?;
+            (start < end).then_some(start..end)
+        })
+        .collect();
+    (out, spoilers)
+}
+
+/// Moves the spoilers of `caption` to where `caption` sits in `full`, the preview made from it
+/// ("{media}, {caption}" or the caption alone). None when `full` does not show the caption.
+pub(crate) fn caption_spoilers_in(
+    full: &str,
+    caption: &str,
+    spoilers: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    if caption.is_empty() || spoilers.is_empty() {
+        return Vec::new();
+    }
+    let at = if full.ends_with(caption) {
+        Some(full.len() - caption.len())
+    } else {
+        full.rfind(caption)
+    };
+    at.map_or_else(Vec::new, |at| {
+        spoilers.iter().map(|r| r.start + at..r.end + at).collect()
+    })
+}
+
+/// A one-line preview and the byte ranges of `text` drawn under the spoiler cover.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreviewText {
+    /// The text, as [`message_preview_text`] gives it.
+    pub text: String,
+    /// Byte ranges of `text` under a spoiler, sorted, on char boundaries.
+    pub spoilers: Vec<Range<usize>>,
+}
+
+/// [`message_preview_text`] with the spoiler ranges of the caption kept
+/// (`HistoryItem::toPreview` keeps the spoiler entities; the dialogs row draws them with
+/// `dialogsTextPalette.spoilerFg`).
+#[must_use]
+pub fn message_preview(session: &Session, msg: &Message) -> PreviewText {
+    match &msg.content {
+        MessageContent::Regular { text, media } => {
+            let (caption, spoilers) = one_line_with_spoilers(text);
+            let full = regular_preview(media, &caption, true);
+            PreviewText {
+                spoilers: caption_spoilers_in(&full, &caption, &spoilers),
+                text: full,
+            }
+        }
+        _ => PreviewText {
+            text: message_preview_text(session, msg),
+            spoilers: Vec::new(),
+        },
+    }
 }
 
 /// `WithCaptionNotificationText`: the media type alone, the caption alone when the row shows a

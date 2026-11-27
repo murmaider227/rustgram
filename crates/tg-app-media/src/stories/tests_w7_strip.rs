@@ -436,3 +436,87 @@ fn expanding_morphs_the_small_userpics_into_the_full_strip() {
     let at = frame.pixels[mid.y as usize * frame.width + mid.x as usize];
     assert!(at[0] > 200 && at[1] < 60 && at[2] < 60, "{at:?} at {mid:?}");
 }
+
+/// One frame laid out like the chat-list column: the strip in the search row, then the chat
+/// list below it, whose rows take clicks on the same layer (registered after the strip).
+fn run_column_frame(
+    ctx: &Context,
+    strip: &mut StoriesStrip,
+    store: &StoriesStore,
+    backend: &MockStoriesBackend,
+    events: Vec<egui::Event>,
+) -> (StoriesStripFrame, bool) {
+    let palette = Palette::day();
+    let mut out = StoriesStripFrame::default();
+    let mut list_clicked = false;
+    let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0));
+    let input = RawInput {
+        screen_rect: Some(screen),
+        events,
+        ..RawInput::default()
+    };
+    let output = ctx.run_ui(input, |ui| {
+        let row = Rect::from_min_max(
+            screen.min,
+            Pos2::new(screen.right(), field().bottom() + 6.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(row), |ui| {
+            ui.set_clip_rect(row);
+            out = strip.show_in_search_row(
+                ui,
+                StoriesSearchSlot::for_field(field(), &palette),
+                store,
+                backend,
+                &palette,
+            );
+        });
+        let list = Rect::from_min_max(Pos2::new(screen.left(), row.bottom()), screen.max);
+        list_clicked = ui
+            .interact(list, ui.scope_id().with("chat_list"), egui::Sense::click())
+            .clicked();
+    });
+    let mut deltas = output.textures_delta;
+    deltas.clear();
+    (out, list_clicked)
+}
+
+/// TGB-3127: the × of the first-run tooltip hides it for good (`storiesClickTooltipHidden`),
+/// also when the chat list lies under the tooltip.
+#[test]
+fn click_tooltip_close_button_hides_it_for_good() {
+    let (store, backend) = mock_store();
+    let ctx = Context::default();
+    let mut strip = StoriesStrip::new();
+    let _ = run_column_frame(&ctx, &mut strip, &store, &backend, Vec::new());
+    let _ = run_column_frame(&ctx, &mut strip, &store, &backend, Vec::new());
+    let close = strip
+        .click_tooltip_close_rect()
+        .expect("the tooltip and its close button are shown");
+    let at = close.center();
+    let button = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let mut actions = Vec::new();
+    let mut list_clicked = false;
+    for events in [
+        vec![egui::Event::PointerMoved(at)],
+        vec![button(true)],
+        vec![button(false)],
+    ] {
+        let (frame, clicked) = run_column_frame(&ctx, &mut strip, &store, &backend, events);
+        actions.extend(frame.actions);
+        list_clicked |= clicked;
+    }
+    assert!(
+        actions.contains(&StoriesStripAction::SetClickTooltipHidden(true)),
+        "{actions:?}"
+    );
+    assert!(strip.click_tooltip_hidden());
+    assert!(
+        !list_clicked,
+        "the click belongs to the ×, not the chat under it"
+    );
+}

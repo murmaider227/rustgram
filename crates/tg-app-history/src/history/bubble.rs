@@ -36,9 +36,11 @@ use crate::history::media::{
 };
 use crate::history::message_text_state::MessageTextState;
 use crate::history::paint_cache::{MessagePaintCache, PreparedBody};
-use crate::history::reply_preview::{paint_reply_thumb, reply_preview_skip, reply_text_galley};
+use crate::history::reply_preview::{paint_reply_thumb, reply_preview_skip, reply_text_line};
 use crate::history::sections_model::LinkPreviewData;
-use crate::history::text_bridge::{char_range_rects, message_text_style, pointer_to_char_index};
+use crate::history::text_bridge::{
+    char_range_rects, char_to_utf16, message_text_style, pointer_to_char_index, utf16_to_char,
+};
 use crate::history::theme::HistoryColors;
 use tg_app_core::stand_in::theme::Palette;
 use tg_app_core::stand_in::types::{FullMsgId, MsgId, PeerId};
@@ -575,6 +577,7 @@ pub fn paint_message_element(
         None,
         &mut MessagePaintCache::default(),
         None,
+        false,
     )
 }
 
@@ -613,6 +616,7 @@ pub fn paint_message_element_with_runtime(
         None,
         &mut MessagePaintCache::default(),
         None,
+        false,
     )
 }
 
@@ -652,6 +656,7 @@ pub fn paint_message_element_with_bots(
         None,
         &mut MessagePaintCache::default(),
         None,
+        false,
     )
 }
 
@@ -682,6 +687,7 @@ pub fn paint_message_element_full(
     reaction_userpics: Option<&ReactionUserpics>,
     paint_cache: &mut MessagePaintCache,
     text_state: Option<&MessageTextState>,
+    last_and_self: bool,
 ) -> Vec<MessagePaintEvent> {
     paint_message_element_internal(
         ui,
@@ -702,7 +708,23 @@ pub fn paint_message_element_full(
         reaction_userpics,
         paint_cache,
         text_state,
+        last_and_self,
     )
+}
+
+/// The text palette of a message: a selected one paints its spoiler particles in the selected
+/// date colour (`inTextPaletteSelected` / `outTextPaletteSelected`, `spoilerFg:
+/// msgInDateFgSelected`).
+pub(crate) fn selected_text_palette(
+    colors: &HistoryColors,
+    outgoing: bool,
+    selected: bool,
+) -> tg_ui::stand_in::TextPalette {
+    let mut palette = colors.text_palette(outgoing);
+    if selected {
+        palette.spoiler_fg = palette.select_spoiler_fg;
+    }
+    palette
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -725,6 +747,7 @@ fn paint_message_element_internal(
     reaction_userpics: Option<&ReactionUserpics>,
     paint_cache: &mut MessagePaintCache,
     text_state: Option<&MessageTextState>,
+    last_and_self: bool,
 ) -> Vec<MessagePaintEvent> {
     let mut events = Vec::new();
     let is_selected = selection.is_full();
@@ -880,25 +903,44 @@ fn paint_message_element_internal(
                 .galley(Pos2::new(text_x, name_top), name, name_col);
             // The media part of the text ("Photo") takes the name colour
             // (`replyTextPalette.linkFg`), the rest the bubble's text colour.
-            let (snippet_text, colored_len) = if let Some(ref quote) = reply.quote_text {
-                (format!("“{quote}”"), 0)
+            let (snippet_text, colored_len, spoilers) = if let Some(ref quote) = reply.quote_text {
+                (format!("“{quote}”"), 0, &[][..])
             } else {
-                (reply.preview_text.clone(), reply.preview_colored_len)
+                (
+                    reply.preview_text.clone(),
+                    reply.preview_colored_len,
+                    reply.preview_spoilers.as_slice(),
+                )
             };
-            let snippet = reply_text_galley(
+            let snippet = reply_text_line(
                 ui,
                 &snippet_text,
                 colored_len,
+                spoilers,
                 FontId::proportional(13.0),
                 name_col,
                 colors.text_fg,
                 text_max_w,
             );
-            ui.painter().galley(
-                Pos2::new(text_x, name_top + name_h),
-                snippet,
-                colors.text_fg,
-            );
+            let snippet_pos = Pos2::new(text_x, name_top + name_h);
+            ui.painter()
+                .galley(snippet_pos, snippet.galley, colors.text_fg);
+            if !snippet.spoilers.is_empty() {
+                // `replyTextPalette.spoilerFg`: the message's date colour, as in its text.
+                let rects: Vec<Rect> = snippet
+                    .spoilers
+                    .iter()
+                    .map(|r| r.translate(snippet_pos.to_vec2()))
+                    .collect();
+                tg_ui::effects::paint_text_spoiler(
+                    ui.ctx(),
+                    ui.painter(),
+                    &rects,
+                    snippet_pos,
+                    selected_text_palette(colors, layout.has_out_layout, is_selected).spoiler_fg,
+                    1.0,
+                );
+            }
         }
 
         let reply_resp = ui.interact(
@@ -919,7 +961,15 @@ fn paint_message_element_internal(
     if let Some(ref media) = msg.media
         && !layout.media_rect.is_empty()
     {
-        let media_rect = hist_rect_to_egui(layout.media_rect, origin.x, origin.y);
+        // An unwrapped sticker sits in its content rect, the time beside or below it
+        // (`UnwrappedMedia::draw`).
+        let media_rect = if matches!(media, HistoryMedia::Sticker(_))
+            && !layout.unwrapped_content_rect.is_empty()
+        {
+            hist_rect_to_egui(layout.unwrapped_content_rect, origin.x, origin.y)
+        } else {
+            hist_rect_to_egui(layout.media_rect, origin.x, origin.y)
+        };
         if matches!(media, HistoryMedia::RoundVideo(_)) && !layout.has_bubble {
             place_round_transcribe_button(ui, msg, layout, origin, colors);
         }
@@ -1072,22 +1122,40 @@ fn paint_message_element_internal(
         }
     }
 
-    // 3b. A message of only 1-3 emoji: large emoji without a bubble (`LargeEmoji::draw`).
+    // 3b. A message of only 1-3 emoji (`LargeEmoji::draw`) or of only custom emoji
+    // (`CustomEmoji::draw`): large emoji without a bubble.
     let large_emoji = (msg.media.is_none() && layout.unwrapped && !layout.media_rect.is_empty())
-        .then(|| crate::history::large_emoji::isolated_emoji(&msg.text))
+        .then(|| crate::history::large_emoji::large_emoji_text(&msg.text))
         .flatten();
-    if let Some(ref emoji) = large_emoji {
-        let row = tg_history::large_emoji_inner_rect(
-            layout.media_rect,
-            emoji.len(),
-            layout.has_right_layout,
-        );
-        crate::history::large_emoji::paint_large_emoji(
-            ui.ctx(),
-            ui.painter(),
-            emoji,
-            hist_rect_to_egui(row, origin.x, origin.y),
-        );
+    match &large_emoji {
+        Some(crate::history::large_emoji::LargeEmoji::Isolated(emoji)) => {
+            let row = tg_history::large_emoji_inner_rect(
+                layout.media_rect,
+                emoji.len(),
+                layout.has_right_layout,
+            );
+            // A selected message colours its emoji (`LargeEmoji::draw`, `.colored`).
+            crate::history::large_emoji::paint_large_emoji(
+                ui.ctx(),
+                ui.painter(),
+                emoji,
+                hist_rect_to_egui(row, origin.x, origin.y),
+                is_selected.then_some(colors.msg_sticker_overlay),
+                colors.text_fg,
+            );
+        }
+        Some(crate::history::large_emoji::LargeEmoji::OnlyCustom(lines)) => {
+            crate::history::large_emoji::paint_only_custom(
+                ui.ctx(),
+                ui.painter(),
+                lines,
+                layout.media_rect,
+                layout.has_right_layout,
+                origin,
+                colors.text_fg,
+            );
+        }
+        None => {}
     }
 
     // 4. Rich document message blocks + formulas OR standard formatted message body.
@@ -1186,7 +1254,7 @@ fn paint_message_element_internal(
         };
 
         let style = message_text_style();
-        let text_pal = colors.text_palette(layout.has_out_layout);
+        let text_pal = selected_text_palette(colors, layout.has_out_layout, is_selected);
         // The body is prepared once per message text (`MessagePaintCache::body`) and painted
         // from that on later frames.
         let body_wrap = text_rect.width().max(40.0);
@@ -1194,9 +1262,22 @@ fn paint_message_element_internal(
         let mut spoilers_clicked = false;
         match paint_cache.body(active_text) {
             PreparedBody::Blocks(prepared) => {
+                // The list keeps the selection (`HistoryInner::_selectedTextSelection`) in
+                // chars, the widget hit-tests and highlights in UTF-16 of the same text.
+                let source = active_text.text.as_str();
+                let shown = if selection.is_empty() || selection.is_full() {
+                    tg_text::TextSelection::default()
+                } else {
+                    let utf16 = |at: u16| {
+                        let units = char_to_utf16(source, usize::from(at));
+                        units.min(usize::from(u16::MAX)) as u16
+                    };
+                    tg_text::TextSelection::new(utf16(selection.from), utf16(selection.to))
+                };
                 let mut opts = RichTextOptions::new(colors.text_fg, text_rect.width().max(40.0))
                     .selectable(true)
-                    .selection(tg_text::TextSelection::new(selection.from, selection.to));
+                    .external_selection(true)
+                    .selection(shown);
                 opts.syntax_palette = Some(if colors.is_night {
                     SyntaxHighlightPalette::night()
                 } else {
@@ -1206,6 +1287,7 @@ fn paint_message_element_internal(
                 opts.expanded_blockquotes = text_state.map(|s| s.expanded_quotes.clone());
                 let mut clicked_link: Option<(String, bool)> = None;
                 let mut toggled_quote = None;
+                let mut drag = None;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
                     let resp = render_prepared_text_with_entities(
                         ui,
@@ -1222,7 +1304,24 @@ fn paint_message_element_internal(
                     }
                     spoilers_clicked = resp.spoiler_toggled;
                     toggled_quote = resp.blockquote_toggled;
+                    drag = resp.drag;
                 });
+                // A drag in a code block or a quote selects through the list like plain text,
+                // so the menu, Reply with Quote and a drag into other messages see it (TGB-3024).
+                if let Some(drag) = drag {
+                    let char_index = utf16_to_char(source, drag.utf16_offset);
+                    events.push(if drag.started {
+                        MessagePaintEvent::TextDragStart {
+                            msg_id: msg.id,
+                            char_index,
+                        }
+                    } else {
+                        MessagePaintEvent::TextDragUpdate {
+                            msg_id: msg.id,
+                            char_index,
+                        }
+                    });
+                }
                 if let Some(block) = toggled_quote {
                     events.push(MessagePaintEvent::ToggleQuote {
                         msg_id: msg.id,
@@ -1511,8 +1610,14 @@ fn paint_message_element_internal(
     // 6. Bottom info bar (views, edited, time, outgoing sent/read ticks).
     // `UnwrappedMedia::needInfoDisplay`: the time of an incoming large emoji message shows on
     // hover, a right-aligned one always (`LargeEmoji::alwaysShowOutTimestamp`).
-    let info_hidden = large_emoji.is_some()
-        && !layout.has_right_layout
+    let unwrapped_sticker = matches!(msg.media, Some(HistoryMedia::Sticker(_)))
+        && !layout.unwrapped_content_rect.is_empty();
+    let always_out = large_emoji
+        .as_ref()
+        .is_some_and(crate::history::large_emoji::LargeEmoji::always_show_out_timestamp);
+    let info_hidden = (large_emoji.is_some() || unwrapped_sticker)
+        && !(layout.has_right_layout && always_out)
+        && !last_and_self
         && !msg.is_sending
         && !msg.extra.send_failed
         && !ui.ctx().pointer_hover_pos().is_some_and(|pos| {

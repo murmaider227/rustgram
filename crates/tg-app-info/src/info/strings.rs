@@ -49,9 +49,6 @@ pub const MENU_MUTE_NOTIFICATIONS: &str = "Mute notifications";
 pub const MENU_AUTO_DELETE: &str = "Auto-delete messages";
 pub const MENU_ABOUT_TGFORK: &str = "About Rustgram";
 
-/// Toasts emitted by `InfoWrapWidget`.
-pub const TOAST_NOTIFICATIONS_MUTED: &str = "Notifications muted";
-pub const TOAST_NOTIFICATIONS_ENABLED: &str = "Notifications enabled";
 pub const TOAST_MEMBER_REMOVED: &str = "Member removed";
 
 /// Members & common groups copy.

@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TGFORK_VERSION");
     println!("cargo:rerun-if-changed=../../assets/icon.svg");
     println!("cargo::rustc-check-cfg=cfg(rustgram_window_icon_rgba)");
+    println!("cargo::rustc-check-cfg=cfg(rustgram_tray_icon_rgba)");
 
     // Version printed by `rustgram --version` (same source as the VERSIONINFO resource).
     let version = ["RUSTGRAM_VERSION", "TGFORK_VERSION"]
@@ -158,6 +159,20 @@ mod win_resources {
             && fs::write(out_dir.join("window_icon_64.rgba"), rgba).is_ok()
         {
             println!("cargo:rustc-cfg=rustgram_window_icon_rgba");
+        }
+        // The tray icon sizes of `tg_app::startup::icon::TRAY_ICON_SIZES` (TGB-3123).
+        let tray_ok = fs::read(&svg_path)
+            .map_err(|e| format!("read svg: {e}"))
+            .and_then(|svg| parse_icon_tree(&svg))
+            .is_ok_and(|tree| {
+                [16_u32, 20, 24, 32].iter().all(|&size| {
+                    render_tree_rgba(&tree, size).is_ok_and(|rgba| {
+                        fs::write(out_dir.join(format!("tray_icon_{size}.rgba")), rgba).is_ok()
+                    })
+                })
+            });
+        if tray_ok {
+            println!("cargo:rustc-cfg=rustgram_tray_icon_rgba");
         }
     }
 

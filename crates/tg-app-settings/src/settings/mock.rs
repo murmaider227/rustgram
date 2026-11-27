@@ -2,7 +2,7 @@
 //!
 //! All sample users, sessions, folders, and stickers use strictly fictional placeholder names.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use tg_lang::LangPackLanguageInfo;
@@ -17,8 +17,8 @@ use super::backend::{
     MAX_FOLDER_LINK_TITLE_LEN, NotificationEventsSettings, NotifyException, NotifyScope,
     PasskeyEntry, PasskeyHybridQrStatus, PeerRef, PrivacyKey, PrivacyOption, PrivacyRule,
     ProfileInfo, ProxyCheckStatus, SESSION_TTL_OPTIONS, SavedRingtone, ScopeNotifySettings,
-    SettingsBackend, StickerSetInfo, SuggestedFolder, UsernameStatus, WebAuthorization,
-    validate_username_syntax,
+    SettingsBackend, SettingsRead, StickerSetInfo, SuggestedFolder, UsernameStatus,
+    WebAuthorization, validate_username_syntax,
 };
 
 #[derive(Clone)]
@@ -76,6 +76,8 @@ pub struct MockSettingsBackend {
     cable_scanner: CableScannerSlot,
     hybrid_qr_status: Arc<Mutex<PasskeyHybridQrStatus>>,
     active_cable_eid_key: Option<[u8; tg_platform::webauthn::CABLE_EID_KEY_LEN]>,
+    /// Reads reported as still loading (TGB-3105), like a live backend before its first answer.
+    pending_reads: HashSet<SettingsRead>,
 }
 
 impl Default for MockSettingsBackend {
@@ -604,6 +606,7 @@ impl MockSettingsBackend {
             export_count: 0,
             proxy_settings: tg_core::SettingsProxy::new(),
             proxy_checks: Vec::new(),
+            pending_reads: HashSet::new(),
             web_authorizations: vec![
                 WebAuthorization {
                     hash: 0x5EED_0001,
@@ -723,7 +726,23 @@ impl MockSettingsBackend {
     }
 }
 
+impl MockSettingsBackend {
+    /// Marks `read` as still loading (`true`) or answered (`false`), so screens show tdesktop's
+    /// loading states as with a live backend waiting for the server (TGB-3070, TGB-3105).
+    pub fn set_read_pending(&mut self, read: SettingsRead, pending: bool) {
+        if pending {
+            self.pending_reads.insert(read);
+        } else {
+            self.pending_reads.remove(&read);
+        }
+    }
+}
+
 impl SettingsBackend for MockSettingsBackend {
+    fn settings_read_pending(&self, read: SettingsRead) -> bool {
+        self.pending_reads.contains(&read)
+    }
+
     fn profile(&self) -> ProfileInfo {
         self.profile.clone()
     }

@@ -245,6 +245,14 @@ impl TgforkApp {
         )
     }
 
+    /// The tray and notifications host of the running workspace (demo or signed-in live).
+    fn notify_tray_host_mut(&mut self) -> Option<&mut AppNotifyTrayHost> {
+        match self.live_host.as_mut() {
+            Some(live) => live.notify_tray_host_mut(),
+            None => self.demo.as_deref_mut().map(|demo| &mut demo.notify_tray),
+        }
+    }
+
     /// Returns a mutable reference to the demo workspace's [`WindowController`] (`None` in
     /// live mode, where [`crate::live::LiveAppHost`] owns the controllers).
     pub fn controller_mut(&mut self) -> Option<&mut WindowController> {
@@ -393,11 +401,14 @@ impl TgforkApp {
 
         for act in incoming_batch {
             if act.quit {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
+                tg_app_media::tray::window_close::request_quit(ctx);
                 return;
             }
             if act.show {
                 self.started_hidden_to_tray = false;
+                if let Some(tray) = self.notify_tray_host_mut() {
+                    tray.note_window_shown();
+                }
                 ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -438,7 +449,7 @@ impl TgforkApp {
                         Err("updater is not initialized".to_owned())
                     };
                     match launch_res {
-                        Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                        Ok(()) => tg_app_media::tray::window_close::request_quit(ctx),
                         Err(err) => {
                             let msg = format!("Could not launch updater: {err}");
                             if let Some(live) = self.live_host.as_mut() {
@@ -449,6 +460,36 @@ impl TgforkApp {
                         }
                     }
                 }
+            }
+        }
+
+        // "Restart" in a restart box (interface scale, TGB-3111): the settings were saved this
+        // frame; close the window and start again after it (`Core::Restart`).
+        let restart = match self.live_host.as_mut() {
+            Some(live) => live
+                .active_controller_mut()
+                .is_some_and(WindowController::take_app_restart_request),
+            None => self
+                .demo
+                .as_deref_mut()
+                .is_some_and(|demo| demo.controller.take_app_restart_request()),
+        };
+        if restart {
+            crate::startup::scale_restart::request_relaunch();
+            tg_app_media::tray::window_close::request_quit(ctx);
+        }
+
+        // Closing the main window hides it to the tray like tdesktop (TGB-3122).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let has_auth = match self.live_host.as_mut() {
+                Some(live) => live.active_controller_mut().is_some(),
+                None => self
+                    .demo
+                    .as_deref()
+                    .is_some_and(|demo| demo.controller.root_screen() == RootScreen::Main),
+            };
+            if let Some(tray) = self.notify_tray_host_mut() {
+                let _ = tray.on_main_window_close_requested(ctx, has_auth);
             }
         }
 
@@ -589,6 +630,7 @@ impl DemoShell {
             self.controller.palette().layer_backdrop,
             self.controller.palette().divider,
         );
+        self.controller.exchange_studio_theme(ctx);
         self.stories
             .update_and_render(ctx, &self.controller.palette());
         if self.stories.take_update_app_request() {
@@ -609,6 +651,13 @@ impl eframe::App for TgforkApp {
             .as_ref()
             .map_or(tg_core::SCALE_AUTO, |s| s.plan.global_config.config_scale);
         tg_app_window::window::interface_scale::apply(&ctx, config_scale);
+        let active_controller = match self.live_host.as_mut() {
+            Some(live) => live.active_controller_mut(),
+            None => self.demo.as_deref_mut().map(|demo| &mut demo.controller),
+        };
+        if let Some(controller) = active_controller {
+            tg_app_window::window::interface_scale::sync_settings(&ctx, controller);
+        }
         let hwnd = extract_eframe_hwnd(frame);
         let has_crash_recovery = self
             .startup
@@ -654,7 +703,7 @@ impl eframe::App for TgforkApp {
                         ctx.request_repaint();
                     }
                     CrashRecoveryAction::Quit => {
-                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                        tg_app_media::tray::window_close::request_quit(&ctx);
                     }
                 }
             }
@@ -823,6 +872,7 @@ fn live_working_dir_and_key(startup: Option<&StartupContext>) -> (PathBuf, Strin
 /// Launches the native Windows desktop window titled `"Rustgram"`.
 pub fn run_app(mut config: AppConfig) -> anyhow::Result<()> {
     let startup = config.startup.take();
+    crate::startup::icon::install_tray_app_icon();
     let settings_path = config
         .settings_path
         .unwrap_or_else(ShellSettings::default_path);

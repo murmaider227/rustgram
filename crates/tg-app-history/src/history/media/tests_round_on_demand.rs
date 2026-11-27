@@ -29,6 +29,8 @@ fn a_click_downloads_a_round_video_that_does_not_autoplay_and_plays_it() {
         "the play button, not a loader: nothing downloads"
     );
     assert!(rt.take_download_actions().is_empty());
+    // A backend that streams plays it at once instead (TGB-3116, `tests_round_stream`).
+    rt.provide_voice_stream(MsgId(1), None);
 
     rt.click_round_video(PEER, ROUND, "Ivo Marten", 3, 1_000);
     assert_eq!(

@@ -39,7 +39,10 @@ published releases.
 3. **Release notes.** The release body is `.github/release-notes/v<version>.md`. A stable release
    without that file fails before the build. A pre-release without it gets a short default body. A
    notes file that still contains the `RELEASE-NOTES-DRAFT` marker fails the run.
-4. **Test builds never become releases.** A run dispatched on a branch builds, smoke-tests and uploads
+4. **CI must be green.** A tag push, or a run dispatched on the tag, first checks the `CI` workflow
+   runs of the tagged commit: it waits while one is still running (up to 90 minutes) and fails unless
+   one of them succeeded. Tag only a commit whose CI on `main` is green. Test builds skip the check.
+5. **Test builds never become releases.** A run dispatched on a branch builds, smoke-tests and uploads
    the files as a 7-day workflow artifact. It creates no release (not even a draft) and no attestation.
    Only a tag push, or a run dispatched on the tag itself, creates the draft.
 

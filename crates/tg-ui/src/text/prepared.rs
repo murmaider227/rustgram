@@ -192,6 +192,7 @@ fn same_layout_options(a: &RichTextOptions, b: &RichTextOptions) -> bool {
         // `spoilers_revealed` and the `expanded_blockquotes` argument.
         spoiler_reveal: _,
         expanded_blockquotes: _,
+        external_selection: _,
     } = a;
     *max_width == b.max_width
         && *max_lines == b.max_lines

@@ -169,6 +169,14 @@ pub enum InfoWrapEvent {
     OpenHistory(PeerId),
     /// Show an informational toast message.
     Toast(String),
+    /// The Mute button (or its menu's "Mute forever / Unmute") toggled the chat's
+    /// notifications. tdesktop only flips the button (`MuteMenu::ToggleMuteForever`); no toast.
+    NotificationsToggled {
+        /// The chat.
+        peer_id: PeerId,
+        /// Whether it is muted now.
+        muted: bool,
+    },
     /// Open Edit Peer Info modal box.
     OpenEditPeer(PeerId),
     /// Open Edit Username modal box.
@@ -1831,11 +1839,10 @@ impl InfoWrapWidget {
             ProfileAction::SendMessage(pid) => events.push(InfoWrapEvent::OpenHistory(pid)),
             ProfileAction::ToggleNotifications(pid) => {
                 let muted = backend.toggle_notifications(pid);
-                events.push(InfoWrapEvent::Toast(if muted {
-                    strings::TOAST_NOTIFICATIONS_MUTED.to_owned()
-                } else {
-                    strings::TOAST_NOTIFICATIONS_ENABLED.to_owned()
-                }));
+                events.push(InfoWrapEvent::NotificationsToggled {
+                    peer_id: pid,
+                    muted,
+                });
             }
             ProfileAction::CopyValue { label, value } => {
                 events.push(InfoWrapEvent::Toast(format!("{label} copied: {value}")));
@@ -2095,11 +2102,10 @@ impl InfoWrapWidget {
             "auto_delete" => events.push(InfoWrapEvent::OpenAutoDelete(peer.id)),
             "mute_toggle" => {
                 let muted = backend.toggle_notifications(peer.id);
-                events.push(InfoWrapEvent::Toast(if muted {
-                    strings::TOAST_NOTIFICATIONS_MUTED.to_owned()
-                } else {
-                    strings::TOAST_NOTIFICATIONS_ENABLED.to_owned()
-                }));
+                events.push(InfoWrapEvent::NotificationsToggled {
+                    peer_id: peer.id,
+                    muted,
+                });
             }
             "create_group" => events.push(InfoWrapEvent::OpenCreateGroup),
             "create_channel" => events.push(InfoWrapEvent::OpenCreateChannel),

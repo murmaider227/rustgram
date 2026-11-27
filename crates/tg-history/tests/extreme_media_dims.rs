@@ -83,6 +83,7 @@ fn photo_and_gif_sizes_stay_sane_for_any_server_dimensions() {
                     dimensions,
                     custom_size: 0,
                     option_sticker_size: None,
+                    bottom_info_width: None,
                 };
                 sane(
                     count_sticker_optimal_size(&sticker),

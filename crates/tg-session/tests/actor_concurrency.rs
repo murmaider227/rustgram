@@ -407,7 +407,6 @@ async fn start(store: Option<Arc<dyn UpdatesStateStore>>) -> (GatedRpc, Rt) {
         cfg,
     )
     .expect("start runtime");
-    rpc.attach_session(rt.session());
     {
         let mut s = rt.session().write().await;
         for (uid, name) in [(PEER_UID, "PeerOne"), (OTHER_UID, "PeerTwo")] {
@@ -417,6 +416,11 @@ async fn start(store: Option<Arc<dyn UpdatesStateStore>>) -> (GatedRpc, Rt) {
             );
         }
     }
+    // The probe watches the lock only from here: this fixture's own write above (held, or
+    // queued behind the runtime's startup read) made the startup `updates.getState` look like
+    // a request under the lock on a slow runner (TGB-3133). The runtime never holds the lock
+    // across a request; every request after this point is checked.
+    rpc.attach_session(rt.session());
     rt.wait_ready().await.expect("ready");
     (rpc, Arc::new(rt))
 }
@@ -688,13 +692,26 @@ async fn sends_edits_and_deletes_reach_the_server_in_order() {
         rpc.count::<tl_fns::messages::SendMessage>() == 1
     })
     .await;
+    // The delete is queued before the second send is even created: two separately spawned
+    // tasks reached the command channel in either order (TGB-3133), which the runtime then
+    // kept, as it should.
+    let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
     let delete = tokio::spawn({
         let rt = Arc::clone(&rt);
         async move {
-            rt.delete_messages(peer(OTHER_UID), vec![MsgId(7)], true)
-                .await
+            let mut delete =
+                std::pin::pin!(rt.delete_messages(peer(OTHER_UID), vec![MsgId(7)], true));
+            // The first poll sends the command; the answer comes later.
+            let first_poll =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(delete.as_mut().poll(cx))).await;
+            let _ = queued_tx.send(());
+            match first_poll {
+                std::task::Poll::Ready(res) => res,
+                std::task::Poll::Pending => delete.await,
+            }
         }
     });
+    queued_rx.await.expect("delete queued");
     let second = tokio::spawn({
         let rt = Arc::clone(&rt);
         async move {

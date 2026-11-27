@@ -4,6 +4,7 @@
 
 pub mod audio_output;
 pub mod cache;
+pub mod clip_stream;
 pub mod clock;
 pub mod decoder;
 pub mod document;
@@ -17,7 +18,7 @@ pub use audio_output::{AudioSink, PlayerAudio};
 pub use cache::{
     BinlogSliceCache, CacheKey, MediaCacheSliceCache, MemorySliceCache, SliceCache, slice_cache_key,
 };
-
+pub use clip_stream::StreamedClip;
 pub use clock::{
     DEFAULT_FRAME_QUEUE_CAPACITY, FramePopOutcome, FrameQueue, SyncClock, TimePoint,
     world_time_delay,

@@ -22,6 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
+use tg_app_core::core_types::misc::{InlineDocumentData, StreamedDocument};
 use tg_app_core::stand_in::types::{MsgId, PeerId};
 use tg_audio::{AudioError, AudioInput, AudioMsgId, AudioType, StreamedInputOpener};
 use tg_video::{RangeLoader, RangeReadSeek};
@@ -60,6 +61,58 @@ pub enum MediaDownloadAction {
 
 /// How long a started voice track waits for the widget to hand over its loader.
 const STREAM_LOADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often, and how many times, a streamed message is asked for again after its track
+/// stopped: the backend keeps a file the stream read in full (TGB-3115).
+const STREAM_RECHECK_EVERY: Duration = Duration::from_millis(250);
+const STREAM_RECHECK_TRIES: u8 = 8;
+/// `kWaitingShowDelay`, `kWaitingShowDuration`, `kWaitingFastDuration`
+/// (`media_streaming_document.cpp`), in seconds.
+const WAITING_SHOW_DELAY: f64 = 0.5;
+const WAITING_SHOW_DURATION: f64 = 0.5;
+const WAITING_FAST_DURATION: f64 = 0.2;
+
+/// After a streamed message's track stopped, the backend may have kept its file.
+#[derive(Debug, Default, Clone, Copy)]
+struct StreamRecheck {
+    played: bool,
+    tries_left: u8,
+    last: Option<std::time::Instant>,
+}
+
+/// The waiting radial of a streamed round video (`Streaming::Document::waitingOpacity`): it
+/// shows after the stream waited for [`WAITING_SHOW_DELAY`] and fades out fast.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WaitingRadial {
+    waiting_since: Option<f64>,
+    fade_out_from: Option<(f64, f32)>,
+    opacity: f32,
+}
+
+impl WaitingRadial {
+    /// The radial's opacity at `now` (seconds) for the stream's `waiting` state.
+    pub(crate) fn update(&mut self, waiting: bool, now: f64) -> f32 {
+        self.opacity = if waiting {
+            self.fade_out_from = None;
+            // Waiting again while it fades out: go on from where it is.
+            let shown = f64::from(self.opacity);
+            let since = *self.waiting_since.get_or_insert(if shown > 0.0 {
+                now - WAITING_SHOW_DELAY - shown * WAITING_SHOW_DURATION
+            } else {
+                now
+            });
+            ((now - since - WAITING_SHOW_DELAY) / WAITING_SHOW_DURATION).clamp(0.0, 1.0) as f32
+        } else {
+            self.waiting_since = None;
+            if self.opacity > 0.0 {
+                let (from, opacity) = *self.fade_out_from.get_or_insert((now, self.opacity));
+                (f64::from(opacity) - (now - from) / WAITING_FAST_DURATION).max(0.0) as f32
+            } else {
+                0.0
+            }
+        };
+        self.opacity
+    }
+}
 
 #[derive(Default)]
 enum StreamLoader {
@@ -90,6 +143,13 @@ impl VoiceStreamSlot {
         self.changed.notify_all();
     }
 
+    fn ready(&self) -> Option<Arc<dyn RangeLoader>> {
+        match &*self.loader.lock().unwrap_or_else(PoisonError::into_inner) {
+            StreamLoader::Ready(loader) => Some(Arc::clone(loader)),
+            StreamLoader::Waiting | StreamLoader::Unavailable => None,
+        }
+    }
+
     fn is_waiting(&self) -> bool {
         matches!(
             *self.loader.lock().unwrap_or_else(PoisonError::into_inner),
@@ -118,10 +178,11 @@ impl VoiceStreamSlot {
                 .ok_or_else(|| AudioError::SourceNotFound("voice stream unavailable".into()))?;
             let reader = RangeReadSeek::new(loader)
                 .map_err(|e| AudioError::SourceNotFound(e.to_string()))?;
-            let size = reader.size();
+            // No length: with one the decoder probes the end of the file for trailing tags,
+            // which waits for the last part (TGB-3116: round video sound before it).
             Ok(AudioInput {
                 reader: Box::new(reader),
-                byte_len: Some(size),
+                byte_len: None,
                 hint_ext: Some(ext.clone()),
             })
         })
@@ -171,6 +232,10 @@ pub(super) struct MediaDownloads {
     streamed_tracks: HashSet<MsgId>,
     /// The backend cannot stream: voice messages download in full before they play.
     streams_unavailable: bool,
+    /// Streamed messages asked for again after their track stopped (TGB-3115).
+    rechecks: HashMap<MsgId, StreamRecheck>,
+    /// Waiting radials of streamed round videos.
+    pub(super) waiting: HashMap<MsgId, WaitingRadial>,
 }
 
 /// Circle colour between `msgDateImgBg` and `msgDateImgBgOver` (`anim::brush`).
@@ -340,6 +405,40 @@ impl HistoryMediaRuntime {
         );
     }
 
+    /// A click on the round video `msg_id` that is not downloaded: it plays from a stream
+    /// while it downloads (TGB-3116), so it counts as loaded from now on. `false` when the
+    /// backend cannot stream: the click downloads the whole file first (TGB-2997).
+    pub(super) fn stream_round(&mut self, msg_id: MsgId) -> bool {
+        let not_loaded = self
+            .descriptors
+            .get(&msg_id)
+            .is_some_and(|d| d.voice_load == Some(VoiceLoadState::NotLoaded));
+        // A round video that already downloads in full only waits for it.
+        if !not_loaded || !self.streams_voice(msg_id) {
+            return false;
+        }
+        self.request_voice_stream(msg_id);
+        true
+    }
+
+    /// Whether the round video `msg_id` that is not downloaded plays from a stream: its loader
+    /// was asked for and has not been refused.
+    pub(super) fn round_streams(&self, msg_id: MsgId) -> bool {
+        self.downloads.stream_requested.contains(&msg_id)
+            && self
+                .downloads
+                .voice_streams
+                .get(&msg_id)
+                .is_some_and(|slot| slot.is_waiting() || slot.ready().is_some())
+    }
+
+    /// The video of the round video `msg_id` that plays from a stream, once the backend
+    /// handed over its loader.
+    pub(super) fn round_stream_data(&self, msg_id: MsgId) -> Option<InlineDocumentData> {
+        let loader = self.downloads.voice_streams.get(&msg_id)?.ready()?;
+        Some(InlineDocumentData::Stream(StreamedDocument(loader)))
+    }
+
     /// Whether the not cached voice message `msg_id` plays from a stream (TGB-3000).
     pub(super) fn streams_voice(&self, msg_id: MsgId) -> bool {
         !self.downloads.streams_unavailable && self.voice_loaded(msg_id) == Some(false)
@@ -367,6 +466,9 @@ impl HistoryMediaRuntime {
             return;
         }
         self.downloads.streams_unavailable = true;
+        if self.unmuted_round_msg == Some(msg_id) {
+            self.round_stream_refused(msg_id);
+        }
         // Tracks registered to stream fail at once and register again as before.
         for (id, slot) in std::mem::take(&mut self.downloads.voice_streams) {
             slot.set(None);
@@ -395,20 +497,96 @@ impl HistoryMediaRuntime {
         self.request_voice_play(peer_id, msg_id, None);
     }
 
+    /// The backend cannot stream the round video that was to play from a stream: stop its
+    /// sound and download it in full, then play it (the TGB-2997 path).
+    fn round_stream_refused(&mut self, msg_id: MsgId) {
+        if let Some(audio_id) = self.registered_audio.get(&msg_id).copied()
+            && self.audio_player_bar.player().current(AudioType::Voice) == audio_id
+        {
+            self.audio_player_bar
+                .player_mut()
+                .stop(AudioType::Voice, false);
+        }
+        self.unmuted_round_msg = None;
+        self.round_sound_seen_active = false;
+        let Some(meta) = self.downloads.voice_meta.get(&msg_id).cloned() else {
+            return;
+        };
+        let peer_id = self.active_peer;
+        self.request_round_play(peer_id, msg_id, &meta.sender_name, meta.duration_secs, 0);
+    }
+
+    /// Streamed messages to ask the backend for again: their track stopped after it played,
+    /// and the backend keeps a file the stream read in full (TGB-3115), which then counts as
+    /// loaded. Asked a few times, [`STREAM_RECHECK_EVERY`] apart; the flag says whether more
+    /// asks are due (the widget repaints for them).
+    pub fn take_stream_rechecks(&mut self) -> (Vec<MsgId>, bool) {
+        let streamed: Vec<MsgId> = self.downloads.voice_streams.keys().copied().collect();
+        let now = std::time::Instant::now();
+        let (mut due, mut more) = (Vec::new(), false);
+        for msg_id in streamed {
+            let active = self.audio_item_state(msg_id, AudioType::Voice).0;
+            let recheck = self.downloads.rechecks.entry(msg_id).or_default();
+            if active {
+                *recheck = StreamRecheck {
+                    played: true,
+                    tries_left: STREAM_RECHECK_TRIES,
+                    last: None,
+                };
+                continue;
+            }
+            if !recheck.played || recheck.tries_left == 0 {
+                continue;
+            }
+            more = true;
+            if recheck
+                .last
+                .is_some_and(|last| now.duration_since(last) < STREAM_RECHECK_EVERY)
+            {
+                continue;
+            }
+            recheck.last = Some(now);
+            recheck.tries_left -= 1;
+            due.push(msg_id);
+        }
+        (due, more)
+    }
+
+    /// Whether the streamed round video `msg_id` waits for data: no frame yet, or its sound
+    /// waits for the stream (`Streaming::Instance::waitingShown`).
+    pub(crate) fn round_stream_waiting(&self, msg_id: MsgId, has_frame: bool) -> bool {
+        if !self.round_streams(msg_id)
+            || self
+                .descriptors
+                .get(&msg_id)
+                .is_some_and(|d| d.video_data.is_some())
+        {
+            return false;
+        }
+        let (active, _, _, _, state) = self.audio_item_state(msg_id, AudioType::Voice);
+        !has_frame || (active && state.waiting_for_data)
+    }
+
     /// Forgets the stream of `msg_id` once its file is in the cache.
     pub(super) fn drop_voice_stream(&mut self, msg_id: MsgId) {
+        self.downloads.rechecks.remove(&msg_id);
+        self.downloads.waiting.remove(&msg_id);
         self.downloads.voice_streams.remove(&msg_id);
         self.downloads.stream_requested.remove(&msg_id);
         self.downloads.streamed_tracks.remove(&msg_id);
     }
 
     /// The input of `msg_id`'s streamed track; marks the registration as streamed.
-    pub(super) fn voice_stream_opener(&mut self, msg_id: MsgId) -> tg_audio::StreamedInputOpener {
+    pub(super) fn voice_stream_opener(
+        &mut self,
+        msg_id: MsgId,
+        is_round: bool,
+    ) -> tg_audio::StreamedInputOpener {
         let ext = self
             .descriptors
             .get(&msg_id)
             .and_then(|d| d.audio_ext.clone())
-            .unwrap_or_else(|| "ogg".to_owned());
+            .unwrap_or_else(|| if is_round { "mp4" } else { "ogg" }.to_owned());
         self.downloads.streamed_tracks.insert(msg_id);
         self.voice_stream_slot(msg_id).opener(ext)
     }
@@ -425,7 +603,7 @@ impl HistoryMediaRuntime {
         let Some(&audio_id) = self.registered_audio.get(&msg_id) else {
             return;
         };
-        let open = self.voice_stream_opener(msg_id);
+        let open = self.voice_stream_opener(msg_id, false);
         self.audio_backend.stream_track(audio_id, open);
     }
 

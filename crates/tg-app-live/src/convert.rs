@@ -1242,6 +1242,7 @@ pub fn story_reply_header(
         preview_thumb_rgb: None,
         preview_thumb: None,
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     };
     match state {
@@ -1281,6 +1282,7 @@ pub fn story_reply_header(
                     .map(|_| avatar_rgb_for_color_index((story.story.unsigned_abs() % 7) as u8)),
                 preview_thumb: preview_thumb.flatten(),
                 preview_colored_len: 0,
+                preview_spoilers: Vec::new(),
                 quote_text: None,
             }
         }
@@ -1330,6 +1332,7 @@ pub fn reply_header_for(
         preview_thumb_rgb: None,
         preview_thumb: None,
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     };
     match target {
@@ -1362,6 +1365,7 @@ pub fn reply_header_for(
                     .map(|_| avatar_rgb_for_color_index((target_id.0.unsigned_abs() % 7) as u8)),
                 preview_thumb: preview_thumb.flatten(),
                 preview_colored_len: preview.colored_len,
+                preview_spoilers: preview.spoilers,
                 quote_text: quote,
             })
         }
@@ -1409,6 +1413,7 @@ pub fn reply_header_for(
                         }),
                         preview_thumb: preview_thumb.flatten(),
                         preview_colored_len: colored_len,
+                        preview_spoilers: Vec::new(),
                         quote_text: quote,
                     })
                 }
@@ -1612,6 +1617,7 @@ pub fn message_to_history_message_with_resolvers(
             now_unix_i32(),
         ),
         sender_accent: Some(crate::peer_accent::peer_accent(session, from_data_id)),
+        no_forwards: msg.no_forwards(),
     };
 
     HistoryMessage {
@@ -1869,6 +1875,12 @@ fn convert_message_media(
                         width: doc.width.unwrap_or(512).max(1),
                         height: doc.height.unwrap_or(512).max(1),
                         lottie_json,
+                        set: doc.sticker.as_ref().filter(|s| s.set_id != 0).map(|s| {
+                            tg_app_core::history::backend::StickerSetId {
+                                id: s.set_id,
+                                access_hash: s.set_access_hash,
+                            }
+                        }),
                     })
                 }
                 DocumentKind::File | DocumentKind::Audio | DocumentKind::WallPaper => {
@@ -2050,6 +2062,7 @@ fn convert_message_media(
                     width: 160,
                     height: 160,
                     lottie_json,
+                    set: None,
                 })),
                 None,
                 None,

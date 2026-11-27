@@ -290,3 +290,118 @@ fn shared_media_thumbs_decode_bounded() {
     assert!(decode_shared_media_thumb(&[]).is_none());
     assert!(decode_shared_media_thumb(b"not an image at all").is_none());
 }
+
+/// TGB-2875: a left click on Mute toggles the chat like `MuteMenu::ToggleMuteForever` and
+/// shows no toast (tdesktop only flips the button).
+#[test]
+fn mute_click_reports_the_toggle_without_a_toast() {
+    let mut h = harness();
+    h.get_by_label("Mute").click();
+    h.run();
+    let events = &h.state().events;
+    assert!(
+        events.contains(&InfoWrapEvent::NotificationsToggled {
+            peer_id: mock_peers::USER_MIRA,
+            muted: true,
+        }),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, InfoWrapEvent::Toast(_))),
+        "no toast: {events:?}"
+    );
+    assert_eq!(
+        crate::info::map_wrap_events(events, mock_peers::USER_MIRA),
+        Some(crate::info::InfoAction::ToggleMute(mock_peers::USER_MIRA))
+    );
+}
+
+/// TGB-2874: `MuteItem` paints "Unmute" in `boxTextFgGood` and "Mute forever" in
+/// `menuIconAttentionColor`.
+#[test]
+fn unmute_row_is_green_and_mute_forever_is_red() {
+    let good = |items: &[MenuItem]| -> Vec<bool> {
+        items
+            .iter()
+            .filter_map(|it| match it {
+                MenuItem::Action { good, .. } => Some(*good),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        good(&mute_menu_items(true, false)),
+        [false, false, false, true]
+    );
+    assert_eq!(
+        good(&mute_menu_items(false, false)),
+        [false, false, false, false]
+    );
+    let colors = InfoColors::for_mode(ThemeMode::Day);
+    let style = tg_ui::style::PopupMenuStyle::default_popup(&colors);
+    assert_eq!(
+        style.menu.item_fg_good,
+        tg_ui::theme::Colors::color(&colors, "boxTextFgGood")
+    );
+    assert_ne!(style.menu.item_fg_good, style.menu.item_fg);
+}
+
+/// Wave 8 capture (TGB-2874, TGB-2875): the profile column of a muted chat with its Mute menu
+/// open, written to `$W8_SNAP_DIR/<stage>/unmute_menu_<mode>.png` (`<stage>` from
+/// `$W8_SNAP_STAGE`, default `after`).
+#[test]
+#[ignore = "captures the mute menu under W8_SNAP_DIR"]
+fn capture_w8_unmute_menu() {
+    let Some(dir) = std::env::var_os("W8_SNAP_DIR").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let stage = std::env::var("W8_SNAP_STAGE").unwrap_or_else(|_| "after".to_owned());
+    let dir = dir.join(stage);
+    std::fs::create_dir_all(&dir).expect("create snap dir");
+    for (mode, name) in [(ThemeMode::Day, "day"), (ThemeMode::Night, "night")] {
+        let colors = InfoColors::for_mode(mode);
+        let mut backend = MockBackend::new();
+        if !backend
+            .peer_profile(mock_peers::USER_MIRA)
+            .is_some_and(|p| p.muted)
+        {
+            backend.toggle_notifications(mock_peers::USER_MIRA);
+        }
+        let mut h = Harness::builder()
+            .with_size(egui::Vec2::new(420.0, 640.0))
+            .with_context_setup(tg_ui::fonts::register_tdesktop_fonts)
+            .wgpu()
+            .build_ui_state(
+                move |ui, st: &mut State| {
+                    let events = st.wrap.show(ui, &mut st.backend, true, &colors);
+                    st.events.extend(events);
+                },
+                State {
+                    wrap: InfoWrapWidget::for_peer(mock_peers::USER_MIRA),
+                    backend,
+                    events: Vec::new(),
+                },
+            );
+        for _ in 0..10 {
+            h.step();
+        }
+        let mute = h.get_by_label("Unmute").rect().center();
+        h.input_mut().events.push(egui::Event::PointerMoved(mute));
+        h.run();
+        for pressed in [true, false] {
+            h.input_mut().events.push(egui::Event::PointerButton {
+                pos: mute,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run();
+        }
+        for _ in 0..30 {
+            h.step();
+        }
+        let img = h.render().expect("wgpu render");
+        img.save(dir.join(format!("unmute_menu_{name}.png")))
+            .expect("save png");
+    }
+}

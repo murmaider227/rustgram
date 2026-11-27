@@ -185,6 +185,9 @@ pub struct ActiveColorEdit {
 pub struct ThemeEditorOutput {
     /// Live palette changed and was pushed into `ThemeManager`.
     pub palette_changed: bool,
+    /// The palette came from a theme file ("Load file"): the app tests it with "Keep this
+    /// theme?" before keeping it (TGB-2984).
+    pub imported: bool,
     /// User clicked "Save Cloud Theme" while connected to a live [`crate::themes::ThemesBackend`]
     /// without a backend reference passed directly to [`ThemeEditorState::show_with_backend`].
     pub save_cloud_requested: bool,
@@ -1111,6 +1114,7 @@ impl ThemeEditorState {
                                     match self.import_from_file(&p, theme_manager, chat_bg) {
                                         Ok(has_bg) => {
                                             out.palette_changed = true;
+                                            out.imported = true;
                                             out.toast = Some(if has_bg {
                                                 "Imported theme palette + background".to_owned()
                                             } else {

@@ -72,17 +72,18 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Lints and tests the crates that need neither the Windows desktop app (tg-app*, tg-platform) nor native
-  # media libraries (FFmpeg: tg-video, tg-ui, tg-editor; ALSA: tg-audio, tg-voip). The Windows job covers those.
+  # Lints and tests every crate but the Windows desktop app (tg-app*, tg-platform), which the Windows job
+  # covers. The media crates need FFmpeg 8.1 (tg-video, tg-ui, tg-editor) and ALSA (tg-audio, tg-voip).
   ubuntu-core:
-    name: Ubuntu (platform-independent crates)
+    name: Ubuntu (all crates but the Windows desktop app)
     runs-on: ubuntu-latest
     env:
       EXCLUDE_CRATES: >-
         --exclude tg-app --exclude tg-app-core --exclude tg-app-history --exclude tg-app-info
         --exclude tg-app-live --exclude tg-app-media --exclude tg-app-settings --exclude tg-app-window
-        --exclude tg-platform --exclude tg-audio --exclude tg-voip --exclude tg-video --exclude tg-editor
-        --exclude tg-ui
+        --exclude tg-platform
+      # Runners have no audio device; tests must not open real audio output.
+      RUSTGRAM_HEADLESS_AUDIO: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -100,13 +101,21 @@ jobs:
           # Keep compiled dependencies even when clippy or tests fail, so the next run starts warm.
           cache-on-failure: true
 
+      - name: Install ALSA development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
+      - name: Setup FFmpeg shared development build
+        uses: ./.github/actions/setup-ffmpeg
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy (platform-independent crates)
+      - name: Run Clippy (all crates but the Windows desktop app)
         run: cargo clippy --workspace $EXCLUDE_CRATES --all-targets -- -D warnings
 
-      - name: Run tests (platform-independent crates)
+      - name: Run tests (all crates but the Windows desktop app)
         run: cargo test --workspace $EXCLUDE_CRATES
 
   # RustSec advisories, GPL-3.0 compatible licenses, registry sources (deny.toml).

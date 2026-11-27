@@ -937,12 +937,10 @@ impl StickersListWidget {
                                     let query_trimmed = self.effective_query();
                                     self.sync_remote_search(&query_trimmed, backend);
 
-                                    let mut hits = backend.search_stickers(&query_trimmed);
-                                    for &id in &self.remote_search_stickers {
-                                        if !hits.contains(&id) {
-                                            hits.push(id);
-                                        }
-                                    }
+                                    let hits = merge_search_hits(
+                                        backend.search_stickers(&query_trimmed),
+                                        &self.remote_search_stickers,
+                                    );
 
                                     let emoji_pack_sections: Vec<tg_chat::stickers::StickerPanelSection> =
                                         self.remote_emoji_sets
@@ -1857,6 +1855,14 @@ pub(crate) fn paint_clock_icon(painter: &egui::Painter, center: Pos2, radius: f3
     );
 }
 
+/// Local sticker search hits followed by the remote ones not already found, in order. A set
+/// replaces the `Vec::contains` scan, which was quadratic in the number of hits (TGB-2922).
+fn merge_search_hits<T: Copy + Eq + std::hash::Hash>(mut local: Vec<T>, remote: &[T]) -> Vec<T> {
+    let mut seen: std::collections::HashSet<T> = local.iter().copied().collect();
+    local.extend(remote.iter().copied().filter(|id| seen.insert(*id)));
+    local
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2004,5 +2010,19 @@ mod tests {
         assert!(!panel_docks_at_width(931.0, true));
         assert!(!panel_docks_at_width(390.0, true));
         assert!(panel_docks_at_width(672.0, false));
+    }
+}
+
+#[cfg(test)]
+mod tests_w8_merge {
+    use super::merge_search_hits;
+
+    #[test]
+    fn remote_hits_follow_local_ones_without_duplicates() {
+        assert_eq!(
+            merge_search_hits(vec![3, 1, 2], &[2, 5, 3, 4, 5]),
+            vec![3, 1, 2, 5, 4]
+        );
+        assert_eq!(merge_search_hits(Vec::<u8>::new(), &[7, 7]), vec![7]);
     }
 }

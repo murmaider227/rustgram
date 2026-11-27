@@ -110,7 +110,7 @@ pub fn dispatch_global_shortcuts(
 
     // 1. Always-available window commands (any RootScreen).
     if commands.contains(&ShortcutCommand::Quit) {
-        ctx.send_viewport_cmd(ViewportCommand::Close);
+        tg_app_media::tray::window_close::request_quit(ctx);
         return;
     }
     if commands.contains(&ShortcutCommand::Close) {
@@ -204,8 +204,8 @@ pub fn dispatch_global_shortcuts(
         let active_peer = controller
             .session()
             .map_or(PeerId::ZERO, SessionController::active_peer);
-        let dialogs_for_extras = controller.session_backend().dialogs(FilterId::ALL, "");
-        if controller.handle_chat_switch_tab(ctx, &dialogs_for_extras, active_peer) {
+        let dialogs_for_extras = controller.all_dialogs();
+        if controller.handle_chat_switch_tab(ctx, dialogs_for_extras.as_slice(), active_peer) {
             return;
         }
         let sc = if shift {
@@ -483,7 +483,7 @@ pub fn execute_workspace_command(
                 controller.shell_extras_mut().chat_preview.close();
                 return true;
             }
-            let dialogs = controller.session_backend().dialogs(FilterId::ALL, "");
+            let dialogs = controller.all_dialogs();
             if let Some(d) = dialogs.iter().find(|d| d.peer.id == active_peer) {
                 let data = ChatPreviewData {
                     peer_id: d.peer.id,

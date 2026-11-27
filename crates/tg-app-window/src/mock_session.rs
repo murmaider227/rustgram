@@ -1335,6 +1335,7 @@ impl MockSessionState {
                     preview_thumb_rgb: None,
                     preview_thumb: None,
                     preview_colored_len: 0,
+                    preview_spoilers: Vec::new(),
                     quote_text: None,
                 })
         });
@@ -4157,6 +4158,7 @@ impl HistoryBackend for SharedSessionHandle {
                 preview_thumb_rgb: None,
                 preview_thumb: None,
                 preview_colored_len: 0,
+                preview_spoilers: Vec::new(),
                 quote_text: request.reply_quote.as_ref().map(|q| q.text.clone()),
             }
         });
@@ -4225,6 +4227,7 @@ impl HistoryBackend for SharedSessionHandle {
                 sender_badge: None,
                 sender_status: None,
                 sender_accent: None,
+                no_forwards: false,
             },
         };
 
@@ -13223,6 +13226,7 @@ fn build_initial_histories() -> (
                     preview_thumb_rgb: None,
                     preview_thumb: None,
                     preview_colored_len: 0,
+                    preview_spoilers: Vec::new(),
                     quote_text: None,
                 }),
                 forward: None,
@@ -13303,6 +13307,7 @@ fn build_initial_histories() -> (
                     width: 512,
                     height: 512,
                     lottie_json: sample_lottie_star_json(),
+                    set: None,
                 })),
                 service: None,
                 reply: None,
@@ -14339,6 +14344,7 @@ fn build_initial_forum_and_replies() -> (
         preview_thumb_rgb: None,
         preview_thumb: None,
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     });
     let r3 = make_thread_msg(

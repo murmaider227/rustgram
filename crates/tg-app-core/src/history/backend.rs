@@ -175,6 +175,9 @@ pub struct ReplyHeader {
     /// Leading bytes of `preview_text` drawn in the reply's name colour instead of the text
     /// colour (`Ui::Text::Colorized`: a media type such as "Photo", a service action).
     pub preview_colored_len: usize,
+    /// Byte ranges of `preview_text` under a spoiler, drawn hidden under the particle cover
+    /// (`Reply::paint` draws `_text` with `.spoiler`).
+    pub preview_spoilers: Vec<std::ops::Range<usize>>,
     /// Optional quoted excerpt if replying to a specific quote.
     pub quote_text: Option<String>,
 }
@@ -486,6 +489,18 @@ pub struct StickerAttachment {
     pub height: i32,
     /// Uncompressed Lottie JSON source rendered through `tg_lottie`.
     pub lottie_json: String,
+    /// The sticker's set (`StickerData::set`), opened in `StickerSetBox` on a click. `None`
+    /// for a sticker without a set (a dice face, an uploaded image).
+    pub set: Option<StickerSetId>,
+}
+
+/// A sticker set by id (`inputStickerSetID`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StickerSetId {
+    /// Set id.
+    pub id: u64,
+    /// Set access hash.
+    pub access_hash: u64,
 }
 
 /// Single option inside a poll or quiz (`HistoryView::Poll`).
@@ -936,6 +951,9 @@ pub struct MessageExtra {
     /// The sender's accent (`Element::colorIndex` and `colorCollectible`): the server colour
     /// index, or a collectible colour. `None`: the id-based default of `from_id`.
     pub sender_accent: Option<tg_ui::peer_color::PeerAccent>,
+    /// The message is protected (`noforwards`, `HistoryItem::forbidsForward`): its text is
+    /// not copied and it is not forwarded.
+    pub no_forwards: bool,
 }
 
 /// Who a sender is in a group, which picks the badge colour (`HistoryView::BadgeRole`).
@@ -2691,6 +2709,12 @@ pub trait HistoryBackend: Send {
     /// in `EmojiStickersPack`, if the server pack has been loaded.
     fn emoji_interaction_variant_count(&self, _emoticon: &str) -> Option<usize> {
         None
+    }
+
+    /// Whether messages of `peer_id` may be forwarded and copied (`PeerData::allowsForwarding`):
+    /// `false` for a chat with "Restrict saving content".
+    fn peer_allows_forwarding(&self, _peer_id: PeerId) -> bool {
+        true
     }
 
     /// Returns `true` if 1:1 content-sharing protection (`noforwards`) is enabled by us for `peer_id`.

@@ -42,12 +42,13 @@ pub enum RoundVideoPhase {
 }
 
 impl HistoryMediaRuntime {
-    /// Returns `true` once the round video's bytes are available (mock rounds without a
-    /// descriptor count as loaded and play the synthesized track).
+    /// Returns `true` once the round video's bytes are available or it plays from a stream
+    /// (mock rounds without a descriptor count as loaded and play the synthesized track).
     fn round_loaded(&self, msg_id: MsgId) -> bool {
         self.descriptors
             .get(&msg_id)
             .is_none_or(|d| d.video_data.is_some() || d.audio_bytes.is_some())
+            || self.round_streams(msg_id)
     }
 
     /// Returns `true` if a `tg-audio` track is registered for `msg_id` (tests).
@@ -93,7 +94,7 @@ impl HistoryMediaRuntime {
         duration_secs: u32,
         now_ms: i64,
     ) {
-        if !self.round_loaded(msg_id) {
+        if !self.round_loaded(msg_id) && !self.stream_round(msg_id) {
             if !self.request_round_play(peer_id, msg_id, sender_name, duration_secs, now_ms) {
                 tracing::debug!(msg = msg_id.0, "round video click ignored: not loaded");
             }
@@ -166,7 +167,7 @@ impl HistoryMediaRuntime {
 
     /// Decodes the round video's current frame. Unlike [`Self::inline_clip_frame`], a round
     /// playing with sound keeps advancing even when muted autoplay is switched off.
-    fn round_clip_frame(
+    pub(crate) fn round_clip_frame(
         &mut self,
         ctx: &egui::Context,
         msg_id: MsgId,
@@ -175,7 +176,10 @@ impl HistoryMediaRuntime {
         now_ms: i64,
     ) -> Option<InlineFrameState> {
         self.mark_visible(msg_id);
-        let data = self.descriptors.get(&msg_id)?.video_data.clone()?;
+        let data = match self.descriptors.get(&msg_id)?.video_data.clone() {
+            Some(data) => data,
+            None => self.round_stream_data(msg_id)?,
+        };
         let allowed = force_play || self.policy.allows_inline(InlinePlaybackKind::RoundVideo);
         self.inline.set_autoplay_round_videos(allowed);
         let source = InlineMediaSource {
@@ -417,6 +421,33 @@ pub fn paint_round_video_inline(
             );
         }
         _ => {}
+    }
+
+    // A streamed round that waits for data: the radial in the centre (`Gif::draw` with
+    // `streamedForWaiting->waitingShown()`, at `waitingOpacity`), TGB-3115.
+    let has_frame = clip.as_ref().is_some_and(|c| c.texture.is_some());
+    let waiting = runtime.round_stream_waiting(msg_id, has_frame);
+    let opacity = runtime
+        .downloads
+        .waiting
+        .entry(msg_id)
+        .or_default()
+        .update(waiting, now_secs);
+    if opacity > 0.0 && phase != RoundVideoPhase::NotLoaded {
+        let mut painter = ui.painter().clone();
+        painter.multiply_opacity(opacity);
+        painter.circle_filled(
+            center_rect.center(),
+            CENTER_BUTTON_SIZE / 2.0,
+            colors.date_img_bg,
+        );
+        runtime.spinner.start(now_secs);
+        runtime
+            .spinner
+            .paint(&ctx, &painter, center_rect.shrink(3.0));
+    }
+    if waiting || opacity > 0.0 {
+        ctx.request_repaint();
     }
 
     // 4. Mute badge at the top centre while looping muted (`displayMute`).

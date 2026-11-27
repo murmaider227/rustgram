@@ -1,12 +1,14 @@
 name: Setup FFmpeg shared development build
 description: >
-  Downloads the pinned BtbN FFmpeg win64 GPL shared build, verifies its SHA-256 against the
-  release's checksums.sha256, and exports FFMPEG_DIR and the DLL directory on PATH for tg-video.
+  Downloads the pinned BtbN FFmpeg 8.1 GPL shared build for the runner (win64 or linux64), verifies
+  its SHA-256 against the release's checksums.sha256, and exports FFMPEG_DIR and the library
+  directory (PATH on Windows, LD_LIBRARY_PATH on Linux) for tg-video.
 
 runs:
   using: composite
   steps:
     - name: Download, verify and extract FFmpeg
+      if: runner.os == 'Windows'
       shell: pwsh
       # Writes only FFMPEG_DIR and the DLL folder of the archive verified above, never untrusted input.
       run: | # zizmor: ignore[github-env]
@@ -35,3 +37,39 @@ runs:
         }
         Add-Content -Path $env:GITHUB_ENV -Value "FFMPEG_DIR=$ffmpegDir"
         Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $ffmpegDir "bin")
+
+    # Ubuntu ships FFmpeg 6.1; tg-video needs 7.0 or newer (libavformat 61+), so Linux uses the same
+    # BtbN 8.1 release as Windows.
+    - name: Download, verify and extract FFmpeg (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      # Writes only FFMPEG_DIR, the library folder and the bin folder of the archive verified above.
+      run: | # zizmor: ignore[github-env]
+        set -euo pipefail
+        archive="ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
+        base_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+        work_dir="$RUNNER_TEMP/ffmpeg-download"
+        mkdir -p "$work_dir"
+        curl -fsSL --retry 3 -o "$work_dir/checksums.sha256" "$base_url/checksums.sha256"
+        curl -fsSL --retry 3 -o "$work_dir/$archive" "$base_url/$archive"
+        expected="$(awk -v name="$archive" '$NF == name || $NF == "*" name { print tolower($1); exit }' "$work_dir/checksums.sha256")"
+        if [ -z "$expected" ]; then
+          echo "::error::Could not find $archive in BtbN checksums.sha256"
+          exit 1
+        fi
+        actual="$(sha256sum "$work_dir/$archive" | cut -d ' ' -f 1)"
+        if [ "$actual" != "$expected" ]; then
+          echo "::error::FFmpeg SHA-256 mismatch: expected $expected, got $actual"
+          exit 1
+        fi
+        extract_root="$RUNNER_TEMP/ffmpeg-extract"
+        mkdir -p "$extract_root"
+        tar -xJf "$work_dir/$archive" -C "$extract_root"
+        ffmpeg_dir="$(find "$extract_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+        if [ ! -f "$ffmpeg_dir/include/libavcodec/avcodec.h" ]; then
+          echo "::error::Extracted FFmpeg directory is missing headers: $ffmpeg_dir"
+          exit 1
+        fi
+        echo "FFMPEG_DIR=$ffmpeg_dir" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$ffmpeg_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+        echo "$ffmpeg_dir/bin" >> "$GITHUB_PATH"

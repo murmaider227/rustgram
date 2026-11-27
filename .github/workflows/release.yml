@@ -8,6 +8,8 @@
 # - A stable version (no `-suffix`) is refused unless the same commit already shipped as a published
 #   pre-release of the same version (v0.2.0 needs e.g. a published v0.2.0-beta.1 on that exact commit).
 # - The release body is `.github/release-notes/v<version>.md`, required for stable releases.
+# - A release (tag push, or a run dispatched on the tag) is refused unless the CI workflow succeeded for
+#   the tagged commit; a CI run still in progress is waited for (up to 90 minutes). Test builds skip it.
 name: Release
 
 on:
@@ -21,20 +23,67 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
-  # Build provenance attestations for the release files (`gh attestation verify <file> -R murmaider227/rustgram`).
-  id-token: write
-  attestations: write
+# Each job states what it needs.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  # Two releases went out from commits whose CI was red (TGB-3133): only a commit with a green CI run
+  # may become a release. Only runs on a tag can publish, so branch test builds skip this job.
+  ci-green:
+    name: Require green CI for the tagged commit
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for the CI workflow of the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          started="$(date +%s)"
+          while true; do
+            runs="$(gh run list -R "$REPO" --workflow ci.yml --commit "$COMMIT" --limit 20 \
+              --json status,conclusion,url)"
+            if jq -e 'any(.[]; .status == "completed" and .conclusion == "success")' <<<"$runs" >/dev/null; then
+              echo "CI succeeded for $COMMIT."
+              exit 0
+            fi
+            elapsed=$(( $(date +%s) - started ))
+            pending="$(jq 'map(select(.status != "completed")) | length' <<<"$runs")"
+            total="$(jq 'length' <<<"$runs")"
+            # A tag pushed together with its branch commit may arrive before CI registers its run.
+            if [ "$pending" -eq 0 ] && { [ "$total" -gt 0 ] || [ "$elapsed" -ge 300 ]; }; then
+              found="$(jq -r 'if length == 0 then "no CI run" else map("\(.conclusion) \(.url)") | join(", ") end' <<<"$runs")"
+              echo "::error::Refusing to release $COMMIT: the CI workflow did not succeed for this commit (found: $found). Tag a commit whose CI is green; see docs/RELEASING.md."
+              exit 1
+            fi
+            if [ "$elapsed" -ge 5400 ]; then
+              echo "::error::CI for $COMMIT is still not finished after 90 minutes."
+              exit 1
+            fi
+            echo "Waiting for CI of $COMMIT ($pending run(s) in progress, $total found)."
+            sleep 60
+          done
+
   release-windows:
     name: Build & Stage Windows Release Draft
+    needs: ci-green
+    # Runs after a green CI check, or without it for a branch test build (ci-green skipped).
+    if: ${{ !cancelled() && (needs.ci-green.result == 'success' || needs.ci-green.result == 'skipped') }}
     runs-on: windows-latest
+    permissions:
+      contents: write
+      # Build provenance attestations for the release files (`gh attestation verify <file> -R murmaider227/rustgram`).
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

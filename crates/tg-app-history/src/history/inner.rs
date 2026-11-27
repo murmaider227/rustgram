@@ -41,6 +41,7 @@ use crate::history::bubble::{
     paint_date_separator, paint_message_element_full, paint_service_message_interactive,
     paint_unread_bar, parse_paid_media_stars,
 };
+use crate::history::copy_restriction;
 use crate::history::copy_selection::{self, SelectionCopy, UponSelected};
 use crate::history::inline_media::HistoryMediaRuntime;
 use crate::history::media::{
@@ -173,6 +174,8 @@ pub enum InnerEvent {
     },
     /// User clicked a hidden `messageEntityTextUrl` link requiring scheme check and confirmation.
     OpenHiddenLink(String),
+    /// User clicked a sticker that belongs to a set: show the pack (`StickerSetBox`).
+    OpenStickerSet(crate::history::backend::StickerSetId),
     /// User clicked a photo/video/sticker media item.
     OpenMedia {
         /// Target message id.
@@ -266,6 +269,9 @@ pub enum InnerEvent {
     StopPoll(MsgId),
     /// Open the discussion/comments thread for channel post `msg_id`.
     OpenComments(MsgId),
+    /// A copy was refused: the chat or a selected message restricts saving content
+    /// (`HistoryInner::showCopyRestriction`). The toast text.
+    CopyRestricted(String),
     /// Copied text with preserved `tg-text` entities.
     CopiedRich {
         /// Toast summary; empty for no toast (tdesktop shows none for text copies).
@@ -441,6 +447,12 @@ pub struct HistoryInnerWidget {
     bottom_stretch: f32,
     /// Pending explicit scroll target (`Some(y)` overrides `ScrollArea` on next frame).
     pending_scroll_y: Option<f32>,
+    /// A left-button text drag began in a message and the button is still held
+    /// (`MouseAction::Selecting`): see `inner_drag_select.rs`.
+    text_drag_active: bool,
+    /// When the drag auto-scroll last ticked (`Ui::DraggingScrollManager`'s timer), while the
+    /// pointer is held past the list's top or bottom.
+    drag_scroll_clock: Option<f64>,
     /// True if next paint should jump to the very bottom.
     pending_scroll_to_bottom: bool,
     /// The first page of the chat is still loading (`HistoryWidget::_firstLoadRequest`): the
@@ -576,6 +588,8 @@ impl HistoryInnerWidget {
             scroll_offset_y: 0.0,
             bottom_stretch: 0.0,
             pending_scroll_y: None,
+            text_drag_active: false,
+            drag_scroll_clock: None,
             pending_scroll_to_bottom: true,
             pending_open: None,
             pending_jump_msg: None,
@@ -808,7 +822,7 @@ impl HistoryInnerWidget {
         let items: Vec<HistoryListItem> = self
             .messages
             .iter()
-            .map(|m| build_list_item(m, is_group, self.large_emoji))
+            .map(|m| build_list_item(m, is_group, self.large_emoji, self.layout_wide))
             .collect();
         self.list.set_items(items);
         self.update_date_and_unread_heights();
@@ -973,6 +987,47 @@ impl HistoryInnerWidget {
         self.selection_copy()
             .map(|copy| copy.rich)
             .unwrap_or_default()
+    }
+
+    /// The messages a copy of the current selection takes text from: the selected items, the
+    /// messages a drag crossed, or the one message a text selection is in.
+    fn selection_messages(&self) -> Vec<&HistoryMessage> {
+        let selection = &self.list.selection;
+        if selection.has_selected_items() {
+            return self
+                .messages
+                .iter()
+                .filter(|m| {
+                    selection.selected_items.contains(&to_hist_full(FullMsgId {
+                        peer: self.peer_id,
+                        msg: m.id,
+                    }))
+                })
+                .collect();
+        }
+        let (Some(from), Some(to)) = (selection.from, selection.to) else {
+            return Vec::new();
+        };
+        let lo = from.item_index.min(to.item_index);
+        let hi = from.item_index.max(to.item_index);
+        self.messages
+            .get(lo..=hi.min(self.messages.len().saturating_sub(1)))
+            .unwrap_or_default()
+            .iter()
+            .collect()
+    }
+
+    /// The toast shown instead of copying the selection when the chat or a selected message
+    /// restricts saving content (`HistoryInner::showCopyRestrictionForSelected`).
+    #[must_use]
+    pub fn selection_copy_restriction(
+        &self,
+        chat_allows_forwarding: bool,
+        kind: PeerKind,
+    ) -> Option<String> {
+        let selected = self.selection_messages();
+        (!selected.is_empty() && copy_restriction::restricts_any(chat_allows_forwarding, selected))
+            .then(|| copy_restriction::toast_text(kind))
     }
 
     /// What copying the current selection puts on the clipboard (`HistoryInner::
@@ -1293,6 +1348,19 @@ impl HistoryInnerWidget {
                 }
             }
             self.media_watch.dirty = true;
+        }
+        // TGB-3115: a streamed message whose file the backend kept after a full play.
+        let (rechecks, more) = self.media_runtime.take_stream_rechecks();
+        for id in rechecks {
+            if let Some(desc) = backend.inline_media_descriptor(self.peer_id, id)
+                && desc.audio_bytes.is_some()
+            {
+                self.media_runtime.register_descriptor(id, desc);
+                self.media_watch.dirty = true;
+            }
+        }
+        if more {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
         if let Some(id) = self.media_runtime.pending_voice_msg() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -1667,7 +1735,7 @@ impl HistoryInnerWidget {
         let items: Vec<HistoryListItem> = self
             .messages
             .iter()
-            .map(|m| build_list_item(m, is_group, self.large_emoji))
+            .map(|m| build_list_item(m, is_group, self.large_emoji, self.layout_wide))
             .collect();
 
         self.list.loaded_at_top = slice.loaded_at_top;
@@ -1731,7 +1799,7 @@ impl HistoryInnerWidget {
             self.layout_cache.remove(&prev_last.id);
         }
         let is_group = matches!(peer_kind, PeerKind::Group);
-        let item = build_list_item(&msg, is_group, self.large_emoji);
+        let item = build_list_item(&msg, is_group, self.large_emoji, self.layout_wide);
         self.messages.push(msg);
         self.list.push_back(item);
         self.update_date_and_unread_heights();
@@ -1803,7 +1871,7 @@ impl HistoryInnerWidget {
             if let Some(prev_last) = self.messages.last() {
                 self.layout_cache.remove(&prev_last.id);
             }
-            let item = build_list_item(&msg, is_group, self.large_emoji);
+            let item = build_list_item(&msg, is_group, self.large_emoji, self.layout_wide);
             let idx = self.messages.len();
             self.messages.push(msg);
             self.list.push_back(item);
@@ -1828,7 +1896,10 @@ impl HistoryInnerWidget {
                 .map(|u| if u >= idx { u + 1 } else { u });
             // The other items keep their measured heights; only the new one is estimated.
             let mut items = self.list.items().to_vec();
-            items.insert(idx, build_list_item(&msg, is_group, self.large_emoji));
+            items.insert(
+                idx,
+                build_list_item(&msg, is_group, self.large_emoji, self.layout_wide),
+            );
             self.messages.insert(idx, msg);
             self.list.set_items(items);
             self.list.set_unread_bar(prev_unread_bar);
@@ -2017,7 +2088,7 @@ impl HistoryInnerWidget {
         self.media_backlog.remove(&local_id);
         self.media_watch.dirty = true;
         let is_group = matches!(peer_kind, PeerKind::Group);
-        let fresh = build_list_item(&sent, is_group, self.large_emoji);
+        let fresh = build_list_item(&sent, is_group, self.large_emoji, self.layout_wide);
         if let Some(slot) = self.list.items_mut().get_mut(index) {
             *slot = HistoryListItem {
                 y: slot.y,
@@ -2086,7 +2157,7 @@ impl HistoryInnerWidget {
         let items: Vec<HistoryListItem> = self
             .messages
             .iter()
-            .map(|m| build_list_item(m, is_group, self.large_emoji))
+            .map(|m| build_list_item(m, is_group, self.large_emoji, self.layout_wide))
             .collect();
         self.list.set_items(items);
         self.list
@@ -2196,7 +2267,7 @@ impl HistoryInnerWidget {
         let older_items: Vec<HistoryListItem> = older
             .messages
             .iter()
-            .map(|m| build_list_item(m, is_group, self.large_emoji))
+            .map(|m| build_list_item(m, is_group, self.large_emoji, self.layout_wide))
             .collect();
 
         if let Some(prev_first) = self.messages.first() {
@@ -2254,7 +2325,7 @@ impl HistoryInnerWidget {
         }
         let is_group = matches!(peer_kind, PeerKind::Group);
         for msg in newer.messages {
-            let item = build_list_item(&msg, is_group, self.large_emoji);
+            let item = build_list_item(&msg, is_group, self.large_emoji, self.layout_wide);
             self.messages.push(msg);
             self.list.push_back(item);
         }
@@ -2284,7 +2355,10 @@ impl HistoryInnerWidget {
         if self.layout_width != viewport_width || self.layout_wide != is_chat_wide {
             self.layout_cache.clear();
             self.layout_width = viewport_width;
-            self.layout_wide = is_chat_wide;
+            if self.layout_wide != is_chat_wide {
+                self.layout_wide = is_chat_wide;
+                self.refresh_from_photos(matches!(peer_kind, PeerKind::Group));
+            }
         }
         let fonts = FontMetrics::default();
         let overscan = ((visible_bottom - visible_top) / 2).max(200);
@@ -2390,11 +2464,24 @@ impl HistoryInnerWidget {
             ui.ctx().request_repaint();
         }
 
+        // `pausedSpoiler`: the spoiler particles stand still while the window is inactive or
+        // something covers the chat (TGB-3029).
+        if !self.is_marking_as_read() {
+            tg_ui::effects::pause_text_spoilers_this_pass(ui.ctx());
+        }
+
         // Copy shortcut for the text/multi selection (the backend sends `Event::Copy`, not a
         // `C` key, TGB-3016), Escape to clear selection.
         if !self.list.selection.is_empty() {
             if ui.ctx().input(|i| i.key_pressed(Key::Escape)) {
                 self.list.selection.clear();
+            } else if ui.ctx().input(tg_ui::clipboard::copy_requested)
+                && let Some(toast) = self.selection_copy_restriction(
+                    backend.peer_allows_forwarding(self.peer_id),
+                    peer.summary.kind,
+                )
+            {
+                events.push(InnerEvent::CopyRestricted(toast));
             } else if ui.ctx().input(tg_ui::clipboard::copy_requested)
                 && let Some(copy) = self.selection_copy()
             {
@@ -2419,7 +2506,10 @@ impl HistoryInnerWidget {
             }
             self.layout_cache.clear();
             self.layout_width = viewport_w;
-            self.layout_wide = is_chat_wide;
+            if self.layout_wide != is_chat_wide {
+                self.layout_wide = is_chat_wide;
+                self.refresh_from_photos(matches!(peer.summary.kind, PeerKind::Group));
+            }
         }
 
         // Active chat background (Classic wallpaper by default, flat Night background).
@@ -3160,6 +3250,13 @@ impl HistoryInnerWidget {
                                             .get(&msg.id)
                                             .unwrap_or(&UNTOUCHED_TEXT),
                                     ),
+                                    // `Element::isLastAndSelfMessage`: an outgoing message that
+                                    // is the chat's last, outside Saved Messages.
+                                    msg.outgoing
+                                        && !msg.is_post
+                                        && !peer.summary.is_saved_messages
+                                        && self.list.loaded_at_bottom
+                                        && v.index + 1 == self.messages.len(),
                                 );
                                 if msg.is_post
                                     && matches!(peer.summary.kind, PeerKind::Channel)
@@ -3217,6 +3314,9 @@ impl HistoryInnerWidget {
                                                 .push(InnerEvent::ToggleReaction { msg_id, emoji });
                                         }
                                         MessagePaintEvent::Media(mev) => match mev {
+                                            MediaInteraction::OpenStickerSet(set) => {
+                                                events.push(InnerEvent::OpenStickerSet(set));
+                                            }
                                             MediaInteraction::OpenMedia {
                                                 msg_id,
                                                 album_index,
@@ -3345,6 +3445,7 @@ impl HistoryInnerWidget {
                                             char_index,
                                         } => {
                                             self.list.selection.selected_items.clear();
+                                            self.text_drag_active = true;
                                             self.list.selection.start_drag(ListSelectionEndpoint {
                                                 item_id: full_id,
                                                 item_index: v.index,
@@ -3465,31 +3566,38 @@ impl HistoryInnerWidget {
                                 if let Some(ex) = backend.as_layer233_extras()
                                     && let Some(fc) = ex.cached_factcheck(self.peer_id, msg.id)
                                 {
-                                    let bubble_rect = crate::history::bubble::hist_rect_to_egui(
-                                        msg_layout.geometry,
-                                        row_origin.x,
-                                        row_origin.y,
-                                    );
                                     let expanded = self.expanded_factchecks.contains(&msg.id);
-                                    let fc_w = (bubble_rect.width() - 20.0).max(100.0);
-                                    let fc_h =
-                                        crate::history::factcheck::measure_factcheck_footer_height(
-                                            &fc, expanded, fc_w,
-                                        );
-                                    let bottom_reserve = if msg.is_post
-                                        && msg.extra.replies_count.is_some()
-                                    {
-                                        48.0
+                                    // The card ends the text block, above the time line; the
+                                    // reactions and the bottom info come below it (TGB-3022).
+                                    // A message without text keeps the card at its bubble's
+                                    // bottom, inside the bubble's padding.
+                                    let text_rect = if msg_layout.text_rect.is_empty() {
+                                        crate::history::bubble::hist_rect_to_egui(
+                                            msg_layout.geometry,
+                                            row_origin.x,
+                                            row_origin.y,
+                                        )
+                                        .shrink2(Vec2::new(10.0, 8.0))
                                     } else {
-                                        24.0
+                                        crate::history::bubble::hist_rect_to_egui(
+                                            msg_layout.text_rect,
+                                            row_origin.x,
+                                            row_origin.y,
+                                        )
                                     };
-                                    let fc_rect = Rect::from_min_size(
-                                        Pos2::new(
-                                            bubble_rect.left() + 10.0,
-                                            (bubble_rect.bottom() - bottom_reserve - fc_h)
-                                                .max(bubble_rect.top() + 8.0),
+                                    // With reactions in the bubble the time sits by them, so
+                                    // no time line is reserved under the text block.
+                                    let date_line = if msg.reactions.is_empty() {
+                                        msg_layout.bottom_info.current_size.height as f32
+                                    } else {
+                                        0.0
+                                    };
+                                    let fc_rect = crate::history::factcheck::factcheck_rect(
+                                        text_rect,
+                                        crate::history::factcheck::factcheck_reserved_height(
+                                            &fc, expanded,
                                         ),
-                                        Vec2::new(fc_w, fc_h),
+                                        date_line,
                                     );
                                     let can_edit = crate::history::factcheck::can_edit_factcheck(
                                         ex.can_edit_factcheck_config(),
@@ -3655,8 +3763,9 @@ impl HistoryInnerWidget {
                     }
                 }
 
-                // Phase 3: Sticky group userpics (`HistoryList::enumerate_userpics`).
-                if show_sender_in_chat {
+                // Phase 3: Sticky userpics (`HistoryList::enumerate_userpics`): groups, and every
+                // chat in the wide layout (`hasFromPhoto`).
+                if show_sender_in_chat || self.layout_wide {
                     let ui_colors = colors.ui_colors();
                     let userpics = self.list.enumerate_userpics(vis_top, vis_bottom);
                     for up in userpics {
@@ -3707,6 +3816,7 @@ impl HistoryInnerWidget {
         // Track scroll state & bottom-edge detection before read-marking checks so `scrolled_up`
         // reflects this frame's actual scroll position.
         self.scroll_offset_y = scroll_out.inner.state.clamped_offset().y;
+        self.drive_text_drag(ui.ctx(), list_rect);
         if anchor_shift != 0 {
             // The scroll area takes the correction on the next frame, on top of whatever the
             // wheel added this frame.
@@ -3829,6 +3939,12 @@ impl HistoryInnerWidget {
             let ref_now_unix = now_unix_secs.max(i64::from(target_msg.date_unix) + 60);
             let mut items = build_context_menu_items(&target_msg, peer, has_quote_sel);
             copy_selection::apply_upon_selected(&mut items, self.upon_selected(target_id));
+            let allows_forwarding = backend.peer_allows_forwarding(self.peer_id);
+            copy_restriction::drop_restricted_copy_items(
+                &mut items,
+                copy_restriction::restricts(allows_forwarding, &target_msg),
+                copy_restriction::restricts_any(allows_forwarding, self.selection_messages()),
+            );
             if let Some(ref eng) = self.context_menu_engagement
                 && eng.peer_id == self.peer_id
                 && eng.msg_id == target_id
@@ -4136,18 +4252,31 @@ impl HistoryInnerWidget {
         }
     }
 
+    /// The list items, in message order (tests).
+    #[cfg(test)]
+    pub(crate) fn list_items(&self) -> &[HistoryListItem] {
+        self.list.items()
+    }
+
+    /// Recomputes which messages show a userpic (`hasFromPhoto` depends on the chat being wide)
+    /// and the attachments that decide where it is drawn.
+    fn refresh_from_photos(&mut self, is_group: bool) {
+        let wide = self.layout_wide;
+        for (item, msg) in self.list.items_mut().iter_mut().zip(&self.messages) {
+            item.has_from_photo = has_from_photo(msg, is_group, wide);
+        }
+        self.list.recount_attachments();
+    }
+
     fn factcheck_extra_height(&self, msg_id: MsgId, backend: &dyn HistoryBackend) -> i32 {
         backend
             .as_layer233_extras()
             .and_then(|ex| ex.cached_factcheck(self.peer_id, msg_id))
             .map_or(0, |fc| {
-                crate::history::factcheck::measure_factcheck_footer_height(
+                crate::history::factcheck::factcheck_reserved_height(
                     &fc,
                     self.expanded_factchecks.contains(&msg_id),
-                    320.0,
                 )
-                .ceil() as i32
-                    + 8
             })
     }
 }
@@ -4159,7 +4288,12 @@ fn cached_layout_height(cached: &CachedItemLayout) -> i32 {
     }
 }
 
-fn build_list_item(msg: &HistoryMessage, is_group: bool, large_emoji: bool) -> HistoryListItem {
+fn build_list_item(
+    msg: &HistoryMessage,
+    is_group: bool,
+    large_emoji: bool,
+    chat_wide: bool,
+) -> HistoryListItem {
     let full_id = to_hist_full(FullMsgId {
         peer: msg.peer_id,
         msg: msg.id,
@@ -4190,8 +4324,18 @@ fn build_list_item(msg: &HistoryMessage, is_group: bool, large_emoji: bool) -> H
         ..AttachMetadata::default()
     };
     let mut item = HistoryListItem::new(full_id, pos, meta, estimate_initial_height(msg));
-    item.has_from_photo = is_group && !msg.outgoing && !msg.is_service();
+    item.has_from_photo = has_from_photo(msg, is_group, chat_wide);
     item
+}
+
+/// `Message::hasFromPhoto` in the history: no userpic for service messages or channel posts; in
+/// a wide chat (`ElementChatMode::Wide`, every message on the left) every message has one,
+/// outgoing too; otherwise incoming messages of groups.
+fn has_from_photo(msg: &HistoryMessage, is_group: bool, chat_wide: bool) -> bool {
+    if msg.is_service() || msg.is_post {
+        return false;
+    }
+    chat_wide || (is_group && !msg.outgoing)
 }
 
 fn estimate_initial_height(msg: &HistoryMessage) -> i32 {
@@ -4311,16 +4455,17 @@ fn media_textual_max_width(has_text: bool, text_max_width: i32) -> i32 {
 /// `UnwrappedMedia` around `LargeEmoji` for an emoji-only message; `info_width` is the bottom
 /// info's optimal width (`Element::infoWidth`).
 fn large_emoji_media_input(
-    emoji: &crate::history::large_emoji::IsolatedEmoji,
+    emoji: &crate::history::large_emoji::LargeEmoji,
     info_width: i32,
 ) -> MediaInput {
-    MediaInput::LargeEmoji(tg_history::LargeEmojiInput {
-        count: emoji.len(),
-        // `UnwrappedMedia::bottomInfoWidth`.
-        bottom_info_width: tg_history::consts::MSG_REPLY_PADDING.left
-            + info_width
-            + 2 * tg_history::consts::MSG_DATE_IMG_PADDING.x,
-    })
+    emoji.media_input(unwrapped_bottom_info_width(info_width))
+}
+
+/// `UnwrappedMedia::bottomInfoWidth` for the bottom info's optimal width.
+fn unwrapped_bottom_info_width(info_width: i32) -> i32 {
+    tg_history::consts::MSG_REPLY_PADDING.left
+        + info_width
+        + 2 * tg_history::consts::MSG_DATE_IMG_PADDING.x
 }
 
 fn build_media_input(
@@ -4329,6 +4474,7 @@ fn build_media_input(
     has_text: bool,
     text_max_width: i32,
     bottom_info_w: i32,
+    info_width: i32,
     transcribe_text_height: i32,
 ) -> Option<MediaInput> {
     let media = msg.media.as_ref()?;
@@ -4416,6 +4562,7 @@ fn build_media_input(
             dimensions: Size::new(s.width, s.height),
             custom_size: 168,
             option_sticker_size: None,
+            bottom_info_width: Some(unwrapped_bottom_info_width(info_width)),
         }),
         HistoryMedia::Poll(p) => {
             let (qw, qh) = estimate_text_metrics(&p.question, 300);
@@ -4473,6 +4620,7 @@ fn build_media_input(
                 dimensions: Size::new(side, side + transcribe_text_height),
                 custom_size: side + transcribe_text_height,
                 option_sticker_size: None,
+                bottom_info_width: None,
             })
         }
         // `HistoryView::Gif` for a video message: a bare circle of `st::maxVideoMessageSize`.
@@ -4899,6 +5047,7 @@ fn compute_item_layout_egui_with_quotes(
         has_body_text,
         text_max_w,
         bottom_info_w,
+        info_optimal_w,
         transcribe_text_height,
     )
     .or_else(|| {
@@ -4925,12 +5074,14 @@ fn compute_item_layout_egui_with_quotes(
         last_w + info_skip_w <= row_w
     };
     let text_block_h = |wrapped_h: i32, time_fits: bool| {
-        let date_line =
-            if needs_date_line_room && (has_rich_body || has_lp || summary_h > 0 || !time_fits) {
-                fonts.normal.height
-            } else {
-                0
-            };
+        // A fact-check card ends the text block: the time gets a line of its own below it.
+        let date_line = if needs_date_line_room
+            && (has_rich_body || has_lp || summary_h > 0 || factcheck_extra_h > 0 || !time_fits)
+        {
+            fonts.normal.height
+        } else {
+            0
+        };
         wrapped_h + summary_h + lp_extra_h + date_line + factcheck_extra_h
     };
     let adjusted_text_h = text_block_h(
@@ -5211,14 +5362,14 @@ fn compute_item_layout_headless(
         tw
     };
     let th = th + lp_extra_h + if has_lp { 18 } else { 0 };
-    let media =
-        build_media_input(msg, has_header, has_body_text, tw, bottom_info_w, 0).or_else(|| {
-            large.as_ref().map(|emoji| {
-                let info_w = tg_history::BottomInfoLayout::compute(&bottom_info, i32::MAX, fonts)
-                    .optimal_size
-                    .width;
-                large_emoji_media_input(emoji, info_w)
-            })
+    let info_w = tg_history::BottomInfoLayout::compute(&bottom_info, i32::MAX, fonts)
+        .optimal_size
+        .width;
+    let media = build_media_input(msg, has_header, has_body_text, tw, bottom_info_w, info_w, 0)
+        .or_else(|| {
+            large
+                .as_ref()
+                .map(|emoji| large_emoji_media_input(emoji, info_w))
         });
 
     let inline_keyboard = msg
@@ -6208,6 +6359,13 @@ fn bubble_content_max_width(viewport_w: i32, has_from_photo: bool) -> i32 {
     let photo_skip = if has_from_photo { MSG_PHOTO_SKIP } else { 0 };
     (viewport_w - MSG_MARGIN.left - MSG_MARGIN.right - photo_skip).min(MSG_MAX_WIDTH)
 }
+
+#[path = "inner_drag_select.rs"]
+mod drag_select;
+
+#[cfg(test)]
+#[path = "inner_factcheck_tests.rs"]
+mod factcheck_tests;
 
 #[cfg(test)]
 #[path = "inner_caption_tests.rs"]

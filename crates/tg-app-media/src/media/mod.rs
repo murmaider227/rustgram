@@ -27,6 +27,8 @@ mod tests_inline_pacing;
 #[cfg(test)]
 mod tests_seca;
 #[cfg(test)]
+mod tests_w8_copy;
+#[cfg(test)]
 mod tests_wp14;
 pub mod video_playback;
 pub mod video_sound;

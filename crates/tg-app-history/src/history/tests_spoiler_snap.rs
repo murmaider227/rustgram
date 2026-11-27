@@ -355,13 +355,33 @@ fn spoilers_hidden_and_revealed_snapshot() {
         let hidden = dir
             .as_ref()
             .map(|_| harness.render().expect("render hidden"));
+        // TGB-3029: selected messages paint the particles in `msg*DateFgSelected`.
+        let selected = dir.as_ref().map(|_| {
+            let ids: Vec<MsgId> = messages().1.iter().map(|m| m.id).collect();
+            for &id in &ids {
+                harness.state_mut().inner.toggle_select_message(id);
+            }
+            for _ in 0..3 {
+                harness.step();
+            }
+            let image = harness.render().expect("render selected");
+            harness.state_mut().inner.clear_selection();
+            for _ in 0..3 {
+                harness.step();
+            }
+            image
+        });
         reveal_all(&mut harness);
         let revealed = dir
             .as_ref()
             .map(|_| harness.render().expect("render revealed"));
         if let Some(ref dir) = dir {
             std::fs::create_dir_all(dir).expect("create snap dir");
-            for (state, img) in [("hidden", hidden), ("revealed", revealed)] {
+            for (state, img) in [
+                ("hidden", hidden),
+                ("selected", selected),
+                ("revealed", revealed),
+            ] {
                 if let Some(img) = img {
                     img.save(dir.join(format!("spoiler_{tag}_{state}.png")))
                         .expect("save snapshot");

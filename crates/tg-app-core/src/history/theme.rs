@@ -51,6 +51,11 @@ pub struct HistoryColors {
     pub msg_in_date_fg: Color32,
     /// Outgoing timestamp/views/ticks text (`msgOutDateFg`).
     pub msg_out_date_fg: Color32,
+    /// Incoming message time in a selected message (`msgInDateFgSelected`): also the spoiler
+    /// particles there (`inTextPaletteSelected.spoilerFg`).
+    pub msg_in_date_fg_selected: Color32,
+    /// Outgoing message time in a selected message (`msgOutDateFgSelected`).
+    pub msg_out_date_fg_selected: Color32,
     /// Incoming reply accent bar (`msgInReplyBarColor`).
     pub msg_in_reply_bar: Color32,
     /// Outgoing reply accent bar (`msgOutReplyBarColor`).
@@ -83,6 +88,9 @@ pub struct HistoryColors {
     pub unread_bar_fg: Color32,
     /// Selection row overlay tint (`msgSelectOverlay`).
     pub select_overlay: Color32,
+    /// Colour laid over the image of a selected sticker or large emoji (`msgStickerOverlay`,
+    /// applied with `Images::Colored`).
+    pub msg_sticker_overlay: Color32,
     /// Jump-to-message highlight tint.
     pub highlight_tint: Color32,
     /// Voice waveform active bar (incoming).
@@ -142,6 +150,9 @@ impl HistoryColors {
                 msg_out_shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 56),
                 msg_in_date_fg: Color32::from_rgb(0x6D, 0x7F, 0x8F),
                 msg_out_date_fg: Color32::from_rgb(0x7D, 0xA8, 0xD3),
+                // `night.tdesktop-theme`.
+                msg_in_date_fg_selected: Color32::WHITE,
+                msg_out_date_fg_selected: Color32::WHITE,
                 msg_in_reply_bar: Color32::from_rgb(0x64, 0xB5, 0xEF),
                 msg_out_reply_bar: Color32::from_rgb(0x88, 0xC8, 0xF8),
                 msg_in_reply_bg: Color32::from_rgba_unmultiplied(0x64, 0xB5, 0xEF, 26),
@@ -158,6 +169,8 @@ impl HistoryColors {
                 unread_bar_bg: Color32::from_rgb(0x1D, 0x2A, 0x3A),
                 unread_bar_fg: Color32::from_rgb(0x6A, 0xB2, 0xF2),
                 select_overlay: Color32::from_rgba_unmultiplied(0x52, 0x88, 0xC1, 68),
+                // `msgStickerOverlay` of `night.tdesktop-theme`.
+                msg_sticker_overlay: Color32::from_rgba_unmultiplied(0x35, 0x85, 0xD4, 0x7F),
                 highlight_tint: Color32::from_rgba_unmultiplied(0x52, 0x88, 0xC1, 110),
                 // `msgWaveform*` of tdesktop's night theme (`night.tdesktop-theme`).
                 wave_in_active: Color32::from_rgb(0x54, 0x9C, 0xD7),
@@ -197,6 +210,9 @@ impl HistoryColors {
                 msg_out_shadow: Color32::from_rgba_unmultiplied(0x56, 0x8E, 0x52, 54),
                 msg_in_date_fg: Color32::from_rgb(0x95, 0xA2, 0xAD),
                 msg_out_date_fg: Color32::from_rgb(0x5E, 0xA9, 0x56),
+                // `colors.palette`.
+                msg_in_date_fg_selected: Color32::from_rgb(0x6A, 0x9C, 0xC5),
+                msg_out_date_fg_selected: Color32::from_rgb(0x56, 0xB2, 0xA6),
                 msg_in_reply_bar: Color32::from_rgb(0x40, 0xA7, 0xE3),
                 msg_out_reply_bar: Color32::from_rgb(0x55, 0xB3, 0x52),
                 msg_in_reply_bg: Color32::from_rgba_unmultiplied(0x40, 0xA7, 0xE3, 24),
@@ -213,6 +229,8 @@ impl HistoryColors {
                 unread_bar_bg: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 232),
                 unread_bar_fg: Color32::from_rgb(0x37, 0x8F, 0xC9),
                 select_overlay: Color32::from_rgba_unmultiplied(0x35, 0x8C, 0xD4, 58),
+                // `msgStickerOverlay` of `colors.palette`.
+                msg_sticker_overlay: Color32::from_rgba_unmultiplied(0x35, 0x8C, 0xD4, 0x7F),
                 highlight_tint: Color32::from_rgba_unmultiplied(0x40, 0xA7, 0xE3, 86),
                 // `msgWaveform*` of `colors.palette`.
                 wave_in_active: Color32::from_rgb(0x40, 0xA7, 0xE3),
@@ -267,7 +285,12 @@ impl HistoryColors {
             } else {
                 self.mono_in_fg
             },
-            select_spoiler_fg: spoiler_fg,
+            // `selectSpoilerFg: msgInDateFgSelected` / `msgOutDateFgSelected`.
+            select_spoiler_fg: if outgoing {
+                self.msg_out_date_fg_selected
+            } else {
+                self.msg_in_date_fg_selected
+            },
             select_overlay: self.select_overlay,
             mark_bg: self.mono_bg,
             link_always_active: false,

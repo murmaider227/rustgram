@@ -59,6 +59,19 @@ pub enum ModalBox {
     /// Night mode cannot change while auto-night mode follows the system
     /// (`ToggleNightModeWithConfirmation`): offers to disable it.
     ConfirmDisableAutoNight,
+    /// A theme file or cloud theme from the Theme Studio is shown on trial
+    /// (`Window::Theme::WarningWidget`): "Keep this theme?", reverting by itself after 16 s.
+    /// Escape reverts; the scrim does not close it.
+    KeepTheme {
+        /// When the trial started.
+        started: Instant,
+    },
+    /// A new interface scale takes a restart (`SetupInterfaceScale`'s `setScale`):
+    /// "You need to restart... Restart now?" with "Restart" and "Cancel".
+    ConfirmScaleRestart {
+        /// The chosen scale (`SCALE_AUTO` or a percentage).
+        scale: i32,
+    },
     /// The server dropped this session (`AUTH_KEY_DROP_*`): its explanation and one "Log out"
     /// button (`Application::forceLogOut`, `core/application.cpp:1080-1096`). Escape and an
     /// outside click do not close it; closing it logs the account out.
@@ -75,7 +88,7 @@ impl ModalBox {
     /// box (`setCloseByEscape(false)` / `setCloseByOutsideClick(false)` in tdesktop).
     #[must_use]
     pub const fn closes_by_escape(&self) -> bool {
-        !matches!(self, Self::ForcedLogout { .. })
+        !matches!(self, Self::ForcedLogout { .. } | Self::KeepTheme { .. })
     }
 }
 
@@ -101,6 +114,12 @@ pub enum LayerAction {
     OpenLink(String),
     /// "Increase Limit" in a limit box: the Premium screen with this `ref`.
     OpenPremium(String),
+    /// "Keep changes" in the theme trial box (`Window::Theme::KeepApplied`).
+    KeepTheme,
+    /// "Revert", Escape or the countdown in the theme trial box (`Window::Theme::Revert`).
+    RevertTheme,
+    /// "Restart" in the interface scale box: save this scale and restart (`Core::Restart`).
+    RestartWithScale(i32),
 }
 
 /// Ephemeral toast notification displayed near the bottom center.
@@ -477,6 +496,86 @@ fn render_modal_box(
                 }
             });
         }
+        ModalBox::KeepTheme { started } => {
+            let left = keep_theme_seconds_left(
+                tg_app_core::clock::now().saturating_duration_since(*started),
+            );
+            if left <= 0 || ui.input(|i| i.key_pressed(Key::Escape)) {
+                return (Some(LayerAction::RevertTheme), true);
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            ui.label(
+                RichText::new(tg_lang::tr::lng_theme_sure_keep())
+                    .size(17.0)
+                    .strong()
+                    .color(palette.window_bold_fg),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(tg_lang::tr::lng_theme_reverting(i64::from(left)))
+                    .size(13.5)
+                    .color(palette.window_fg),
+            );
+            ui.add_space(18.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let keep = ui.add(
+                    egui::Button::new(
+                        RichText::new(tg_lang::tr::lng_theme_keep_changes())
+                            .strong()
+                            .color(palette.window_active_text_fg),
+                    )
+                    .frame(false),
+                );
+                if keep.clicked() {
+                    action = Some(LayerAction::KeepTheme);
+                    dismiss = true;
+                }
+                ui.add_space(12.0);
+                let revert = ui.add(
+                    egui::Button::new(
+                        RichText::new(tg_lang::tr::lng_theme_revert())
+                            .color(palette.window_active_text_fg),
+                    )
+                    .frame(false),
+                );
+                if revert.clicked() {
+                    action = Some(LayerAction::RevertTheme);
+                    dismiss = true;
+                }
+            });
+        }
+        ModalBox::ConfirmScaleRestart { scale } => {
+            ui.label(
+                RichText::new(tg_lang::tr::lng_settings_need_restart())
+                    .size(13.5)
+                    .color(palette.window_fg),
+            );
+            ui.add_space(18.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let restart = ui.add(
+                    egui::Button::new(
+                        RichText::new(tg_lang::tr::lng_settings_restart_now())
+                            .strong()
+                            .color(palette.window_active_text_fg),
+                    )
+                    .frame(false),
+                );
+                if restart.clicked() {
+                    action = Some(LayerAction::RestartWithScale(*scale));
+                    dismiss = true;
+                }
+                ui.add_space(12.0);
+                let cancel = ui.add(
+                    egui::Button::new(
+                        RichText::new(strings.cancel()).color(palette.window_active_text_fg),
+                    )
+                    .frame(false),
+                );
+                if cancel.clicked() {
+                    dismiss = true;
+                }
+            });
+        }
         ModalBox::ForcedLogout { text, account } => {
             // The box stays: the account logs out only through its button.
             let _ = box_rich_text(ui, "tg_forced_logout_text", text, palette, &mut action);
@@ -780,4 +879,15 @@ fn render_modal_box(
     }
 
     (action, dismiss)
+}
+
+/// `kWaitBeforeRevertMs` of `window_theme_warning.cpp`.
+const KEEP_THEME_WAIT_MS: u128 = 15_999;
+
+/// Whole seconds left before a theme trial reverts (`WarningWidget::handleTimer`); `0` or
+/// less means revert now.
+#[must_use]
+pub fn keep_theme_seconds_left(elapsed: Duration) -> i32 {
+    let left_ms = KEEP_THEME_WAIT_MS.saturating_sub(elapsed.as_millis());
+    i32::try_from(left_ms / 1000).unwrap_or(i32::MAX)
 }

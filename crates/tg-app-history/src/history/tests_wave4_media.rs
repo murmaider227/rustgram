@@ -226,6 +226,7 @@ fn reply(thumb: ReplyThumb) -> ReplyHeader {
         preview_thumb_rgb: Some([0x6E, 0xC9, 0xCB]),
         preview_thumb: Some(thumb),
         preview_colored_len: 0,
+        preview_spoilers: Vec::new(),
         quote_text: None,
     }
 }
@@ -564,6 +565,7 @@ fn wave4_media_snapshots() {
             preview_thumb_rgb: thumb.as_ref().map(|_| [0x6E, 0xC9, 0xCB]),
             preview_thumb: thumb,
             preview_colored_len: text.find(',').map_or(text.len(), |i| i + 1),
+            preview_spoilers: Vec::new(),
             quote_text: None,
         };
         let stripped = |seed| Some(synthetic_stripped_thumb(seed));

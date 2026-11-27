@@ -322,6 +322,7 @@ mod tests {
             preview_thumb_rgb: None,
             preview_thumb: None,
             preview_colored_len: 0,
+            preview_spoilers: Vec::new(),
             quote_text: None,
         });
         let mut b = msg(2, "Noor Ilves", "news");

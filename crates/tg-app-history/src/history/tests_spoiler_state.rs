@@ -211,3 +211,29 @@ fn a_collapsed_quote_is_measured_with_the_lines_it_shows_and_grows_when_expanded
     );
     assert_eq!(expanded.height(), shown_expanded + date_line);
 }
+
+#[test]
+fn a_selected_message_paints_its_spoiler_in_the_selected_date_colour() {
+    // TGB-3029: `inTextPaletteSelected.spoilerFg: msgInDateFgSelected` (and out).
+    use crate::history::bubble::selected_text_palette;
+    use egui::Color32;
+    let colors = crate::history::theme::HistoryColors::from_palette(
+        &tg_app_core::stand_in::theme::Palette::day(),
+    );
+    assert_eq!(
+        selected_text_palette(&colors, false, true).spoiler_fg,
+        Color32::from_rgb(0x6A, 0x9C, 0xC5)
+    );
+    assert_eq!(
+        selected_text_palette(&colors, true, true).spoiler_fg,
+        Color32::from_rgb(0x56, 0xB2, 0xA6)
+    );
+    assert_eq!(
+        selected_text_palette(&colors, false, false).spoiler_fg,
+        colors.msg_in_date_fg
+    );
+    assert_eq!(
+        colors.text_palette(true).select_spoiler_fg,
+        colors.msg_out_date_fg_selected
+    );
+}

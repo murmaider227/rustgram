@@ -17,6 +17,9 @@ pub enum PhotoFit {
     Single,
     /// An album tile: always cropped to cover the tile (`Photo::validateGroupedCache`).
     Cover,
+    /// A sticker: the whole picture, scaled to fit and centered, nothing behind it
+    /// (`Sticker::paintPixmap`).
+    Contain,
 }
 
 /// Where and how a picture is drawn inside its box.
@@ -66,6 +69,17 @@ pub fn photo_frame(outer: Rect, picture: Vec2, fit: PhotoFit) -> PhotoFrame {
     };
     if fit == PhotoFit::Cover {
         return covering;
+    }
+    if fit == PhotoFit::Contain {
+        if picture.x <= 0.0 || picture.y <= 0.0 {
+            return covering;
+        }
+        let scale = (outer.width() / picture.x).min(outer.height() / picture.y);
+        return PhotoFrame {
+            rect: Rect::from_center_size(outer.center(), picture * scale),
+            uv: FULL_UV,
+            letterboxed: true,
+        };
     }
     let outer_px = to_size(outer.size());
     let picture_px = to_size(picture);

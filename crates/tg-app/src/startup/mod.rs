@@ -18,6 +18,7 @@ pub mod plan;
 pub mod platform;
 pub mod profile_paths;
 pub mod profiler;
+pub mod scale_restart;
 pub mod smoke_test;
 pub use crate::core_types::restore_windows;
 pub mod updater;
@@ -155,7 +156,7 @@ pub fn run_from_cli() -> anyhow::Result<()> {
         std::process::exit(code);
     }
     let prefs = StartupPrefs::load_from(&prelim.resolved_working_dir.path);
-    let plan = StartupPlan::build(&raw_args, &work_env, Some(&exe_path), &prefs);
+    let mut plan = StartupPlan::build(&raw_args, &work_env, Some(&exe_path), &prefs);
     profiler::mark("cli_and_plan");
 
     match plan.action {
@@ -177,6 +178,12 @@ pub fn run_from_cli() -> anyhow::Result<()> {
     }
 
     let working_dir = plan.resolved_working_dir.path.clone();
+    // The saved "Default interface scale" unless `-scale` was given (TGB-3111).
+    scale_restart::apply_saved_scale(
+        &mut plan.global_config,
+        scale_restart::read_saved_scale(&working_dir),
+    );
+    let relaunch = scale_restart::relaunch_command(&plan, &exe_path);
 
     // Start `tg-core` working-directory file logger (`log_startN.txt`) + console tracing layer.
     let log_manager = LogManager::new();
@@ -317,7 +324,11 @@ pub fn run_from_cli() -> anyhow::Result<()> {
         }),
     };
 
-    run_app(config)
+    let result = run_app(config);
+    // `Core::Restart`: start again once the window, the single-instance guard and the logs are
+    // gone.
+    scale_restart::relaunch_after_exit(&relaunch);
+    result
 }
 
 /// Runs [`platform::apply_startup_integration`] (Start-menu shortcut validation and first-run

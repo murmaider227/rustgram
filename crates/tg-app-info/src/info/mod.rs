@@ -200,12 +200,12 @@ fn sync_info_tab(section: InfoSection, active_tab: &mut InfoTab) {
     };
 }
 
-fn map_wrap_events(events: &[InfoWrapEvent], peer_id: PeerId) -> Option<InfoAction> {
+pub(crate) fn map_wrap_events(events: &[InfoWrapEvent], peer_id: PeerId) -> Option<InfoAction> {
     for ev in events {
         match ev {
             InfoWrapEvent::CloseOrBack => return Some(InfoAction::CloseOrBack),
             InfoWrapEvent::OpenHistory(pid) => return Some(InfoAction::OpenHistory(*pid)),
-            InfoWrapEvent::Toast(msg) if msg.starts_with("Notifications ") => {
+            InfoWrapEvent::NotificationsToggled { .. } => {
                 return Some(InfoAction::ToggleMute(peer_id));
             }
             _ => {}
