@@ -30,7 +30,7 @@ use tg_app_core::stand_in::theme::{Palette, ThemeMode};
 /// Showcase scene preset for interactive inspection or screenshot capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShowcaseScene {
-    /// Emoji tab open with Noto Emoji sprite sheets + skin-tone popup on 👍.
+    /// Emoji tab open with the emoji sprite sheets + skin-tone popup on 👍.
     EmojiWithSkinTone,
     /// Stickers tab open showing live `tg-lottie` animations and Premium lock badges.
     StickersLottieAndPremium,
@@ -96,7 +96,7 @@ impl ChatHelpersShowcase {
                 (
                     false,
                     "Kestrel".into(),
-                    "Welcome to Rustgram! 👋🏽 Inline Noto Emoji render crisp at every DPI 🚀".into(),
+                    "Welcome to Rustgram! 👋🏽 Inline emoji render crisp at every DPI 🚀".into(),
                 ),
                 (
                     true,
@@ -241,7 +241,7 @@ impl ChatHelpersShowcase {
             Vec2::new(rect.width(), 54.0),
         );
 
-        // Messages area with inline Noto Emoji bubbles
+        // Messages area with inline emoji bubbles
         let msg_rect = Rect::from_min_max(
             Pos2::new(rect.left(), top_rect.bottom()),
             Pos2::new(rect.right(), compose_rect.top()),

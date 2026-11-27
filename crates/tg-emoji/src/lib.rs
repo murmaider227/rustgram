@@ -1,13 +1,18 @@
-//! `tg-emoji`: Apache-2.0 Noto Emoji packed sprite atlas and `egui` rendering helpers.
+//! `tg-emoji`: Telegram Desktop's emoji sprite atlas and `egui` rendering helpers.
 //!
-//! Port origin: `Telegram/lib_ui/ui/emoji_config.cpp` (sprite sheet indexing and drawing),
-//! using Noto Emoji PNG artwork from `googlefonts/noto-emoji` (`v2.042`, Apache-2.0).
+//! Port origin: `Telegram/lib_ui/ui/emoji_config.cpp` (sprite sheet indexing and drawing), with
+//! tdesktop's built-in emoji sheets (Apple Color Emoji artwork, not under the GPL; see
+//! `LICENSE-EMOJI`).
 
 #![deny(clippy::all)]
 
 pub mod atlas;
 pub mod background;
 pub mod egui_ext;
+#[cfg(test)]
+mod resample;
+#[cfg(test)]
+mod tests_emoji_order;
 #[cfg(test)]
 mod tests_shared_textures;
 #[cfg(test)]
@@ -35,13 +40,8 @@ mod tests {
         assert_eq!(stats.sheet_count, SHEET_COUNT);
         assert_eq!(stats.cell_size_px, CELL_SIZE_PX);
         assert_eq!(stats.total_entries, emoji::full_count());
-        // Over 88% of tg-text's emoji table must be directly present in the Apache-2.0 v2.042 atlas.
-        assert!(
-            stats.present_entries * 100 / stats.total_entries >= 88,
-            "expected >=88% coverage, got {}/{}",
-            stats.present_entries,
-            stats.total_entries
-        );
+        // tdesktop's sheets hold a cell for every entry of tg-text's emoji table.
+        assert_eq!(stats.present_entries, stats.total_entries);
 
         // Common emojis and default recent entries must resolve.
         for seq in ["😀", "😂", "❤️", "🔥", "🚀", "👍", "👍🏻", "👍🏽", "👍🏿", "👋🏾"]

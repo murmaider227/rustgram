@@ -1,7 +1,7 @@
 //! `egui` texture caching and inline rich-text emoji painting helpers.
 //!
 //! Enables `tg-ui` text rendering and `tg-app` chat views to render crisp color
-//! Noto Emoji sprites inline alongside standard proportional text.
+//! emoji sprites inline alongside standard proportional text.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -341,7 +341,7 @@ impl EmojiTextureCache {
         false
     }
 
-    /// Measures and paints single-line text containing inline Noto Emoji starting at `origin`.
+    /// Measures and paints single-line text containing inline emoji starting at `origin`.
     ///
     /// Returns the total `(width, height)` occupied.
     pub fn paint_single_line_with_emoji(
@@ -385,7 +385,7 @@ impl EmojiTextureCache {
         Vec2::new(cursor_x - origin.x, line_h)
     }
 
-    /// Renders wrapping multi-line text with inline Noto Emoji inside `ui`.
+    /// Renders wrapping multi-line text with inline emoji inside `ui`.
     ///
     /// Allocates the exact laid-out rectangle and returns it.
     pub fn paint_wrapped_text_with_emoji(

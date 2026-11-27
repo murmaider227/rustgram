@@ -1333,7 +1333,7 @@ fn capture_wp72_after_screenshots() {
             save_wgpu_png(&mut h, &format!("peer_qr_{tag}_after"));
         }
 
-        // 4. EmojiUserpicBox with server default emoji catalog + crisp Noto Emoji rendering
+        // 4. EmojiUserpicBox with server default emoji catalog + crisp sprite emoji rendering
         {
             let mut h = build_snap_harness(size);
             let ctx = h.ctx.clone();

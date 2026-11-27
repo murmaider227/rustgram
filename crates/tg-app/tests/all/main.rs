@@ -42,6 +42,7 @@ mod e2e_tgb2955_theme_switch;
 mod e2e_tgb2971_pull_next_channel;
 mod e2e_tgb3005_cli_guard;
 mod e2e_tgb3008_stories_search_row;
+mod e2e_tgb3010_emoji_evidence;
 mod e2e_uip2_a;
 mod e2e_uip2_b;
 mod e2e_uip2_c;

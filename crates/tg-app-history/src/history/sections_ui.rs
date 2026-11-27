@@ -2943,7 +2943,7 @@ pub struct SubsectionTabsWidget {
     last_active_idx: Option<usize>,
     /// Layout/peer fingerprint used to snap indicator & reset scroll on peer or mode switches.
     last_layout_key: Option<(u64, SubsectionTabsMode, SubsectionTabsAppearance)>,
-    /// Bundled Noto emoji texture cache for custom forum topic icons.
+    /// Bundled emoji texture cache for custom forum topic icons.
     emoji_cache: EmojiTextureCache,
 }
 

@@ -1,6 +1,6 @@
 //! The tiles must draw exactly like the WebP sprite sheets they replace.
 //!
-//! The "old path" here is the pre-tile code: decode `assets/sheet_N.webp` and sample the cell at
+//! The "old path" here is the whole-sheet code: decode `assets/emoji_{N+1}.webp` and sample the cell at
 //! its sheet UV. The tiles are compared against it texel by texel (as the premultiplied
 //! `Color32` that egui uploads) and as drawn by a bilinear sampler at the sizes the UI uses.
 
@@ -13,13 +13,35 @@ use crate::{
     TILE_HEIGHT_PX, TILE_WIDTH_PX,
 };
 
-/// The removed sheet decoder: the embedded WebP decoded to straight RGBA8.
+/// The whole-sheet decoder: tdesktop's WebP decoded to straight RGBA8, shrunk from 72 px to
+/// 64 px cells like `build.rs` does, and padded with transparent rows to the full sheet height
+/// (tdesktop's last sheet is shorter).
 fn decode_sheet_old_path(sheet: usize) -> image::RgbaImage {
-    let path = format!("{}/assets/sheet_{sheet}.webp", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/assets/emoji_{}.webp",
+        env!("CARGO_MANIFEST_DIR"),
+        sheet + 1
+    );
     let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("{path}: {err}"));
-    image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP)
+    let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP)
         .unwrap_or_else(|err| panic!("{path}: {err}"))
-        .to_rgba8()
+        .to_rgba8();
+    let (width, height) = (decoded.width() as usize, decoded.height() as usize);
+    assert_eq!(width, 2304, "{path}");
+    assert!(height <= 1152 && height % 72 == 0, "{path}");
+    let rows = height / 72;
+    let small = crate::resample::area_downscale(
+        decoded.as_raw(),
+        width,
+        height,
+        SHEET_WIDTH_PX as usize,
+        rows * CELL_SIZE_PX as usize,
+    );
+    let small = image::RgbaImage::from_raw(SHEET_WIDTH_PX, rows as u32 * CELL_SIZE_PX, small)
+        .expect("resampled size");
+    let mut full = image::RgbaImage::new(SHEET_WIDTH_PX, SHEET_HEIGHT_PX);
+    image::imageops::replace(&mut full, &small, 0, 0);
+    full
 }
 
 /// The removed sheet UV of cell `index` (0.5-texel inset inside the 2048x1024 sheet).

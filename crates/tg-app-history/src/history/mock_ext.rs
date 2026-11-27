@@ -194,7 +194,7 @@ impl MockSectionsData {
             "Morgan Kim",
             EXT_BASE_UNIX - 1500,
             false,
-            "The new Noto Emoji sprite sheet + tg-lottie animated reactions feel super crisp on Day and Night themes!",
+            "The new emoji sprite sheet + tg-lottie animated reactions feel super crisp on Day and Night themes!",
             MessageExtra::default(),
         );
         let c4 = make_msg(

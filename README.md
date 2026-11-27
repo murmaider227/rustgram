@@ -215,6 +215,13 @@ Rustgram is a port of Telegram Desktop and is licensed under the
 [GNU General Public License v3.0 or later](LICENSE), with the OpenSSL exception, like Telegram
 Desktop itself. See [LEGAL](LEGAL) for the full notice.
 
+### Third-party: emoji images
+
+The emoji images in `crates/tg-emoji/assets/` are taken from Telegram Desktop's repository, which draws them from
+Apple's "Apple Color Emoji" font, so Rustgram's emoji look the same as Telegram Desktop's. They are not covered by the
+GPL and the Rustgram authors do not license them. See [LICENSE-EMOJI](crates/tg-emoji/LICENSE-EMOJI). The
+Apache-2.0 Noto Emoji set can replace them if needed.
+
 ## Disclaimer
 
 Rustgram is an independent, unofficial client. It is not affiliated with, endorsed by or connected to

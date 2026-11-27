@@ -897,8 +897,8 @@ pub fn paint_sidebar_icon(painter: &Painter, center: Pos2, size: f32, color: Col
     );
 }
 
-/// Paints one emoji of the 4-emoji call encryption fingerprint using `tg-emoji`'s Apache-2.0
-/// Noto Emoji sprite atlas (normalizing `U+FE0F` variation selectors for BMP & keycap emoji).
+/// Paints one emoji of the 4-emoji call encryption fingerprint using `tg-emoji`'s sprite atlas
+/// (normalizing `U+FE0F` variation selectors for BMP & keycap emoji).
 pub fn paint_fingerprint_emoji_glyph(painter: &Painter, center: Pos2, radius: f32, emoji: &str) {
     let ctx = painter.ctx().clone();
     let rect = Rect::from_center_size(center, Vec2::splat((radius * 2.25).max(12.0)));
@@ -926,8 +926,8 @@ pub fn paint_fingerprint_emoji_glyph(painter: &Painter, center: Pos2, radius: f3
                 return;
             }
         }
-        // Fallback if an emoji is absent from Noto Emoji v2.042 (e.g. regional indicator flags
-        // or keycap digits): draw a crisp badge instead of a missing-glyph tofu rectangle.
+        // Fallback if an emoji is absent from the atlas: draw a crisp badge instead of a
+        // missing-glyph tofu rectangle.
         paint_emoji_fallback_badge(painter, center, radius, emoji);
     } else {
         paint_emoji_fallback_badge(painter, center, radius, emoji);

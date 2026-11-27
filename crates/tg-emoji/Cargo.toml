@@ -3,7 +3,7 @@ name = "tg-emoji"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Noto Emoji (Apache-2.0) packed sprite atlas and egui inline emoji renderer for Rustgram"
+description = "Telegram Desktop emoji sprite atlas and egui inline emoji renderer for Rustgram"
 
 [dependencies]
 egui = "0.37.0"

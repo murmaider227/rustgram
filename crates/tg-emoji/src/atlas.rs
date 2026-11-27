@@ -1,21 +1,22 @@
-//! Packed Noto Emoji sprite sheet atlas indexed by `tg-text`'s `EmojiRef` table.
+//! Telegram Desktop's emoji sprite sheet atlas indexed by `tg-text`'s `EmojiRef` table.
 //!
 //! Port origin: `Telegram/lib_ui/ui/emoji_config.cpp` (`Ui::Emoji::One::sprite/row/column`
-//! and sprite sheet loading), using Apache-2.0 Noto Emoji (`googlefonts/noto-emoji` v2.042)
-//! instead of Apple's proprietary emoji artwork.
+//! and sprite sheet loading). The sheets are tdesktop's built-in set (Apple Color Emoji artwork,
+//! not under the GPL; see `LICENSE-EMOJI`).
 //!
 //! The emoji keep their sheet/row/column indexing, but the binary embeds each sheet row as its own
-//! tile (`build.rs` splits `assets/sheet_*.webp`), so drawing an emoji for the first time decodes
-//! one 2048x64 row of 32 emoji (about 1 ms) instead of a whole 2048x1024 sheet.
+//! tile (`build.rs` splits `assets/emoji_*.webp`), so drawing an emoji for the first time decodes
+//! one 2048x64 row of 32 emoji (about 1 ms) instead of a whole sheet. `build.rs` shrinks tdesktop's
+//! 72 px cells to 64 px so a row fits egui's 2048 px minimum texture side.
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use tg_text::emoji::{self, EmojiRef};
 use thiserror::Error;
 
-/// Number of sprite sheets in the checked-in Noto Emoji atlas (`ceil(full_count / 512)`).
+/// Number of sprite sheets in the checked-in emoji atlas (`ceil(full_count / 512)`).
 pub const SHEET_COUNT: usize = 8;
-/// Pixel width and height of each emoji cell inside a sprite sheet.
+/// Pixel width and height of each emoji cell inside a tile (tdesktop's 72 px, area-averaged).
 pub const CELL_SIZE_PX: u32 = 64;
 /// Number of emoji columns per sprite sheet (matches `EmojiRef::column() = idx & 0x1F`).
 pub const SHEET_COLS: usize = 32;
@@ -37,7 +38,8 @@ pub const TILE_HEIGHT_PX: u32 = CELL_SIZE_PX;
 
 include!(concat!(env!("OUT_DIR"), "/tiles.rs"));
 
-static PRESENT_BITMAP: &[u8] = include_bytes!("../assets/present.bin");
+/// One bit per emoji index (LSB first) set when its cell has pixels; written by `build.rs`.
+static PRESENT_BITMAP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/present.bin"));
 
 /// Errors produced when decoding or querying an emoji tile.
 #[derive(Debug, Error)]
@@ -58,7 +60,7 @@ pub enum EmojiError {
     },
 }
 
-/// Summary statistics for the packed Noto Emoji atlas.
+/// Summary statistics for the packed emoji atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AtlasStats {
     /// Total emoji entries defined in `tg-text`.
@@ -134,7 +136,7 @@ impl EmojiTileImage {
     }
 }
 
-/// Thread-safe, lazily decoded Noto Emoji sprite atlas.
+/// Thread-safe, lazily decoded emoji sprite atlas.
 ///
 /// Tiles are embedded in the binary and decoded on demand. [`Self::decode_tile`] keeps the
 /// decoded pixels for later single-emoji extraction ([`Self::emoji_rgba`]); the GPU texture path

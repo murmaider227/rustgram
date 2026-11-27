@@ -1,24 +1,23 @@
 # `tg-emoji`
 
-Packed Noto Emoji sprite sheet atlas and `egui` inline rendering helpers for Rustgram.
+Telegram Desktop's emoji sprite sheets, split into lazily decoded tiles, and `egui` inline
+rendering helpers for Rustgram.
 
-## Attribution & License
+## Where the images come from, and their license
 
-The emoji artwork packed into `assets/sheet_0.webp`..`assets/sheet_7.webp` is derived from **Google Noto Emoji** (`googlefonts/noto-emoji`, tag `v2.042`, `png/72`), licensed under the **Apache License, Version 2.0**.
-
-- Upstream repository: <https://github.com/googlefonts/noto-emoji>
-- Release tag: `v2.042` (commit `d79d23e`)
-- License text: see [LICENSE-NOTO](LICENSE-NOTO) (Apache License, Version 2.0)
-
-Telegram Desktop's Apple-style emoji artwork is **not** used or redistributed here.
+`assets/emoji_1.webp` .. `assets/emoji_8.webp` are Telegram Desktop's built-in emoji sheets
+(`Telegram/Resources/emoji/`, tdesktop 7.4.5), copied byte for byte. tdesktop's build draws them
+from Apple's "Apple Color Emoji" font. **The artwork is Apple's: it is not covered by Rustgram's
+GPL-3.0 license and the Rustgram authors do not license it.** See [LICENSE-EMOJI](LICENSE-EMOJI),
+which also says which commit to revert to switch back to the Apache-2.0 Noto Emoji set.
 
 ## Atlas Layout
 
-- **8 WebP sprite sheets** (`assets/sheet_0.webp` .. `assets/sheet_7.webp`), total ~5.3 MB
-- **Cell size**: `64 × 64 px`, **32 columns × 16 rows** (`512` emojis per sheet, `2048 × 1024 px` per sheet)
-- **Indexing**: direct O(1) mapping from `tg_text::emoji::EmojiRef` (`sprite = index >> 9`, `row = (index >> 5) & 0x0F`, `col = index & 0x1F`)
-- **Tiles**: `build.rs` decodes the sheets once and embeds each sheet row as a lossless PNG tile (`2048 × 64 px`, 32 emojis, `tile = index >> 5`), so the first use of an emoji decodes one row (~1 ms) instead of a whole sheet. Colour channels hidden by premultiplied alpha are normalised; the textures egui uploads are byte-identical to the sheet path (`tests_tile_pixels`).
-- **Coverage**: 3,499 / 3,900 entries directly present (3,484 exact Noto `v2.042` matches + 15 fallbacks), with automatic fallback to `EmojiRef::original()` for rare multi-skin-tone sequences not present in `v2.042`.
+- **8 WebP sprite sheets** (`assets/emoji_1.webp` .. `assets/emoji_8.webp`), 9.6 MB in the repo
+- **Cell size**: `72 × 72 px` (tdesktop's largest size, kept without resampling), **32 columns × 16 rows** (`512` emojis per sheet, `2304 × 1152 px` per sheet)
+- **Indexing**: direct O(1) mapping from `tg_text::emoji::EmojiRef` (`sprite = index >> 9`, `row = (index >> 5) & 0x0F`, `col = index & 0x1F`), the order tdesktop's codegen draws the sheets in (`tests_emoji_order`)
+- **Tiles**: `build.rs` decodes the sheets once and embeds each sheet row as a lossless PNG tile (`2304 × 72 px`, 32 emojis, `tile = index >> 5`), so the first use of an emoji decodes one row (~1 ms) instead of a whole sheet. Colour channels hidden by premultiplied alpha are normalised; the textures egui uploads are byte-identical to the sheet path (`tests_tile_pixels`).
+- **Coverage**: all 3,900 entries of `tg-text`'s table have their own cell; `build.rs` writes the presence bitmap from the sheets' alpha.
 
 ## Usage
 

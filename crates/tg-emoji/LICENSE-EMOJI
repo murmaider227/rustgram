@@ -1,0 +1,28 @@
+Emoji images: crates/tg-emoji/assets/emoji_1.webp .. emoji_8.webp
+
+Where they come from
+  Copied byte for byte from the Telegram Desktop repository
+  (https://github.com/telegramdesktop/tdesktop, Telegram/Resources/emoji/emoji_1.webp ..
+  emoji_8.webp, commit c2d0ad9, version 7.4.5). Telegram Desktop's build draws these sheets from
+  Apple's "Apple Color Emoji" font (Telegram/codegen/codegen/emoji/generator.cpp, emoji set 0,
+  "Mac"). Telegram Desktop ships them as its default emoji, and so do its forks.
+
+License
+  The emoji artwork is Apple's. It is NOT covered by Rustgram's GPL-3.0 license, and the
+  Rustgram authors do not license it to you. Telegram Desktop's repository states no license for
+  these images either: its LEGAL and LICENSE files cover its code.
+
+Switching back
+  To switch back to the Apache-2.0 Google Noto Emoji set (googlefonts/noto-emoji v2.042),
+  revert commit 5d8fb9c1 ("tg-emoji: ship Telegram Desktop's emoji set (TGB-3010)")
+  and the commit that added this notice.
+
+SHA-256 of the files as copied
+  emoji_1.webp  4fdc6288fa0bae49d33f5e22bd2c9c5fca0068a8d6a45eea4e6964c7e5e4b587
+  emoji_2.webp  514ac69f6ec47f1f76b29cc7d4ef6773a3947fb136137275ea2f5ce914bc506c
+  emoji_3.webp  5497f55a124f294dcac29afa67b01bee79a00e4f2a42d3122d4e708077212ab4
+  emoji_4.webp  afc6004cddb86b4a42f36b00b796233a13de672af70f272be30e632979026486
+  emoji_5.webp  30244f93022238009ccbbf25b4b4216279a8137fbac9e37444048eea72dda422
+  emoji_6.webp  5efccb2328e320c7c3e6f02f6b7f5dee7d11361a0ef5cccfad6a2776a9dc68ef
+  emoji_7.webp  cc59c1e9db9c72fcee9e7d200eb971f59e856558755289adca31c18433323a26
+  emoji_8.webp  9b8217e33c41102fdec2ee5d97274f4a6b6a2b9bef949802a431ed2098bf1866
