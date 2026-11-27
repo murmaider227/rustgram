@@ -796,7 +796,20 @@ impl MixerCore {
         out_stereo: &mut [f32],
         heard_at: Instant,
     ) -> Vec<MixerEvent> {
-        let events = self.render_stereo_48k(out_stereo);
+        let mut events = Vec::new();
+        self.render_stereo_48k_at_into(out_stereo, heard_at, &mut events);
+        events
+    }
+
+    /// [`Self::render_stereo_48k_at`] that appends its events to `events` instead of returning
+    /// a new `Vec`, so the device callback reuses one buffer and does not allocate.
+    pub fn render_stereo_48k_at_into(
+        &mut self,
+        out_stereo: &mut [f32],
+        heard_at: Instant,
+        events: &mut Vec<MixerEvent>,
+    ) {
+        self.render_stereo_48k_into(out_stereo, events);
         if let Some((audio, position_ms)) = self.last_video_render.take() {
             self.video_sync = Some(ExternalSyncPoint {
                 audio,
@@ -804,7 +817,6 @@ impl MixerCore {
                 at: heard_at,
             });
         }
-        events
     }
 
     /// The latest played position of the video sound `audio`
@@ -869,10 +881,19 @@ impl MixerCore {
     /// Renders `out_stereo.len() / 2` stereo frames at 48 kHz into `out_stereo`,
     /// mixing all active tracks and UI sounds with fades and suppression.
     pub fn render_stereo_48k(&mut self, out_stereo: &mut [f32]) -> Vec<MixerEvent> {
+        let mut events = Vec::new();
+        self.render_stereo_48k_into(out_stereo, &mut events);
+        events
+    }
+
+    /// [`Self::render_stereo_48k`] that appends its events to `events` (TGB-3103): a playing
+    /// track reports its position every 50 ms, and a new `Vec` for each report is an allocation
+    /// on the real-time audio thread.
+    pub fn render_stereo_48k_into(&mut self, out_stereo: &mut [f32], events: &mut Vec<MixerEvent>) {
         out_stereo.fill(0.0);
         let frames = out_stereo.len() / 2;
         if frames == 0 {
-            return Vec::new();
+            return;
         }
 
         let dt_ms = ((frames as f64) * 1000.0) / f64::from(DEFAULT_FREQUENCY);
@@ -900,7 +921,6 @@ impl MixerCore {
             self.suppression.mult_song,
         );
 
-        let mut events = Vec::new();
         let mut any_active = false;
         let mut unsuppress_song_after = false;
         let video_start = (
@@ -913,15 +933,14 @@ impl MixerCore {
         for (idx, track) in self.voice_tracks.iter_mut().enumerate() {
             let is_current = idx == self.voice_current;
             let (active, ended) =
-                render_one_track(track, out_stereo, frames, voice_base_gain, &mut events);
+                render_one_track(track, out_stereo, frames, voice_base_gain, events);
             any_active |= active;
             if ended && is_current {
                 unsuppress_song_after = true;
             }
         }
         for track in &mut self.song_tracks {
-            let (active, _) =
-                render_one_track(track, out_stereo, frames, song_base_gain, &mut events);
+            let (active, _) = render_one_track(track, out_stereo, frames, song_base_gain, events);
             any_active |= active;
         }
         {
@@ -930,7 +949,7 @@ impl MixerCore {
                 out_stereo,
                 frames,
                 video_base_gain,
-                &mut events,
+                events,
             );
             any_active |= active;
         }
@@ -948,21 +967,18 @@ impl MixerCore {
             self.suppression.unsuppress_song();
         }
 
-        // Mix active UI / notification sound tracks.
-        let mut finished_sounds = Vec::new();
-        for st in &mut self.sound_tracks {
-            if st.is_active() {
-                any_active = true;
-                if st.mix_into(out_stereo) {
-                    finished_sounds.push(st.id);
-                    events.push(MixerEvent::SoundTrackFinished(st.id));
-                }
+        // Mix active UI / notification sound tracks; finished ones leave the list.
+        self.sound_tracks.retain_mut(|st| {
+            if !st.is_active() {
+                return true;
             }
-        }
-        if !finished_sounds.is_empty() {
-            self.sound_tracks
-                .retain(|st| !finished_sounds.contains(&st.id));
-        }
+            any_active = true;
+            let finished = st.mix_into(out_stereo);
+            if finished {
+                events.push(MixerEvent::SoundTrackFinished(st.id));
+            }
+            !finished
+        });
 
         // Soft-clip mixed output to prevent digital harsh clipping when multiple tracks overlap.
         for s in out_stereo.iter_mut() {
@@ -974,8 +990,6 @@ impl MixerCore {
         } else {
             self.idle_samples = self.idle_samples.saturating_add(frames as i64);
         }
-
-        events
     }
 
     fn faded_stop(&mut self, audio_type: AudioType, faded_start: &mut bool) -> Option<AudioMsgId> {

@@ -125,14 +125,44 @@ pub fn hardware_voice_capture_enabled() -> bool {
     crate::history::inline_media::default_hardware_audio_enabled()
 }
 
+/// The microphone could not start a recording: no capture device, or opening it failed.
+///
+/// tdesktop's `VoiceRecordBar::startRecording` stops when `Media::Capture::instance()->available()`
+/// is false or the capture reports an error; nothing is recorded or sent. The compose bar shows
+/// `lng_record_audio_problem` for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceCaptureUnavailable;
+
+impl fmt::Display for VoiceCaptureUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("no usable microphone")
+    }
+}
+
+impl std::error::Error for VoiceCaptureUnavailable {}
+
+/// Opens the microphone and streams its levels into the feed, or `None` when it cannot start.
+type MicrophoneOpener = fn(&Arc<Mutex<LiveLevelFeed>>) -> Option<AudioRecorder>;
+
+/// Where a recording takes its sound from, fixed when the controller is created.
+#[derive(Clone, Copy)]
+enum CaptureSource {
+    /// The real microphone; a recording does not start without one.
+    Microphone(MicrophoneOpener),
+    /// Generated speech-like PCM: headless agent/CI runs and unit tests only.
+    Synthetic,
+}
+
 /// Voice recorder controller wrapping `tg-audio`'s [`AudioRecorder`] and [`VoiceCapturePipeline`].
 ///
-/// Uses real microphone capture via `cpal` when a capture device is available and hardware
-/// capture is allowed ([`hardware_voice_capture_enabled`]); otherwise it feeds synthetic PCM
-/// into `VoiceCapturePipeline`, so the real Opus + 5-bit waveform pipeline always produces a
-/// sendable [`RecordedVoice`].
+/// Records from the microphone via `cpal` when hardware capture is allowed
+/// ([`hardware_voice_capture_enabled`]); without a usable microphone a recording does not
+/// start ([`VoiceCaptureUnavailable`]). Headless runs and unit tests feed synthetic PCM into
+/// `VoiceCapturePipeline` instead, so the real Opus + 5-bit waveform pipeline still produces
+/// a sendable [`RecordedVoice`] there.
 pub struct VoiceRecorderController {
     phase: VoiceRecordPhase,
+    source: CaptureSource,
     recorder: Option<AudioRecorder>,
     fallback_pipeline: Option<VoiceCapturePipeline>,
     feed: Arc<Mutex<LiveLevelFeed>>,
@@ -154,11 +184,29 @@ impl Default for VoiceRecorderController {
 }
 
 impl VoiceRecorderController {
-    /// Creates an idle voice recorder controller.
+    /// Creates an idle voice recorder controller: microphone capture in a normal run, the
+    /// synthetic source in headless runs and unit tests.
     #[must_use]
     pub fn new() -> Self {
+        let source = if hardware_voice_capture_enabled() {
+            CaptureSource::Microphone(open_microphone)
+        } else {
+            CaptureSource::Synthetic
+        };
+        Self::with_source(source)
+    }
+
+    /// A controller whose microphone never opens, like a machine without a capture device.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn without_microphone() -> Self {
+        Self::with_source(CaptureSource::Microphone(|_| None))
+    }
+
+    fn with_source(source: CaptureSource) -> Self {
         Self {
             phase: VoiceRecordPhase::Idle,
+            source,
             recorder: None,
             fallback_pipeline: None,
             feed: Arc::new(Mutex::new(LiveLevelFeed::default())),
@@ -211,26 +259,34 @@ impl VoiceRecorderController {
     }
 
     /// Starts hold-to-record at `now_secs`, initializing `tg-audio` capture.
-    pub fn start_hold(&mut self, now_secs: f64) {
-        self.begin_capture(now_secs);
+    ///
+    /// # Errors
+    /// [`VoiceCaptureUnavailable`] when the microphone cannot start; the controller stays idle.
+    pub fn start_hold(&mut self, now_secs: f64) -> Result<(), VoiceCaptureUnavailable> {
+        self.begin_capture(now_secs)?;
         self.phase = VoiceRecordPhase::Holding {
             started_at: now_secs,
             drag_dx: 0.0,
             drag_dy: 0.0,
         };
+        Ok(())
     }
 
     /// Starts directly in locked mode (e.g. click-to-record convenience).
-    pub fn start_locked(&mut self, now_secs: f64) {
-        self.begin_capture(now_secs);
+    ///
+    /// # Errors
+    /// [`VoiceCaptureUnavailable`] when the microphone cannot start; the controller stays idle.
+    pub fn start_locked(&mut self, now_secs: f64) -> Result<(), VoiceCaptureUnavailable> {
+        self.begin_capture(now_secs)?;
         self.phase = VoiceRecordPhase::Locked {
             started_at: now_secs,
             paused: false,
             paused_elapsed_secs: 0.0,
         };
+        Ok(())
     }
 
-    fn begin_capture(&mut self, now_secs: f64) {
+    fn begin_capture(&mut self, now_secs: f64) -> Result<(), VoiceCaptureUnavailable> {
         self.cancel();
         if let Ok(mut feed) = self.feed.lock() {
             feed.bars.clear();
@@ -239,35 +295,19 @@ impl VoiceRecorderController {
         }
         self.last_fallback_tick_secs = now_secs;
 
-        self.recorder = self.start_hardware_capture();
-        self.fallback_pipeline = if self.recorder.is_some() {
-            None
-        } else {
-            // Headless / no-mic source feeding the real `tg-audio` Opus + waveform pipeline.
-            VoiceCapturePipeline::telegram_default().ok()
-        };
-    }
-
-    /// Opens the microphone stream, or `None` when hardware capture is off or unavailable.
-    /// Nothing touches the audio devices while it is off (not even device enumeration).
-    fn start_hardware_capture(&self) -> Option<AudioRecorder> {
-        if !hardware_voice_capture_enabled() {
-            return None;
-        }
-        let rec = AudioRecorder::new(Arc::new(DeviceManager::new()), CaptureConfig::default());
-        let feed_cb = Arc::clone(&self.feed);
-        let cb = Arc::new(move |upd: CaptureUpdate| {
-            let level_bar = ((u32::from(upd.level) * 31) / 32768).clamp(2, 31) as u8;
-            if let Ok(mut guard) = feed_cb.lock() {
-                guard.hardware_active = true;
-                guard.last_sample_count = upd.samples;
-                guard.bars.push(level_bar);
-                if guard.bars.len() > 64 {
-                    guard.bars.remove(0);
-                }
+        match self.source {
+            CaptureSource::Microphone(open) => {
+                self.recorder = Some(open(&self.feed).ok_or(VoiceCaptureUnavailable)?);
             }
-        });
-        (rec.available() && rec.start(Some(cb)).is_ok()).then_some(rec)
+            CaptureSource::Synthetic => {
+                // Headless source feeding the real `tg-audio` Opus + waveform pipeline.
+                self.fallback_pipeline = Some(
+                    VoiceCapturePipeline::telegram_default()
+                        .map_err(|_| VoiceCaptureUnavailable)?,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Updates pointer drag delta during hold-to-record.
@@ -462,6 +502,25 @@ impl VoiceRecorderController {
     pub const fn uses_hardware_capture(&self) -> bool {
         self.recorder.is_some()
     }
+}
+
+/// Opens the default microphone (`cpal`) and streams its levels into `feed`, or `None` when
+/// there is no capture device or it fails to start.
+fn open_microphone(feed: &Arc<Mutex<LiveLevelFeed>>) -> Option<AudioRecorder> {
+    let rec = AudioRecorder::new(Arc::new(DeviceManager::new()), CaptureConfig::default());
+    let feed_cb = Arc::clone(feed);
+    let cb = Arc::new(move |upd: CaptureUpdate| {
+        let level_bar = ((u32::from(upd.level) * 31) / 32768).clamp(2, 31) as u8;
+        if let Ok(mut guard) = feed_cb.lock() {
+            guard.hardware_active = true;
+            guard.last_sample_count = upd.samples;
+            guard.bars.push(level_bar);
+            if guard.bars.len() > 64 {
+                guard.bars.remove(0);
+            }
+        }
+    });
+    (rec.available() && rec.start(Some(cb)).is_ok()).then_some(rec)
 }
 
 /// Action emitted by [`paint_voice_recording_bar`].

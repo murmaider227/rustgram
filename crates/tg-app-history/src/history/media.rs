@@ -3249,3 +3249,8 @@ fn paint_video_stream_card(
 
 #[cfg(test)]
 mod tests_wave4_downloads;
+
+#[cfg(test)]
+mod tests_round_on_demand;
+#[cfg(test)]
+mod tests_voice_stream;

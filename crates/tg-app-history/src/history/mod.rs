@@ -3890,6 +3890,9 @@ impl HistoryWidget {
                         now_secs,
                     );
                 }
+                ComposeEvent::VoiceCaptureUnavailable => {
+                    self.show_toast(tg_lang::tr::lng_record_audio_problem(), now_secs);
+                }
             }
         }
 

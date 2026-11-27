@@ -16,6 +16,12 @@ published releases.
   v0.1.0-alpha.2 installs need the switch on to see v0.2.0-alpha.1).
 - The updater never installs an older version than the one running (anti-downgrade), and only
   installs packages signed with the release key.
+- An update staged in `tupdates` that is not newer than the running version, or whose version cannot
+  be read, is deleted when Rustgram starts and never offered (tdesktop's `checkReadyUpdate`). This
+  happens after a newer version is installed by hand over a copy that had already downloaded an older
+  update. From v0.2.0-alpha.3 `rustgram-updater.exe` also refuses such a package: it installs nothing,
+  deletes it, exits with code 1 and starts the installed version again. It compares with the version
+  the app passes (`-appversion`), else with the installed `rustgram.exe`'s product version.
 
 ## The rules the workflow enforces
 
@@ -143,7 +149,9 @@ $p = Start-Process -FilePath "$app\rustgram-updater.exe" -ArgumentList '-update'
 $p.ExitCode
 ```
 
-Exit code 1 means the updater found no update in `$work`: check the two paths. Rustgram now runs the
+Exit code 1 means the updater found no update in `$work` (check the two paths), or, with an updater
+from v0.2.0-alpha.3 on, that the staged update is not newer than the installed version (the updater
+then deletes it). Rustgram now runs the
 version that was waiting. That version still has the old updater, but the next update it downloads
 (v0.2.0-alpha.2 or later) brings the new updater along and installs the usual way.
 
@@ -156,6 +164,17 @@ from the newest release, quit Rustgram, unzip it over the program folder (replac
 the `tupdates` folder in the working folder, and start `rustgram.exe`. The profile in the working
 folder is not touched.
 
-The steps above were tested against the released v0.2.0-alpha.1 `rustgram-updater.exe` with
+## An older update offered as ready (v0.2.0-alpha.2)
+
+v0.2.0-alpha.2 offers whatever is staged in `tupdates`, even an older version. After installing
+v0.2.0-alpha.2 by hand over a copy that had already downloaded v0.2.0-alpha.1, its menu says
+"New version is ready · v0.2.0-alpha.1", and "Restart to update" would install the older version.
+Tell users not to restart for it: quit Rustgram, delete the `tupdates` folder in the working folder
+(`%APPDATA%\Rustgram` by default) and start Rustgram again. From v0.2.0-alpha.3 the app deletes such
+a leftover at start and the updater refuses it, so this needs no action there
+(`crates/tg-updater/tests/e2e_tgb3113_workdir.rs`, case `tgb3117_…`).
+
+The steps for stuck users above were tested against the released v0.2.0-alpha.1
+`rustgram-updater.exe` with
 `crates/tg-updater/tests/e2e_tgb3113_workdir.rs`
 (`RUSTGRAM_E2E_RELEASED_UPDATER=<path to that exe> cargo test -p tg-updater --test e2e_tgb3113_workdir`).

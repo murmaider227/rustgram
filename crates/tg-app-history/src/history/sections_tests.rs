@@ -516,7 +516,7 @@ fn voice_recorder_hold_lock_cancel_waveform_and_round_video() {
     assert!(!rec.is_active());
 
     // Hold -> slide left cancels
-    rec.start_hold(10.0);
+    rec.start_hold(10.0).expect("synthetic capture starts");
     assert!(matches!(rec.phase(), VoiceRecordPhase::Holding { .. }));
     let res = rec.update_hold_drag(
         egui::Vec2::new(-VOICE_SLIDE_CANCEL_THRESHOLD_PX - 4.0, 0.0),
@@ -526,7 +526,7 @@ fn voice_recorder_hold_lock_cancel_waveform_and_round_video() {
     assert!(!rec.is_active());
 
     // Hold -> slide up locks -> tick -> pause/resume -> finish emits valid 5-bit waveform
-    rec.start_hold(20.0);
+    rec.start_hold(20.0).expect("synthetic capture starts");
     let locked = rec.update_hold_drag(
         egui::Vec2::new(0.0, -VOICE_SLIDE_LOCK_THRESHOLD_PX - 4.0),
         20.5,

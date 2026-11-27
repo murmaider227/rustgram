@@ -320,6 +320,8 @@ pub enum ComposeEvent {
     SaveDefaultSendAs(PeerId),
     /// User attempted to send while slow mode cooldown still had `remaining_secs` left.
     SlowModeBlocked(u32),
+    /// The mic button was pressed but no microphone could start (`lng_record_audio_problem`).
+    VoiceCaptureUnavailable,
 }
 
 /// Optional bot chrome configuration painted inside the compose bar (`history_view_bot_menu_button.cpp`
@@ -1638,20 +1640,26 @@ impl ComposeControls {
                 RecordButtonMode::Voice => {
                     paint_mic_icon(ui.painter(), send_rect.center(), colors.sub_text_fg);
                     if send_resp.drag_started() {
-                        self.voice_recorder.start_hold(now_secs);
-                        self.recording_voice = true;
-                        self.recording_started_at = now_secs;
-                        events.push(ComposeEvent::SendTyping(TypingAction::RecordingVoice));
+                        if self.voice_recorder.start_hold(now_secs).is_ok() {
+                            self.recording_voice = true;
+                            self.recording_started_at = now_secs;
+                            events.push(ComposeEvent::SendTyping(TypingAction::RecordingVoice));
+                        } else {
+                            events.push(ComposeEvent::VoiceCaptureUnavailable);
+                        }
                     } else if send_resp.secondary_clicked() {
                         self.record_mode = RecordButtonMode::RoundVideo;
                     } else if send_resp
                         .on_hover_text("Hold to record voice · Click to record locked · Right-click for Round Video")
                         .clicked()
                     {
-                        self.voice_recorder.start_locked(now_secs);
-                        self.recording_voice = true;
-                        self.recording_started_at = now_secs;
-                        events.push(ComposeEvent::SendTyping(TypingAction::RecordingVoice));
+                        if self.voice_recorder.start_locked(now_secs).is_ok() {
+                            self.recording_voice = true;
+                            self.recording_started_at = now_secs;
+                            events.push(ComposeEvent::SendTyping(TypingAction::RecordingVoice));
+                        } else {
+                            events.push(ComposeEvent::VoiceCaptureUnavailable);
+                        }
                     }
                 }
                 RecordButtonMode::RoundVideo => {

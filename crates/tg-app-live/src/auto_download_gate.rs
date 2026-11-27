@@ -1,8 +1,9 @@
 //! Auto-download gate for chat photos (`Data::AutoDownload::Should(settings, peer, photo)`,
-//! `data/data_auto_download.cpp:131-136,406-424`).
+//! `data/data_auto_download.cpp:131-136,406-424`) and autoplay of round video messages
+//! (`Data::AutoDownload::ShouldAutoPlay`).
 
 use tg_app_core::settings::backend::{AutoDownloadSettings, AutoDownloadSource, AutoDownloadType};
-use tg_data::{Message, MessageContent, MessageMedia, PeerId as DataPeerId, Session};
+use tg_data::{DocumentKind, Message, MessageContent, MessageMedia, PeerId as DataPeerId, Session};
 
 use crate::media::photo_to_location;
 
@@ -49,6 +50,33 @@ pub fn photo_autoload_allowed(
         AutoDownloadType::Photo,
     );
     limit > 0 && size <= limit
+}
+
+/// Whether `msg`'s round video message (if any) may play, and so download, by itself when it
+/// enters the list (`ShouldAutoPlay` with `AutoPlayVideoMessage`, TGB-2997). tdesktop never
+/// downloads a video message automatically otherwise (`Should` is false for it). Messages
+/// without a round video always return `true`.
+#[must_use]
+pub fn round_video_autoplay_allowed(
+    session: &Session,
+    settings: &AutoDownloadSettings,
+    msg: &Message,
+) -> bool {
+    let MessageContent::Regular {
+        media: MessageMedia::Document(doc),
+        ..
+    } = &msg.content
+    else {
+        return true;
+    };
+    if doc.kind != DocumentKind::RoundVideo {
+        return true;
+    }
+    let limit = settings.bytes_limit(
+        source_for_peer(session, msg.peer_id),
+        AutoDownloadType::AutoPlayVideoMessage,
+    );
+    settings.autoplay_round_videos && limit > 0 && doc.size <= limit
 }
 
 #[cfg(test)]

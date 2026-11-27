@@ -2298,6 +2298,18 @@ pub trait HistoryBackend: Send {
     /// message). Never blocks; the progress arrives through [`Self::inline_media_descriptor`].
     fn start_media_download(&self, _peer_id: PeerId, _msg_id: MsgId) {}
 
+    /// A loader that serves `msg_id`'s media file part by part, so a voice message plays while
+    /// it downloads (tdesktop streams voice messages, TGB-3000). `None` when the backend cannot
+    /// stream it: the first play then downloads the file through
+    /// [`Self::start_media_download`] and plays when it is there.
+    fn open_media_stream(
+        &self,
+        _peer_id: PeerId,
+        _msg_id: MsgId,
+    ) -> Option<std::sync::Arc<dyn tg_video::RangeLoader>> {
+        None
+    }
+
     /// Cancels the running download of `msg_id`'s media file (`PhotoCancelClickHandler`). It
     /// stays not downloaded until [`Self::start_media_download`].
     fn cancel_media_download(&self, _peer_id: PeerId, _msg_id: MsgId) {}

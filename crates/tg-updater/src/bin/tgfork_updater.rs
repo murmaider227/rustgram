@@ -6,6 +6,9 @@
 //! failure), cleans up `tupdates`, updates the Windows uninstall registry version, and relaunches
 //! `rustgram.exe` with `-noupdate` plus forwarded flags (`-workdir`, `-key`, `-debug`,
 //! `-autostart`, `-startintray`).
+//! A staged package that is not newer than the installed app (`-appversion`, else the installed
+//! executable's product version) is deleted instead of installed; the updater then relaunches the
+//! app unchanged and exits with code 1.
 //! Release builds use the GUI subsystem (like tdesktop's `Updater.exe`), so applying an update
 //! never flashes a console window; `-debug` writes its log to a file instead.
 //! The working dir is `-workdir`, else the current directory (as in tdesktop, which the app sets to
@@ -34,7 +37,8 @@ fn main() -> ExitCode {
             "rustgram-updater — Rustgram staged update applier\n\
              Usage: rustgram-updater [-update] [-finishprocess <PID> <CREATED>] \
              [-workdir <DIR>] [-writeprotected <DIR>] [-exename <NAME>] \
-             [-key <NAME>] [-autostart] [-debug] [-startintray] [-justupdate]"
+             [-key <NAME>] [-appversion <VERSION>] [-autostart] [-debug] [-startintray] \
+             [-justupdate]"
         );
         return ExitCode::SUCCESS;
     }

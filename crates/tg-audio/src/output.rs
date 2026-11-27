@@ -17,8 +17,9 @@ use crate::error::{AudioError, AudioResult};
 use crate::mixer::{MixerCore, MixerEvent};
 use crate::types::DEFAULT_FREQUENCY;
 
-/// Callback invoked whenever [`MixerCore`] produces events on the audio callback.
-pub type MixerEventCallback = Arc<dyn Fn(Vec<MixerEvent>) + Send + Sync>;
+/// Callback invoked whenever [`MixerCore`] produces events on the audio callback. The slice is
+/// the engine's reused buffer: copy what you keep.
+pub type MixerEventCallback = Arc<dyn Fn(&[MixerEvent]) + Send + Sync>;
 
 /// Output audio engine driving a `cpal::Stream` from a shared [`MixerCore`].
 pub struct AudioOutputEngine {
@@ -184,8 +185,7 @@ impl AudioOutputEngine {
                         data.fill(0);
                         return;
                     }
-                    let mut tmp = vec![0.0f32; data.len()];
-                    renderer.fill_f32(&mixer, &cb_slot, &mut tmp, output_latency(info));
+                    let tmp = renderer.fill_converted(&mixer, &cb_slot, data.len(), info);
                     for (dst, &src) in data.iter_mut().zip(tmp.iter()) {
                         *dst = (src.clamp(-1.0, 1.0) * 32767.0).round() as i16;
                     }
@@ -200,8 +200,7 @@ impl AudioOutputEngine {
                         data.fill(u16::MAX / 2);
                         return;
                     }
-                    let mut tmp = vec![0.0f32; data.len()];
-                    renderer.fill_f32(&mixer, &cb_slot, &mut tmp, output_latency(info));
+                    let tmp = renderer.fill_converted(&mixer, &cb_slot, data.len(), info);
                     for (dst, &src) in data.iter_mut().zip(tmp.iter()) {
                         *dst = ((src.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u16;
                     }
@@ -249,6 +248,10 @@ struct StreamRenderer {
     mixer_buf: Vec<f32>,
     resampled_buf: Vec<f32>,
     resampled_offset: usize,
+    /// Mixer events of one callback, reused so the audio thread does not allocate per event.
+    events: Vec<MixerEvent>,
+    /// `f32` staging for integer sample formats, reused across callbacks.
+    converted: Vec<f32>,
 }
 
 impl StreamRenderer {
@@ -265,7 +268,25 @@ impl StreamRenderer {
             mixer_buf: Vec::new(),
             resampled_buf: Vec::new(),
             resampled_offset: 0,
+            events: Vec::new(),
+            converted: Vec::new(),
         }
+    }
+
+    /// Renders `len` samples into the reused `f32` staging buffer for an integer device format.
+    fn fill_converted(
+        &mut self,
+        mixer: &Arc<Mutex<MixerCore>>,
+        cb: &Option<MixerEventCallback>,
+        len: usize,
+        info: &cpal::OutputCallbackInfo,
+    ) -> &[f32] {
+        let mut converted = std::mem::take(&mut self.converted);
+        converted.clear();
+        converted.resize(len, 0.0);
+        self.fill_f32(mixer, cb, &mut converted, output_latency(info));
+        self.converted = converted;
+        &self.converted
     }
 
     fn fill_f32(
@@ -283,12 +304,12 @@ impl StreamRenderer {
         // the mixer's position at that instant (tdesktop reads it back from OpenAL instead).
         let heard_at = Instant::now() + latency;
 
-        let mut all_events = Vec::new();
+        self.events.clear();
 
         if self.out_rate == DEFAULT_FREQUENCY {
             self.mixer_buf.resize(out_frames * 2, 0.0);
             if let Ok(mut m) = mixer.lock() {
-                all_events = m.render_stereo_48k_at(&mut self.mixer_buf, heard_at);
+                m.render_stereo_48k_at_into(&mut self.mixer_buf, heard_at, &mut self.events);
             } else {
                 self.mixer_buf.fill(0.0);
             }
@@ -307,8 +328,11 @@ impl StreamRenderer {
                 let ahead_frames = (self.resampled_buf.len() - self.resampled_offset) / 2;
                 let ahead = Duration::from_secs_f64(ahead_frames as f64 / f64::from(self.out_rate));
                 if let Ok(mut m) = mixer.lock() {
-                    let ev = m.render_stereo_48k_at(&mut self.mixer_buf, heard_at + ahead);
-                    all_events.extend(ev);
+                    m.render_stereo_48k_at_into(
+                        &mut self.mixer_buf,
+                        heard_at + ahead,
+                        &mut self.events,
+                    );
                 } else {
                     self.mixer_buf.fill(0.0);
                 }
@@ -326,10 +350,10 @@ impl StreamRenderer {
             }
         }
 
-        if !all_events.is_empty()
+        if !self.events.is_empty()
             && let Some(callback) = cb
         {
-            callback(all_events);
+            callback(&self.events);
         }
     }
 }

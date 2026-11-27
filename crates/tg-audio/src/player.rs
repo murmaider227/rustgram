@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::decoder::AudioDecoder;
 use crate::error::{AudioError, AudioResult};
 use crate::mixer::{MixerCore, MixerEvent};
 use crate::output::AudioOutputEngine;
@@ -1069,8 +1068,7 @@ impl PlayerInstance {
         position_ms: i64,
         start_paused: bool,
     ) -> AudioResult<()> {
-        let input = self.source.open(&audio)?;
-        let decoder = AudioDecoder::open(input)?;
+        let decoder = self.source.open_stream(&audio)?;
         let speed = self.lookup_playback_speed(&audio);
 
         let track_changed = self.current(audio.audio_type) != audio;
@@ -1089,7 +1087,7 @@ impl PlayerInstance {
                 .mixer
                 .lock()
                 .map_err(|_| AudioError::InvalidOperation("mixer lock poisoned".into()))?;
-            mixer.play(audio, Box::new(decoder), position_ms, speed, start_paused)?;
+            mixer.play(audio, decoder, position_ms, speed, start_paused)?;
         }
 
         if let Some(out) = &self.output {

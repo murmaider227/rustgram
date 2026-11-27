@@ -334,6 +334,17 @@ impl AudioDataSource for CompositeAudioSource {
             }
         }
     }
+
+    fn open_stream(&self, id: &AudioMsgId) -> AudioResult<Box<dyn tg_audio::AudioStream>> {
+        if self.overlay.contains(id.document_id) {
+            return self.overlay.open_stream(id);
+        }
+        let fallback = self.fallback.lock().ok().and_then(|g| g.clone());
+        match fallback {
+            Some(fb) => fb.open_stream(id),
+            None => self.overlay.open_stream(id),
+        }
+    }
 }
 
 /// Composite [`PlaylistProvider`] unifying history chat playlists with the shared app
@@ -422,6 +433,24 @@ impl SharedAudioBackend {
         if let Ok(mut guard) = self.metadata.lock() {
             guard.insert(audio_id, meta);
         }
+    }
+
+    fn register_streamed_track(
+        &self,
+        audio_id: AudioMsgId,
+        open: tg_audio::StreamedInputOpener,
+        meta: AudioTrackMetadata,
+    ) {
+        self.stream_track(audio_id, open);
+        if let Ok(mut guard) = self.metadata.lock() {
+            guard.insert(audio_id, meta);
+        }
+    }
+
+    /// Makes the registered `audio_id` stream through `open` (its metadata stays).
+    fn stream_track(&self, audio_id: AudioMsgId, open: tg_audio::StreamedInputOpener) {
+        self.overlay_source
+            .insert_streamed(audio_id.document_id, open);
     }
 
     fn set_playlist(&self, peer_id: PeerId, audio_type: AudioType, entries: Vec<PlaylistEntry>) {
@@ -885,9 +914,12 @@ impl HistoryMediaRuntime {
         if !had_audio && descriptor.audio_bytes.is_some() && self.unmuted_round_msg != Some(msg_id)
         {
             self.registered_audio.remove(&msg_id);
+            self.drop_voice_stream(msg_id);
         }
         self.descriptors.insert(msg_id, descriptor);
+        self.stream_registered_voice(msg_id);
         self.play_pending_voice_if_loaded(msg_id);
+        self.play_pending_round_if_loaded(msg_id);
     }
 
     /// Returns the registered [`InlineMediaDescriptor`] for `msg_id`, if any.
@@ -1310,6 +1342,9 @@ impl HistoryMediaRuntime {
         is_round: bool,
     ) -> AudioMsgId {
         if let Some(&existing) = self.registered_audio.get(&msg_id) {
+            if !is_round {
+                self.stream_registered_voice(msg_id);
+            }
             return existing;
         }
         if !is_round {
@@ -1324,6 +1359,23 @@ impl HistoryMediaRuntime {
             MediaKind::VoiceMessage
         };
         let audio_id = AudioMsgId::new(doc_id, full, kind, dur_ms, 0);
+
+        if !is_round && self.streams_voice(msg_id) {
+            // TGB-3000: not cached, so the track streams the file instead of a stand-in tone.
+            let open = self.voice_stream_opener(msg_id);
+            self.audio_backend.register_streamed_track(
+                audio_id,
+                open,
+                AudioTrackMetadata {
+                    id: audio_id,
+                    title: sender_name.to_owned(),
+                    subtitle: "Voice message".to_owned(),
+                    duration_ms: dur_ms,
+                },
+            );
+            self.registered_audio.insert(msg_id, audio_id);
+            return audio_id;
+        }
 
         let (bytes, ext) = self
             .descriptors
@@ -1418,10 +1470,14 @@ impl HistoryMediaRuntime {
         seek_frac: Option<f64>,
     ) {
         if self.voice_loaded(msg_id) == Some(false) {
-            // Not in the media cache: the play starts the download (TGB-2958).
             self.remember_voice_meta(msg_id, sender_name, duration_secs);
-            self.request_voice_play(peer_id, msg_id, seek_frac);
-            return;
+            if !self.streams_voice(msg_id) {
+                // The backend cannot stream: the play starts the download (TGB-2958).
+                self.request_voice_play(peer_id, msg_id, seek_frac);
+                return;
+            }
+            // Not in the media cache: the track starts now and streams the file (TGB-3000).
+            self.request_voice_stream(msg_id);
         }
         let audio_id =
             self.ensure_voice_registered(peer_id, msg_id, sender_name, duration_secs, false);

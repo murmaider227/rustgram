@@ -121,7 +121,9 @@ fn translate_bar_menu_and_replaced_ui_icons_render_without_missing_glyphs() {
     }
 
     let mut voice = VoiceRecorderController::new();
-    voice.start_hold(0.0);
+    voice
+        .start_hold(0.0)
+        .expect("headless runs record from the synthetic source");
 
     let initial = State {
         bar: TranslateBarState {

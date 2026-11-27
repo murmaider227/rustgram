@@ -9,7 +9,10 @@ use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::background_stream::BackgroundAudioStream;
+use crate::decoder::AudioDecoder;
 use crate::error::{AudioError, AudioResult};
+use crate::mixer::AudioStream;
 use crate::types::{AudioMsgId, AudioType};
 use tg_data::{DocumentId, FullMsgId, PeerId};
 
@@ -74,14 +77,28 @@ impl AudioInput {
 pub trait AudioDataSource: Send + Sync {
     /// Opens an [`AudioInput`] for the requested audio track.
     fn open(&self, id: &AudioMsgId) -> AudioResult<AudioInput>;
+
+    /// Opens the decoded stream the player hands to the mixer. The default decodes
+    /// [`Self::open`] on the caller's thread; a source whose bytes come over the network
+    /// returns a [`BackgroundAudioStream`] instead, so nothing waits for the network on the UI
+    /// or audio thread.
+    fn open_stream(&self, id: &AudioMsgId) -> AudioResult<Box<dyn AudioStream>> {
+        Ok(Box::new(AudioDecoder::open(self.open(id)?)?))
+    }
 }
 
 type MemoryAudioEntry = (Arc<[u8]>, Option<String>);
 
-/// In-memory [`AudioDataSource`] mapping [`DocumentId`] to byte buffers.
+/// Opens the input of a streamed track; it may block until the bytes arrive, so the player
+/// calls it on a background thread only.
+pub type StreamedInputOpener = Arc<dyn Fn() -> AudioResult<AudioInput> + Send + Sync>;
+
+/// In-memory [`AudioDataSource`] mapping [`DocumentId`] to byte buffers, or to an opener of
+/// an input that is still downloading (played through a [`BackgroundAudioStream`]).
 #[derive(Default)]
 pub struct MemoryAudioSource {
     entries: Mutex<HashMap<DocumentId, MemoryAudioEntry>>,
+    streamed: Mutex<HashMap<DocumentId, StreamedInputOpener>>,
 }
 
 impl MemoryAudioSource {
@@ -93,8 +110,22 @@ impl MemoryAudioSource {
 
     /// Inserts or replaces an audio buffer for `document_id`.
     pub fn insert(&self, document_id: DocumentId, bytes: Vec<u8>, hint_ext: Option<String>) {
+        if let Ok(mut guard) = self.streamed.lock() {
+            guard.remove(&document_id);
+        }
         if let Ok(mut guard) = self.entries.lock() {
             guard.insert(document_id, (Arc::from(bytes), hint_ext));
+        }
+    }
+
+    /// Inserts or replaces a track for `document_id` whose input `open` returns while it still
+    /// downloads (TGB-3000): the player decodes it on a background thread.
+    pub fn insert_streamed(&self, document_id: DocumentId, open: StreamedInputOpener) {
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.remove(&document_id);
+        }
+        if let Ok(mut guard) = self.streamed.lock() {
+            guard.insert(document_id, open);
         }
     }
 
@@ -103,11 +134,33 @@ impl MemoryAudioSource {
         if let Ok(mut guard) = self.entries.lock() {
             guard.remove(&document_id);
         }
+        if let Ok(mut guard) = self.streamed.lock() {
+            guard.remove(&document_id);
+        }
+    }
+
+    fn streamed_opener(&self, document_id: DocumentId) -> Option<StreamedInputOpener> {
+        self.streamed
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&document_id).cloned())
+    }
+
+    /// Whether `document_id` has a track (bytes or a streamed input).
+    #[must_use]
+    pub fn contains(&self, document_id: DocumentId) -> bool {
+        self.entries
+            .lock()
+            .is_ok_and(|guard| guard.contains_key(&document_id))
+            || self.streamed_opener(document_id).is_some()
     }
 }
 
 impl AudioDataSource for MemoryAudioSource {
     fn open(&self, id: &AudioMsgId) -> AudioResult<AudioInput> {
+        if let Some(open) = self.streamed_opener(id.document_id) {
+            return open();
+        }
         let guard = self
             .entries
             .lock()
@@ -116,6 +169,17 @@ impl AudioDataSource for MemoryAudioSource {
             .get(&id.document_id)
             .ok_or_else(|| AudioError::SourceNotFound(format!("document {}", id.document_id.0)))?;
         Ok(AudioInput::from_arc_bytes(Arc::clone(bytes), ext.clone()))
+    }
+
+    fn open_stream(&self, id: &AudioMsgId) -> AudioResult<Box<dyn AudioStream>> {
+        let Some(open) = self.streamed_opener(id.document_id) else {
+            return Ok(Box::new(AudioDecoder::open(self.open(id)?)?));
+        };
+        let stream = BackgroundAudioStream::spawn(
+            Box::new(move || Ok(Box::new(AudioDecoder::open(open()?)?) as Box<dyn AudioStream>)),
+            id.duration_ms,
+        )?;
+        Ok(Box::new(stream))
     }
 }
 

@@ -68,7 +68,13 @@ impl HistoryMediaRuntime {
             };
         }
         if !self.round_loaded(msg_id) {
-            RoundVideoPhase::NotLoaded
+            if self.round_waits_for_click(msg_id) {
+                // Not downloaded and not autoplaying: the play button (`Gif::draw` shows it
+                // when the video can be played), the click downloads it (TGB-2997).
+                RoundVideoPhase::Static
+            } else {
+                RoundVideoPhase::NotLoaded
+            }
         } else if self.policy.allows_inline(InlinePlaybackKind::RoundVideo) {
             RoundVideoPhase::SilentLoop
         } else {
@@ -77,7 +83,8 @@ impl HistoryMediaRuntime {
     }
 
     /// Handles a click on the circle: the first click restarts the video from the start with
-    /// sound, later clicks pause / resume it. Ignored until the video is downloaded.
+    /// sound, later clicks pause / resume it. A video that is not downloaded downloads and then
+    /// starts with sound (TGB-2997).
     pub fn click_round_video(
         &mut self,
         peer_id: PeerId,
@@ -87,7 +94,9 @@ impl HistoryMediaRuntime {
         now_ms: i64,
     ) {
         if !self.round_loaded(msg_id) {
-            tracing::debug!(msg = msg_id.0, "round video click ignored: not loaded");
+            if !self.request_round_play(peer_id, msg_id, sender_name, duration_secs, now_ms) {
+                tracing::debug!(msg = msg_id.0, "round video click ignored: not loaded");
+            }
             return;
         }
         let item = media_item_id_for_msg(msg_id);

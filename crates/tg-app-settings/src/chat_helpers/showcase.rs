@@ -274,12 +274,16 @@ impl ChatHelpersShowcase {
                                                 .color(palette.window_active_text_fg),
                                         );
                                     }
-                                    self.emoji_cache.paint_wrapped_text_with_emoji(
-                                        ui,
-                                        body,
-                                        &FontId::proportional(14.0),
-                                        palette.window_fg,
-                                        396.0,
+                                    // Emoji come from tdesktop's sheets through the galley
+                                    // (`tg_emoji::text_glyphs`), like every other text.
+                                    ui.set_max_width(396.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(body)
+                                                .font(FontId::proportional(14.0))
+                                                .color(palette.window_fg),
+                                        )
+                                        .wrap(),
                                     );
                                 });
                         });

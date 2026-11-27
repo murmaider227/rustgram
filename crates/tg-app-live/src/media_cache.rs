@@ -1058,7 +1058,9 @@ impl LiveMediaCache {
         };
         match media {
             MessageMedia::Photo(p) => Some(photo(p)),
-            MessageMedia::Document(doc) if doc.kind == DocumentKind::Voice => {
+            MessageMedia::Document(doc)
+                if matches!(doc.kind, DocumentKind::Voice | DocumentKind::RoundVideo) =>
+            {
                 let resolved = document_to_location(doc);
                 let key = document_cache_key(resolved.dc_id, doc.id.0);
                 Some((key, MediaCacheTag::Voice, resolved))
@@ -1220,19 +1222,21 @@ impl LiveMediaCache {
             MessageMedia::Photo(photo) => {
                 Some(self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge))
             }
-            MessageMedia::Document(doc) => self.descriptor_for_document(doc, rpc, handle, bridge),
+            MessageMedia::Document(doc) => {
+                self.descriptor_for_document(doc, photo_autoload, rpc, handle, bridge)
+            }
             MessageMedia::WebPage(wp) => {
                 if let Some(ref photo) = wp.photo {
                     Some(self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge))
                 } else if let Some(ref doc) = wp.document {
-                    self.descriptor_for_document(doc, rpc, handle, bridge)
+                    self.descriptor_for_document(doc, photo_autoload, rpc, handle, bridge)
                 } else {
                     None
                 }
             }
             MessageMedia::Game(game) => {
                 if let Some(ref doc) = game.document {
-                    self.descriptor_for_document(doc, rpc, handle, bridge)
+                    self.descriptor_for_document(doc, photo_autoload, rpc, handle, bridge)
                 } else {
                     game.photo.as_ref().map(|photo| {
                         self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge)
@@ -1311,9 +1315,12 @@ impl LiveMediaCache {
         }
     }
 
+    /// `autoload`: the message's media may download by itself (for a round video: its
+    /// autoplay is on, [`crate::auto_download_gate::round_video_autoplay_allowed`]).
     fn descriptor_for_document<C: RpcClient + Clone + 'static>(
         &self,
         doc: &DocumentData,
+        autoload: bool,
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
@@ -1359,6 +1366,29 @@ impl LiveMediaCache {
                 } else {
                     None
                 }
+            }
+            DocumentKind::RoundVideo if !autoload => {
+                // TGB-2997: a video message is not downloaded when it enters the list unless it
+                // autoplays; only the cache is read, a click downloads it (`download_target`).
+                let resolved = document_to_location(doc);
+                let ext = resolved.ext_hint.clone().or_else(|| Some("mp4".to_owned()));
+                let key = document_cache_key(resolved.dc_id, doc.id.0);
+                match self.read_blocking(&key) {
+                    Some(bytes) => {
+                        desc.video_data = Some(InlineDocumentData::Bytes(bytes.to_vec()));
+                        desc.audio_bytes = Some(bytes.to_vec());
+                        desc.audio_ext = ext;
+                    }
+                    None => {
+                        desc.voice_load = Some(if self.is_in_flight(&key) {
+                            VoiceLoadState::Loading
+                        } else {
+                            VoiceLoadState::NotLoaded
+                        });
+                        self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
+                    }
+                }
+                Some(desc)
             }
             DocumentKind::RoundVideo => {
                 let resolved = document_to_location(doc);

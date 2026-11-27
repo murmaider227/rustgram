@@ -597,6 +597,13 @@ pub fn read_version_file(path: &Path) -> Result<(u32, String), UpdateError> {
     Ok((numeric, text))
 }
 
+/// Reads the version of the update staged in `staged_dir` (`tupdates/temp` or the legacy
+/// `tupdates/ready`) from its `tdata/version` file.
+pub fn read_staged_version(staged_dir: &Path) -> Result<Version, UpdateError> {
+    let (_, text) = read_version_file(&staged_dir.join("tdata").join("version"))?;
+    Version::parse(&text)
+}
+
 /// Extracts an authenticated [`VerifiedPackage`] into `<working_dir>/tupdates/temp`,
 /// writes `tdata/version`, and creates the `ready` marker file as the final atomic step.
 ///

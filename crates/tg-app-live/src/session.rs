@@ -4274,6 +4274,14 @@ impl HistoryBackend for LiveSession {
         crate::media_download::start(self, peer_id, msg_id);
     }
 
+    fn open_media_stream(
+        &self,
+        peer_id: PeerId,
+        msg_id: MsgId,
+    ) -> Option<Arc<dyn tg_video::RangeLoader>> {
+        crate::media_download::stream(self, peer_id, msg_id)
+    }
+
     fn cancel_media_download(&self, peer_id: PeerId, msg_id: MsgId) {
         crate::media_download::cancel(self, peer_id, msg_id);
     }
@@ -4294,7 +4302,8 @@ impl HistoryBackend for LiveSession {
             let msg = s
                 .message(DataFullMsgId::new(data_peer, data_msg))
                 .cloned()?;
-            let allowed = crate::auto_download_gate::photo_autoload_allowed(s, &settings, &msg);
+            let allowed = crate::auto_download_gate::photo_autoload_allowed(s, &settings, &msg)
+                && crate::auto_download_gate::round_video_autoplay_allowed(s, &settings, &msg);
             Some((msg, allowed))
         })?;
         self.media_cache.inline_media_descriptor_for_message_with(

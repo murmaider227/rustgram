@@ -166,6 +166,7 @@ fn e2e_fake_http_check_download_verify_unpack_apply_and_relaunch() {
         debug: true,
         start_in_tray: false,
         just_update: false,
+        app_version: None,
     });
 
     let output = Command::new(&promoted_updater)

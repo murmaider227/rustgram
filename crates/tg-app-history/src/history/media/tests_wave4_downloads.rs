@@ -330,6 +330,17 @@ fn voice_status_shows_the_size_only_while_the_file_is_not_cached() {
     );
 }
 
+/// The first play of a voice message asks for a stream (TGB-3000); a backend that cannot
+/// stream answers `None`, and the play falls back to downloading the file.
+fn play_without_streaming(rt: &mut HistoryMediaRuntime) {
+    rt.toggle_or_seek_voice(PEER, ID, "Ivo Marten", 4, None);
+    assert_eq!(
+        rt.take_download_actions(),
+        vec![(ID, MediaDownloadAction::Stream)]
+    );
+    rt.provide_voice_stream(ID, None);
+}
+
 #[test]
 fn a_play_of_a_voice_that_is_not_cached_downloads_it_and_plays_when_it_arrives() {
     let mut rt = HistoryMediaRuntime::new(false);
@@ -340,11 +351,11 @@ fn a_play_of_a_voice_that_is_not_cached_downloads_it_and_plays_when_it_arrives()
             ..InlineMediaDescriptor::default()
         },
     );
-    rt.toggle_or_seek_voice(PEER, ID, "Ivo Marten", 4, None);
+    play_without_streaming(&mut rt);
     assert_eq!(
         rt.take_download_actions(),
         vec![(ID, MediaDownloadAction::Start)],
-        "the first play asks for the file"
+        "without streaming the play asks for the file"
     );
     assert!(rt.voice_play_pending(ID));
     assert!(
@@ -380,7 +391,8 @@ fn a_second_click_before_the_file_arrives_takes_the_play_back() {
             ..InlineMediaDescriptor::default()
         },
     );
-    rt.toggle_or_seek_voice(PEER, ID, "Ivo Marten", 4, None);
+    play_without_streaming(&mut rt);
+    assert!(rt.voice_play_pending(ID));
     rt.toggle_or_seek_voice(PEER, ID, "Ivo Marten", 4, None);
     assert!(!rt.voice_play_pending(ID));
     rt.register_descriptor(

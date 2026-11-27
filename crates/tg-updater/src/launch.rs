@@ -76,12 +76,12 @@ pub fn spawn_updater(plan: &UpdaterLaunchPlan) -> Result<Child, String> {
         .map_err(|e| format!("failed to launch {}: {e}", plan.updater_exe.display()))
 }
 
-#[cfg(test)]
+// Windows paths (`C:\...`) only split into parent and file name on Windows.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(windows)]
     fn default_working_dir_is_current_dir_without_workdir_flag() {
         let plan = plan_updater_launch(
             Path::new(r"C:\Apps\Rustgram\rustgram.exe"),
@@ -102,7 +102,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn custom_working_dir_is_current_dir_and_forwarded() {
         let plan = plan_updater_launch(
             Path::new(r"C:\Apps\Rustgram\rustgram-beta.exe"),

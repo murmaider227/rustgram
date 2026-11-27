@@ -491,7 +491,7 @@ fn the_synthetic_source_records_wall_time_even_with_sparse_frames() {
     // An idle window repaints a few times a second; the old source fed a fixed 80 ms per
     // frame, so a 3 s recording at 4 fps came out as about 1 s.
     let mut rec = VoiceRecorderController::new();
-    rec.start_locked(10.0);
+    rec.start_locked(10.0).expect("synthetic capture starts");
     assert!(!rec.uses_hardware_capture());
     for frame in 1..=12 {
         rec.tick(10.0 + f64::from(frame) * 0.25);
@@ -509,7 +509,7 @@ fn the_synthetic_source_records_wall_time_even_with_sparse_frames() {
 #[test]
 fn a_paused_span_is_not_recorded() {
     let mut rec = VoiceRecorderController::new();
-    rec.start_locked(0.0);
+    rec.start_locked(0.0).expect("synthetic capture starts");
     for frame in 1..=10 {
         rec.tick(f64::from(frame) * 0.1);
     }
@@ -526,4 +526,72 @@ fn a_paused_span_is_not_recorded() {
         voice.attachment.duration_secs, 2,
         "the 5 s pause is not in the file"
     );
+}
+
+/// TGB-3034: without a usable microphone a recording does not start, and the compose bar shows
+/// tdesktop's capture problem text. Before the fix the controller fell back to its synthetic
+/// source and recorded a generated tone that could be sent as a voice message.
+#[test]
+fn no_microphone_refuses_to_record_instead_of_recording_a_tone() {
+    let mut rec = VoiceRecorderController::without_microphone();
+    assert!(rec.start_hold(1.0).is_err());
+    assert!(!rec.is_active());
+    assert!(rec.start_locked(2.0).is_err());
+    assert!(!rec.is_active());
+    rec.tick(3.0);
+    assert!(rec.live_bars().is_empty(), "no tone is metered");
+    assert!(rec.finish(4.0).is_none(), "nothing can be sent");
+}
+
+#[test]
+fn pressing_the_mic_without_a_microphone_shows_the_capture_problem() {
+    let fake = FakeRpcClient::new();
+    accept_uploads_and_sends(&fake);
+    let mut harness = start_chat(&fake);
+    harness.state_mut().widget.compose.voice_recorder =
+        VoiceRecorderController::without_microphone();
+
+    let mic = harness.get_by_label("Record voice message").rect().center();
+    let press = |pos: Pos2, pressed: bool| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    // Hold-to-record gesture.
+    harness.input_mut().events.push(Event::PointerMoved(mic));
+    harness.step();
+    harness.input_mut().events.push(press(mic, true));
+    harness.step();
+    let held = mic + Vec2::new(10.0, 0.0);
+    harness.input_mut().events.push(Event::PointerMoved(held));
+    harness.step();
+    assert!(!harness.state().widget.compose.voice_recorder.is_active());
+    assert!(!harness.state().widget.compose.recording_voice);
+    for _ in 0..15 {
+        harness.step();
+    }
+    harness.input_mut().events.push(press(held, false));
+    harness.step();
+    assert_eq!(
+        harness.state().widget.active_toast(),
+        Some(tg_lang::tr::lng_record_audio_problem().as_str()),
+    );
+
+    // Click-to-record (locked) gesture.
+    harness.input_mut().events.push(Event::PointerMoved(mic));
+    harness.step();
+    harness.input_mut().events.push(press(mic, true));
+    harness.step();
+    harness.input_mut().events.push(press(mic, false));
+    harness.step();
+    assert!(!harness.state().widget.compose.voice_recorder.is_active());
+    for _ in 0..10 {
+        harness.step();
+    }
+    assert!(
+        fake.recorded_of::<tl_fns::upload::SaveFilePart>()
+            .is_empty()
+    );
+    assert!(fake.recorded_of::<tl_fns::messages::SendMedia>().is_empty());
 }

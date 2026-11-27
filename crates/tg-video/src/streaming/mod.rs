@@ -10,6 +10,7 @@ pub mod document;
 pub mod loader;
 pub mod player;
 pub mod reader;
+pub mod std_io;
 pub mod threaded;
 
 pub use audio_output::{AudioSink, PlayerAudio};
@@ -42,4 +43,5 @@ pub use reader::{
     is_contiguous_serialization, parse_cached_map, parse_complex_cached_map,
     serialize_complex_parts_map,
 };
+pub use std_io::RangeReadSeek;
 pub use threaded::{THREADED_VIDEO_AHEAD, ThreadedDecoder};

@@ -28,17 +28,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tg_core::launcher::ParsedArgs;
 use tg_core::update_checker::UPDATE_DELAY_CONST_SECS;
 use tg_updater::checker::{
-    StagedUpdate, UpdateChecker, UpdateConfig, UpdaterLaunchOptions, has_ready_update,
+    ReadyUpdateCheck, StagedUpdate, UpdateChecker, UpdateConfig, UpdaterLaunchOptions,
+    check_ready_update,
 };
 use tg_updater::github::HttpClient;
 pub use tg_updater::launch::UpdaterLaunchPlan;
 use tg_updater::launch::{plan_updater_launch, spawn_updater};
-use tg_updater::package::read_version_file;
 use tg_updater::version::{Target, Version};
-use tg_updater::{
-    DEFAULT_GITHUB_REPO, TUPDATES_DIR_NAME, UpdateError, release_verifying_key,
-    verifying_key_from_hex,
-};
+use tg_updater::{DEFAULT_GITHUB_REPO, UpdateError, release_verifying_key, verifying_key_from_hex};
 
 use super::plan::StartupPrefs;
 
@@ -146,7 +143,8 @@ pub struct UpdateStateMachine<C: HttpClient> {
 
 impl<C: HttpClient> UpdateStateMachine<C> {
     /// Creates a new state machine, inspecting `<working_dir>/tupdates/temp/ready` for an already
-    /// staged update left over from a previous run.
+    /// staged update left over from a previous run (kept only when newer, see
+    /// [`staged_update_state`]).
     #[must_use]
     pub fn new(
         client: C,
@@ -155,15 +153,10 @@ impl<C: HttpClient> UpdateStateMachine<C> {
         disabled_by_cli: bool,
         last_check_unix: i64,
     ) -> Self {
-        let state = if has_ready_update(&config.working_dir) {
-            let staging_dir = config.working_dir.join(TUPDATES_DIR_NAME).join("temp");
-            let version =
-                read_staged_version(&staging_dir).unwrap_or_else(|| config.current_version.clone());
-            UpdateState::Ready {
-                version,
-                staging_dir,
-                updater_promoted: false,
-            }
+        let state = if let Some(ready) =
+            staged_update_state(&config.working_dir, &config.current_version)
+        {
+            ready
         } else if disabled_by_cli || !auto_update {
             UpdateState::Disabled
         } else {
@@ -364,10 +357,26 @@ impl<C: HttpClient> HttpClient for RefHttpClient<'_, C> {
     }
 }
 
-fn read_staged_version(staging_dir: &Path) -> Option<Version> {
-    let version_file = staging_dir.join("tdata").join("version");
-    let (_, ver_str) = read_version_file(&version_file).ok()?;
-    Version::parse(&ver_str).ok()
+/// The state for an update staged by an earlier run: `Ready` when it is newer than `current`.
+/// One that is not newer, or whose version cannot be read, is deleted and gives `None`, so an
+/// older install's leftover is never offered as an update (TGB-3117; tdesktop `checkReadyUpdate`
+/// in `core/update_checker.cpp`).
+pub(crate) fn staged_update_state(working_dir: &Path, current: &Version) -> Option<UpdateState> {
+    match check_ready_update(working_dir, current) {
+        ReadyUpdateCheck::Ready {
+            version,
+            staging_dir,
+        } => Some(UpdateState::Ready {
+            version,
+            staging_dir,
+            updater_promoted: false,
+        }),
+        ReadyUpdateCheck::NotStaged => None,
+        ReadyUpdateCheck::Rejected(err) => {
+            tracing::info!(%err, "Deleted a staged update that is not newer than this version");
+            None
+        }
+    }
 }
 
 /// Command sent from the UI thread to the background updater worker thread.
@@ -390,6 +399,28 @@ pub fn build_updater_launch_plan(
     parent_pid: Option<u32>,
     parent_created: Option<u64>,
 ) -> UpdaterLaunchPlan {
+    build_updater_launch_plan_for_version(
+        exe_path,
+        working_dir,
+        is_custom_workdir,
+        parsed_args,
+        parent_pid,
+        parent_created,
+        None,
+    )
+}
+
+/// [`build_updater_launch_plan`] that also passes the running version as `-appversion`, so the
+/// updater refuses a staged package that is not newer (TGB-3117).
+fn build_updater_launch_plan_for_version(
+    exe_path: &Path,
+    working_dir: &Path,
+    is_custom_workdir: bool,
+    parsed_args: &ParsedArgs,
+    parent_pid: Option<u32>,
+    parent_created: Option<u64>,
+    app_version: Option<&Version>,
+) -> UpdaterLaunchPlan {
     let opts = UpdaterLaunchOptions {
         parent_pid,
         parent_created,
@@ -400,6 +431,7 @@ pub fn build_updater_launch_plan(
         debug: parsed_args.debug,
         start_in_tray: parsed_args.start_in_tray,
         just_update: false,
+        app_version: app_version.map(ToString::to_string),
     };
     plan_updater_launch(exe_path, working_dir, is_custom_workdir, opts)
 }
@@ -530,18 +562,9 @@ impl UpdateController {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        // If a ready update is already staged on disk, surface it immediately even if verifying key
-        // or network is unavailable.
-        let pre_staged = has_ready_update(&working_dir).then(|| {
-            let staging_dir = working_dir.join(TUPDATES_DIR_NAME).join("temp");
-            let version =
-                read_staged_version(&staging_dir).unwrap_or_else(|| current_version.clone());
-            UpdateState::Ready {
-                version,
-                staging_dir,
-                updater_promoted: false,
-            }
-        });
+        // If a newer update is already staged on disk, surface it immediately even if verifying
+        // key or network is unavailable; an older one is deleted here.
+        let pre_staged = staged_update_state(&working_dir, &current_version);
 
         let initial_state = if let Some(ready) = pre_staged {
             ready
@@ -725,13 +748,14 @@ impl UpdateController {
             .launch_context
             .as_ref()
             .ok_or_else(|| "updater launch context is unavailable".to_owned())?;
-        let plan = build_updater_launch_plan(
+        let plan = build_updater_launch_plan_for_version(
             &ctx.exe_path,
             &ctx.working_dir,
             ctx.is_custom_workdir,
             &ctx.parsed_args,
             Some(std::process::id()),
             current_process_creation_time(),
+            Some(&snap.current_version),
         );
         spawn_updater_process(&plan)?;
         Ok(plan)
@@ -875,6 +899,167 @@ mod tests {
                 custom.to_string_lossy().into_owned()
             ]
         );
+    }
+
+    /// Stages `<working_dir>/tupdates/temp` with a `ready` marker and, when given, `tdata/version`.
+    fn stage_update(working_dir: &Path, version: Option<&Version>) -> PathBuf {
+        let temp = working_dir.join(tg_updater::TUPDATES_DIR_NAME).join("temp");
+        std::fs::create_dir_all(&temp).expect("temp");
+        std::fs::write(temp.join("rustgram.exe"), b"staged").expect("staged app");
+        if let Some(version) = version {
+            tg_updater::package::write_version_file(&temp, version).expect("version file");
+        }
+        std::fs::write(temp.join("ready"), b"1").expect("ready");
+        temp
+    }
+
+    struct OfflineHttp;
+
+    impl HttpClient for OfflineHttp {
+        fn get_bytes(
+            &self,
+            url: &str,
+            _headers: &[(&str, &str)],
+            _max_bytes: usize,
+        ) -> Result<Vec<u8>, UpdateError> {
+            Err(UpdateError::Network(format!("offline test: {url}")))
+        }
+    }
+
+    fn offline_machine(working_dir: &Path, current: &Version) -> UpdateStateMachine<OfflineHttp> {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x31_u8; 32]).verifying_key();
+        let config = UpdateConfig {
+            github_repo: DEFAULT_GITHUB_REPO.to_owned(),
+            api_base_url: None,
+            current_version: current.clone(),
+            allow_beta: true,
+            target: Target::current(),
+            working_dir: working_dir.to_path_buf(),
+            install_dir: working_dir.join("install"),
+            verifying_key: key,
+        };
+        UpdateStateMachine::new(OfflineHttp, config, true, false, 0)
+    }
+
+    /// TGB-3117, the owner's case: 0.2.0-alpha.2 runs over a profile that still holds a staged
+    /// 0.2.0-alpha.1. The old code offered "New version is ready · v0.2.0-alpha.1" (a downgrade).
+    #[test]
+    fn startup_deletes_a_staged_update_older_than_the_running_app() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let running = Version::parse("0.2.0-alpha.2").expect("version");
+        stage_update(
+            tmp.path(),
+            Some(&Version::parse("0.2.0-alpha.1").expect("v")),
+        );
+
+        let machine = offline_machine(tmp.path(), &running);
+        assert_eq!(machine.state(), &UpdateState::Idle);
+        assert!(!machine.snapshot().is_ready());
+        assert!(
+            !tmp.path().join(tg_updater::TUPDATES_DIR_NAME).exists(),
+            "the stale staged update must be deleted"
+        );
+    }
+
+    #[test]
+    fn startup_deletes_a_staged_update_of_the_same_or_an_unreadable_version() {
+        let running = Version::parse("0.2.0-alpha.2").expect("version");
+
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        stage_update(tmp.path(), Some(&running));
+        assert_eq!(staged_update_state(tmp.path(), &running), None);
+        assert!(!tmp.path().join(tg_updater::TUPDATES_DIR_NAME).exists());
+
+        // The old code showed an unreadable staged version as the running version and offered it.
+        stage_update(tmp.path(), None);
+        let machine = offline_machine(tmp.path(), &running);
+        assert_eq!(machine.state(), &UpdateState::Idle);
+        assert!(!tmp.path().join(tg_updater::TUPDATES_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn startup_keeps_a_newer_staged_update_ready() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let running = Version::parse("0.2.0-alpha.2").expect("version");
+        let newer = Version::parse("0.2.0-alpha.3").expect("version");
+        let temp = stage_update(tmp.path(), Some(&newer));
+
+        let machine = offline_machine(tmp.path(), &running);
+        assert_eq!(
+            machine.state(),
+            &UpdateState::Ready {
+                version: newer,
+                staging_dir: temp,
+                updater_promoted: false,
+            }
+        );
+        assert!(tg_updater::checker::has_ready_update(tmp.path()));
+    }
+
+    /// The controller's first snapshot (what the main menu reads) follows the same rule.
+    #[test]
+    fn controller_start_offers_only_a_newer_staged_update() {
+        let running = current_app_version();
+        let newer = Version::new(running.major.saturating_add(1), 0, 0);
+        let exe = std::env::temp_dir()
+            .join("tgb3117-install")
+            .join("rustgram.exe");
+        let parsed = tg_core::launcher::parse_arguments(&[
+            "rustgram.exe".to_owned(),
+            "-noupdate".to_owned(),
+        ]);
+        let prefs = StartupPrefs::default();
+
+        let stale = tempfile::TempDir::new().expect("tmp");
+        stage_update(stale.path(), Some(&running));
+        let controller = UpdateController::start(
+            exe.clone(),
+            stale.path().to_path_buf(),
+            true,
+            parsed.clone(),
+            &prefs,
+        );
+        assert!(!controller.snapshot().is_ready());
+        assert!(!stale.path().join(tg_updater::TUPDATES_DIR_NAME).exists());
+
+        let fresh = tempfile::TempDir::new().expect("tmp");
+        stage_update(fresh.path(), Some(&newer));
+        let controller =
+            UpdateController::start(exe, fresh.path().to_path_buf(), true, parsed, &prefs);
+        let snap = controller.snapshot();
+        assert!(snap.is_ready());
+        assert!(matches!(snap.state, UpdateState::Ready { ref version, .. } if *version == newer));
+    }
+
+    /// "Restart to update" passes the running version so the updater can refuse an older package.
+    #[test]
+    fn restart_plan_passes_the_running_version_to_the_updater() {
+        let exe = std::env::temp_dir()
+            .join("tgb3117-install")
+            .join("rustgram.exe");
+        let working_dir = std::env::temp_dir().join("tgb3117-appdata");
+        let parsed = tg_core::launcher::parse_arguments(&["rustgram.exe".to_owned()]);
+        let running = Version::parse("0.2.0-alpha.3").expect("version");
+
+        let plan = build_updater_launch_plan_for_version(
+            &exe,
+            &working_dir,
+            false,
+            &parsed,
+            None,
+            None,
+            Some(&running),
+        );
+        assert_eq!(
+            plan.args,
+            vec![
+                "-update".to_owned(),
+                "-appversion".to_owned(),
+                "0.2.0-alpha.3".to_owned()
+            ]
+        );
+        let updater_args = tg_updater::apply::parse_args(&plan.args);
+        assert_eq!(updater_args.app_version.as_deref(), Some("0.2.0-alpha.3"));
     }
 
     /// The updater finds the app's default working dir by itself (rescue for broken releases);

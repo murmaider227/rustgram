@@ -11,7 +11,9 @@ use crate::github::{
     AvailableUpdate, DEFAULT_GITHUB_API_BASE, HttpClient, MAX_METADATA_SIZE, MAX_PACKAGE_SIZE,
     parse_releases_json, parse_sha256_sums, releases_api_url_with_base, select_release,
 };
-use crate::package::{promote_ready_updater, unpack_verified_package, verify_package_with_hash};
+use crate::package::{
+    promote_ready_updater, read_staged_version, unpack_verified_package, verify_package_with_hash,
+};
 use crate::version::{Target, Version};
 use crate::{DEFAULT_EXE_NAME, TUPDATES_DIR_NAME, UpdateError};
 
@@ -168,6 +170,55 @@ pub fn has_ready_update(working_dir: &Path) -> bool {
         .is_file()
 }
 
+/// What [`check_ready_update`] found in `<working_dir>/tupdates`.
+#[derive(Debug)]
+pub enum ReadyUpdateCheck {
+    /// No `tupdates/temp/ready` marker: nothing is staged.
+    NotStaged,
+    /// A staged update newer than the running app, ready to install.
+    Ready {
+        /// Version read from the staged `tdata/version`.
+        version: Version,
+        /// `<working_dir>/tupdates/temp`.
+        staging_dir: PathBuf,
+    },
+    /// A staged update that is not newer than the running app, or whose version cannot be read
+    /// (e.g. left by an older install). `tupdates` has been deleted.
+    Rejected(UpdateError),
+}
+
+/// Validates an update staged by an earlier run before the app offers it, deleting `tupdates`
+/// when the staged version is not newer than `current` or cannot be read.
+///
+/// Port of the "check ready version" step of `PromoteReadyUpdater` (`checkReadyUpdate`) in
+/// `core/update_checker.cpp`: `versionNum <= AppVersion` or an unreadable version file ->
+/// `ClearAll()`. Without it a copy updated by hand over a profile that still holds an older
+/// staged update offers that older version, and installing it is a downgrade (TGB-3117).
+pub fn check_ready_update(working_dir: &Path, current: &Version) -> ReadyUpdateCheck {
+    if !has_ready_update(working_dir) {
+        return ReadyUpdateCheck::NotStaged;
+    }
+    let staging_dir = working_dir.join(TUPDATES_DIR_NAME).join("temp");
+    let rejection = match read_staged_version(&staging_dir) {
+        Ok(version) if version > *current => {
+            return ReadyUpdateCheck::Ready {
+                version,
+                staging_dir,
+            };
+        }
+        Ok(version) => UpdateError::NotNewer {
+            current: current.to_string(),
+            package: version.to_string(),
+        },
+        Err(err) => err,
+    };
+    tracing::warn!(%rejection, "Removing staged update that cannot be installed");
+    if let Err(err) = clear_updates(working_dir) {
+        tracing::warn!(%err, "Could not remove the rejected staged update");
+    }
+    ReadyUpdateCheck::Rejected(rejection)
+}
+
 /// Deletes `<working_dir>/tupdates`, matching `ClearAll` in `core/update_checker.cpp`.
 pub fn clear_updates(working_dir: &Path) -> Result<(), UpdateError> {
     let dir = working_dir.join(TUPDATES_DIR_NAME);
@@ -198,6 +249,9 @@ pub struct UpdaterLaunchOptions {
     pub start_in_tray: bool,
     /// Pass `-justupdate` (do not relaunch after applying).
     pub just_update: bool,
+    /// Running app version, passed as `-appversion` so the updater refuses a staged package that
+    /// is not newer (TGB-3117).
+    pub app_version: Option<String>,
 }
 
 /// Builds the argument vector for launching `rustgram-updater.exe`.
@@ -234,6 +288,10 @@ pub fn build_updater_launch_args(opts: &UpdaterLaunchOptions) -> Vec<String> {
     {
         args.push("-exename".to_string());
         args.push(exe_name.clone());
+    }
+    if let Some(ref version) = opts.app_version {
+        args.push("-appversion".to_string());
+        args.push(version.clone());
     }
     args
 }

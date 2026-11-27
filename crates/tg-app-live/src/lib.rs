@@ -61,6 +61,7 @@ pub mod reply_targets;
 pub mod rich_message;
 pub mod search_and_info;
 pub mod sender_badge;
+mod sent_media_cache;
 pub mod session;
 pub mod settings_extra;
 mod settings_reads;

@@ -97,7 +97,17 @@ impl RpcClient for FakeRpcClient {
             .expect("lock recorded")
             .push((ctor, bytes));
 
-        let next = self.responses.lock().expect("lock responses").pop_front();
+        // Requests that tdesktop sends independently (a scope's `getNotifySettings` and
+        // `getNotifyExceptions`, TGB-3070) reach the server in either order: the first answer
+        // queued for this constructor is taken. A request nothing was queued for still meets
+        // the front answer and fails the constructor check below.
+        let next = {
+            let mut queue = self.responses.lock().expect("lock responses");
+            match queue.iter().position(|(expected, _)| *expected == ctor) {
+                Some(pos) => queue.remove(pos),
+                None => queue.pop_front(),
+            }
+        };
         match next {
             Some((expected, res)) => {
                 assert_eq!(
@@ -761,7 +771,11 @@ fn notify_settings_silent_flag_sounds_and_get_exceptions_wire_format() {
 
     let calls = rpc.recorded_calls();
     assert_eq!(calls.len(), 2);
-    let exc_req = tl_fns::account::GetNotifyExceptions::from_bytes(&calls[1].1).expect("decode");
+    let exc_call = calls
+        .iter()
+        .find(|(ctor, _)| *ctor == tl_fns::account::GetNotifyExceptions::CONSTRUCTOR_ID)
+        .expect("getNotifyExceptions was sent");
+    let exc_req = tl_fns::account::GetNotifyExceptions::from_bytes(&exc_call.1).expect("decode");
     assert!(
         !exc_req.compare_sound,
         "tdesktop sends compare_sound: false"

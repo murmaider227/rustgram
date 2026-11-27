@@ -1852,3 +1852,95 @@ fn recorded_voice_bytes_are_uploaded_and_sent_with_the_voice_attribute_only() {
 
     h.shutdown();
 }
+
+/// TGB-2998: the bytes of a sent voice message are in the media cache under the document the
+/// server returns, so it counts as loaded (no size in the status line) and is never downloaded
+/// again. Before the fix nothing wrote the uploaded bytes to the cache: the descriptor said
+/// "not loaded" and the first play sent `upload.getFile` for the user's own file.
+#[test]
+fn a_sent_voice_message_is_in_the_media_cache_without_a_download() {
+    let h = UploadTestHarness::start();
+    let self_uid = h.self_uid;
+    let bob_uid = h.bob_uid;
+    let mut ogg = b"OggS".to_vec();
+    ogg.extend(synth_bytes(5_000, 0x31));
+    let size = ogg.len() as i64;
+    h.fake.set_dynamic_handler(Arc::new(move |ctor, raw| {
+        if ctor == tl_fns::upload::SaveFilePart::CONSTRUCTOR_ID {
+            return Some(Ok(true.to_bytes()));
+        }
+        if ctor == tl_fns::messages::SendMedia::CONSTRUCTOR_ID {
+            let send = tl_fns::messages::SendMedia::from_bytes(raw).ok()?;
+            let tl_enums::InputMedia::UploadedDocument(doc) = send.media else {
+                return None;
+            };
+            let mut msg = synthetic_tl_message(513, bob_uid, self_uid, true, "");
+            if let tl_enums::Message::Message(m) = &mut msg {
+                m.media = Some(tl_enums::MessageMedia::Document(
+                    tl_types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(tl_enums::Document::Document(tl_types::Document {
+                            id: 88_001,
+                            access_hash: 88_002,
+                            file_reference: vec![4, 5, 6],
+                            date: 1_750_000_000,
+                            mime_type: doc.mime_type.clone(),
+                            size,
+                            thumbs: None,
+                            video_thumbs: None,
+                            dc_id: 2,
+                            attributes: doc.attributes.clone(),
+                        })),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    },
+                ));
+            }
+            return Some(Ok(make_updates_with_messages(vec![msg]).to_bytes()));
+        }
+        None
+    }));
+
+    let mut live = h.live.clone();
+    HistoryBackend::send_message_extended(
+        &mut live,
+        h.bob_peer,
+        SendMessageExtended {
+            media: Some(HistoryMedia::Voice(
+                tg_app_core::history::backend::VoiceAttachment {
+                    duration_secs: 4,
+                    waveform_5bit: vec![0x11, 0x22, 0x33],
+                    size_bytes: ogg.len() as u64,
+                    is_unread: false,
+                    transcription: None,
+                },
+            )),
+            voice_ogg: Some(ogg.clone()),
+            ..SendMessageExtended::default()
+        },
+    )
+    .expect("the voice message is sent");
+
+    let desc = HistoryBackend::inline_media_descriptor(&live, h.bob_peer, MsgId(513))
+        .expect("voice descriptor");
+    assert_eq!(
+        desc.audio_bytes.as_deref(),
+        Some(ogg.as_slice()),
+        "the sent file is loaded from the cache"
+    );
+    assert_eq!(desc.voice_load, None, "no size in the status line");
+    assert!(
+        h.fake
+            .recorded_calls_of(tl_fns::upload::GetFile::CONSTRUCTOR_ID)
+            .is_empty(),
+        "the user's own file is not downloaded again"
+    );
+
+    h.shutdown();
+}

@@ -227,13 +227,102 @@ pub fn rasterize_emoji_cluster(
 
 /// Decoded tiles kept for the next few emoji (one sheet row each, 512 KiB).
 const KEPT_TILES: usize = 4;
-/// Scaled emoji images kept before the cache starts over.
+/// Scaled emoji images kept; when full, the least recently used quarter is dropped.
 const KEPT_IMAGES: usize = 4096;
 
-#[derive(Default)]
-struct PixelCache {
+/// Key of a scaled image: the emoji's index in the sheets and the image side in pixels.
+type ImageKey = (usize, u32);
+
+/// Scaled emoji images with least-recently-used eviction (TGB-3102).
+///
+/// Before, a full cache was cleared at once, so the next frame missed on every glyph and rescaled
+/// them all. Now only the quarter used longest ago goes, so the emoji on screen stay.
+pub(crate) struct ScaledImages {
+    images: HashMap<ImageKey, (Arc<[Color32]>, u64)>,
+    clock: u64,
+    capacity: usize,
+}
+
+impl ScaledImages {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            images: HashMap::new(),
+            clock: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.images.len()
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    /// The image under `key`, marked as just used.
+    pub(crate) fn get(&mut self, key: ImageKey) -> Option<Arc<[Color32]>> {
+        let now = self.tick();
+        let (pixels, used) = self.images.get_mut(&key)?;
+        *used = now;
+        Some(Arc::clone(pixels))
+    }
+
+    /// Stores `pixels` under `key`, first dropping the least recently used quarter when full.
+    pub(crate) fn insert(&mut self, key: ImageKey, pixels: Arc<[Color32]>) {
+        if !self.images.contains_key(&key) && self.images.len() >= self.capacity {
+            self.evict_least_recent(self.capacity.div_ceil(4));
+        }
+        let now = self.tick();
+        self.images.insert(key, (pixels, now));
+    }
+
+    fn evict_least_recent(&mut self, count: usize) {
+        let mut ages: Vec<u64> = self.images.values().map(|(_, used)| *used).collect();
+        let Some(nth) = count.checked_sub(1).filter(|n| *n < ages.len()) else {
+            self.images.clear();
+            return;
+        };
+        let (_, oldest_kept, _) = ages.select_nth_unstable(nth);
+        let cutoff = *oldest_kept;
+        // Use ticks are unique, so exactly `count` entries are at or below the cutoff.
+        self.images.retain(|_, (_, used)| *used > cutoff);
+    }
+}
+
+pub(crate) struct PixelCache {
     tiles: VecDeque<(usize, Arc<EmojiTileImage>)>,
-    images: HashMap<(usize, u32), Arc<[Color32]>>,
+    images: ScaledImages,
+}
+
+impl Default for PixelCache {
+    fn default() -> Self {
+        Self {
+            tiles: VecDeque::new(),
+            images: ScaledImages::with_capacity(KEPT_IMAGES),
+        }
+    }
+}
+
+impl PixelCache {
+    /// A kept decoded tile, moved to the front.
+    fn tile(&mut self, index: usize) -> Option<Arc<EmojiTileImage>> {
+        let at = self.tiles.iter().position(|(t, _)| *t == index)?;
+        let kept = self.tiles.remove(at)?;
+        let tile = Arc::clone(&kept.1);
+        self.tiles.push_front(kept);
+        Some(tile)
+    }
+
+    fn keep_tile(&mut self, index: usize, tile: Arc<EmojiTileImage>) {
+        if self.tiles.iter().any(|(t, _)| *t == index) {
+            return;
+        }
+        self.tiles.push_front((index, tile));
+        self.tiles.truncate(KEPT_TILES);
+    }
 }
 
 fn pixel_cache() -> &'static Mutex<PixelCache> {
@@ -241,28 +330,55 @@ fn pixel_cache() -> &'static Mutex<PixelCache> {
     CACHE.get_or_init(Mutex::default)
 }
 
+fn lock(cache: &Mutex<PixelCache>) -> std::sync::MutexGuard<'_, PixelCache> {
+    cache.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The sheet image of `emoji_ref` shrunk to `side` x `side` premultiplied pixels.
 fn scaled_emoji_pixels(emoji_ref: EmojiRef, side: u32) -> Option<Arc<[Color32]>> {
     let atlas = EmojiAtlas::global();
     let sprite = atlas.sprite(emoji_ref)?;
-    let mut cache = pixel_cache().lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(found) = cache.images.get(&(sprite.emoji_index, side)) {
-        return Some(Arc::clone(found));
-    }
-    let tile = match cache.tiles.iter().position(|(t, _)| *t == sprite.tile) {
-        Some(at) => {
-            let kept = cache.tiles.remove(at)?;
-            cache.tiles.push_front(kept.clone());
-            kept.1
+    cached_scaled_pixels(
+        pixel_cache(),
+        (sprite.emoji_index, side),
+        sprite.tile,
+        || atlas.decode_tile_transient(sprite.tile).ok(),
+        |tile| scale_cell(tile, sprite.pixel_rect, side),
+    )
+}
+
+/// Looks `key` up in `cache`; on a miss decodes the tile (unless kept) and scales the cell with
+/// the lock released, so a layout on another thread is not held up by a ~1 ms tile decode.
+pub(crate) fn cached_scaled_pixels(
+    cache: &Mutex<PixelCache>,
+    key: ImageKey,
+    tile_index: usize,
+    decode_tile: impl FnOnce() -> Option<Arc<EmojiTileImage>>,
+    scale: impl FnOnce(&EmojiTileImage) -> Option<Arc<[Color32]>>,
+) -> Option<Arc<[Color32]>> {
+    let kept_tile = {
+        let mut cache = lock(cache);
+        if let Some(found) = cache.images.get(key) {
+            return Some(found);
         }
+        cache.tile(tile_index)
+    };
+    let tile = match kept_tile {
+        Some(tile) => tile,
         None => {
-            let decoded = atlas.decode_tile_transient(sprite.tile).ok()?;
-            cache.tiles.push_front((sprite.tile, Arc::clone(&decoded)));
-            cache.tiles.truncate(KEPT_TILES);
+            let decoded = decode_tile()?;
+            lock(cache).keep_tile(tile_index, Arc::clone(&decoded));
             decoded
         }
     };
-    let [x, y, w, h] = sprite.pixel_rect.map(|v| v as usize);
+    let pixels = scale(&tile)?;
+    lock(cache).images.insert(key, Arc::clone(&pixels));
+    Some(pixels)
+}
+
+/// The `pixel_rect` cell of `tile` shrunk to `side` x `side` premultiplied pixels.
+fn scale_cell(tile: &EmojiTileImage, pixel_rect: [u32; 4], side: u32) -> Option<Arc<[Color32]>> {
+    let [x, y, w, h] = pixel_rect.map(|v| v as usize);
     let stride = tile.width as usize * 4;
     let mut cell = Vec::with_capacity(w * h * 4);
     for row in y..y + h {
@@ -271,14 +387,9 @@ fn scaled_emoji_pixels(emoji_ref: EmojiRef, side: u32) -> Option<Arc<[Color32]>>
     }
     let side = side as usize;
     let scaled = area_downscale(&cell, w, h, side, side);
-    let pixels: Arc<[Color32]> = ColorImage::from_rgba_unmultiplied([side, side], &scaled)
-        .pixels
-        .into();
-    if cache.images.len() >= KEPT_IMAGES {
-        cache.images.clear();
-    }
-    cache
-        .images
-        .insert((sprite.emoji_index, side as u32), Arc::clone(&pixels));
-    Some(pixels)
+    Some(
+        ColorImage::from_rgba_unmultiplied([side, side], &scaled)
+            .pixels
+            .into(),
+    )
 }

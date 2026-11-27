@@ -1956,6 +1956,8 @@ impl LiveSession {
         let state_arc = upload_state_for(self);
         let total_bytes = media.total_upload_bytes();
         let display_name = media.display_name();
+        // TGB-2998: kept to seed the media cache under the document the server returns.
+        let seed_bytes = crate::sent_media_cache::seedable_bytes(&media);
         let (upload_id, random_id) = {
             let mut guard = state_arc
                 .lock()
@@ -2049,6 +2051,9 @@ impl LiveSession {
                 }
                 let new_ids = self.apply_updates_to_session(&updates);
                 let msg_id = new_ids.last().copied().unwrap_or(DataMsgId(0));
+                if let Some(bytes) = seed_bytes {
+                    crate::sent_media_cache::seed(self, to_data_peer(peer_id), msg_id, &bytes);
+                }
                 Ok(fallback_sent_history_message(
                     self,
                     peer_id,

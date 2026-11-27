@@ -13,6 +13,8 @@ mod resample;
 #[cfg(test)]
 mod tests_emoji_order;
 #[cfg(test)]
+mod tests_pixel_cache;
+#[cfg(test)]
 mod tests_shared_textures;
 #[cfg(test)]
 mod tests_text_glyphs;

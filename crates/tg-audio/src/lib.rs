@@ -4,6 +4,7 @@
 //! Ported from Telegram Desktop's `Telegram/SourceFiles/media/audio/`,
 //! `Telegram/SourceFiles/media/player/`, and `Telegram/lib_webrtc/webrtc/webrtc_device_*`.
 
+pub mod background_stream;
 pub mod capture;
 pub mod decoder;
 pub mod device;
@@ -21,6 +22,7 @@ pub mod source;
 pub mod types;
 pub mod waveform;
 
+pub use background_stream::{AudioStreamOpener, BackgroundAudioStream};
 pub use capture::{
     AudioRecorder, CAPTURE_FADE_IN_DURATION_MS, CAPTURE_FREQUENCY, CAPTURE_MAX_DURATION_SECS,
     CAPTURE_SKIP_DURATION_MS, CAPTURE_UPDATE_DELTA_MS, CaptureConfig, CaptureResult, CaptureUpdate,
@@ -63,7 +65,7 @@ pub use sound_track::{MAX_SOUND_TRACK_FILE_SIZE, SoundTrack, SoundTrackId};
 pub use source::{
     AudioDataSource, AudioInput, FileAudioSource, InMemoryPlaylistProvider, InMemoryPositionStore,
     MemoryAudioSource, PlaylistContext, PlaylistEntry, PlaylistProvider, ReadSeek,
-    ResumePositionStore,
+    ResumePositionStore, StreamedInputOpener,
 };
 pub use tg_data::{DocumentId, FullMsgId, MsgId, PeerId};
 pub use types::{

@@ -9,7 +9,8 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use crate::package::read_version_file;
+use crate::package::{read_staged_version, read_version_file};
+use crate::version::Version;
 use crate::{DEFAULT_EXE_NAME, TUPDATES_DIR_NAME, UPDATER_EXE_NAME, UpdateError};
 
 /// Maximum time to wait for the parent app to exit gracefully before terminating it (5s),
@@ -76,6 +77,8 @@ pub struct UpdaterArgs {
     pub key: Option<String>,
     /// `-exename <file>`: target executable filename (validated against path separators).
     pub exe_name: String,
+    /// `-appversion <version>`: version of the app that started the updater (TGB-3117).
+    pub app_version: Option<String>,
 }
 
 impl Default for UpdaterArgs {
@@ -91,6 +94,7 @@ impl Default for UpdaterArgs {
             workdir: None,
             key: None,
             exe_name: DEFAULT_EXE_NAME.to_string(),
+            app_version: None,
         }
     }
 }
@@ -142,6 +146,9 @@ where
         } else if arg.eq_ignore_ascii_case("-workdir") && i + 1 < raw.len() {
             i += 1;
             parsed.workdir = Some(PathBuf::from(&raw[i]));
+        } else if arg.eq_ignore_ascii_case("-appversion") && i + 1 < raw.len() {
+            i += 1;
+            parsed.app_version = Some(raw[i].clone());
         } else if arg.eq_ignore_ascii_case("-key") && i + 1 < raw.len() {
             i += 1;
             parsed.key = Some(raw[i].clone());
@@ -319,6 +326,63 @@ pub fn resolve_working_dir(
         }
     }
     (current_dir.to_path_buf(), WorkingDirSource::CurrentDir)
+}
+
+/// Version of the installed app: `-appversion` when the app passed it, otherwise the
+/// `ProductVersion` of the installed executable (Windows), otherwise unknown.
+#[must_use]
+pub fn installed_app_version(
+    app_version_arg: Option<&str>,
+    installed_exe: &Path,
+) -> Option<Version> {
+    app_version_arg
+        .and_then(|v| Version::parse(v).ok())
+        .or_else(|| executable_product_version(installed_exe))
+}
+
+/// Reads the `ProductVersion` string of the executable's `VERSIONINFO` resource.
+#[must_use]
+pub fn executable_product_version(exe: &Path) -> Option<Version> {
+    #[cfg(windows)]
+    {
+        win32::product_version_string(exe).and_then(|v| Version::parse(&v).ok())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        None
+    }
+}
+
+/// Refuses the update staged in `working_dir` when its version is not newer than `installed`
+/// (defence in depth behind the app's own check, `checkReadyUpdate` in `core/update_checker.cpp`;
+/// TGB-3117). The staged files are deleted so a stale package is never offered again.
+///
+/// Returns `None` (go ahead) when nothing is staged, when the installed version is unknown, or
+/// when the staged package has no readable version file: tdesktop's updater treats that file as
+/// optional metadata, and write-protected installs delete it after a successful update.
+pub fn refuse_stale_staged_update(
+    working_dir: &Path,
+    installed: Option<&Version>,
+) -> Option<UpdateError> {
+    let installed = installed?;
+    let tupdates = working_dir.join(TUPDATES_DIR_NAME);
+    let staged_dir = if tupdates.join("temp").join("ready").is_file() {
+        tupdates.join("temp")
+    } else if tupdates.join("ready").is_dir() {
+        tupdates.join("ready")
+    } else {
+        return None;
+    };
+    let staged = read_staged_version(&staged_dir).ok()?;
+    if staged > *installed {
+        return None;
+    }
+    clear_tupdates(working_dir);
+    Some(UpdateError::NotNewer {
+        current: installed.to_string(),
+        package: staged.to_string(),
+    })
 }
 
 /// Removes `tupdates/ready`, `tupdates/temp`, and `tupdates` (if empty).
@@ -614,7 +678,9 @@ fn copy_with_retry(
 
 /// Orchestrates the full `rustgram-updater` lifecycle:
 /// 1. Waits for `-finishprocess` if given.
-/// 2. Applies staged update if `-update` is set.
+/// 2. Applies staged update if `-update` is set, unless it is not newer than the installed app
+///    ([`refuse_stale_staged_update`]): then nothing is installed, the app is still relaunched,
+///    and [`UpdateError::NotNewer`] is returned.
 /// 3. Updates the Windows Uninstall registry version if an update succeeded.
 /// 4. Relaunches `rustgram.exe` with `-noupdate` + forwarded flags unless `-justupdate` is set.
 pub fn run_updater(
@@ -655,7 +721,17 @@ pub fn run_updater_with_policy(
         tracing::warn!(%err, pid, "Could not finish waiting for parent process; continuing with copy retries");
     }
 
-    let mut outcome = if args.need_update {
+    let refusal = if args.need_update {
+        let installed = installed_app_version(
+            args.app_version.as_deref(),
+            &install_dir.join(&args.exe_name),
+        );
+        refuse_stale_staged_update(working_dir, installed.as_ref())
+    } else {
+        None
+    };
+
+    let mut outcome = if args.need_update && refusal.is_none() {
         apply_staged_update_with_policy(
             working_dir,
             install_dir,
@@ -676,7 +752,7 @@ pub fn run_updater_with_policy(
     if outcome.updated
         && let Some(ref version_str) = outcome.installed_version
     {
-        update_uninstall_registry(version_str);
+        update_uninstall_registry(version_str, install_dir);
     }
 
     if !args.just_update {
@@ -686,18 +762,36 @@ pub fn run_updater_with_policy(
         outcome.relaunched = true;
     }
 
-    Ok(outcome)
+    match refusal {
+        Some(err) => Err(err),
+        None => Ok(outcome),
+    }
 }
 
 /// Updates `DisplayVersion` and `InstallDate` in the per-user Inno Setup Uninstall registry key
 /// on Windows (no-op on other platforms or if Rustgram was not installed via the Inno Setup installer).
 ///
-/// Port of `updateRegistry()` in `Telegram/SourceFiles/_other/updater_win.cpp`.
-pub fn update_uninstall_registry(version_str: &str) {
+/// Port of `updateRegistry()` in `Telegram/SourceFiles/_other/updater_win.cpp`. Unlike tdesktop,
+/// the key is changed only when its `InstallLocation` is `install_dir`: updating a portable copy
+/// (or a test install in a temp folder) must not rewrite the version of the installed copy.
+pub fn update_uninstall_registry(version_str: &str, install_dir: &Path) {
     #[cfg(windows)]
-    win32::update_uninstall_registry_win(version_str);
+    win32::update_uninstall_registry_win(version_str, install_dir);
     #[cfg(not(windows))]
-    let _ = version_str;
+    let _ = (version_str, install_dir);
+}
+
+/// Whether two directory paths name the same folder (case-insensitive, ignoring a trailing
+/// separator and the `\\?\` prefix; resolved through the filesystem when they exist).
+#[must_use]
+pub fn same_directory(a: &Path, b: &Path) -> bool {
+    fn normalized(path: &Path) -> String {
+        let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let text = resolved.to_string_lossy().replace('/', r"\").to_lowercase();
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        text.trim_end_matches('\\').to_owned()
+    }
+    !a.as_os_str().is_empty() && !b.as_os_str().is_empty() && normalized(a) == normalized(b)
 }
 
 #[cfg(windows)]
@@ -712,11 +806,12 @@ mod win32 {
         ERROR_SUCCESS, FILETIME, GetLastError, HANDLE, SYSTEMTIME, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING, MoveFileExW,
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, MOVEFILE_DELAY_UNTIL_REBOOT,
+        MOVEFILE_REPLACE_EXISTING, MoveFileExW, VerQueryValueW,
     };
     use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RegCloseKey,
-        RegOpenKeyExW, RegSetValueExW,
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     };
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
     use windows_sys::Win32::System::Threading::{
@@ -902,7 +997,7 @@ mod win32 {
     }
 
     /// Updates `DisplayVersion` and `InstallDate` in the Inno Setup Uninstall key if present.
-    pub(super) fn update_uninstall_registry_win(version_str: &str) {
+    pub(super) fn update_uninstall_registry_win(version_str: &str, install_dir: &Path) {
         let subkey =
             format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_ID_GUID}_is1");
         let subkey_w = to_wide_null(OsStr::new(&subkey));
@@ -919,6 +1014,15 @@ mod win32 {
             )
         };
         if status != ERROR_SUCCESS || hkey == 0 {
+            return;
+        }
+
+        let location = query_string_value(hkey, "InstallLocation");
+        if !location.is_some_and(|loc| super::same_directory(Path::new(&loc), install_dir)) {
+            // SAFETY: `hkey` was opened by `RegOpenKeyExW`.
+            unsafe {
+                let _ = RegCloseKey(hkey);
+            }
             return;
         }
 
@@ -962,6 +1066,109 @@ mod win32 {
         unsafe {
             let _ = RegCloseKey(hkey);
         }
+    }
+
+    /// A `REG_SZ` / `REG_EXPAND_SZ` value of the open key `hkey`, without expansion.
+    fn query_string_value(hkey: HKEY, name: &str) -> Option<String> {
+        let name_w = to_wide_null(OsStr::new(name));
+        let mut kind = 0u32;
+        let mut size = 0u32;
+        // SAFETY: size query: null data pointer, valid out-pointers.
+        let status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name_w.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        if status != ERROR_SUCCESS || (kind != REG_SZ && kind != REG_EXPAND_SZ) || size > 65_536 {
+            return None;
+        }
+        let mut buf = vec![0u16; (size as usize).div_ceil(2)];
+        let mut size_bytes = (buf.len() * 2) as u32;
+        // SAFETY: `buf` holds `size_bytes` writable bytes.
+        let status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name_w.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                buf.as_mut_ptr().cast(),
+                &mut size_bytes,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let units = (size_bytes as usize / 2).min(buf.len());
+        let text: Vec<u16> = buf[..units]
+            .iter()
+            .copied()
+            .take_while(|&u| u != 0)
+            .collect();
+        String::from_utf16(&text).ok()
+    }
+
+    /// `StringFileInfo\<lang><codepage>\ProductVersion` of `exe`, using the first `Translation`
+    /// entry (both Rustgram executables write `040904b0`).
+    pub(super) fn product_version_string(exe: &Path) -> Option<String> {
+        let path_w = to_wide_null(exe.as_os_str());
+        let mut handle = 0u32;
+        // SAFETY: `path_w` is null-terminated and `handle` is a valid out-pointer.
+        let size = unsafe { GetFileVersionInfoSizeW(path_w.as_ptr(), &mut handle) };
+        if size == 0 {
+            return None;
+        }
+        let mut block = vec![0u8; size as usize];
+        // SAFETY: `block` holds exactly `size` writable bytes.
+        let ok =
+            unsafe { GetFileVersionInfoW(path_w.as_ptr(), 0, size, block.as_mut_ptr().cast()) };
+        if ok == 0 {
+            return None;
+        }
+
+        let query = |sub_block: &str| -> Option<&[u8]> {
+            let sub_w = to_wide_null(OsStr::new(sub_block));
+            let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut len = 0u32;
+            // SAFETY: `block` is the buffer filled by `GetFileVersionInfoW`; on success `ptr`
+            // points `len` units into it and lives as long as `block`.
+            let ok = unsafe {
+                VerQueryValueW(block.as_ptr().cast(), sub_w.as_ptr(), &mut ptr, &mut len)
+            };
+            if ok == 0 || ptr.is_null() {
+                return None;
+            }
+            let start = ptr as usize;
+            let base = block.as_ptr() as usize;
+            if start < base || start >= base + block.len() {
+                return None;
+            }
+            let available = base + block.len() - start;
+            Some(&block[start - base..start - base + available.min(len as usize * 2)])
+        };
+
+        let lang = query(r"\VarFileInfo\Translation")
+            .filter(|t| t.len() >= 4)
+            .map(|t| {
+                let language = u16::from_le_bytes([t[0], t[1]]);
+                let codepage = u16::from_le_bytes([t[2], t[3]]);
+                format!("{language:04x}{codepage:04x}")
+            })
+            .unwrap_or_else(|| "040904b0".to_owned());
+        let value = query(&format!(r"\StringFileInfo\{lang}\ProductVersion"))?;
+        let (pairs, _) = value.as_chunks::<2>();
+        let units: Vec<u16> = pairs
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .take_while(|&u| u != 0)
+            .collect();
+        let text = String::from_utf16(&units).ok()?;
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
     }
 }
 

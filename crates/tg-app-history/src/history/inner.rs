@@ -1281,6 +1281,10 @@ impl HistoryInnerWidget {
             match action {
                 MediaDownloadAction::Start => backend.start_media_download(self.peer_id, id),
                 MediaDownloadAction::Cancel => backend.cancel_media_download(self.peer_id, id),
+                MediaDownloadAction::Stream => {
+                    let loader = backend.open_media_stream(self.peer_id, id);
+                    self.media_runtime.provide_voice_stream(id, loader);
+                }
             }
             if let Some(desc) = backend.inline_media_descriptor(self.peer_id, id) {
                 match desc.photo_load {

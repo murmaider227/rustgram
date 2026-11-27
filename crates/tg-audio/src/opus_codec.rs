@@ -7,9 +7,11 @@
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
+/// Opus encoder tuning passed to [`encode_ogg_opus_i16`].
+pub use opus_pure::Application;
 use opus_pure::{
-    Application, MAX_PACKET_BYTES, MAX_PACKET_SAMPLES, OggOpusReader, OggOpusWriter, OpusDecoder,
-    OpusEncoder, OpusHead, OpusTags, Trim,
+    MAX_PACKET_BYTES, MAX_PACKET_SAMPLES, OggOpusReader, OggOpusWriter, OpusDecoder, OpusEncoder,
+    OpusHead, OpusTags, Trim,
 };
 
 use crate::error::{AudioError, AudioResult};

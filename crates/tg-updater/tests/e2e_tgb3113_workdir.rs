@@ -11,8 +11,10 @@
 //! and started by the updater, it writes its current dir and arguments next to itself and exits.
 //!
 //! `APPDATA` is pointed at a temp folder for the whole run, so the updater's default-working-dir
-//! lookup never reaches a real profile. The staged `tdata/version` file is removed before each run,
-//! so the updater never writes the Windows uninstall registry key of a real installation.
+//! lookup never reaches a real profile. The staged `tdata/version` file is removed before each run
+//! that installs, so the updater never writes the Windows uninstall registry key of a real
+//! installation (it also writes that key only when its `InstallLocation` is the updated folder).
+//! Only the TGB-3117 case keeps the file: the updater must read the stale version to refuse it.
 //!
 //! Opt-in: `RUSTGRAM_E2E_RELEASED_UPDATER=<path to a released rustgram-updater.exe>` also runs the
 //! released (broken) updater: once as the broken app starts it, and once the way the manual steps
@@ -32,6 +34,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tempfile::TempDir;
 
+use tg_updater::apply::{executable_product_version, installed_app_version};
 use tg_updater::checker::UpdaterLaunchOptions;
 use tg_updater::launch::{plan_updater_launch, spawn_updater};
 use tg_updater::package::{
@@ -66,6 +69,14 @@ fn main() -> ExitCode {
         (
             "new_updater_rescues_launch_from_broken_app",
             new_updater_rescues_launch_from_broken_app,
+        ),
+        (
+            "tgb3117_stale_staged_package_is_refused_and_app_relaunched",
+            tgb3117_stale_staged_package_is_refused_and_app_relaunched,
+        ),
+        (
+            "tgb3117_installed_version_is_read_from_the_exe",
+            tgb3117_installed_version_is_read_from_the_exe,
         ),
     ];
     if released_updater().is_some() {
@@ -204,6 +215,79 @@ fn new_updater_rescues_launch_from_broken_app() {
     );
 }
 
+/// TGB-3117: the profile still holds a 0.2.0-alpha.1 package staged by an older install while
+/// 0.2.0-alpha.2 runs. The updater, started with the plan the app builds (`-appversion`), installs
+/// nothing, deletes the stale `tupdates`, exits non-zero, and relaunches the app unchanged.
+fn tgb3117_stale_staged_package_is_refused_and_app_relaunched() {
+    let fx = Fixture::new(&built_updater(), false);
+    let working_dir = fx.default_working_dir();
+    fx.stage_package(&working_dir, "0.2.0-alpha.1", true);
+
+    let plan = plan_updater_launch(
+        &fx.install.join(DEFAULT_EXE_NAME),
+        &working_dir,
+        false,
+        UpdaterLaunchOptions {
+            debug: true,
+            app_version: Some("0.2.0-alpha.2".to_owned()),
+            ..UpdaterLaunchOptions::default()
+        },
+    );
+    assert_eq!(
+        plan.args,
+        vec!["-update", "-debug", "-appversion", "0.2.0-alpha.2"]
+    );
+    let status = wait(spawn_updater(&plan).expect("spawn updater"));
+    assert_eq!(status.code(), Some(1), "a refused update exits non-zero");
+
+    assert!(
+        fs::read(fx.install.join(DEFAULT_EXE_NAME)).expect("app") == fx.old_app,
+        "rustgram.exe must not be downgraded"
+    );
+    assert_eq!(
+        fs::read(fx.install.join("resources.dat")).expect("resources"),
+        b"old resources"
+    );
+    assert!(!fx.install.join("modules").exists());
+    assert!(
+        !working_dir.join(TUPDATES_DIR_NAME).exists(),
+        "the stale package must be deleted"
+    );
+    assert!(working_dir.join("tdata").is_dir(), "the profile stays");
+    let log = fx.updater_log(&working_dir);
+    assert!(
+        log.contains("anti-downgrade") && log.contains("0.2.0-alpha.1"),
+        "updater log should name the refusal: {log}"
+    );
+    assert_eq!(
+        fx.relaunch_record(),
+        launch_record(&fx.install, &["-noupdate", "-debug"])
+    );
+}
+
+/// Without `-appversion` (an app that does not pass it) the updater reads the installed
+/// executable's `ProductVersion`; the built updater carries the same kind of resource.
+fn tgb3117_installed_version_is_read_from_the_exe() {
+    let expected = [
+        option_env!("RUSTGRAM_VERSION"),
+        option_env!("TGFORK_VERSION"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|v| !v.is_empty())
+    .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let expected = Version::parse(expected).expect("build version");
+    let exe = Path::new(env!("CARGO_BIN_EXE_rustgram-updater"));
+    assert_eq!(executable_product_version(exe), Some(expected.clone()));
+    assert_eq!(installed_app_version(None, exe), Some(expected));
+    assert_eq!(
+        installed_app_version(Some("0.2.0-alpha.2"), exe),
+        Some(Version::parse("0.2.0-alpha.2").expect("version")),
+        "the app's own -appversion wins"
+    );
+}
+
 /// The released updater, started the way the released app starts it, installs nothing and
 /// relaunches the old app: the bug the owner saw.
 fn released_updater_broken_launch_installs_nothing() {
@@ -306,9 +390,15 @@ impl Fixture {
     /// Stages a signed v0.2.0-alpha.2 package in `<working_dir>/tupdates` the way the app does
     /// (`UpdateChecker::download_and_stage`: verify, unpack, promote the bundled updater).
     fn stage(&self, working_dir: &Path) {
+        self.stage_package(working_dir, "0.2.0-alpha.2", false);
+    }
+
+    /// [`Self::stage`] for any `version`. `keep_version_file` keeps the staged `tdata/version`;
+    /// only cases where the updater must refuse the package keep it (see module docs).
+    fn stage_package(&self, working_dir: &Path, version: &str, keep_version_file: bool) {
         fs::create_dir_all(working_dir.join("tdata")).expect("profile tdata");
         let key = SigningKey::generate(&mut OsRng);
-        let version = Version::parse("0.2.0-alpha.2").expect("version");
+        let version = Version::parse(version).expect("version");
         let updater = built_updater();
         let mut files: Vec<(&str, &[u8])> = vec![
             (DEFAULT_EXE_NAME, self.new_app.as_slice()),
@@ -327,7 +417,7 @@ impl Fixture {
             &key,
         )
         .expect("pack");
-        let current = Version::parse("0.2.0-alpha.1").expect("version");
+        let current = Version::parse("0.1.0").expect("version");
         let verified = verify_package(
             &package,
             &key.verifying_key(),
@@ -339,7 +429,9 @@ impl Fixture {
         let temp = unpack_verified_package(&verified, working_dir).expect("unpack");
         promote_ready_updater(working_dir, &self.install).expect("promote");
         // Without a version file the updater skips the uninstall registry key (see module docs).
-        fs::remove_file(temp.join("tdata").join("version")).expect("remove version file");
+        if !keep_version_file {
+            fs::remove_file(temp.join("tdata").join("version")).expect("remove version file");
+        }
         assert!(temp.join("ready").is_file());
     }
 

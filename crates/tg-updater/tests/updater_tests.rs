@@ -463,6 +463,7 @@ fn offline_check_stage_promote_and_apply_end_to_end() {
         debug: true,
         start_in_tray: true,
         just_update: false,
+        app_version: None,
     });
     let parsed = parse_args(&launch_args);
     assert!(parsed.need_update);

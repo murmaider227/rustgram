@@ -31,8 +31,9 @@ pub enum PhotoLoadState {
     NotLoaded,
 }
 
-/// Download state of a voice message's file, set only for data that is downloaded on demand
-/// (tdesktop never downloads voice messages automatically, `Data::AutoDownload::Should`).
+/// Download state of a voice message's or round video message's file, set only for data that
+/// is downloaded on demand (tdesktop never downloads voice messages automatically, and video
+/// messages only when they autoplay: `Data::AutoDownload::Should` / `ShouldAutoPlay`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceLoadState {
     /// Not in the media cache: the status line shows the file size and the first play starts
@@ -67,7 +68,8 @@ pub struct InlineMediaDescriptor {
     pub music_duration_secs: Option<u32>,
     /// True if this sticker attachment is a WebM VP9 alpha video sticker (decoded via `tg-video`).
     pub is_video_sticker: bool,
-    /// `Some` while a voice message's file is not in the media cache (`audio_bytes` is then
-    /// `None`). `None` with no `audio_bytes` means stand-in data without a cache (demo).
+    /// `Some` while a voice message's (or a round video's that does not autoplay) file is not
+    /// in the media cache (`audio_bytes` is then `None`). `None` with no `audio_bytes` means
+    /// stand-in data without a cache (demo).
     pub voice_load: Option<VoiceLoadState>,
 }

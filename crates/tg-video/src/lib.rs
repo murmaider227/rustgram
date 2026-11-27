@@ -36,10 +36,10 @@ pub use streaming::{
     LOAD_IN_ADVANCE_LOCAL_MS, LOAD_IN_ADVANCE_REMOTE_MS, LoadedPart, LocalFileLoader,
     MAX_FILE_SIZE, MAX_ONLY_IN_HEADER, MAX_PARTS_IN_HEADER, MAX_SINGLE_READ_AMOUNT,
     MediaCacheSliceCache, MemoryRangeLoader, MemorySliceCache, PART_SIZE, PRELOAD_PARTS_AHEAD,
-    PartsMap, PlayerAudio, PlayerStage, PriorityQueue, RangeLoader, ReaderStats, SLICES_IN_MEMORY,
-    SliceCache, SliceConfig, SpeedEstimator, StreamingDocument, StreamingInstance, StreamingPlayer,
-    StreamingReader, SyncClock, TDESKTOP_PARTS_IN_SLICE, THREADED_VIDEO_AHEAD, ThreadedDecoder,
-    TimePoint, slice_cache_key,
+    PartsMap, PlayerAudio, PlayerStage, PriorityQueue, RangeLoader, RangeReadSeek, ReaderStats,
+    SLICES_IN_MEMORY, SliceCache, SliceConfig, SpeedEstimator, StreamingDocument,
+    StreamingInstance, StreamingPlayer, StreamingReader, SyncClock, TDESKTOP_PARTS_IN_SLICE,
+    THREADED_VIDEO_AHEAD, ThreadedDecoder, TimePoint, slice_cache_key,
 };
 pub use thumbnail::{
     GOOD_THUMB_QUALITY, ThumbnailEncoding, ThumbnailOptions, encode_thumbnail, extract_thumbnail,
