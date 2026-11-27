@@ -43,6 +43,7 @@ pub mod reply_preview;
 pub mod rich_compose;
 pub use tg_app_core::history::sections_model;
 pub mod sections_ui;
+pub mod send_flight;
 pub mod sponsored;
 pub mod streamed_drafts;
 pub mod suggestion_cards;
@@ -542,6 +543,8 @@ pub struct HistoryWidget {
     // Decorative UI effects (`tg-ui::effects::{thanos, fly}`) & Draw-to-Reply (`tg-editor`)
     thanos_effect: tg_ui::effects::ThanosEffect,
     fly_effects: tg_ui::effects::FlyEffectsManager,
+    /// The text message flying from the field into the list (`MessageSendingTextFlight`).
+    send_flight: Option<send_flight::SendFlight>,
     effects_chat_enabled: bool,
     effects_reactions_enabled: bool,
     effects_emoji_enabled: bool,
@@ -710,6 +713,7 @@ impl HistoryWidget {
             widget_helper_path: None,
             thanos_effect: tg_ui::effects::ThanosEffect::new(),
             fly_effects: tg_ui::effects::FlyEffectsManager::new(),
+            send_flight: None,
             effects_chat_enabled: true,
             effects_reactions_enabled: true,
             effects_emoji_enabled: true,
@@ -1510,6 +1514,9 @@ impl HistoryWidget {
                     }
                     self.inner
                         .request_media_descriptor(peer_id, sent_id, backend);
+                    if let Some(flight) = self.send_flight.as_mut() {
+                        flight.follow_id(local_id, sent_id);
+                    }
                     self.inner
                         .replace_local_message(local_id, *message, peer_info.summary.kind);
                 }
@@ -1757,6 +1764,32 @@ impl HistoryWidget {
             chat_effects_enabled: self.effects_chat_enabled,
             animations_enabled: self.effects_animations_enabled && !tg_ui::anim::disabled(),
         }
+    }
+
+    /// Starts the send animation of text message `msg_id` from the field text captured when it
+    /// was sent (`MessageSendingAnimationController::appendSending`).
+    fn start_send_flight(
+        &mut self,
+        ui: &egui::Ui,
+        peer_id: PeerId,
+        msg_id: MsgId,
+        text: &str,
+        now_secs: f64,
+    ) {
+        let field_text = self.compose.take_sent_field_text();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.send_flight = field_text.and_then(|source| {
+            send_flight::SendFlight::start(
+                peer_id,
+                msg_id,
+                source,
+                ui.layer_id(),
+                now_secs,
+                self.fly_policy(),
+            )
+        });
     }
 
     fn fly_policy(&self) -> tg_ui::effects::FlyEffectPolicy {
@@ -2986,6 +3019,11 @@ impl HistoryWidget {
                 stop_draft_rect.top().max(content_bounds.top() + 40.0),
             ),
         );
+        self.inner.set_send_flight_row(
+            self.send_flight
+                .as_ref()
+                .and_then(|flight| flight.row(peer_id, now_secs)),
+        );
         let inner_events = self.inner.show_with_bots(
             ui,
             list_rect,
@@ -2998,6 +3036,18 @@ impl HistoryWidget {
             bot_snapshot.as_ref().is_some_and(|s| s.bot_verified),
             backend,
         );
+        let flight_row = self.inner.take_send_flight_row();
+        if let Some(flight) = self.send_flight.as_mut()
+            && !flight.after_list(
+                ui.ctx(),
+                ui.layer_id(),
+                flight_row,
+                colors.text_fg,
+                now_secs,
+            )
+        {
+            self.send_flight = None;
+        }
         if let Some(inner_act) = self.handle_inner_events(
             ui.ctx(),
             inner_events,
@@ -3455,29 +3505,9 @@ impl HistoryWidget {
                     match backend.send_message(peer_id, req) {
                         Ok(sent) => {
                             backend.record_slow_mode_send(peer_id, now_unix_i64);
+                            let sent_id = sent.id;
                             self.inner.append_message(sent, peer_info.summary.kind);
-                            if self.last_compose_rect.is_positive()
-                                && self.last_list_rect.is_positive()
-                            {
-                                let dst_w =
-                                    (self.last_list_rect.width() * 0.55).clamp(120.0, 340.0);
-                                let target_rect = Rect::from_min_size(
-                                    Pos2::new(
-                                        self.last_list_rect.right() - dst_w - 16.0,
-                                        self.last_list_rect.bottom() - 48.0,
-                                    ),
-                                    Vec2::new(dst_w, 36.0),
-                                );
-                                self.fly_effects.push_text_flight(
-                                    plain_copy.clone(),
-                                    self.last_compose_rect,
-                                    target_rect,
-                                    colors.msg_out_bg,
-                                    colors.text_fg,
-                                    now_secs,
-                                    self.fly_policy(),
-                                );
-                            }
+                            self.start_send_flight(ui, peer_id, sent_id, &plain_copy, now_secs);
                             action = Some(HistoryAction::SendMessage {
                                 peer_id,
                                 text: plain_copy,
@@ -3513,29 +3543,7 @@ impl HistoryWidget {
                                     );
                                 }
                             }
-                            if !plain_copy.is_empty()
-                                && self.last_compose_rect.is_positive()
-                                && self.last_list_rect.is_positive()
-                            {
-                                let dst_w =
-                                    (self.last_list_rect.width() * 0.55).clamp(120.0, 340.0);
-                                let target_rect = Rect::from_min_size(
-                                    Pos2::new(
-                                        self.last_list_rect.right() - dst_w - 16.0,
-                                        self.last_list_rect.bottom() - 48.0,
-                                    ),
-                                    Vec2::new(dst_w, 36.0),
-                                );
-                                self.fly_effects.push_text_flight(
-                                    plain_copy.clone(),
-                                    self.last_compose_rect,
-                                    target_rect,
-                                    colors.msg_out_bg,
-                                    colors.text_fg,
-                                    now_secs,
-                                    self.fly_policy(),
-                                );
-                            }
+                            self.start_send_flight(ui, peer_id, sent_id, &plain_copy, now_secs);
                             action = Some(HistoryAction::SendMessage {
                                 peer_id,
                                 text: plain_copy,

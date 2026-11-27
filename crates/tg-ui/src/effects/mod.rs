@@ -10,7 +10,7 @@ pub mod thanos;
 
 pub use fly::{
     EmojiFlyAnimation, FlyEffectPolicy, FlyEffectsManager, FlyParabola, MessageSendingTextFlight,
-    MiniCopy, ReactionFlyAnimation, ReactionFlyArgs, ReactionFlyStage, TextFlightSample,
+    MiniCopy, ReactionFlyAnimation, ReactionFlyArgs, ReactionFlyStage, TextFlightFrame,
     compute_fly_parabola, cubic_bezier_ease, reveal_height, rise_progress,
 };
 pub use radial::{

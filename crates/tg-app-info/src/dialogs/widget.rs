@@ -234,6 +234,25 @@ pub struct DialogsPanel {
     request_search_focus: bool,
     /// Folder list for the sidebar and the tabs, read only when the backend's version moves.
     folders: VersionedRead<Vec<ChatFolder>>,
+    /// The search field drawn this frame, `None` when the search bar is not shown.
+    search_field_rect: Option<Rect>,
+}
+
+/// The chat-list search row as drawn this frame, for what tdesktop places in it: the collapsed
+/// stories at the right end of the field and the expanded stories right under the bar
+/// (`Dialogs::Widget::updateControlsGeometry`, `Stories::List::setLayoutConstraints`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DialogsSearchRow {
+    /// The rounded search field (`_search`).
+    pub field_rect: Rect,
+    /// Its inactive background (`filterInputInactiveBg`).
+    pub field_bg: egui::Color32,
+    /// The whole dialogs column.
+    pub column_rect: Rect,
+    /// The chat list's vertical scroll offset.
+    pub list_scroll_y: f32,
+    /// The chat list's largest scroll offset (`0` when all chats fit).
+    pub list_scroll_max: f32,
 }
 
 /// `dialogsMenuToggle` width / height.
@@ -267,6 +286,7 @@ impl DialogsPanel {
             last_birthdays_date: None,
             request_search_focus: false,
             folders: VersionedRead::default(),
+            search_field_rect: None,
         }
     }
 
@@ -583,6 +603,44 @@ impl DialogsPanel {
         palette: &Palette,
         strings: &dyn Strings,
     ) -> Option<DialogsPanelAction> {
+        self.show_column_with_search_row(
+            ui,
+            backend,
+            active_peer,
+            show_horizontal_folders,
+            compact_small_column,
+            show_hamburger,
+            enable_shortcuts,
+            palette,
+            strings,
+            &mut |_, _| {},
+        )
+    }
+
+    /// The search field drawn on the last frame, `None` when the search bar was not shown.
+    #[must_use]
+    pub const fn search_field_rect(&self) -> Option<Rect> {
+        self.search_field_rect
+    }
+
+    /// [`Self::show_column`] that calls `search_row` right after the search bar while the bar
+    /// shows the main chat list (no search, not the Archive, not the narrow column), with `ui`'s
+    /// cursor under the bar: what it allocates there sits between the bar and the folder tabs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_column_with_search_row(
+        &mut self,
+        ui: &mut Ui,
+        backend: &mut dyn DialogsBackend,
+        active_peer: PeerId,
+        show_horizontal_folders: bool,
+        compact_small_column: bool,
+        show_hamburger: bool,
+        enable_shortcuts: bool,
+        palette: &Palette,
+        strings: &dyn Strings,
+        search_row: &mut dyn FnMut(&mut Ui, &DialogsSearchRow),
+    ) -> Option<DialogsPanelAction> {
+        self.search_field_rect = None;
         ensure_tdesktop_fonts(ui.ctx());
         let colors = DialogColors::new(palette);
         let mut action = None;
@@ -620,6 +678,22 @@ impl DialogsPanel {
             strings,
         ) {
             action = Some(a);
+        }
+        if !compact_small_column
+            && !self.search_active
+            && !self.opened_archive
+            && let Some(field_rect) = self.search_field_rect
+        {
+            search_row(
+                ui,
+                &DialogsSearchRow {
+                    field_rect,
+                    field_bg: colors.color("filterInputInactiveBg"),
+                    column_rect: full_rect,
+                    list_scroll_y: self.inner.scroll_offset_y(),
+                    list_scroll_max: self.inner.scroll_max_y(),
+                },
+            );
         }
 
         // 2. Horizontal folder tabs when vertical sidebar is hidden and not searching/in archive.
@@ -1048,6 +1122,7 @@ impl DialogsPanel {
                         Pos2::new(ui.cursor().min.x, pill_top),
                         Vec2::new(pill_w, SEARCH_FIELD_HEIGHT),
                     );
+                    self.search_field_rect = Some(pill_rect);
                     let focused = ui.ctx().memory(|m| m.has_focus(input_id));
                     ui.painter().rect_filled(
                         pill_rect,

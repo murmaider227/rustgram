@@ -486,6 +486,8 @@ pub struct HistoryInnerWidget {
     expanded_factchecks: HashSet<MsgId>,
     /// Screen-space bubble rects recorded during the most recent paint pass (for layout tests).
     last_painted_bubble_rects: HashMap<MsgId, Rect>,
+    /// The message flying from the field this frame (`send_flight`).
+    send_flight_row: Option<crate::history::send_flight::SendFlightRow>,
     /// Per-chat viewport read-metrics visibility tracker (`HistoryView::ReadMetricsTracker`).
     read_metrics: Option<tg_app_core::core_types::read_metrics::ReadMetricsTracker>,
     /// Messages painted this frame (filled while painting the visible window).
@@ -597,6 +599,7 @@ impl HistoryInnerWidget {
             inline_kb_state: InlineKeyboardState::new(),
             expanded_factchecks: HashSet::new(),
             last_painted_bubble_rects: HashMap::new(),
+            send_flight_row: None,
             read_metrics: None,
             emoji_interactions:
                 crate::history::emoji_interactions::HistoryViewEmojiInteractions::new(),
@@ -1086,6 +1089,21 @@ impl HistoryInnerWidget {
     #[must_use]
     pub fn last_painted_bubble_rect(&self, msg_id: MsgId) -> Option<Rect> {
         self.last_painted_bubble_rects.get(&msg_id).copied()
+    }
+
+    /// Sets the message the next paint draws into the send flight's layer.
+    pub(crate) fn set_send_flight_row(
+        &mut self,
+        row: Option<crate::history::send_flight::SendFlightRow>,
+    ) {
+        self.send_flight_row = row;
+    }
+
+    /// Takes the send flight row back after the paint, with where its text was drawn.
+    pub(crate) fn take_send_flight_row(
+        &mut self,
+    ) -> Option<crate::history::send_flight::SendFlightRow> {
+        self.send_flight_row.take()
     }
 
     /// Returns the cached message layout of `msg_id` (tests).
@@ -2688,6 +2706,38 @@ impl HistoryInnerWidget {
                 for v in &visible_paint {
                     let msg = &self.messages[v.index];
                     let item = &self.list.items()[v.index];
+                    // The message flying from the field is drawn in the flight's layer, which is
+                    // moved after the paint (tdesktop skips it here and draws the view itself).
+                    let mut flight_ui = None;
+                    if let Some(row) = self
+                        .send_flight_row
+                        .as_mut()
+                        .filter(|row| row.msg_id == msg.id)
+                    {
+                        let text_bubble = matches!(
+                            self.layout_cache.get(&msg.id).map(|cached| &cached.layout),
+                            Some(CachedItemLayout::Message(layout))
+                                if layout.has_bubble
+                                    && !layout.unwrapped
+                                    && layout.media_rect.is_empty()
+                                    && !layout.text_rect.is_empty()
+                        );
+                        if text_bubble {
+                            let mut child = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .layer_id(row.layer)
+                                    .max_rect(ui.max_rect()),
+                            );
+                            child.set_opacity(row.opacity);
+                            flight_ui = Some(child);
+                        } else {
+                            row.refused = true;
+                        }
+                    }
+                    let ui: &mut Ui = match flight_ui.as_mut() {
+                        Some(child) => child,
+                        None => &mut *ui,
+                    };
                     if let Some(ref mut tracker) = self.read_metrics {
                         tracker.push(
                             msg.id,
@@ -2904,6 +2954,20 @@ impl HistoryInnerWidget {
                                         row_origin.y,
                                     ),
                                 );
+                                if let Some(row) = self
+                                    .send_flight_row
+                                    .as_mut()
+                                    .filter(|row| row.msg_id == msg.id && !row.refused)
+                                {
+                                    row.text_origin = Some(
+                                        hist_rect_to_egui(
+                                            msg_layout.text_rect,
+                                            row_origin.x,
+                                            row_origin.y,
+                                        )
+                                        .min,
+                                    );
+                                }
                                 let bubble_rect = hist_rect_to_egui(
                                     msg_layout.geometry,
                                     row_origin.x,

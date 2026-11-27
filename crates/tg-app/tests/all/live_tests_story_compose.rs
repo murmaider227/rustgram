@@ -809,7 +809,12 @@ fn kittest_strip_add_story_opens_composer_edits_privacy_and_posts_live_story() {
         .build_ui_state(
             |ui, st: &mut UiState| {
                 egui::Panel::top("stories_strip_panel").show(ui, |ui| {
-                    st.host.show_strip(ui, &st.palette);
+                    let (field, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 35.0),
+                        egui::Sense::hover(),
+                    );
+                    let slot = tg_app::stories::StoriesSearchSlot::for_field(field, &st.palette);
+                    st.host.show_strip(ui, slot, &st.palette);
                 });
                 st.host.update_and_render(ui.ctx(), &st.palette);
             },
@@ -942,7 +947,12 @@ fn kittest_story_drafts_save_resume_delete_and_upload_progress_strip() {
         .build_ui_state(
             |ui, st: &mut UiState| {
                 egui::Panel::top("stories_strip_panel").show(ui, |ui| {
-                    st.host.show_strip(ui, &st.palette);
+                    let (field, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 35.0),
+                        egui::Sense::hover(),
+                    );
+                    let slot = tg_app::stories::StoriesSearchSlot::for_field(field, &st.palette);
+                    st.host.show_strip(ui, slot, &st.palette);
                 });
                 st.host.update_and_render(ui.ctx(), &st.palette);
             },
@@ -950,8 +960,9 @@ fn kittest_story_drafts_save_resume_delete_and_upload_progress_strip() {
         );
 
     harness.step();
-    // Open composer via "+ Add Story", attach sample photo, write caption, save draft.
-    harness.get_by_label("+ Add Story").click();
+    // Open the composer (the "+" badge on the own userpic), attach sample photo, write caption,
+    // save draft.
+    harness.state_mut().host.open_composer();
     harness.step();
     harness.step();
     harness.get_by_label("Sample Photo").click();
@@ -976,7 +987,7 @@ fn kittest_story_drafts_save_resume_delete_and_upload_progress_strip() {
     );
 
     // Re-open composer -> click "Drafts (1)" -> click "Resume" in StoryDraftsBox.
-    harness.get_by_label("+ Add Story").click();
+    harness.state_mut().host.open_composer();
     harness.step();
     harness.step();
     harness.get_by_label("Drafts (1)").click();

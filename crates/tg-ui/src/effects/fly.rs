@@ -9,7 +9,7 @@
 //! per-category power-saving flags (`EMOJI_REACTIONS`, `EMOJI_CHAT`, `CHAT_EFFECTS`,
 //! `ANIMATIONS`).
 
-use egui::{Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Vec2};
 
 use crate::anim::{
     disabled as anim_disabled, ease_out_quint, interpolate_f32, interpolate_f64, slow_multiplier,
@@ -577,38 +577,33 @@ pub fn reveal_height(height: f64, lift: f64, lead: f64, progress: f64) -> f64 {
     interpolate_f64(start - follow, 0.0, rise) + interpolate_f64(follow, 0.0, fade)
 }
 
-/// Sampled frame geometry & opacity of a [`MessageSendingTextFlight`].
+/// One frame of a [`MessageSendingTextFlight`].
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TextFlightSample {
-    /// Current screen-space position of the flying text bubble.
-    pub rect: Rect,
+pub struct TextFlightFrame {
+    /// How far the sent message is drawn from its place in the list (the flight widget's
+    /// `_position - target`): the field text's start offset, shrinking to zero.
+    pub offset: Vec2,
     /// Overall normalized progress in `[0.0, 1.0]`.
     pub progress: f64,
-    /// Horizontal slide progress (`easeOutQuint` over `160ms`).
-    pub slide_progress: f64,
-    /// Vertical rise progress (`CubicBezier(0.25, 0.1, 0.25, 1.0)` over `280ms`).
-    pub rise_progress: f64,
-    /// Bubble backdrop fade-in progress over `110ms`.
-    pub fade_progress: f64,
+    /// Cross-fade from the field text to the message (`mix`, over `110ms`): the message is
+    /// drawn with this opacity, the field text with `1 - mix`.
+    pub mix: f32,
 }
 
-/// Message-sending text flight animation (`Ui::MessageSendingTextFlight`).
+/// Message-sending text flight (`Ui::MessageSendingTextFlight`).
 ///
-/// Flies newly sent outgoing text smoothly from the compose input field rectangle up
-/// into the outgoing message bubble position over `280ms` (`160ms` quintic horizontal
-/// slide, `280ms` cubic-bezier vertical rise, `110ms` bubble cross-fade).
+/// tdesktop draws the real message view (its bubble, side and width) in a widget that starts
+/// where the field text was, so the field text and the message text overlap, and slides into
+/// the message's live place in the list: `160ms` `easeOutQuint` horizontally, `280ms`
+/// `CubicBezier(0.25, 0.1, 0.25, 1)` vertically, the field text cross-fading into the message
+/// over the first `110ms`. This type holds only the timing and the offset; the caller draws
+/// the message and the field text.
 #[derive(Debug, Clone)]
 pub struct MessageSendingTextFlight {
-    /// Outgoing message text snippet being flown.
-    pub text: String,
-    /// Starting compose-field text rect.
-    pub source_rect: Rect,
-    /// Destination bubble rect in the history list.
-    pub target_rect: Rect,
-    /// Outgoing bubble background fill color.
-    pub bubble_bg: Color32,
-    /// Outgoing message text color.
-    pub text_fg: Color32,
+    /// Screen position of the field text when it was sent.
+    source_pos: Pos2,
+    /// `source - target` at the first frame with a known target (`_residual`).
+    residual: Option<Vec2>,
     /// Timestamp when the flight started (seconds).
     started_sec: f64,
     /// Effective total flight duration (seconds).
@@ -624,45 +619,40 @@ pub struct MessageSendingTextFlight {
 }
 
 impl MessageSendingTextFlight {
-    /// Starts a message-sending text flight animation from `source_rect` to `target_rect`.
+    /// Starts a flight of the field text that was at `source_pos` on screen.
     ///
-    /// Immediately marks finished if `policy.allows_text_flight()` is `false` or `text` is empty.
+    /// Finished at once when `policy.allows_text_flight()` is `false`.
     #[must_use]
-    pub fn start(
-        text: impl Into<String>,
-        source_rect: Rect,
-        target_rect: Rect,
-        bubble_bg: Color32,
-        text_fg: Color32,
-        now_sec: f64,
-        policy: FlyEffectPolicy,
-    ) -> Self {
-        let text = text.into();
+    pub fn start(source_pos: Pos2, now_sec: f64, policy: FlyEffectPolicy) -> Self {
         let slow = f64::from(slow_multiplier());
-        let duration_sec = (f64::from(TEXT_FLIGHT_DURATION_MS) * slow) / 1000.0;
-        let slide_duration_sec = (f64::from(TEXT_FLIGHT_SLIDE_DURATION_MS) * slow) / 1000.0;
-        let fade_duration_sec = (f64::from(TEXT_FLIGHT_FADE_DURATION_MS) * slow) / 1000.0;
-        let give_up_sec = now_sec + (f64::from(TEXT_FLIGHT_GIVE_UP_MS) * slow) / 1000.0;
-        let finished = !policy.allows_text_flight() || text.trim().is_empty();
-
+        let seconds = |ms: u32| (f64::from(ms) * slow) / 1000.0;
         Self {
-            text,
-            source_rect,
-            target_rect,
-            bubble_bg,
-            text_fg,
+            source_pos,
+            residual: None,
             started_sec: now_sec,
-            duration_sec,
-            slide_duration_sec,
-            fade_duration_sec,
-            give_up_sec,
-            finished,
+            duration_sec: seconds(TEXT_FLIGHT_DURATION_MS),
+            slide_duration_sec: seconds(TEXT_FLIGHT_SLIDE_DURATION_MS),
+            fade_duration_sec: seconds(TEXT_FLIGHT_FADE_DURATION_MS),
+            give_up_sec: now_sec + seconds(TEXT_FLIGHT_GIVE_UP_MS),
+            finished: !policy.allows_text_flight(),
         }
     }
 
-    /// Updates the live target rect (e.g. if the history viewport scrolled mid-flight).
-    pub fn set_target_rect(&mut self, target_rect: Rect) {
-        self.target_rect = target_rect;
+    /// Screen position of the field text when it was sent.
+    #[must_use]
+    pub const fn source_pos(&self) -> Pos2 {
+        self.source_pos
+    }
+
+    /// Whether the flight already knows where the message is (`_residual` is set).
+    #[must_use]
+    pub const fn has_target(&self) -> bool {
+        self.residual.is_some()
+    }
+
+    /// Ends the flight (`finish()`: the message lost its view or its place).
+    pub fn finish(&mut self) {
+        self.finished = true;
     }
 
     /// Returns `true` when the flight has completed or timed out past [`TEXT_FLIGHT_GIVE_UP_MS`].
@@ -674,80 +664,50 @@ impl MessageSendingTextFlight {
         now_sec >= self.started_sec + self.duration_sec || now_sec >= self.give_up_sec
     }
 
-    /// Evaluates the interpolated geometry and phase curves at `now_sec`.
+    /// Cross-fade progress at `now_sec` (`mix`).
     #[must_use]
-    pub fn sample(&self, now_sec: f64) -> TextFlightSample {
-        if self.finished || self.duration_sec <= 0.0 {
-            return TextFlightSample {
-                rect: self.target_rect,
+    pub fn mix(&self, now_sec: f64) -> f32 {
+        if self.finished(now_sec) {
+            return 1.0;
+        }
+        let elapsed = (now_sec - self.started_sec).max(0.0);
+        (elapsed / self.fade_duration_sec.max(1e-6)).clamp(0.0, 1.0) as f32
+    }
+
+    /// The frame at `now_sec` for a message whose text starts at `target` on screen this
+    /// frame (`refresh()`): the start offset is taken once, the target stays live.
+    pub fn frame(&mut self, now_sec: f64, target: Pos2) -> TextFlightFrame {
+        let residual = *self
+            .residual
+            .get_or_insert_with(|| self.source_pos - target);
+        if self.finished(now_sec) {
+            return TextFlightFrame {
+                offset: Vec2::ZERO,
                 progress: 1.0,
-                slide_progress: 1.0,
-                rise_progress: 1.0,
-                fade_progress: 1.0,
+                mix: 1.0,
             };
         }
         let elapsed = (now_sec - self.started_sec).max(0.0);
         let progress = (elapsed / self.duration_sec).clamp(0.0, 1.0);
-        let slide_raw = (elapsed / self.slide_duration_sec.max(1e-6)).clamp(0.0, 1.0);
-        let slide_progress = ease_out_quint(1.0, slide_raw);
-        let rise = rise_progress(progress);
-        let fade_progress = (elapsed / self.fade_duration_sec.max(1e-6)).clamp(0.0, 1.0);
-
-        let residual_x = self.source_rect.left() - self.target_rect.left();
-        let residual_y = self.source_rect.top() - self.target_rect.top();
-        let x = self.target_rect.left() + residual_x * (1.0 - slide_progress as f32);
-        let y = self.target_rect.top() + residual_y * (1.0 - rise as f32);
-        let w = interpolate_f32(
-            self.source_rect.width(),
-            self.target_rect.width(),
-            slide_progress as f32,
-        );
-        let h = interpolate_f32(
-            self.source_rect.height(),
-            self.target_rect.height(),
-            rise as f32,
-        );
-
-        TextFlightSample {
-            rect: Rect::from_min_size(Pos2::new(x, y), Vec2::new(w.max(24.0), h.max(20.0))),
+        let slide = (elapsed / self.slide_duration_sec.max(1e-6)).clamp(0.0, 1.0);
+        let x = 1.0 - ease_out_quint(1.0, slide);
+        let y = 1.0 - rise_progress(progress);
+        TextFlightFrame {
+            offset: Vec2::new(
+                (f64::from(residual.x) * x).round() as f32,
+                (f64::from(residual.y) * y).round() as f32,
+            ),
             progress,
-            slide_progress,
-            rise_progress: rise,
-            fade_progress,
+            mix: self.mix(now_sec),
         }
-    }
-
-    /// Paints the flying message text + morphing outgoing bubble onto `painter`.
-    pub fn paint(&mut self, painter: &Painter, now_sec: f64, policy: FlyEffectPolicy) -> bool {
-        if !policy.allows_text_flight() || self.finished(now_sec) {
-            self.finished = true;
-            return false;
-        }
-        let s = self.sample(now_sec);
-        let radius = (4.0 + 8.0 * s.fade_progress as f32).round() as u8;
-        painter.rect_filled(
-            s.rect,
-            CornerRadius::same(radius),
-            with_alpha(self.bubble_bg, 0.25 + 0.75 * s.fade_progress),
-        );
-        let preview: String = self.text.chars().take(64).collect();
-        painter.text(
-            Pos2::new(s.rect.left() + 10.0, s.rect.center().y),
-            Align2::LEFT_CENTER,
-            preview,
-            FontId::proportional(13.5),
-            with_alpha(self.text_fg, 0.85 + 0.15 * s.fade_progress),
-        );
-        true
     }
 }
 
-/// Unified container driving active reaction flies, emoji flies, and message-send text flights.
+/// Unified container driving active reaction flies and emoji flies.
 #[derive(Debug, Default)]
 pub struct FlyEffectsManager {
     reactions: Vec<ReactionFlyAnimation>,
     emojis: Vec<EmojiFlyAnimation>,
-    text_flights: Vec<MessageSendingTextFlight>,
 }
 
 impl FlyEffectsManager {
@@ -757,7 +717,6 @@ impl FlyEffectsManager {
         Self {
             reactions: Vec::new(),
             emojis: Vec::new(),
-            text_flights: Vec::new(),
         }
     }
 
@@ -799,56 +758,23 @@ impl FlyEffectsManager {
         true
     }
 
-    /// Launches a message-sending text flight animation if allowed by `policy`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn push_text_flight(
-        &mut self,
-        text: impl Into<String>,
-        source_rect: Rect,
-        target_rect: Rect,
-        bubble_bg: Color32,
-        text_fg: Color32,
-        now_sec: f64,
-        policy: FlyEffectPolicy,
-    ) -> bool {
-        if !policy.allows_text_flight() {
-            return false;
-        }
-        let flight = MessageSendingTextFlight::start(
-            text,
-            source_rect,
-            target_rect,
-            bubble_bg,
-            text_fg,
-            now_sec,
-            policy,
-        );
-        if flight.finished(now_sec) {
-            return false;
-        }
-        self.text_flights.push(flight);
-        true
-    }
-
-    /// Returns `true` if any fly or text-flight effect is currently active at `now_sec`.
+    /// Returns `true` if any fly effect is currently active at `now_sec`.
     #[must_use]
     pub fn animating(&self, now_sec: f64) -> bool {
         self.reactions.iter().any(|r| !r.finished(now_sec))
             || self.emojis.iter().any(|e| !e.finished(now_sec))
-            || self.text_flights.iter().any(|t| !t.finished(now_sec))
     }
 
     /// Returns total count of currently queued animations.
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.reactions.len() + self.emojis.len() + self.text_flights.len()
+        self.reactions.len() + self.emojis.len()
     }
 
-    /// Immediately clears all active fly and text-flight animations.
+    /// Immediately clears all active fly animations.
     pub fn clear(&mut self) {
         self.reactions.clear();
         self.emojis.clear();
-        self.text_flights.clear();
     }
 
     /// Paints all active fly effects onto `ui` and prunes finished animations.
@@ -862,8 +788,6 @@ impl FlyEffectsManager {
             e.paint(painter, now_sec, policy);
             !e.finished(now_sec)
         });
-        self.text_flights
-            .retain_mut(|t| t.paint(painter, now_sec, policy));
         if self.active_count() > 0 {
             ui.ctx().request_repaint();
         }
@@ -970,34 +894,35 @@ mod tests {
         assert!((reveal_height(100.0, 0.0, 0.0, 1.0) - 0.0).abs() < 1e-5);
         assert!(reveal_height(100.0, 20.0, 15.0, 0.5) < 80.0);
 
-        let src = Rect::from_min_size(Pos2::new(20.0, 500.0), Vec2::new(220.0, 32.0));
-        let dst = Rect::from_min_size(Pos2::new(240.0, 420.0), Vec2::new(180.0, 38.0));
-        let flight = MessageSendingTextFlight::start(
-            "Hello world",
-            src,
-            dst,
-            Color32::from_rgb(0xEF, 0xFD, 0xDE),
-            Color32::BLACK,
-            5.0,
-            FlyEffectPolicy::all_enabled(),
-        );
-
+        // The field text starts 300px left of and 80px below the message's text.
+        let source = Pos2::new(20.0, 500.0);
+        let target = Pos2::new(320.0, 420.0);
+        let mut flight =
+            MessageSendingTextFlight::start(source, 5.0, FlyEffectPolicy::all_enabled());
         assert!(!flight.finished(5.0));
-        let s0 = flight.sample(5.0);
-        assert!((s0.rect.left() - src.left()).abs() < 1e-3);
-        assert!((s0.rect.top() - src.top()).abs() < 1e-3);
+        assert!(!flight.has_target());
+        let f0 = flight.frame(5.0, target);
+        assert_eq!(
+            target + f0.offset,
+            source,
+            "the message starts at the field text"
+        );
+        assert!(f0.mix.abs() < 1e-6, "only the field text is drawn at first");
 
-        // At 160ms horizontal slide reaches target X while vertical rise is still in flight.
-        let s_slide = flight.sample(5.16);
-        assert!((s_slide.slide_progress - 1.0).abs() < 1e-6);
-        assert!((s_slide.rect.left() - dst.left()).abs() < 1e-3);
-        assert!(s_slide.rise_progress < 1.0);
-        assert!((s_slide.fade_progress - 1.0).abs() < 1e-6);
+        // The list scrolled 10px: the target stays live, the start offset does not change.
+        let scrolled = target - Vec2::new(0.0, 10.0);
+        // At 160ms the horizontal slide is done while the vertical rise is still in flight.
+        let f_slide = flight.frame(5.16, scrolled);
+        assert!(f_slide.offset.x.abs() < 1e-3);
+        assert!(f_slide.offset.y > 0.0 && f_slide.offset.y < 80.0);
+        assert!((f_slide.mix - 1.0).abs() < 1e-6);
 
-        // At 280ms flight completes.
+        // At 280ms the message is in its place.
         assert!(flight.finished(5.28));
-        let s_end = flight.sample(5.28);
-        assert!((s_end.rect.top() - dst.top()).abs() < 1e-3);
+        assert_eq!(flight.frame(5.28, scrolled).offset, Vec2::ZERO);
+
+        let off = MessageSendingTextFlight::start(source, 1.0, FlyEffectPolicy::all_disabled());
+        assert!(off.finished(1.0), "power saving turns the flight off");
     }
 
     #[test]
@@ -1013,15 +938,6 @@ mod tests {
             FlyEffectPolicy::all_disabled(),
         ));
         assert!(!mgr.push_emoji_fly("✨", r1, r2, 1.0, FlyEffectPolicy::all_disabled()));
-        assert!(!mgr.push_text_flight(
-            "Hi",
-            r1,
-            r2,
-            Color32::WHITE,
-            Color32::BLACK,
-            1.0,
-            FlyEffectPolicy::all_disabled(),
-        ));
         assert_eq!(mgr.active_count(), 0);
 
         // Selective policy: allow emoji fly only, block reaction fly & text flight.
@@ -1033,15 +949,6 @@ mod tests {
         };
         assert!(!mgr.push_reaction_fly(ReactionFlyArgs::new("👍", r1, r2), 1.0, emoji_only));
         assert!(mgr.push_emoji_fly("✨", r1, r2, 1.0, emoji_only));
-        assert!(!mgr.push_text_flight(
-            "Hi",
-            r1,
-            r2,
-            Color32::WHITE,
-            Color32::BLACK,
-            1.0,
-            emoji_only,
-        ));
         assert_eq!(mgr.active_count(), 1);
         assert!(mgr.animating(1.1));
     }

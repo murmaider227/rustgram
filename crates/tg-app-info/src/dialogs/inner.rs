@@ -311,6 +311,8 @@ pub struct DialogsInnerWidget {
     context_menu: EntryMenu,
     context_target: Option<ContextTarget>,
     scroll_offset_y: f32,
+    /// Largest scroll offset of the last frame (content height minus viewport height).
+    scroll_max_y: f32,
     pending_scroll_to_y: Option<f32>,
     /// Animated video avatars of visible rows (`InnerWidget::_videoUserpics`).
     video_userpics: crate::dialogs::video_userpic::DialogVideoUserpicCache,
@@ -348,6 +350,7 @@ impl DialogsInnerWidget {
             context_menu: EntryMenu::default(),
             context_target: None,
             scroll_offset_y: 0.0,
+            scroll_max_y: 0.0,
             pending_scroll_to_y: None,
             video_userpics: crate::dialogs::video_userpic::DialogVideoUserpicCache::new(),
             quick_dialog_action: QuickDialogAction::Disabled,
@@ -406,6 +409,12 @@ impl DialogsInnerWidget {
     #[must_use]
     pub const fn scroll_offset_y(&self) -> f32 {
         self.scroll_offset_y
+    }
+
+    /// Largest vertical scroll offset of the list on the last frame (`0` when it all fits).
+    #[must_use]
+    pub const fn scroll_max_y(&self) -> f32 {
+        self.scroll_max_y
     }
 
     /// Requests scrolling smoothly/immediately to the top of the list.
@@ -922,6 +931,7 @@ impl DialogsInnerWidget {
             }
         });
         self.scroll_offset_y = output.state.clamped_offset().y;
+        self.scroll_max_y = (output.content_size.y - output.inner_rect.height()).max(0.0);
 
         // Commit any pinned swaps produced during drag.
         for (from, to) in pending_swaps {

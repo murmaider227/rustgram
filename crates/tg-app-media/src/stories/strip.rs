@@ -1,18 +1,26 @@
-//! Collapsible dialogs-list top stories strip widget (`StoriesStrip`).
+//! Dialogs-list stories strip widget (`StoriesStrip`).
 //!
 //! Port origin: `Telegram/SourceFiles/dialogs/ui/dialogs_stories_list.h`,
 //! `Telegram/SourceFiles/dialogs/ui/dialogs_stories_list.cpp`,
-//! `Telegram/SourceFiles/dialogs/ui/dialogs_stories_content.cpp`, and
-//! `Telegram/SourceFiles/dialogs/dialogs.style`.
+//! `Telegram/SourceFiles/dialogs/ui/dialogs_stories_content.cpp`,
+//! `Telegram/SourceFiles/dialogs/dialogs_widget.cpp` (`setupStories`, `updateControlsGeometry`,
+//! `storiesToggleExplicitExpand`) and `Telegram/SourceFiles/dialogs/dialogs.style`.
 //!
-//! Designed to be embedded directly at the top of `dialogs/` (or standalone)
-//! without modifying `crates/tg-app/src/dialogs/`.
+//! Collapsed, the strip has no row of its own: up to three overlapping 21 px userpics sit at the
+//! right end of the chat-list search field (`setLayoutConstraints(..., al_right, ...)`). Expanded,
+//! it is a 77 px band right under the search bar that pushes the chat list down.
+//!
+//! Internally this differs from tdesktop: tdesktop morphs one `List` widget between the small and
+//! the full geometry and drives it from the elastic-scroll overscroll; here the collapsed userpics
+//! are painted over the search field and the band is allocated in the column with an eased height.
 
 use std::f32::consts::PI;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_STRIP_ID: AtomicU64 = AtomicU64::new(1);
 
+use egui::epaint::PathStroke;
 use egui::{
     Align2, Color32, CornerRadius, FontId, Id, Painter, Pos2, Rect, RichText, Sense, Shape, Stroke,
     Ui, Vec2,
@@ -25,13 +33,25 @@ use tg_stories::{
 };
 
 use crate::stories::backend::{PeerProfile, StoriesBackend};
-use crate::stories::layout::{StoriesStripMetrics, compute_strip_layout, ring_segment_arc_angles};
+use crate::stories::layout::{
+    StoriesStripMetrics, collapsed_photo_center, collapsed_strip_geometry, compute_strip_layout,
+    ring_segment_arc_angles,
+};
 use tg_app_core::stand_in::theme::Palette;
 
-/// Expand/collapse animation duration in seconds (`st::slideWrapDuration * 1.4` ≈ 280 ms).
-const EXPAND_ANIM_SECS: f64 = 0.28;
+/// Expand/collapse duration in seconds (`kStoriesExpandDuration`, 200 ms).
+const EXPAND_ANIM_SECS: f64 = 0.2;
+/// `st::dialogsRowHeight`: scrolling the chat list this far past the expand point collapses the
+/// expanded strip (`_storiesExplicitExpandScrollTop + st::dialogsRowHeight`).
+const COLLAPSE_SCROLL_SKIP: f32 = 62.0;
+/// `dialogsStoriesList.readOpacity`: read stories' userpics in the collapsed strip.
+const READ_OPACITY: f32 = 0.6;
+/// `st::groupCallLive1`: start (top-right) of `Ui::UnreadStoryOutlineGradient`.
+const UNREAD_GRADIENT_FROM: Color32 = Color32::from_rgb(0x0D, 0xCC, 0x39);
+/// `st::groupCallMuted1`: end (bottom-left) of `Ui::UnreadStoryOutlineGradient`.
+const UNREAD_GRADIENT_TILL: Color32 = Color32::from_rgb(0x09, 0x92, 0xEF);
 
-/// User actions emitted by [`StoriesStrip::show`].
+/// User actions emitted by [`StoriesStrip::show_in_search_row`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoriesStripAction {
     /// Open the story viewer for `peer_id` in `list`.
@@ -61,13 +81,54 @@ pub enum StoriesStripAction {
     LoadMore(StorySourcesList),
     /// Expanded state toggled (`true` = Full, `false` = Small).
     ExpandedChanged(bool),
-    /// Open the story composer (`SendStoryBox`) to create and post a new story.
+    /// Open the story composer (`SendStoryBox`): the "+" badge on the own userpic.
     AddStory,
     /// Dismiss a failed outgoing story upload indicator for `peer_id`.
     DismissFailedUpload(PeerId),
 }
 
-/// Collapsible top stories strip widget (`Dialogs::Stories::List`).
+/// Where the strip lives in the chat-list column (`Dialogs::Widget::updateControlsGeometry`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StoriesSearchSlot {
+    /// The rounded search field; the collapsed userpics right-align to its right edge.
+    pub field_rect: Rect,
+    /// The search field background, used for the cut-outs between overlapping userpics.
+    pub field_bg: Color32,
+    /// The chat-list column: a wheel scroll up there at the top of the list expands the strip.
+    pub column_rect: Rect,
+    /// The chat list's vertical scroll offset.
+    pub list_scroll_y: f32,
+    /// The chat list's largest scroll offset (`0` when all chats fit).
+    pub list_scroll_max: f32,
+}
+
+impl StoriesSearchSlot {
+    /// A slot for a lone search field (previews and tests): the list is at its top and only the
+    /// field itself counts as the column.
+    #[must_use]
+    pub const fn for_field(field_rect: Rect, palette: &Palette) -> Self {
+        Self {
+            field_rect,
+            field_bg: palette.window_bg_over,
+            column_rect: field_rect,
+            list_scroll_y: 0.0,
+            list_scroll_max: 0.0,
+        }
+    }
+}
+
+/// What [`StoriesStrip::show_in_search_row`] drew this frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StoriesStripFrame {
+    /// Triggered actions.
+    pub actions: Vec<StoriesStripAction>,
+    /// The collapsed userpics inside the search field, when visible.
+    pub collapsed_rect: Option<Rect>,
+    /// The expanded band below the search bar, when it has any height.
+    pub band_rect: Option<Rect>,
+}
+
+/// The dialogs stories strip (`Dialogs::Stories::List`).
 pub struct StoriesStrip {
     instance_id: u64,
     metrics: StoriesStripMetrics,
@@ -78,6 +139,7 @@ pub struct StoriesStrip {
     context_menu_peer: Option<PeerId>,
     context_menu_pos: Pos2,
     upload_spin_phase: f32,
+    expand_scroll_top: f32,
 }
 
 impl Default for StoriesStrip {
@@ -106,6 +168,7 @@ impl StoriesStrip {
             context_menu_peer: None,
             context_menu_pos: Pos2::ZERO,
             upload_spin_phase: 0.0,
+            expand_scroll_top: 0.0,
         }
     }
 
@@ -189,26 +252,24 @@ impl StoriesStrip {
         self.bar_state.set_content(content);
     }
 
-    /// Renders the stories strip widget inside `ui`, returning any triggered [`StoriesStripAction`]s.
-    pub fn show(
-        &mut self,
-        ui: &mut Ui,
-        store: &StoriesStore,
-        backend: &dyn StoriesBackend,
-        palette: &Palette,
-    ) -> Vec<StoriesStripAction> {
-        self.sync_from_store(store, backend);
-        let mut actions = Vec::new();
+    /// The collapsed geometry inside `field_rect` for the current content
+    /// (`List::countSmallGeometry`), or `None` while there is nothing to show.
+    #[must_use]
+    pub fn collapsed_rect(&self, field_rect: Rect) -> Option<Rect> {
+        let count = self.bar_state.small_visible_indices().len();
+        (count > 0).then(|| collapsed_strip_geometry(&self.metrics, field_rect, count))
+    }
 
-        let uploads = backend.pending_uploads();
-        // `Dialogs::Stories::List` stays hidden while its content has no elements, so the chat
-        // list search sits directly under the window title when there are no stories.
-        if self.bar_state.content().elements.is_empty() && uploads.is_empty() {
-            return actions;
-        }
-        let hidden_count = store.sources(StorySourcesList::Hidden).len();
+    /// Height of the expanded band for the current animation progress
+    /// (`_aboveScrollAdded`, eased with `anim::sineInOut`).
+    #[must_use]
+    pub fn band_height(&self) -> f32 {
+        let t = self.anim_progress.clamp(0.0, 1.0);
+        let eased = 0.5 - (PI as f64 * t).cos() / 2.0;
+        (f64::from(self.metrics.full_height) * eased).round() as f32
+    }
 
-        // Advance expand/collapse animation smoothly.
+    fn step_animation(&mut self, ui: &Ui) {
         let now_t = ui.input(|i| i.time);
         let dt = self
             .last_frame_time
@@ -233,119 +294,167 @@ impl StoriesStrip {
             self.anim_progress = target;
         }
 
-        // Advance upload spinner when any upload is active.
-        let has_upload = uploads.iter().any(|u| !u.failed)
-            || self
-                .bar_state
-                .content()
-                .elements
-                .iter()
-                .any(|e| e.uploading && !e.upload_failed);
-        if has_upload {
+        let uploading = self
+            .bar_state
+            .content()
+            .elements
+            .iter()
+            .any(|e| e.uploading && !e.upload_failed);
+        if uploading {
             self.upload_spin_phase = (self.upload_spin_phase + dt as f32 * 2.1) % (2.0 * PI);
             ui.ctx().request_repaint();
         }
+    }
 
-        let width = ui.available_width().max(120.0);
-        self.bar_state.set_viewport_width(width as i32);
-        let layout =
-            compute_strip_layout(&self.bar_state, &self.metrics, width, self.anim_progress);
-
-        let (strip_rect, strip_resp) =
-            ui.allocate_exact_size(Vec2::new(width, layout.height), Sense::click_and_drag());
-
-        // Background + bottom 1px divider.
-        let painter = ui.painter().with_clip_rect(strip_rect);
-        painter.rect_filled(strip_rect, 0.0, palette.window_bg);
-        painter.line_segment(
-            [
-                Pos2::new(strip_rect.left(), strip_rect.bottom() - 0.5),
-                Pos2::new(strip_rect.right(), strip_rect.bottom() - 0.5),
-            ],
-            Stroke::new(1.0, palette.divider),
-        );
-
-        // Handle wheel scrolling: horizontal scrolls items; vertical down/up expands/collapses.
-        if strip_resp.hovered() {
-            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-            if self.anim_progress > 0.5 {
-                let dx = if scroll_delta.x.abs() > 0.5 {
-                    -scroll_delta.x
-                } else {
-                    0.0
-                };
-                if dx.abs() > 0.5 && self.bar_state.scroll_by(dx.round() as i32) {
-                    actions.push(StoriesStripAction::LoadMore(self.active_list));
-                }
-                if scroll_delta.y < -18.0 && self.bar_state.is_expanded() {
-                    self.request_expanded(false);
-                    actions.push(StoriesStripAction::ExpandedChanged(false));
-                }
-            } else if scroll_delta.y > 18.0 && !self.bar_state.is_expanded() {
-                self.request_expanded(true);
-                actions.push(StoriesStripAction::ExpandedChanged(true));
-            }
+    fn expand(&mut self, list_scroll_y: f32, actions: &mut Vec<StoriesStripAction>) {
+        if !self.bar_state.is_expanded() {
+            self.expand_scroll_top = list_scroll_y;
+            self.request_expanded(true);
+            actions.push(StoriesStripAction::ExpandedChanged(true));
         }
+    }
 
-        // Handle horizontal drag scrolling in expanded mode.
-        if self.anim_progress > 0.5 && strip_resp.dragged() {
-            let dx = -strip_resp.drag_delta().x;
-            if dx.abs() > 0.5 && self.bar_state.scroll_by(dx.round() as i32) {
-                actions.push(StoriesStripAction::LoadMore(self.active_list));
-            }
+    fn collapse(&mut self, actions: &mut Vec<StoriesStripAction>) {
+        if self.bar_state.is_expanded() {
+            self.request_expanded(false);
+            actions.push(StoriesStripAction::ExpandedChanged(false));
         }
+    }
 
+    /// Renders the strip for the chat-list search row: the collapsed userpics over the right end
+    /// of `slot.field_rect`, and, while expanded, the full strip in a band allocated at the
+    /// cursor of `ui` (right under the search bar).
+    pub fn show_in_search_row(
+        &mut self,
+        ui: &mut Ui,
+        slot: StoriesSearchSlot,
+        store: &StoriesStore,
+        backend: &dyn StoriesBackend,
+        palette: &Palette,
+    ) -> StoriesStripFrame {
+        self.sync_from_store(store, backend);
+        let mut frame = StoriesStripFrame::default();
+        // `Dialogs::Stories::List` stays hidden while its content has no elements.
+        if self.bar_state.content().elements.is_empty() {
+            if self.bar_state.is_expanded() || self.anim_progress > 0.0 {
+                self.set_expanded_immediate(false);
+            }
+            return frame;
+        }
+        self.step_animation(ui);
         let content = self.bar_state.content().clone();
+        let hidden_count = store.sources(StorySourcesList::Hidden).len();
 
-        if layout.expand_ratio < 0.35 {
-            self.paint_collapsed_bar(
+        // A collapse is due once the list scrolled a row past where the strip expanded.
+        if self.bar_state.is_expanded()
+            && slot.list_scroll_y > self.expand_scroll_top + COLLAPSE_SCROLL_SKIP
+        {
+            self.collapse(&mut frame.actions);
+        }
+
+        // Raw wheel input of this frame (positive = up): the chat list's scroll area consumes
+        // the smoothed delta, and a pull is a direction, not a distance.
+        let (pointer, scroll_y) = ui.input(|i| {
+            let wheel: f32 = i
+                .raw
+                .events
+                .iter()
+                .map(|e| match e {
+                    egui::Event::MouseWheel { delta, .. } => delta.y,
+                    _ => 0.0,
+                })
+                .sum();
+            (i.pointer.hover_pos(), wheel)
+        });
+        let small_opacity = (1.0 - self.anim_progress as f32).clamp(0.0, 1.0);
+        if small_opacity > 0.01
+            && let Some(small) = self.collapsed_rect(slot.field_rect)
+        {
+            self.paint_collapsed(
                 ui,
-                &painter,
-                strip_rect,
+                small,
+                slot.field_bg,
                 &content,
-                &uploads,
                 backend,
                 palette,
-                hidden_count,
-                &strip_resp,
-                &mut actions,
+                small_opacity,
             );
-        } else {
+            let resp = ui.interact(
+                small,
+                ui.make_persistent_id(("stories_strip_small", self.instance_id)),
+                // Also senses drag so the press does not reach the search field's text edit
+                // under the userpics (it focuses on a drag start).
+                Sense::click_and_drag(),
+            );
+            let tooltip = format_tooltip_summary(&self.bar_state.tooltip_summary());
+            if resp.on_hover_text(tooltip).clicked() {
+                self.expand(slot.list_scroll_y, &mut frame.actions);
+            }
+            frame.collapsed_rect = Some(small);
+        }
+
+        // Scrolling up at the top of the chat list pulls the strip down; scrolling down past
+        // the bottom collapses it (`position.overscroll > 0` in `setupStories`).
+        let over_column = pointer.is_some_and(|p| slot.column_rect.contains(p));
+        if over_column && scroll_y > 0.5 && slot.list_scroll_y <= 0.5 {
+            self.expand(slot.list_scroll_y, &mut frame.actions);
+        } else if over_column && scroll_y < -0.5 && slot.list_scroll_y >= slot.list_scroll_max - 0.5
+        {
+            self.collapse(&mut frame.actions);
+        }
+
+        let band_h = self.band_height();
+        if band_h >= 1.0 {
+            let width = ui.available_width().max(120.0);
+            self.bar_state.set_viewport_width(width as i32);
+            let (band, band_resp) =
+                ui.allocate_exact_size(Vec2::new(width, band_h), Sense::click_and_drag());
+            // The full strip slides out from under the search bar.
+            let full = Rect::from_min_size(
+                Pos2::new(band.left(), band.bottom() - self.metrics.full_height),
+                Vec2::new(width, self.metrics.full_height),
+            );
+            let painter = ui.painter().with_clip_rect(band);
+            painter.rect_filled(band, 0.0, palette.window_bg);
+
+            if band_resp.hovered() && self.anim_progress > 0.5 {
+                let delta = ui.input(|i| i.smooth_scroll_delta);
+                if delta.x.abs() > 0.5 && self.bar_state.scroll_by((-delta.x).round() as i32) {
+                    frame
+                        .actions
+                        .push(StoriesStripAction::LoadMore(self.active_list));
+                }
+                // The band is outside the chat list's scroll area; a wheel down over it scrolls
+                // the list in tdesktop, which collapses the strip after a row.
+                if scroll_y < -0.5 {
+                    self.collapse(&mut frame.actions);
+                }
+            }
+            if self.anim_progress > 0.5 && band_resp.dragged() {
+                let dx = -band_resp.drag_delta().x;
+                if dx.abs() > 0.5 && self.bar_state.scroll_by(dx.round() as i32) {
+                    frame
+                        .actions
+                        .push(StoriesStripAction::LoadMore(self.active_list));
+                }
+            }
+
+            let layout = compute_strip_layout(&self.bar_state, &self.metrics, width, 1.0);
             self.paint_expanded_bar(
                 ui,
                 &painter,
-                strip_rect,
+                full,
+                band,
                 &layout,
                 &content,
-                &uploads,
                 backend,
                 palette,
                 hidden_count,
-                &mut actions,
+                &mut frame.actions,
             );
+            frame.band_rect = Some(band);
         }
 
-        // Bottom thin upload progress bar synced from `backend.pending_uploads()`.
-        if let Some(first_upload) = uploads.first() {
-            let bar_h = 2.5;
-            let bar_frac = if first_upload.failed {
-                1.0
-            } else {
-                (first_upload.progress as f32).clamp(0.05, 1.0)
-            };
-            let bar_color = if first_upload.failed {
-                palette.attention_fg
-            } else {
-                Color32::from_rgb(0x3B, 0xA8, 0xF5)
-            };
-            let bar_rect = Rect::from_min_size(
-                Pos2::new(strip_rect.left(), strip_rect.bottom() - bar_h),
-                Vec2::new(strip_rect.width() * bar_frac, bar_h),
-            );
-            painter.rect_filled(bar_rect, 0.0, bar_color);
-        }
-
-        // Render right-click context menu if open.
         if let Some(menu_peer) = self.context_menu_peer {
             self.show_context_menu(
                 ui.ctx(),
@@ -353,164 +462,74 @@ impl StoriesStrip {
                 backend,
                 palette,
                 hidden_count,
-                &mut actions,
+                &mut frame.actions,
             );
         }
-
-        actions
+        frame
     }
 
+    /// Paints the collapsed userpics (`List::paint` with `expandRatio == 0`): right to left so the
+    /// first one is on top, each cut out of its neighbour in the field colour, with the unread
+    /// gradient ring and read userpics at `readOpacity`.
     #[allow(clippy::too_many_arguments)]
-    fn paint_collapsed_bar(
-        &mut self,
-        ui: &mut Ui,
-        painter: &Painter,
-        strip_rect: Rect,
+    fn paint_collapsed(
+        &self,
+        ui: &Ui,
+        small: Rect,
+        field_bg: Color32,
         content: &DialogStoriesContent,
-        uploads: &[tg_stories::StoryUploadStatus],
         backend: &dyn StoriesBackend,
         palette: &Palette,
-        hidden_count: usize,
-        strip_resp: &egui::Response,
-        actions: &mut Vec<StoriesStripAction>,
+        opacity: f32,
     ) {
-        if strip_resp.hovered() {
-            painter.rect_filled(strip_rect, 0.0, palette.window_bg_over);
-        }
-
-        let visible_indices = self.bar_state.small_visible_indices();
-        let photo_d = self.metrics.small_photo;
-        let radius = photo_d / 2.0;
-        let cy = strip_rect.center().y;
-        let base_x = strip_rect.left() + self.metrics.small_left + 8.0 + radius;
-
-        // Paint overlapping mini userpics right-to-left so the leftmost story sits on top.
-        for (slot_idx, &elem_idx) in visible_indices.iter().enumerate().rev() {
-            let elem = &content.elements[elem_idx];
-            let peer_id = PeerId(elem.id as i64);
-            let profile = backend.peer_profile(peer_id);
-            let cx = base_x + (slot_idx as f32) * self.metrics.small_shift;
-            let center = Pos2::new(cx, cy);
-
-            // Cutout halo matching `dialogsBg`.
-            painter.circle_filled(center, radius + 3.0, palette.window_bg);
-            // Unread/live ring in small mode.
-            let ring_color = if elem.has_video_stream {
-                Color32::from_rgb(0xE5, 0x39, 0x35)
-            } else if elem.is_unread_in_small() {
-                Color32::from_rgb(0x3B, 0xA8, 0xF5)
-            } else {
-                palette.unread_badge_muted_bg
+        let painter = ui.painter();
+        let m = &self.metrics;
+        let radius = m.small_photo / 2.0;
+        let line = m.small_line;
+        let visible = self.bar_state.small_visible_indices();
+        for (slot_idx, &elem_idx) in visible.iter().enumerate().rev() {
+            let Some(elem) = content.elements.get(elem_idx) else {
+                continue;
             };
-            painter.circle_stroke(
+            let center = collapsed_photo_center(m, small, slot_idx);
+            let profile = backend.peer_profile(PeerId(elem.id as i64));
+            let unread = elem.is_unread_in_small();
+            let ring_radius = radius + 1.5 * line;
+            if elem.uploading {
+                let color = if elem.upload_failed {
+                    palette.attention_fg
+                } else {
+                    UNREAD_GRADIENT_TILL
+                };
+                let sweep = ((f32::from(elem.upload_progress) / 100.0) * 2.0 * PI).max(0.35);
+                let start = -PI / 2.0 + self.upload_spin_phase;
+                paint_arc(
+                    painter,
+                    center,
+                    ring_radius,
+                    start,
+                    start + sweep,
+                    Stroke::new(line, color.gamma_multiply(opacity)),
+                );
+            } else if elem.has_video_stream {
+                painter.circle_stroke(
+                    center,
+                    ring_radius,
+                    Stroke::new(line, palette.attention_fg.gamma_multiply(opacity)),
+                );
+            } else if unread {
+                paint_gradient_circle(painter, center, radius, ring_radius, line, opacity);
+            }
+            painter.circle_filled(center, radius + line, field_bg.gamma_multiply(opacity));
+            let photo_opacity = if unread { 1.0 } else { READ_OPACITY };
+            paint_avatar_circle_faded(
+                painter,
                 center,
-                radius + 1.4,
-                Stroke::new(self.metrics.small_line, ring_color),
+                radius,
+                &profile,
+                9.0,
+                opacity * photo_opacity,
             );
-            paint_avatar_circle(painter, center, radius - 0.5, &profile, 9.5);
-        }
-
-        let thumbs_right = if visible_indices.is_empty() {
-            strip_rect.left() + 12.0
-        } else {
-            base_x
-                + ((visible_indices.len().saturating_sub(1)) as f32) * self.metrics.small_shift
-                + radius
-                + 11.0
-        };
-
-        let title = if let Some(u) = uploads.first() {
-            if u.failed {
-                "Story upload failed".to_owned()
-            } else {
-                let pct = (u.progress.clamp(0.0, 1.0) * 100.0).round() as u8;
-                format!("Uploading story {pct}%")
-            }
-        } else {
-            match self.active_list {
-                StorySourcesList::NotHidden => {
-                    if content.total == 0 {
-                        "Stories".to_owned()
-                    } else if content.total == 1 {
-                        "1 story".to_owned()
-                    } else {
-                        format!("{} stories", content.total)
-                    }
-                }
-                StorySourcesList::Hidden => format!("Archived stories ({})", content.total),
-            }
-        };
-        let title_color = if uploads.first().is_some_and(|u| u.failed) {
-            palette.attention_fg
-        } else {
-            palette.window_bold_fg
-        };
-        painter.text(
-            Pos2::new(thumbs_right, cy),
-            Align2::LEFT_CENTER,
-            title,
-            FontId::proportional(13.0),
-            title_color,
-        );
-
-        // "+ Add Story" button on the right, left of the expand chevron (leaving strip_rect.center()
-        // unobstructed so clicking the center of the collapsed bar still expands the strip).
-        let add_btn_w = 84.0_f32.min((strip_rect.width() * 0.34).max(66.0));
-        let add_btn_rect = Rect::from_min_size(
-            Pos2::new(strip_rect.right() - 26.0 - add_btn_w, cy - 11.0),
-            Vec2::new(add_btn_w, 22.0),
-        );
-        let mut add_clicked = false;
-        let mut add_ui = ui.new_child(egui::UiBuilder::new().max_rect(add_btn_rect));
-        let add_btn = egui::Button::new(
-            RichText::new("+ Add Story")
-                .size(11.0)
-                .strong()
-                .color(palette.window_fg_active),
-        )
-        .fill(palette.window_bg_active)
-        .corner_radius(CornerRadius::same(11))
-        .min_size(add_btn_rect.size());
-        if add_ui
-            .add(add_btn)
-            .on_hover_text("Post a new story")
-            .clicked()
-        {
-            add_clicked = true;
-            actions.push(StoriesStripAction::AddStory);
-        }
-
-        // Right-side expand chevron indicator.
-        let chev_x = strip_rect.right() - 14.0;
-        let chev_stroke = Stroke::new(1.6, palette.window_sub_text_fg);
-        painter.line_segment(
-            [
-                Pos2::new(chev_x - 4.0, cy - 2.0),
-                Pos2::new(chev_x, cy + 2.5),
-            ],
-            chev_stroke,
-        );
-        painter.line_segment(
-            [
-                Pos2::new(chev_x, cy + 2.5),
-                Pos2::new(chev_x + 4.0, cy - 2.0),
-            ],
-            chev_stroke,
-        );
-
-        // Tooltip listing up to `MAX_TOOLTIP_NAMES` (3) peer names (`List::computeTooltipText`).
-        let tooltip = format_tooltip_summary(&self.bar_state.tooltip_summary());
-        let resp = strip_resp.clone().on_hover_text(tooltip);
-        let clicked_in_add = resp
-            .interact_pointer_pos()
-            .is_some_and(|p| add_btn_rect.contains(p));
-        if resp.clicked() && !add_clicked && !clicked_in_add {
-            self.request_expanded(true);
-            actions.push(StoriesStripAction::ExpandedChanged(true));
-        } else if resp.secondary_clicked() && hidden_count > 0 {
-            let next = self.active_list.other();
-            self.set_active_list(next);
-            actions.push(StoriesStripAction::SwitchList(next));
         }
     }
 
@@ -520,20 +539,19 @@ impl StoriesStrip {
         ui: &mut Ui,
         painter: &Painter,
         strip_rect: Rect,
+        hit_rect: Rect,
         layout: &crate::stories::layout::StripRenderLayout,
         content: &DialogStoriesContent,
-        uploads: &[tg_stories::StoryUploadStatus],
         backend: &dyn StoriesBackend,
         palette: &Palette,
         hidden_count: usize,
         actions: &mut Vec<StoriesStripAction>,
     ) {
-        let photo_d = layout.photo_size;
+        let photo_d = self.metrics.full_photo;
         let photo_r = photo_d / 2.0;
         let photo_top = strip_rect.top() + self.metrics.full_photo_top;
         let name_y = strip_rect.top() + self.metrics.full_name_top;
 
-        // Paint each visible story source cell first so top-right controls paint & hit-test above them.
         for (i, elem) in content.elements.iter().enumerate() {
             let cell_left = strip_rect.left() + layout.left_full + (i as f32) * layout.single_full;
             let cell_rect = Rect::from_min_size(
@@ -549,7 +567,7 @@ impl StoriesStrip {
             let center = Pos2::new(cell_rect.center().x, photo_top + photo_r);
 
             let item_resp = ui.interact(
-                cell_rect.intersect(strip_rect),
+                cell_rect.intersect(hit_rect),
                 ui.make_persistent_id((
                     "stories_strip_item",
                     self.instance_id,
@@ -558,35 +576,25 @@ impl StoriesStrip {
                 )),
                 Sense::click(),
             );
-            if item_resp.hovered() {
-                painter.circle_filled(center, photo_r + 6.0, palette.window_bg_over);
-            }
 
-            // Paint segmented unread/read/live ring around avatar.
             paint_story_ring(
                 painter,
                 center,
-                photo_r + 3.2,
+                photo_r + 3.0,
                 elem,
                 &self.metrics,
                 palette,
                 self.upload_spin_phase,
             );
+            paint_avatar_circle(painter, center, photo_r, &profile, 14.5);
 
-            // Paint circular avatar (slightly dimmed if all read, matching `readOpacity: 0.6`).
-            paint_avatar_circle(painter, center, photo_r - 0.5, &profile, 14.5);
-
-            // Paint LIVE pill on live video stream sources, or `+` badge on self avatar.
+            let mut add_clicked = false;
             if elem.has_video_stream {
                 let pill_rect = Rect::from_center_size(
                     Pos2::new(center.x, center.y + photo_r - 1.0),
                     Vec2::new(28.0, 12.0),
                 );
-                painter.rect_filled(
-                    pill_rect,
-                    CornerRadius::same(6),
-                    Color32::from_rgb(0xE5, 0x39, 0x35),
-                );
+                painter.rect_filled(pill_rect, CornerRadius::same(6), palette.attention_fg);
                 painter.rect_stroke(
                     pill_rect,
                     CornerRadius::same(6),
@@ -600,66 +608,50 @@ impl StoriesStrip {
                     FontId::proportional(8.0),
                     Color32::WHITE,
                 );
-            } else if elem.mine {
+            } else if elem.mine && !elem.uploading {
+                // `List::paintAddBadge`: a click on it posts a new story (`addStoryClicks`).
                 let badge_c = Pos2::new(center.x + photo_r * 0.68, center.y + photo_r * 0.68);
-                painter.circle_filled(badge_c, 8.0, palette.window_bg);
-                painter.circle_filled(badge_c, 6.5, palette.window_bg_active);
-                let plus_stroke = Stroke::new(1.6, Color32::WHITE);
+                painter.circle_filled(badge_c, 9.0, palette.window_bg);
+                painter.circle_filled(badge_c, 7.0, palette.window_bg_active);
+                let plus_stroke = Stroke::new(2.0, palette.window_fg_active);
                 painter.line_segment(
                     [
-                        Pos2::new(badge_c.x - 3.0, badge_c.y),
-                        Pos2::new(badge_c.x + 3.0, badge_c.y),
+                        Pos2::new(badge_c.x - 4.0, badge_c.y),
+                        Pos2::new(badge_c.x + 4.0, badge_c.y),
                     ],
                     plus_stroke,
                 );
                 painter.line_segment(
                     [
-                        Pos2::new(badge_c.x, badge_c.y - 3.0),
-                        Pos2::new(badge_c.x, badge_c.y + 3.0),
+                        Pos2::new(badge_c.x, badge_c.y - 4.0),
+                        Pos2::new(badge_c.x, badge_c.y + 4.0),
                     ],
                     plus_stroke,
                 );
+                let badge_rect = Rect::from_center_size(badge_c, Vec2::splat(18.0));
+                add_clicked = item_resp.clicked()
+                    && item_resp
+                        .interact_pointer_pos()
+                        .is_some_and(|p| badge_rect.contains(p));
             }
 
-            // Peer short name beneath userpic (`nameTop = 56px`, `font = 11px`).
-            if layout.name_opacity > 0.05 {
-                let name_color = if elem.unread_count > 0 || elem.has_video_stream || elem.mine {
-                    palette.window_bold_fg
-                } else {
-                    palette.window_sub_text_fg
-                };
-                let alpha = (layout.name_opacity * 255.0).round() as u8;
-                let faded = Color32::from_rgba_unmultiplied(
-                    name_color.r(),
-                    name_color.g(),
-                    name_color.b(),
-                    alpha,
-                );
-                let label = truncate_short_name(&elem.name, 9);
-                painter.text(
-                    Pos2::new(center.x, name_y + 6.0),
-                    Align2::CENTER_CENTER,
-                    label,
-                    FontId::proportional(11.0),
-                    faded,
-                );
-            }
-
-            let hover_hint = if elem.has_video_stream {
-                format!("{} — Live video stream", profile.name)
-            } else if elem.unread_count > 0 {
-                format!(
-                    "{} — {} unread of {} stories (Right-click for menu)",
-                    profile.name, elem.unread_count, elem.count
-                )
+            let name_color = if elem.unread_count > 0 || elem.has_video_stream || elem.mine {
+                palette.window_bold_fg
             } else {
-                format!(
-                    "{} — {} stories (Right-click for menu)",
-                    profile.name, elem.count
-                )
+                palette.window_sub_text_fg
             };
-            let item_resp = item_resp.on_hover_text(hover_hint);
-            if item_resp.clicked() {
+            painter.text(
+                Pos2::new(center.x, name_y + 6.0),
+                Align2::CENTER_CENTER,
+                truncate_short_name(&elem.name, 9),
+                FontId::proportional(11.0),
+                name_color,
+            );
+
+            let item_resp = item_resp.on_hover_text(profile.name.clone());
+            if add_clicked {
+                actions.push(StoriesStripAction::AddStory);
+            } else if item_resp.clicked() {
                 self.context_menu_peer = None;
                 actions.push(StoriesStripAction::OpenStory {
                     peer_id,
@@ -673,7 +665,7 @@ impl StoriesStrip {
             }
         }
 
-        // Render an archive chip at the end of the main strip if hidden sources exist.
+        // Archive chip at the end of the main strip if hidden sources exist.
         if self.active_list == StorySourcesList::NotHidden && hidden_count > 0 {
             let idx = content.elements.len();
             let cell_left =
@@ -685,7 +677,7 @@ impl StoriesStrip {
             if cell_rect.left() < strip_rect.right() {
                 let center = Pos2::new(cell_rect.center().x, photo_top + photo_r);
                 let resp = ui.interact(
-                    cell_rect.intersect(strip_rect),
+                    cell_rect.intersect(hit_rect),
                     ui.make_persistent_id(("stories_strip_archived_chip", self.instance_id)),
                     Sense::click(),
                 );
@@ -701,7 +693,7 @@ impl StoriesStrip {
                 painter.circle_stroke(
                     center,
                     photo_r + 2.5,
-                    Stroke::new(1.2, palette.unread_badge_muted_bg),
+                    Stroke::new(1.0, palette.unread_badge_muted_bg),
                 );
                 painter.text(
                     center,
@@ -724,117 +716,44 @@ impl StoriesStrip {
             }
         }
 
-        // Collapse chevron button in the top-right corner of the strip.
-        let collapse_rect = Rect::from_min_size(
-            Pos2::new(strip_rect.right() - 24.0, strip_rect.top() + 4.0),
-            Vec2::splat(20.0),
-        );
-        let collapse_resp = ui.interact(
-            collapse_rect,
-            ui.make_persistent_id(("stories_strip_collapse_btn", self.instance_id)),
-            Sense::click(),
-        );
-        if collapse_resp.hovered() {
-            painter.circle_filled(collapse_rect.center(), 9.0, palette.window_bg_over);
-        }
-        let c = collapse_rect.center();
-        let chev_stroke = Stroke::new(1.5, palette.window_sub_text_fg);
-        painter.line_segment(
-            [Pos2::new(c.x - 3.5, c.y + 1.5), Pos2::new(c.x, c.y - 2.0)],
-            chev_stroke,
-        );
-        painter.line_segment(
-            [Pos2::new(c.x, c.y - 2.0), Pos2::new(c.x + 3.5, c.y + 1.5)],
-            chev_stroke,
-        );
-        if collapse_resp
-            .on_hover_text("Collapse stories strip")
-            .clicked()
+        // A failed upload keeps a dismiss pill in the corner.
+        if let Some(failed) = content
+            .elements
+            .iter()
+            .find(|e| e.uploading && e.upload_failed)
         {
-            self.request_expanded(false);
-            actions.push(StoriesStripAction::ExpandedChanged(false));
-        }
-
-        // "+ Add Story" button in the top-right controls area of the expanded strip.
-        let add_right_anchor = if self.active_list == StorySourcesList::Hidden {
-            strip_rect.right() - 94.0
-        } else {
-            strip_rect.right() - 28.0
-        };
-        let add_btn_rect = Rect::from_min_size(
-            Pos2::new(add_right_anchor - 84.0, strip_rect.top() + 4.0),
-            Vec2::new(82.0, 20.0),
-        );
-        if add_btn_rect.left() > strip_rect.left() + 4.0 {
-            let mut add_ui = ui.new_child(egui::UiBuilder::new().max_rect(add_btn_rect));
-            let add_btn = egui::Button::new(
-                RichText::new("+ Add Story")
-                    .size(10.5)
-                    .strong()
-                    .color(palette.window_fg_active),
-            )
-            .fill(palette.window_bg_active)
-            .corner_radius(CornerRadius::same(10))
-            .min_size(add_btn_rect.size());
-            if add_ui
-                .add(add_btn)
-                .on_hover_text("Post a new story")
-                .clicked()
-            {
-                actions.push(StoriesStripAction::AddStory);
-            }
-        }
-
-        // Upload status pill (with Dismiss button if failed) in the bottom-right corner.
-        if let Some(upload) = uploads.first() {
-            let status_text = if upload.failed {
-                "Upload failed ×".to_owned()
-            } else {
-                let pct = (upload.progress.clamp(0.0, 1.0) * 100.0).round() as u8;
-                format!("Uploading {pct}%")
-            };
             let pill_rect = Rect::from_min_size(
                 Pos2::new(strip_rect.right() - 108.0, strip_rect.bottom() - 23.0),
                 Vec2::new(102.0, 18.0),
             );
             let pill_resp = ui.interact(
-                pill_rect,
+                pill_rect.intersect(hit_rect),
                 ui.make_persistent_id(("stories_strip_upload_status", self.instance_id)),
-                if upload.failed {
-                    Sense::click()
-                } else {
-                    Sense::hover()
-                },
+                Sense::click(),
             );
-            painter.rect_filled(
-                pill_rect,
-                CornerRadius::same(9),
-                if upload.failed {
-                    palette.attention_fg
-                } else {
-                    Color32::from_rgb(0x3B, 0xA8, 0xF5)
-                },
-            );
+            painter.rect_filled(pill_rect, CornerRadius::same(9), palette.attention_fg);
             painter.text(
                 pill_rect.center(),
                 Align2::CENTER_CENTER,
-                status_text,
+                "Upload failed ×",
                 FontId::proportional(10.0),
                 Color32::WHITE,
             );
-            if upload.failed && pill_resp.on_hover_text("Dismiss failed upload").clicked() {
-                actions.push(StoriesStripAction::DismissFailedUpload(upload.peer_id));
+            if pill_resp.on_hover_text("Dismiss failed upload").clicked() {
+                actions.push(StoriesStripAction::DismissFailedUpload(PeerId(
+                    failed.id as i64,
+                )));
             }
         }
 
-        // Archived badge/switch pill when viewing hidden list.
+        // "Main" pill back from the archived list.
         if self.active_list == StorySourcesList::Hidden {
             let back_rect = Rect::from_min_size(
-                Pos2::new(strip_rect.right() - 88.0, strip_rect.top() + 4.0),
+                Pos2::new(strip_rect.right() - 68.0, strip_rect.top() + 4.0),
                 Vec2::new(60.0, 18.0),
             );
             let back_resp = ui.interact(
-                back_rect,
+                back_rect.intersect(hit_rect),
                 ui.make_persistent_id(("stories_strip_back_main", self.instance_id)),
                 Sense::click(),
             );
@@ -967,6 +886,18 @@ pub fn paint_avatar_circle(
     profile: &PeerProfile,
     font_size: f32,
 ) {
+    paint_avatar_circle_faded(painter, center, radius, profile, font_size, 1.0);
+}
+
+/// [`paint_avatar_circle`] at `opacity` (`readOpacity` for read stories in the collapsed strip).
+pub fn paint_avatar_circle_faded(
+    painter: &Painter,
+    center: Pos2,
+    radius: f32,
+    profile: &PeerProfile,
+    font_size: f32,
+    opacity: f32,
+) {
     let [r0, g0, b0] = profile.avatar_top_rgb;
     let [r1, g1, b1] = profile.avatar_bottom_rgb;
     let mid = Color32::from_rgb(
@@ -974,20 +905,50 @@ pub fn paint_avatar_circle(
         ((u16::from(g0) + u16::from(g1)) / 2) as u8,
         ((u16::from(b0) + u16::from(b1)) / 2) as u8,
     );
-    painter.circle_filled(center, radius, mid);
+    painter.circle_filled(center, radius, mid.gamma_multiply(opacity));
     // Subtle top highlight arc for tdesktop avatar depth.
     painter.circle_filled(
         Pos2::new(center.x, center.y - radius * 0.22),
         radius * 0.65,
-        Color32::from_rgba_unmultiplied(r0, g0, b0, 110),
+        Color32::from_rgba_unmultiplied(r0, g0, b0, 110).gamma_multiply(opacity),
     );
     painter.text(
         center,
         Align2::CENTER_CENTER,
         &profile.initials,
         FontId::proportional(font_size),
-        Color32::WHITE,
+        Color32::WHITE.gamma_multiply(opacity),
     );
+}
+
+/// `Ui::UnreadStoryOutlineGradient` over the userpic square of `photo_radius` around `center`:
+/// `groupCallLive1` at the top-right corner to `groupCallMuted1` at the bottom-left one.
+fn unread_gradient_stroke(center: Pos2, photo_radius: f32, width: f32, opacity: f32) -> PathStroke {
+    let from = Pos2::new(center.x + photo_radius, center.y - photo_radius);
+    let dir = Vec2::new(-2.0 * photo_radius, 2.0 * photo_radius);
+    let len_sq = dir.length_sq().max(f32::EPSILON);
+    PathStroke::new_uv(width, move |_bounds, pos| {
+        let t = ((pos - from).dot(dir) / len_sq).clamp(0.0, 1.0);
+        UNREAD_GRADIENT_FROM
+            .lerp_to_gamma(UNREAD_GRADIENT_TILL, t)
+            .gamma_multiply(opacity)
+    })
+}
+
+/// Unread ring of a collapsed userpic: one gradient circle of `ring_radius`.
+fn paint_gradient_circle(
+    painter: &Painter,
+    center: Pos2,
+    photo_radius: f32,
+    ring_radius: f32,
+    width: f32,
+    opacity: f32,
+) {
+    let points = arc_points(center, ring_radius, -PI / 2.0, 3.0 * PI / 2.0);
+    painter.add(Shape::closed_line(
+        points,
+        unread_gradient_stroke(center, photo_radius, width, opacity),
+    ));
 }
 
 /// Paints segmented story rings matching `List::validateSegments` (`dialogs_stories_list.cpp`).
@@ -1005,7 +966,7 @@ pub fn paint_story_ring(
         let color = if element.upload_failed {
             palette.attention_fg
         } else {
-            Color32::from_rgb(0x3B, 0xA8, 0xF5)
+            UNREAD_GRADIENT_TILL
         };
         let sweep = ((f32::from(element.upload_progress) / 100.0) * 2.0 * PI).max(0.35);
         let start = -PI / 2.0 + upload_spin_phase;
@@ -1025,32 +986,42 @@ pub fn paint_story_ring(
         return;
     }
     let total = segments.len() as u32;
+    let photo_radius = metrics.full_photo / 2.0;
     for seg in &segments {
         let (start, end) = ring_segment_arc_angles(total, seg.index);
-        let (color, width) = match seg.kind {
-            RingSegmentKind::VideoStream => (
-                Color32::from_rgb(0xE5, 0x39, 0x35),
-                metrics.full_line_unread + 0.5,
-            ),
-            RingSegmentKind::Unread => {
-                // Smooth teal -> sky-blue gradient sweep along segment angle.
-                let frac = (seg.index as f32) / (total.max(1) as f32);
-                let r = (42.0 + 54.0 * frac) as u8;
-                let g = (212.0 - 52.0 * frac) as u8;
-                let b = (176.0 + 70.0 * frac) as u8;
-                (Color32::from_rgb(r, g, b), metrics.full_line_unread)
+        let points = arc_points(center, radius, start, end);
+        match seg.kind {
+            RingSegmentKind::VideoStream => {
+                painter.add(Shape::line(
+                    points,
+                    Stroke::new(metrics.full_line_unread, palette.attention_fg),
+                ));
             }
-            RingSegmentKind::Read => (palette.unread_badge_muted_bg, metrics.full_line_read),
-        };
-        paint_arc(
-            painter,
-            center,
-            radius,
-            start,
-            end,
-            Stroke::new(width, color),
-        );
+            RingSegmentKind::Unread => {
+                painter.add(Shape::line(
+                    points,
+                    unread_gradient_stroke(center, photo_radius, metrics.full_line_unread, 1.0),
+                ));
+            }
+            RingSegmentKind::Read => {
+                painter.add(Shape::line(
+                    points,
+                    Stroke::new(metrics.full_line_read, palette.unread_badge_muted_bg),
+                ));
+            }
+        }
     }
+}
+
+fn arc_points(center: Pos2, radius: f32, start_rad: f32, end_rad: f32) -> Vec<Pos2> {
+    let sweep = (end_rad - start_rad).abs();
+    let steps = ((sweep * radius / 3.0).ceil() as usize).clamp(4, 64);
+    (0..=steps)
+        .map(|i| {
+            let a = start_rad + (end_rad - start_rad) * (i as f32 / steps as f32);
+            Pos2::new(center.x + radius * a.cos(), center.y + radius * a.sin())
+        })
+        .collect()
 }
 
 /// Draws a smooth circular arc polyline from `start_rad` to `end_rad`.
@@ -1062,18 +1033,10 @@ pub fn paint_arc(
     end_rad: f32,
     stroke: Stroke,
 ) {
-    let sweep = (end_rad - start_rad).abs();
-    let steps = ((sweep * radius / 3.0).ceil() as usize).clamp(4, 64);
-    let mut points = Vec::with_capacity(steps + 1);
-    for i in 0..=steps {
-        let t = i as f32 / steps as f32;
-        let a = start_rad + (end_rad - start_rad) * t;
-        points.push(Pos2::new(
-            center.x + radius * a.cos(),
-            center.y + radius * a.sin(),
-        ));
-    }
-    painter.add(Shape::line(points, stroke));
+    painter.add(Shape::line(
+        arc_points(center, radius, start_rad, end_rad),
+        stroke,
+    ));
 }
 
 /// Formats `TooltipSummary` into the exact collapsed-strip tooltip text.

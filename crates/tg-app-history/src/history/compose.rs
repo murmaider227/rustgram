@@ -41,6 +41,7 @@ use crate::history::rich_compose::{
 use crate::history::sections_model::{
     CopiedRichText, ForwardOptions, InlineBotResult, ReplyQuote, RoundVideoAttachment, SendAsPeer,
 };
+use crate::history::send_flight::SendingFieldText;
 use crate::history::text_bridge::parse_compose_markdown;
 use crate::history::theme::HistoryColors;
 use tg_app_core::stand_in::types::{MsgId, PeerId, PeerKind};
@@ -406,11 +407,17 @@ pub struct ComposeControls {
     /// True while a `HistoryWidget`-managed bot popup (commands, inline results, attach bots)
     /// is visible above the compose bar, so `MainWidget`'s `FieldAutocompleteView` defers to it.
     pub bot_popup_active: bool,
+    /// The field text painted this frame, when all of it is visible.
+    last_field_text: Option<SendingFieldText>,
+    /// The field text of the message sent this frame (`PrepareTextSending`).
+    sent_field_text: Option<SendingFieldText>,
 }
 
 impl Default for ComposeControls {
     fn default() -> Self {
         Self {
+            last_field_text: None,
+            sent_field_text: None,
             text: String::new(),
             rich_edit: RichEditState::new(),
             format_menu: FormattingContextMenu::default(),
@@ -710,6 +717,11 @@ impl ComposeControls {
         self.draft_scheduler.reset();
         self.typing_throttle.reset();
         self.focus_requested = true;
+    }
+
+    /// Takes the field text of the message sent this frame, for the send animation.
+    pub fn take_sent_field_text(&mut self) -> Option<SendingFieldText> {
+        self.sent_field_text.take()
     }
 
     /// Ensures external callers mutating `self.text` directly stay synced with `self.rich_edit`.
@@ -1428,6 +1440,7 @@ impl ComposeControls {
             let rich_pal =
                 RichInputPalette::from_colors(colors.text_fg, colors.accent, colors.is_night);
             let mut input_secondary_pos = None;
+            self.last_field_text = None;
             ui.scope_builder(egui::UiBuilder::new().max_rect(field_rect), |ui| {
                 ScrollArea::vertical()
                     .id_salt(("tg_compose_scroll", peer_id.0))
@@ -1448,6 +1461,16 @@ impl ComposeControls {
                         }
                         if out.response.secondary_clicked() {
                             input_secondary_pos = ui.ctx().pointer_interact_pos();
+                        }
+                        let no_selection = out
+                            .cursor_range
+                            .is_none_or(|range| range.primary == range.secondary);
+                        if no_selection {
+                            self.last_field_text = SendingFieldText::visible_in(
+                                out.galley,
+                                out.galley_pos,
+                                out.text_clip_rect.intersect(ui.clip_rect()),
+                            );
                         }
                     });
             });
@@ -1666,6 +1689,10 @@ impl ComposeControls {
         if submit_now && has_sendable_content && !slowmode_blocks_submit {
             let ext_req = self.build_pending_extended(submit_silent_override);
             let mode = std::mem::replace(&mut self.mode, ComposeMode::Normal);
+            self.sent_field_text = match mode {
+                ComposeMode::Normal | ComposeMode::Reply { .. } => self.last_field_text.take(),
+                _ => None,
+            };
             self.clear_after_send();
 
             match mode {

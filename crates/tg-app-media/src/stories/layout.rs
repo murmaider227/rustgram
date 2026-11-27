@@ -571,6 +571,10 @@ pub struct StoriesStripMetrics {
     pub small_left: f32,
     /// Collapsed ring stroke width (`dialogsStories.lineTwice / 2 = 1.5px`).
     pub small_line: f32,
+    /// Collapsed margin around each avatar (`dialogsStories.photoLeft = 4px`).
+    pub small_photo_left: f32,
+    /// Collapsed top margin for avatar (`dialogsStories.photoTop = 4px`).
+    pub small_photo_top: f32,
     /// Expanded strip height (`dialogsStoriesFull.height = 77px`).
     pub full_height: f32,
     /// Expanded avatar diameter (`dialogsStoriesFull.photo = 42px`).
@@ -597,6 +601,8 @@ impl Default for StoriesStripMetrics {
             small_shift: 16.0,
             small_left: 4.0,
             small_line: 1.5,
+            small_photo_left: 4.0,
+            small_photo_top: 4.0,
             full_height: 77.0,
             full_photo: 42.0,
             full_photo_left: 10.0,
@@ -615,6 +621,43 @@ impl StoriesStripMetrics {
     pub const fn single_full_width(&self) -> f32 {
         self.full_photo_left * 2.0 + self.full_photo
     }
+}
+
+/// Collapsed strip geometry inside the chat-list search field (`List::countSmallGeometry` with
+/// `setLayoutConstraints({filterLeft + filterWidth, filterTop + added}, al_right, ...)`):
+/// right-aligned to the field's right edge and centred in its height.
+#[must_use]
+pub fn collapsed_strip_geometry(
+    metrics: &StoriesStripMetrics,
+    field_rect: Rect,
+    count: usize,
+) -> Rect {
+    let shown = count.clamp(1, SMALL_THUMBS_SHOWN) as f32;
+    let width = 2.0 * metrics.small_left
+        + 2.0 * metrics.small_photo_left
+        + metrics.small_photo
+        + (shown - 1.0) * metrics.small_shift;
+    let height = 2.0 * metrics.small_photo_top + metrics.small_photo;
+    // `added = (st::dialogsFilter.heightMin - storiesHeight) / 2`, integer pixels.
+    let added = ((field_rect.height() - height) / 2.0).floor();
+    Rect::from_min_size(
+        Pos2::new(field_rect.right() - width, field_rect.top() + added),
+        Vec2::new(width, height),
+    )
+}
+
+/// Centre of the collapsed userpic in `slot` (0 = leftmost, painted on top) inside `geometry`.
+#[must_use]
+pub fn collapsed_photo_center(metrics: &StoriesStripMetrics, geometry: Rect, slot: usize) -> Pos2 {
+    let radius = metrics.small_photo / 2.0;
+    Pos2::new(
+        geometry.left()
+            + metrics.small_left
+            + metrics.small_photo_left
+            + radius
+            + slot as f32 * metrics.small_shift,
+        geometry.top() + metrics.small_photo_top + radius,
+    )
 }
 
 /// Decelerate easing from `dialogs_stories_list.cpp:48-50`.

@@ -80,7 +80,8 @@ pub use video_userpic::{
     VideoUserpicSource, VideoUserpicState, apply_ellipse_mask, paint_dialog_userpic,
 };
 pub use widget::{
-    DialogsPanel, DialogsPanelAction, DialogsShortcut, detect_dialogs_shortcut, resolve_folder_slot,
+    DialogsPanel, DialogsPanelAction, DialogsSearchRow, DialogsShortcut, detect_dialogs_shortcut,
+    resolve_folder_slot,
 };
 
 /// Standard dialog row height (`st::dialogsRowHeight = 62px`).

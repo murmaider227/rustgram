@@ -39,7 +39,7 @@ use tg_app_info::info::{InfoWrapEvent, InfoWrapWidget};
 use tg_app_info::statistics::{StatisticsScreen, StatisticsScreenHost};
 use tg_app_media::media::style::MEDIA_PLAYER_HEIGHT;
 use tg_app_media::media::{AudioPlayerBar, AudioPlayerBarEvent, MediaBackend};
-use tg_app_media::stories::AppStoriesHost;
+use tg_app_media::stories::{AppStoriesHost, StoriesSearchSlot};
 use tg_app_settings::chat_helpers::{
     AutocompleteAction, ChatHelpersEvent, FieldAutocompleteView, TabbedPanel,
 };
@@ -1123,14 +1123,11 @@ impl MainWidget {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            if let Some(stories_host) = stories
-                && !compact_small_column
-                && !self.dialogs.search_active
-                && !self.dialogs.opened_archive
-            {
-                stories_host.show_strip(ui, palette);
-            }
-            if let Some(act) = self.dialogs.show_column(
+            // tdesktop puts the collapsed stories at the right end of the search field and the
+            // expanded ones right under the search bar (`Dialogs::Widget::updateControlsGeometry`).
+            let mut stories = stories;
+            let mut strip_shown = false;
+            let shown_action = self.dialogs.show_column_with_search_row(
                 ui,
                 session_backend,
                 active_peer,
@@ -1140,7 +1137,27 @@ impl MainWidget {
                 false,
                 palette,
                 strings,
-            ) {
+                &mut |ui, row| {
+                    if let Some(host) = stories.as_deref_mut() {
+                        host.show_strip(
+                            ui,
+                            StoriesSearchSlot {
+                                field_rect: row.field_rect,
+                                field_bg: row.field_bg,
+                                column_rect: row.column_rect,
+                                list_scroll_y: row.list_scroll_y,
+                                list_scroll_max: row.list_scroll_max,
+                            },
+                            palette,
+                        );
+                        strip_shown = true;
+                    }
+                },
+            );
+            if !strip_shown && let Some(host) = stories {
+                host.hide_strip();
+            }
+            if let Some(act) = shown_action {
                 self.handle_dialogs_action(act, session, session_backend, now_ms, actions);
                 // The list above was painted with the chat open before this click; the history
                 // below paints the chat it opened. Run the pass again (without the input) so the

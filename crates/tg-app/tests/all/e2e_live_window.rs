@@ -654,7 +654,8 @@ fn live_active_window_renders_chat_settings_calls_stories_and_boxes() {
         "live HistoryInnerWidget must load and render Bob's message from FakeRpcClient"
     );
 
-    // 2. Live Stories strip is populated from GetAllStories and rendered above dialogs.
+    // 2. Live Stories strip is populated from GetAllStories and its userpics are drawn at the
+    //    right end of the chat-list search field (TGB-3008).
     assert!(
         harness.state().workspace.stories_host().has_stories(),
         "live AppStoriesHost must have Bob's story from GetAllStories"
@@ -666,8 +667,20 @@ fn live_active_window_renders_chat_settings_calls_stories_and_boxes() {
         .last_strip_rect()
         .expect("live StoriesStrip must be rendered in dialogs column");
     assert!(
-        strip_rect.height() >= 20.0 && strip_rect.width() >= 120.0,
+        strip_rect.height() >= 20.0 && strip_rect.width() >= 30.0,
         "rendered StoriesStrip must have positive bounds, got {strip_rect:?}"
+    );
+    let search_field = harness
+        .state_mut()
+        .workspace
+        .controller_mut()
+        .main_widget_mut()
+        .dialogs_mut()
+        .search_field_rect()
+        .expect("the chat-list search field is shown");
+    assert!(
+        search_field.contains_rect(strip_rect),
+        "collapsed stories sit inside the search field {search_field:?}, got {strip_rect:?}"
     );
     click_pos(&mut harness, strip_rect.center());
     step_n(&mut harness, 12);

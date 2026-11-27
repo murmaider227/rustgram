@@ -50,7 +50,10 @@ pub use media_loader::{
     video_frame_to_color_image,
 };
 pub use mock::{GradientPreset, MockStoriesBackend, generate_gradient_story_png, mock_peers};
-pub use strip::{StoriesStrip, StoriesStripAction, format_tooltip_summary, paint_avatar_circle};
+pub use strip::{
+    StoriesSearchSlot, StoriesStrip, StoriesStripAction, StoriesStripFrame, format_tooltip_summary,
+    paint_avatar_circle,
+};
 pub use viewer::{
     HOLD_TO_PAUSE_THRESHOLD_MS, QUICK_REACTIONS, StoryViewerOverlay, format_reply_placeholder,
 };
@@ -385,27 +388,26 @@ impl AppStoriesHost {
         )
     }
 
-    /// Renders the embeddable [`StoriesStrip`] inside `ui` (ready for `dialogs/` to call directly)
-    /// and dispatches all emitted [`StoriesStripAction`]s.
-    pub fn show_strip(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        let top_before = ui.cursor().top();
-        let left = ui.max_rect().left();
-        let width = ui.available_width();
-        let actions = self
-            .strip
-            .show(ui, &self.store, self.backend.as_ref(), palette);
-        let bottom_after = ui.cursor().top();
-        if bottom_after > top_before + 1.0 {
-            self.last_strip_rect = Some(egui::Rect::from_min_max(
-                egui::Pos2::new(left, top_before),
-                egui::Pos2::new(left + width, bottom_after),
-            ));
-        } else {
-            self.last_strip_rect = None;
-        }
+    /// Renders the [`StoriesStrip`] for the chat-list search row (`slot`): the collapsed userpics
+    /// over the right end of the search field, and while expanded the full strip in a band at the
+    /// cursor of `ui`, right under the search bar. Dispatches all emitted [`StoriesStripAction`]s.
+    pub fn show_strip(&mut self, ui: &mut egui::Ui, slot: StoriesSearchSlot, palette: &Palette) {
+        let frame =
+            self.strip
+                .show_in_search_row(ui, slot, &self.store, self.backend.as_ref(), palette);
+        self.last_strip_rect = frame.band_rect.or(frame.collapsed_rect);
         let now_secs = current_unix_secs();
         let now_ms = self.elapsed_ms();
-        self.handle_strip_actions(actions, now_secs, now_ms);
+        self.handle_strip_actions(frame.actions, now_secs, now_ms);
+    }
+
+    /// Notes that the strip is not shown this frame (search active, Archive open, narrow
+    /// column): like `storiesExplicitCollapse`, an expanded strip collapses at once.
+    pub fn hide_strip(&mut self) {
+        self.last_strip_rect = None;
+        if self.strip.is_expanded() || self.strip.anim_progress() > 0.0 {
+            self.strip.set_expanded_immediate(false);
+        }
     }
 
     /// Consumes a pending request from the story viewer to open the Telegram Premium screen.
@@ -622,7 +624,7 @@ impl AppStoriesHost {
         self.toast_text = Some((msg, now_ms + 3_200));
     }
 
-    /// Dispatches actions emitted by [`StoriesStrip::show`].
+    /// Dispatches actions emitted by [`StoriesStrip::show_in_search_row`].
     pub fn handle_strip_actions(
         &mut self,
         actions: Vec<StoriesStripAction>,
@@ -852,6 +854,48 @@ mod tests {
     // -------------------------------------------------------------------------
     // 3. Mock backend action execution, strip expand/collapse, hide/archive
     // -------------------------------------------------------------------------
+
+    /// TGB-3008: `List::countSmallGeometry` with the dialogs widget's right-aligned position at
+    /// the end of the search field, not a row of its own.
+    #[test]
+    fn collapsed_strip_is_right_aligned_inside_the_search_field() {
+        let m = layout::StoriesStripMetrics::default();
+        let field = Rect::from_min_size(Pos2::new(60.0, 9.0), Vec2::new(300.0, 35.0));
+        for (count, width) in [(1, 37.0), (2, 53.0), (3, 69.0), (5, 69.0)] {
+            let g = layout::collapsed_strip_geometry(&m, field, count);
+            assert_eq!(
+                g.right(),
+                field.right(),
+                "{count} userpics end at the field edge"
+            );
+            assert_eq!(g.width(), width, "{count} userpics");
+            assert_eq!(g.top(), field.top() + 3.0, "filterTop + added");
+            assert_eq!(g.height(), 29.0, "photoTop + photo + photoTop");
+        }
+        let g = layout::collapsed_strip_geometry(&m, field, 3);
+        let first = layout::collapsed_photo_center(&m, g, 0);
+        let last = layout::collapsed_photo_center(&m, g, 2);
+        assert_eq!(first.x - 10.5, g.left() + 8.0);
+        assert_eq!(last.x + 10.5, field.right() - 8.0);
+        assert_eq!(first.y, field.center().y, "userpics centred in the field");
+
+        let (store, backend) = setup_mock_store();
+        let mut strip = StoriesStrip::new();
+        strip.sync_from_store(&store, &backend);
+        let shown = strip.bar_state().small_visible_indices().len();
+        assert!((1..=3).contains(&shown));
+        assert_eq!(
+            strip.collapsed_rect(field),
+            Some(layout::collapsed_strip_geometry(&m, field, shown))
+        );
+        assert_eq!(
+            strip.band_height(),
+            0.0,
+            "collapsed: no band below the search bar"
+        );
+        strip.set_expanded_immediate(true);
+        assert_eq!(strip.band_height(), 77.0, "dialogsStoriesFull.height");
+    }
 
     #[test]
     fn mock_backend_executes_actions_and_strip_handles_expand_hysteresis_and_hide() {
@@ -1207,6 +1251,19 @@ mod tests {
         };
 
         let docs_dir = tg_app_core::core_types::paths::workspace_app_docs_dir();
+
+        /// A search-field stand-in for previews: a 35 px pill across the width.
+        fn preview_search_slot(ui: &mut egui::Ui, palette: &Palette) -> StoriesSearchSlot {
+            let (row, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), egui::Sense::hover());
+            let field = Rect::from_min_size(
+                Pos2::new(row.left() + 8.0, row.top() + 9.0),
+                Vec2::new(row.width() - 16.0, 35.0),
+            );
+            ui.painter()
+                .rect_filled(field, egui::CornerRadius::same(18), palette.window_bg_over);
+            StoriesSearchSlot::for_field(field, palette)
+        }
         let _ = std::fs::create_dir_all(&docs_dir);
 
         #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1318,7 +1375,8 @@ mod tests {
                                     });
                                     ui.add_space(4.0);
                                     self.host.strip_mut().set_expanded_immediate(true);
-                                    self.host.show_strip(ui, &self.palette);
+                                    let slot = preview_search_slot(ui, &self.palette);
+                                    self.host.show_strip(ui, slot, &self.palette);
                                     for (name, msg, time, rgb) in [
                                         (
                                             "Aurora Studio",
@@ -1394,8 +1452,10 @@ mod tests {
                                         );
                                     });
                                     ui.add_space(4.0);
-                                    let _ = self.collapsed_strip.show(
+                                    let slot = preview_search_slot(ui, &self.palette);
+                                    let _ = self.collapsed_strip.show_in_search_row(
                                         ui,
+                                        slot,
                                         self.host.store(),
                                         self.host.backend.as_ref(),
                                         &self.palette,
@@ -1413,8 +1473,10 @@ mod tests {
                                     });
                                     ui.add_space(4.0);
                                     let night = Palette::night();
-                                    let _ = self.night_strip.show(
+                                    let slot = preview_search_slot(ui, &night);
+                                    let _ = self.night_strip.show_in_search_row(
                                         ui,
+                                        slot,
                                         self.host.store(),
                                         self.host.backend.as_ref(),
                                         &night,
