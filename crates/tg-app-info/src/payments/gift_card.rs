@@ -668,6 +668,7 @@ fn paint_gift_sticker(ui: &Ui, painter: &egui::Painter, rect: Rect, document_id:
         force_first_frame: done,
         force_last_frame: false,
         text_color: Color32::WHITE,
+        overlay: None,
     };
     if !guard.duration.contains_key(&document_id) {
         let px = (rect.width() * ctx.pixels_per_point()).round() as u32;

@@ -443,10 +443,6 @@ impl AppNotifyTrayHost {
                     self.window_hidden_to_tray = true;
                     ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                 }
-                TrayAction::MuteForOneHour => {
-                    self.system.clear_all(now_ms);
-                }
-                TrayAction::UnmuteGlobal => {}
                 TrayAction::ToggleNotifications => {
                     self.system
                         .notify_settings_changed(ChangeType::DesktopEnabled, now_ms);
@@ -541,8 +537,8 @@ mod tests {
     };
     use crate::notifications::mock::MockNotifyBackend;
     use crate::notifications::settings::{
-        DefaultNotify, MUTE_ONE_HOUR_SECS, MuteValue, NotificationPreferences, NotifySettingsStore,
-        NotifySound, NotifyView, ScreenCorner, UnreadBadgeResult, UnreadBadgeState, compute_badge,
+        DefaultNotify, MuteValue, NotificationPreferences, NotifySettingsStore, NotifySound,
+        NotifyView, ScreenCorner, UnreadBadgeResult, UnreadBadgeState, compute_badge,
         compute_unread_badge, compute_unread_badge_muted,
     };
     use crate::notifications::sound::{NotificationSoundPlayer, generate_fallback_chime_track};
@@ -1361,12 +1357,12 @@ mod tests {
         tray.initialize(&prefs, now_unix);
         assert!(tray.has_icon());
 
-        // Menu contains Open/Minimize, Mute for 1 hour, Disable notifications, Simulate, Quit.
+        // Menu contains Open/Minimize, Disable notifications, Quit (`Tray::rebuildMenu`).
         let menu = tray.build_menu(&prefs, now_unix);
         assert!(menu.iter().any(|item| matches!(
             item,
-            tg_platform::tray::TrayMenuItem::Action { id, label, .. }
-                if *id == menu_id::MUTE_ONE_HOUR && label == "Mute for 1 hour"
+            tg_platform::tray::TrayMenuItem::Action { id, .. }
+                if *id == menu_id::TOGGLE_NOTIFICATIONS
         )));
         assert!(menu.iter().any(|item| matches!(
             item,
@@ -1383,9 +1379,7 @@ mod tests {
         assert!(sound_ch2 && flash_ch2);
         assert!(prefs.desktop_notify && prefs.sound_notify && prefs.flash_bounce_notify);
 
-        // Mute for 1 hour via tray menu sets global_mute_until_unix = now + 3600.
         let mut mock_plat = MockTrayPlatform::default();
-        mock_plat.push_event(TrayEvent::MenuItem(menu_id::MUTE_ONE_HOUR));
         mock_plat.push_event(TrayEvent::MenuItem(menu_id::SIMULATE_MESSAGE));
         mock_plat.push_event(TrayEvent::MenuItem(menu_id::QUIT));
 
@@ -1398,14 +1392,8 @@ mod tests {
         let acts = tray2.poll_actions(&mut prefs, 1_000, now_unix);
         assert_eq!(
             acts,
-            vec![
-                TrayAction::MuteForOneHour,
-                TrayAction::SimulateIncomingMessage,
-                TrayAction::Quit
-            ]
+            vec![TrayAction::SimulateIncomingMessage, TrayAction::Quit]
         );
-        assert!(prefs.is_globally_muted(now_unix + 10));
-        assert!(!prefs.is_globally_muted(now_unix + MUTE_ONE_HOUR_SECS));
 
         // WorkMode::WindowOnly destroys icon; switching back recreates it.
         tray.set_work_mode(WorkMode::WindowOnly, &prefs, now_unix);

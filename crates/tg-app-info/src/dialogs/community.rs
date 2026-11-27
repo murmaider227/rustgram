@@ -194,6 +194,7 @@ pub fn synthesize_community_dialog_item(
         folder_tags: Vec::new(),
         last_message_id: MsgId(0),
         last_message: preview,
+        last_message_spoilers: Vec::new(),
         last_sender: Some(format!("{} chats", members.len())),
         last_message_time: newest_time,
         send_state: DialogSendState::None,

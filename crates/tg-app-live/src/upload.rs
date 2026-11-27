@@ -2062,10 +2062,14 @@ impl LiveSession {
 
         let live = self.clone();
         let handle = self.runtime().tokio_handle().clone();
-        let in_flight = self.sends.begin_media_send();
+        // Taken here, on the caller's thread, so the queue order is the order of the sends.
+        let mut in_flight = self.sends.begin_media_send();
         drop(self.runtime().tokio_handle().spawn_blocking(move || {
-            let _in_flight = in_flight;
-            let outcome = block_on_runtime(&handle, send.request);
+            let previous = in_flight.previous();
+            let outcome = block_on_runtime(&handle, async move {
+                previous.await;
+                send.request.await
+            });
             let cancelled = send.cancel.is_cancelled();
             finish_tracked_upload(
                 &send.state,

@@ -33,7 +33,8 @@ pub use forum::{
     TOPICS_FIRST_LOAD, TOPICS_PER_PAGE, TOPICS_STALE_PER_REQUEST,
 };
 pub use history::{
-    Draft, DraftKey, History, IdSlice, SparseIdsList, SparseIdsSnapshot, WebPageDraft,
+    Draft, DraftKey, History, IdSlice, InboxReadOutcome, SparseIdsList, SparseIdsSnapshot,
+    WebPageDraft,
 };
 pub use id::{
     ARCHIVE_FOLDER_ID, BareId, BotAppId, BusinessShortcutId, CANCELLED_WEB_PAGE_ID, CLIENT_MSG_IDS,

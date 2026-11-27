@@ -334,6 +334,7 @@ fn status_paint_context(
         force_first_frame: done,
         force_last_frame: false,
         text_color: tint,
+        overlay: None,
     }
 }
 

@@ -42,6 +42,8 @@ pub struct SnippetRun {
     pub text: String,
     /// Drawn in `dialogsTextFgService` (sender prefix or a query match).
     pub service: bool,
+    /// Hidden under the spoiler cover (the message text's spoilers).
+    pub spoiler: bool,
 }
 
 /// A message search result line split into plain and service-coloured runs.
@@ -56,6 +58,18 @@ impl SearchSnippet {
     #[must_use]
     pub fn text(&self) -> String {
         self.runs.iter().map(|r| r.text.as_str()).collect()
+    }
+
+    /// Per drawn char, whether it is hidden under the spoiler cover; empty when nothing is.
+    #[must_use]
+    pub fn hidden_chars(&self) -> Vec<bool> {
+        if !self.runs.iter().any(|r| r.spoiler) {
+            return Vec::new();
+        }
+        self.runs
+            .iter()
+            .flat_map(|r| std::iter::repeat_n(r.spoiler, r.text.chars().count()))
+            .collect()
     }
 
     /// Texts of the service-coloured runs.
@@ -92,7 +106,13 @@ impl SearchSnippet {
                 0.0,
                 TextFormat {
                     font_id: font_id.clone(),
-                    color: if run.service { service_fg } else { text_fg },
+                    color: if run.spoiler {
+                        Color32::TRANSPARENT
+                    } else if run.service {
+                        service_fg
+                    } else {
+                        text_fg
+                    },
                     ..Default::default()
                 },
             );
@@ -149,6 +169,18 @@ fn find_word_highlight(inside: &[char], word: &[char]) -> Option<Range<usize>> {
 /// group `sender` (`"You"`, a short name) included like `PreviewWithSender` when given.
 #[must_use]
 pub fn message_search_snippet(sender: Option<&str>, text: &str, query: &str) -> SearchSnippet {
+    message_search_snippet_with_spoilers(sender, text, &[], query)
+}
+
+/// [`message_search_snippet`] with the byte ranges of `text` under a spoiler kept hidden
+/// (`MessageView::prepare` keeps the preview's entities).
+#[must_use]
+pub fn message_search_snippet_with_spoilers(
+    sender: Option<&str>,
+    text: &str,
+    spoilers: &[Range<usize>],
+    query: &str,
+) -> SearchSnippet {
     let mut chars: Vec<(char, Part)> = Vec::new();
     if let Some(sender) = sender {
         chars.push((LRM, Part::Hidden));
@@ -161,8 +193,21 @@ pub fn message_search_snippet(sender: Option<&str>, text: &str, query: &str) -> 
     // `HistoryItem::toPreview` wraps the message text with `st::wrap_rtl` too.
     chars.push((LRM, Part::Hidden));
     chars.push((FSI, Part::Hidden));
-    chars.extend(text.trim().chars().map(|c| (c, Part::Text)));
+    let text_from = chars.len();
+    let lead = text.len() - text.trim_start().len();
+    let mut hidden_text = Vec::new();
+    for (at, c) in text.trim().char_indices() {
+        chars.push((c, Part::Text));
+        let byte = lead + at;
+        hidden_text.push(spoilers.iter().any(|r| r.contains(&byte)));
+    }
     chars.push((PDI, Part::Hidden));
+    let is_spoiler = |i: usize| {
+        i.checked_sub(text_from)
+            .and_then(|t| hidden_text.get(t))
+            .copied()
+            .unwrap_or(false)
+    };
 
     // One lowercase char per source char keeps indices aligned (UTF-16 `toLower` does too
     // for all but a few special cases).
@@ -187,15 +232,18 @@ pub fn message_search_snippet(sender: Option<&str>, text: &str, query: &str) -> 
     };
 
     let mut snippet = SearchSnippet::default();
-    let mut push = |text: &str, service: bool| match snippet.runs.last_mut() {
-        Some(last) if last.service == service => last.text.push_str(text),
+    let mut push = |text: &str, service: bool, spoiler: bool| match snippet.runs.last_mut() {
+        Some(last) if last.service == service && last.spoiler == spoiler => {
+            last.text.push_str(text);
+        }
         _ => snippet.runs.push(SnippetRun {
             text: text.to_owned(),
             service,
+            spoiler,
         }),
     };
     if cut > 0 {
-        push(LEADING_ELLIPSIS, false);
+        push(LEADING_ELLIPSIS, false, false);
     }
     let mut buf = [0u8; 4];
     for (i, (c, part)) in chars.iter().enumerate().skip(cut) {
@@ -203,7 +251,7 @@ pub fn message_search_snippet(sender: Option<&str>, text: &str, query: &str) -> 
             continue;
         }
         let service = *part == Part::Sender || highlighted[i];
-        push(c.encode_utf8(&mut buf), service);
+        push(c.encode_utf8(&mut buf), service, is_spoiler(i));
     }
     snippet
 }

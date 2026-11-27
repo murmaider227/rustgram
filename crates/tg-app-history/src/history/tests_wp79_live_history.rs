@@ -35,7 +35,7 @@ type QueuedReply = (u32, Result<Vec<u8>, InvocationError>);
 type RecordedCalls = Arc<Mutex<Vec<(u32, Vec<u8>)>>>;
 
 #[derive(Clone)]
-struct FakeRpcClient {
+pub(super) struct FakeRpcClient {
     main_dc: Arc<Mutex<DcId>>,
     responses: Arc<Mutex<VecDeque<QueuedReply>>>,
     recorded: RecordedCalls,
@@ -53,18 +53,18 @@ impl FakeRpcClient {
         }
     }
 
-    fn enqueue_ok<T: Serializable>(&self, expected_ctor: u32, resp: &T) {
+    pub(super) fn enqueue_ok<T: Serializable>(&self, expected_ctor: u32, resp: &T) {
         self.responses
             .lock()
             .expect("lock responses")
             .push_back((expected_ctor, Ok(resp.to_bytes())));
     }
 
-    fn push_update(&self, updates: tl_enums::Updates) {
+    pub(super) fn push_update(&self, updates: tl_enums::Updates) {
         let _ = self.updates_tx.send(updates);
     }
 
-    fn recorded_of<R: Identifiable + Deserializable>(&self) -> Vec<R> {
+    pub(super) fn recorded_of<R: Identifiable + Deserializable>(&self) -> Vec<R> {
         self.recorded
             .lock()
             .expect("lock recorded")
@@ -123,7 +123,7 @@ impl RpcClient for FakeRpcClient {
     }
 }
 
-fn tl_text_message(
+pub(super) fn tl_text_message(
     id: i32,
     peer_id: tl_enums::Peer,
     from_id: Option<tl_enums::Peer>,
@@ -185,7 +185,7 @@ fn tl_text_message(
     })
 }
 
-fn render_frame(
+pub(super) fn render_frame(
     ctx: &Context,
     widget: &mut HistoryWidget,
     live: &mut LiveSession,
@@ -219,7 +219,7 @@ fn render_frame(
     assert!(live.flush_background_rpcs(std::time::Duration::from_secs(10)));
 }
 
-fn wait_for_generation_above(live: &LiveSession, baseline: u64) {
+pub(super) fn wait_for_generation_above(live: &LiveSession, baseline: u64) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while live.bridge_state().generation() <= baseline {
         assert!(
@@ -230,7 +230,7 @@ fn wait_for_generation_above(live: &LiveSession, baseline: u64) {
     }
 }
 
-fn start_live_fixture(
+pub(super) fn start_live_fixture(
     initial_pts: i32,
 ) -> (
     tokio::runtime::Runtime,

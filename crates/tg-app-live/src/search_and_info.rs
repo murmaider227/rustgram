@@ -818,7 +818,7 @@ pub(crate) fn message_to_search_result(
     if matches!(msg.content, MessageContent::Empty) {
         return None;
     }
-    let text = crate::preview_text::message_preview_text(session, msg);
+    let preview = crate::preview_text::message_preview(session, msg);
     let sender_name = crate::preview_text::preview_sender(session, msg);
     Some(MessageSearchResult {
         peer_id: from_data_peer(msg.peer_id),
@@ -828,7 +828,8 @@ pub(crate) fn message_to_search_result(
         color_index,
         msg_id: from_data_msg(msg.id),
         sender_name,
-        text,
+        text: preview.text,
+        text_spoilers: preview.spoilers,
         time: unix_to_local_datetime(msg.date),
         send_state: crate::convert::message_send_state(session, msg),
         archived,
@@ -3111,11 +3112,13 @@ pub(super) fn search_dialogs(
                 && request.chat_type_filter.matches(item.kind)
             {
                 for msg in stored_messages_ordered(session, pid).into_iter().rev() {
-                    let body = match &msg.content {
-                        MessageContent::Regular { text, .. } => text.text.as_str(),
-                        MessageContent::Empty | MessageContent::Service(_) => "",
+                    let MessageContent::Regular { text, .. } = &msg.content else {
+                        continue;
                     };
+                    let body = text.text.as_str();
                     if !body.is_empty() && body.to_ascii_lowercase().contains(&query_lower) {
+                        let (one_line, text_spoilers) =
+                            crate::preview_text::one_line_with_spoilers(text);
                         results.messages.push(MessageSearchResult {
                             peer_id: item.peer_id,
                             kind: item.kind,
@@ -3124,7 +3127,8 @@ pub(super) fn search_dialogs(
                             color_index: item.color_index,
                             msg_id: from_data_msg(msg.id),
                             sender_name: crate::preview_text::preview_sender(session, msg),
-                            text: body.to_owned(),
+                            text: one_line,
+                            text_spoilers,
                             time: unix_to_local_datetime(msg.date),
                             send_state: crate::convert::message_send_state(session, msg),
                             archived: item.archived,
@@ -3419,14 +3423,30 @@ pub(super) fn shared_media(
 
 /// Hook for [`tg_app_core::history::backend::HistoryBackend::pinned_messages`].
 pub(super) fn pinned_messages(live: &LiveSession, peer_id: PeerId) -> Vec<PinnedMessageSummary> {
-    pinned_full_messages(live, peer_id, None)
-        .into_iter()
-        .map(|hm| PinnedMessageSummary {
-            msg_id: hm.id,
-            sender_name: hm.sender_name.clone(),
-            preview: hm.preview_snippet(),
-        })
-        .collect()
+    let messages = pinned_full_messages(live, peer_id, None);
+    let data_peer = to_data_peer(peer_id);
+    live.read_session(|session| {
+        messages
+            .into_iter()
+            .map(|hm| {
+                // `MessageBar` shows `item->inReplyText()`, the reply header's text with its
+                // spoilers (`history_view_pinned_bar.cpp:38-45`).
+                let (preview, preview_spoilers) = session
+                    .message(tg_data::FullMsgId::new(data_peer, to_data_msg(hm.id)))
+                    .map(|m| {
+                        let p = crate::reply_preview::reply_preview_text(session, m);
+                        (p.text, p.spoilers)
+                    })
+                    .unwrap_or_else(|| (hm.preview_snippet(), Vec::new()));
+                PinnedMessageSummary {
+                    msg_id: hm.id,
+                    sender_name: hm.sender_name,
+                    preview,
+                    preview_spoilers,
+                }
+            })
+            .collect()
+    })
 }
 
 /// Whether the first pinned-messages page of `peer`'s main chat is cached.

@@ -2947,10 +2947,11 @@ async fn read_state_counters_deletes_and_edits_over_wire() {
         1_700_003_013,
         TextWithEntities::plain("latest incoming"),
     );
-    session.insert_message(m10);
-    session.insert_message(m11);
-    session.insert_message(m12);
-    session.insert_message(m13);
+    // New messages (`NewMessageType::Unread`): only they raise the unread count (TGB-3160).
+    session.insert_new_unread_message(m10);
+    session.insert_new_unread_message(m11);
+    session.insert_new_unread_message(m12);
+    session.insert_new_unread_message(m13);
 
     assert_eq!(session.history(peer_id).unwrap().unread_count, Some(3));
     assert_eq!(session.history(peer_id).unwrap().unread_mentions_count, 1);
@@ -3143,7 +3144,9 @@ async fn read_state_counters_deletes_and_edits_over_wire() {
         .unwrap();
     assert_eq!(session.history(ch_peer_id).unwrap().unread_count, Some(7));
 
-    // Mismatched channel pts (999 != 40) -> falls back to local incoming count (203 only, NOT outgoing 202) -> 1!
+    // Mismatched channel pts (999 != 40) -> falls back to a local count: like
+    // `History::countStillUnreadLocal` (`history.cpp:2200-2225`), the known 7 minus the incoming
+    // messages read since the old read mark (201) -> 6 (TGB-3160).
     updates
         .handle_updates(
             &rpc,
@@ -3165,8 +3168,8 @@ async fn read_state_counters_deletes_and_edits_over_wire() {
         .unwrap();
     assert_eq!(
         session.history(ch_peer_id).unwrap().unread_count,
-        Some(1),
-        "fallback local unread count must exclude outgoing message 202"
+        Some(6),
+        "fallback local unread count subtracts the incoming messages read since the old mark"
     );
 
     // 7F. Unread mentions & reactions counters:
@@ -3428,7 +3431,8 @@ async fn read_state_counters_deletes_and_edits_over_wire() {
             .is_none()
     );
     let ch_hist = session.history(ch_peer_id).unwrap();
-    assert_eq!(ch_hist.unread_count, Some(0));
+    // The deleted unread 203 leaves the 6 counted after the read at 201 (7E).
+    assert_eq!(ch_hist.unread_count, Some(5));
     assert_eq!(ch_hist.top_message_id, Some(MsgId(202)));
     assert_eq!(ch_hist.chat_list_time_id, 1_700_003_031);
 

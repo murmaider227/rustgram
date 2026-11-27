@@ -424,9 +424,86 @@ pub fn paint_text_spoiler(
     }
 }
 
+/// Splits the spoiler `rects` at the `selected` text rectangles of the same lines
+/// (`Renderer::pushSpoilerRange`): the parts outside the selection, then the parts inside it.
+#[must_use]
+pub fn split_spoiler_rects(rects: &[Rect], selected: &[Rect]) -> (Vec<Rect>, Vec<Rect>) {
+    if selected.is_empty() {
+        return (rects.to_vec(), Vec::new());
+    }
+    let mut outside = Vec::new();
+    let mut inside = Vec::new();
+    for rect in rects {
+        // The selection of this line: rectangles that share most of its height.
+        let mut spans: Vec<(f32, f32)> = selected
+            .iter()
+            .filter(|s| {
+                let overlap = s.max.y.min(rect.max.y) - s.min.y.max(rect.min.y);
+                overlap > 0.5 * rect.height().min(s.height())
+            })
+            .map(|s| (s.min.x.max(rect.min.x), s.max.x.min(rect.max.x)))
+            .filter(|(from, till)| from < till)
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut x = rect.min.x;
+        for (from, till) in spans {
+            let from = from.max(x);
+            if from > x {
+                outside.push(Rect::from_x_y_ranges(x..=from, rect.y_range()));
+            }
+            if till > from {
+                inside.push(Rect::from_x_y_ranges(from..=till, rect.y_range()));
+            }
+            x = x.max(till);
+        }
+        if x < rect.max.x {
+            outside.push(Rect::from_x_y_ranges(x..=rect.max.x, rect.y_range()));
+        }
+    }
+    (outside, inside)
+}
+
+/// [`paint_text_spoiler`] with the cover over the `selected` text in `select_color`
+/// (`TextPalette::selectSpoilerFg`) and the rest in `color` (`Renderer::paintSpoilerRects`).
+#[allow(clippy::too_many_arguments)]
+pub fn paint_text_spoiler_selected(
+    ctx: &Context,
+    painter: &Painter,
+    rects: &[Rect],
+    selected: &[Rect],
+    anchor: Pos2,
+    color: Color32,
+    select_color: Color32,
+    opacity: f32,
+) {
+    let (outside, inside) = split_spoiler_rects(rects, selected);
+    paint_text_spoiler(ctx, painter, &outside, anchor, color, opacity);
+    paint_text_spoiler(ctx, painter, &inside, anchor, select_color, opacity);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_selection_splits_the_cover() {
+        let line = |x0: f32, x1: f32| Rect::from_min_max(pos2(x0, 0.0), pos2(x1, 20.0));
+        // A spoiler from 10 to 100, the selection from 40 to 70 of the same line.
+        let (outside, inside) = split_spoiler_rects(&[line(10.0, 100.0)], &[line(40.0, 70.0)]);
+        assert_eq!(outside, vec![line(10.0, 40.0), line(70.0, 100.0)]);
+        assert_eq!(inside, vec![line(40.0, 70.0)]);
+
+        // A selection on the next line does not touch it.
+        let next = Rect::from_min_max(pos2(0.0, 20.0), pos2(200.0, 40.0));
+        let (outside, inside) = split_spoiler_rects(&[line(10.0, 100.0)], &[next]);
+        assert_eq!(outside, vec![line(10.0, 100.0)]);
+        assert!(inside.is_empty());
+
+        // A selection over the whole spoiler and beyond.
+        let (outside, inside) = split_spoiler_rects(&[line(10.0, 100.0)], &[line(0.0, 300.0)]);
+        assert!(outside.is_empty());
+        assert_eq!(inside, vec![line(10.0, 100.0)]);
+    }
 
     #[test]
     fn frames_hold_the_particles_alive_at_their_time() {

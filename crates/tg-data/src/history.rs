@@ -373,6 +373,44 @@ impl SparseIdsList {
         }
         Some(matched)
     }
+
+    /// Counts loaded messages in `from..=till` satisfying `predicate` when one slice covers the
+    /// whole range without gaps; `None` when the range is not fully loaded.
+    pub fn count_between<F>(&self, from: MsgId, till: MsgId, mut predicate: F) -> Option<i32>
+    where
+        F: FnMut(MsgId) -> bool,
+    {
+        if from > till {
+            return Some(0);
+        }
+        let slice = self
+            .slices
+            .iter()
+            .find(|s| s.range.from <= from && till <= s.range.till)?;
+        let matched = slice
+            .messages
+            .range(from..=till)
+            .filter(|&&id| predicate(id))
+            .count();
+        Some(i32::try_from(matched).unwrap_or(i32::MAX))
+    }
+}
+
+/// Most messages after the read mark counted locally before giving up
+/// (`kCountUnreadMessagesLimit`).
+const COUNT_UNREAD_LOCAL_LIMIT: usize = 1000;
+
+/// What a read of the inbox did to the unread count ([`History::inbox_read_with_filter`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboxReadOutcome {
+    /// `up_to` is not past the read mark: nothing changed.
+    Stale,
+    /// The read mark moved and the unread count is exact.
+    Counted,
+    /// The read mark moved, but the count could not be computed from loaded messages: the
+    /// dialog entry has to be requested (`History::inboxRead` ->
+    /// `Histories::requestDialogEntry`, `history/history.cpp:2291-2299`).
+    CountUnknown,
 }
 
 /// Webpage preview draft options (`Data::WebPageDraft`).
@@ -701,20 +739,45 @@ impl History {
 
     /// Advances the inbox read watermark to `up_to` and updates `unread_count`
     /// (`History::inboxRead` / `History::applyInboxReadUpdate`, `history/history.cpp:2266-2304`).
-    pub fn inbox_read(&mut self, up_to: MsgId, still_unread: Option<i32>) {
-        self.inbox_read_with_filter(up_to, still_unread, |_| true);
+    pub fn inbox_read(&mut self, up_to: MsgId, still_unread: Option<i32>) -> InboxReadOutcome {
+        self.inbox_read_with_filter(up_to, still_unread, |_| true)
+    }
+
+    /// How many incoming messages stay unread once the chat is read up to `read_till`, counted
+    /// from loaded messages (`History::countStillUnreadLocal`, `history/history.cpp:2189-2254`):
+    /// the known count minus the messages read since the old read mark when they are all loaded,
+    /// else the messages after `read_till` when the bottom of the history is loaded. `None` when
+    /// neither is loaded.
+    pub fn count_still_unread_local<F>(
+        &self,
+        read_till: MsgId,
+        mut is_unread_candidate: F,
+    ) -> Option<i32>
+    where
+        F: FnMut(MsgId) -> bool,
+    {
+        if let (Some(before), Some(unread)) = (self.inbox_read_before, self.unread_count)
+            && let Some(read) =
+                self.loaded_ranges
+                    .count_between(before, read_till, &mut is_unread_candidate)
+        {
+            return Some(unread.saturating_sub(read).max(0));
+        }
+        self.loaded_ranges
+            .count_after(read_till, COUNT_UNREAD_LOCAL_LIMIT, is_unread_candidate)
     }
 
     /// Advances the inbox read watermark to `up_to`, ignoring stale updates where
     /// `up_to <= inbox_read_till_id()` (`history/history.cpp:2277`, `History::applyInboxReadUpdate`),
     /// and filtering local unread message counts via `is_unread_candidate`
-    /// (`history/history.cpp:2251-2264`, `History::countStillUnreadLocalFromMessages`).
+    /// (`History::inboxRead`, `history/history.cpp:2291-2309`).
     pub fn inbox_read_with_filter<F>(
         &mut self,
         up_to: MsgId,
         still_unread: Option<i32>,
         is_unread_candidate: F,
-    ) where
+    ) -> InboxReadOutcome
+    where
         F: FnMut(MsgId) -> bool,
     {
         let next_before = MsgId(up_to.0 + 1);
@@ -723,24 +786,20 @@ impl History {
         {
             // Stale or already-applied read watermark (`_inboxReadBefore > upTo`):
             // do not overwrite `unread_count` with an outdated `still_unread_count`.
-            return;
+            return InboxReadOutcome::Stale;
         }
+        let remaining = still_unread
+            .map(|remaining| remaining.max(0))
+            .or_else(|| self.count_still_unread_local(up_to, is_unread_candidate));
         self.inbox_read_before = Some(next_before);
-        if let Some(remaining) = still_unread {
-            let clamped = remaining.max(0);
-            self.unread_count = Some(clamped);
-            if clamped == 0 {
-                self.unread_mark = false;
-            }
-        } else if let Some(counted) =
-            self.loaded_ranges
-                .count_after(up_to, 1000, is_unread_candidate)
-        {
-            self.unread_count = Some(counted);
-            if counted == 0 {
-                self.unread_mark = false;
-            }
+        let Some(remaining) = remaining else {
+            return InboxReadOutcome::CountUnknown;
+        };
+        self.unread_count = Some(remaining);
+        if remaining == 0 {
+            self.unread_mark = false;
         }
+        InboxReadOutcome::Counted
     }
 
     /// Advances the outbox read watermark to `up_to` (`History::outboxRead`).

@@ -20,8 +20,9 @@ use tg_video::{
 use tg_app_core::stand_in::types::MsgId;
 use tg_app_media::media::inline::InlineDocumentData;
 
-/// `(sticker_id, size_bucket_px, step_idx)` of one rasterised Lottie frame.
-pub(super) type LottieFrameKey = (u64, u32, u32);
+/// `(sticker_id, size_bucket_px, step_idx, overlay)` of one rasterised Lottie frame; a
+/// selected sticker's frames are coloured with `overlay` (`Lottie::FrameRequest::colored`).
+pub(super) type LottieFrameKey = (u64, u32, u32, Option<egui::Color32>);
 
 /// Work for a decode worker.
 pub(super) enum DecodeJob {
@@ -135,13 +136,14 @@ pub(super) fn run_job(job: DecodeJob) -> DecodeOutput {
         } => {
             let size = key.1;
             let fb = render_composition(&comp, sample_frame, LottieSize::new(size, size));
-            DecodeOutput::LottieFrame {
-                key,
-                image: ColorImage::from_rgba_premultiplied(
-                    [fb.width as usize, fb.height as usize],
-                    &fb.data,
-                ),
+            let mut image = ColorImage::from_rgba_premultiplied(
+                [fb.width as usize, fb.height as usize],
+                &fb.data,
+            );
+            if let Some(add) = key.3 {
+                tg_ui::colored::colored(&mut image, add);
             }
+            DecodeOutput::LottieFrame { key, image }
         }
     }
 }

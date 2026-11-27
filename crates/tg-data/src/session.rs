@@ -19,7 +19,7 @@ use crate::dialogs::{
     IncludeInBadge, MainList, UnreadState, badges_for_unread, compute_dialog_sort_key,
 };
 use crate::forum::{ForumState, ForumTopicData};
-use crate::history::{Draft, DraftKey, History};
+use crate::history::{Draft, DraftKey, History, InboxReadOutcome};
 use crate::id::{
     ARCHIVE_FOLDER_ID, ChannelId, ChatId, FilterId, FolderId, FullMsgId, MsgId, MsgRange, PeerId,
     PhotoId, UNKNOWN_PHOTO_ID, UserId,
@@ -81,6 +81,9 @@ pub struct Session {
     /// their dialog entries must be requested with `messages.getPeerDialogs`
     /// (`Histories::requestDialogEntry` from `History::addNewItem`, `history/history.cpp:1731`).
     dialog_entry_requests: BTreeSet<PeerId>,
+    /// Histories read past what loaded messages can count; their dialog entries bring the
+    /// server's unread count (`History::inboxRead`, `history/history.cpp:2291-2299`).
+    unread_count_requests: BTreeSet<PeerId>,
     random_id_map: FxHashMap<i64, FullMsgId>,
     typing_actions: FxHashMap<(PeerId, PeerId, Option<MsgId>), TypingAction>,
     main_list: MainList,
@@ -141,6 +144,14 @@ fn message_media_key(message: &Message) -> Option<u64> {
     }
 }
 
+/// Whether a loaded message counts as unread once past the read mark: a regular incoming one
+/// (`History::countStillUnreadLocal`, `history/history.cpp:2210-2213, 2242-2246`).
+fn is_unread_candidate(messages: &FxHashMap<FullMsgId, Message>, id: FullMsgId) -> bool {
+    messages
+        .get(&id)
+        .is_some_and(|m| m.is_regular() && !m.is_outgoing())
+}
+
 impl Session {
     /// Creates a new `Session` for the logged-in account `self_user_id`.
     pub fn new(self_user_id: UserId) -> Self {
@@ -163,6 +174,7 @@ impl Session {
             messages: FxHashMap::default(),
             non_channel_messages: FxHashMap::default(),
             dialog_entry_requests: BTreeSet::new(),
+            unread_count_requests: BTreeSet::new(),
             random_id_map: FxHashMap::default(),
             typing_actions: FxHashMap::default(),
             main_list: MainList::new(0, DEFAULT_MAIN_PINNED_LIMIT),
@@ -818,7 +830,8 @@ impl Session {
     /// ranges and top message, refreshes dialog lists, and broadcasts notifications.
     ///
     /// Used for messages that come with history slices, dialogs pages and other loads
-    /// (`NewMessageType::Existing` / `Last`): they never raise desktop notifications.
+    /// (`NewMessageType::Existing` / `Last`): they never raise desktop notifications and never
+    /// change the chat's unread count, which comes with the dialog.
     pub fn insert_message(&mut self, message: Message) {
         self.insert_message_typed(message, false);
     }
@@ -827,7 +840,8 @@ impl Session {
     /// `updateShortMessage`, a `getDifference` during the session): like
     /// [`Self::insert_message`], but a newly added message is also flagged
     /// [`MessageUpdateFlags::NEW_UNREAD`] (`NewMessageType::Unread`) so the notifications
-    /// layer may show it (`data/data_session.cpp:3629-3661`, `history/history.cpp:674`).
+    /// layer may show it, and an incoming one past the read mark raises the unread count
+    /// (`data/data_session.cpp:3629-3661`, `history/history.cpp:674, 1717-1723`).
     ///
     /// A new service message that changes a loaded checklist or poll is applied to it
     /// (`History::applyServiceChanges`).
@@ -912,8 +926,12 @@ impl Session {
                 .history_updated(peer_id, HistoryUpdateFlags::UNREAD_REACTIONS);
         }
         // Increment known unread count for newly arriving unread incoming messages
-        // (`history/history.cpp:1717-1723`, `History::addNewMessage`).
-        if is_new
+        // (`History::newItemAdded`, `history/history.cpp:1717-1723`). Only a message added as
+        // `NewMessageType::Unread` gets there (`History::addNewItem` / `addNewToBack`,
+        // `history.cpp:865-900, 1210-1214`): one stored with a dialogs page or the startup
+        // catch-up is already in the server's `dialog.unread_count`.
+        if unread_type
+            && is_new
             && is_regular
             && (!is_outgoing || is_post)
             && msg_id > history.inbox_read_till_id()
@@ -950,7 +968,8 @@ impl Session {
     }
 
     /// Like [`Self::apply_sent_or_new_message`]; `unread_type == false` adds a new message
-    /// like history (`NewMessageType::Existing`), so it never raises a notification.
+    /// like history (`NewMessageType::Existing`), so it never raises a notification or the
+    /// unread count.
     pub fn apply_sent_or_new_message_typed(&mut self, mut message: Message, unread_type: bool) {
         let full_id = message.full_id();
         if let Some(existing) = self.messages.get(&full_id)
@@ -1005,15 +1024,19 @@ impl Session {
     /// `true` when [`Self::take_dialog_entry_requests`] has peers to return.
     #[must_use]
     pub fn has_dialog_entry_requests(&self) -> bool {
-        !self.dialog_entry_requests.is_empty()
+        !self.dialog_entry_requests.is_empty() || !self.unread_count_requests.is_empty()
     }
 
-    /// Takes the queued dialog entry requests whose folder is still unknown.
+    /// Takes the queued dialog entry requests: histories whose folder is still unknown and
+    /// histories whose unread count could not be counted after a read, sorted by peer.
     pub fn take_dialog_entry_requests(&mut self) -> Vec<PeerId> {
-        std::mem::take(&mut self.dialog_entry_requests)
-            .into_iter()
-            .filter(|pid| self.histories.get(pid).is_some_and(|h| !h.folder_known()))
-            .collect()
+        let mut out = std::mem::take(&mut self.unread_count_requests);
+        out.extend(
+            std::mem::take(&mut self.dialog_entry_requests)
+                .into_iter()
+                .filter(|pid| self.histories.get(pid).is_some_and(|h| !h.folder_known())),
+        );
+        out.into_iter().collect()
     }
 
     /// Registers a `random_id -> FullMsgId` mapping for an outgoing local message.
@@ -1767,22 +1790,43 @@ impl Session {
     }
 
     /// Advances inbox read watermark for `peer_id`, counting only incoming regular messages
-    /// when `still_unread` is unknown
-    /// (`history/history.cpp:2251-2264`, `History::countStillUnreadLocalFromMessages`).
+    /// when `still_unread` is unknown (`History::inboxRead`, `history/history.cpp:2291-2309`).
+    /// When the count cannot be computed from loaded messages, the dialog entry is queued for
+    /// [`Self::take_dialog_entry_requests`] so the server's count replaces the old one.
     pub fn mark_inbox_read(&mut self, peer_id: PeerId, up_to: MsgId, still_unread: Option<i32>) {
         let messages = &self.messages;
         let history = self
             .histories
             .entry(peer_id)
             .or_insert_with(|| History::new(peer_id));
-        history.inbox_read_with_filter(up_to, still_unread, |id| {
-            messages
-                .get(&FullMsgId::new(peer_id, id))
-                .is_some_and(|m| m.is_regular() && !m.is_outgoing())
+        let outcome = history.inbox_read_with_filter(up_to, still_unread, |id| {
+            is_unread_candidate(messages, FullMsgId::new(peer_id, id))
         });
+        if outcome == InboxReadOutcome::CountUnknown {
+            self.unread_count_requests.insert(peer_id);
+        }
         self.changes
             .history_updated(peer_id, HistoryUpdateFlags::UNREAD_VIEW);
         self.sync_dialog_lists(peer_id);
+    }
+
+    /// The local half of a read the user made (`Data::Histories::readInboxTill`,
+    /// `data/data_histories.cpp:260-352`): when the messages still unread after `up_to` can be
+    /// counted from loaded messages, the read mark and the count change now and `true` is
+    /// returned. Otherwise nothing changes: the read goes to the server, and its answer applies
+    /// the read through [`Self::mark_inbox_read`], which requests the dialog entry for the count.
+    pub fn read_inbox_till_local(&mut self, peer_id: PeerId, up_to: MsgId) -> bool {
+        let messages = &self.messages;
+        let still_unread = self.histories.get(&peer_id).and_then(|history| {
+            history.count_still_unread_local(up_to, |id| {
+                is_unread_candidate(messages, FullMsgId::new(peer_id, id))
+            })
+        });
+        let Some(still_unread) = still_unread else {
+            return false;
+        };
+        self.mark_inbox_read(peer_id, up_to, Some(still_unread));
+        true
     }
 
     /// Advances outbox read watermark for `peer_id`.

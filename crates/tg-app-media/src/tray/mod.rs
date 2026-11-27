@@ -8,6 +8,8 @@
 
 pub mod accounts_menu;
 pub mod strings;
+#[cfg(test)]
+mod tests_tgb3159_menu;
 pub mod window_close;
 
 use std::collections::VecDeque;
@@ -25,7 +27,7 @@ use tg_platform::tray::{
 };
 
 use crate::notifications::settings::{
-    AccountUnreadEntry, MUTE_ONE_HOUR_SECS, NotificationPreferences, UnreadBadgeResult,
+    AccountUnreadEntry, NotificationPreferences, UnreadBadgeResult,
     aggregate_account_badges_per_account,
 };
 pub use crate::tray::accounts_menu::TrayAccountEntry;
@@ -38,8 +40,6 @@ pub const TRAY_CLICK_DEBOUNCE_MS: i64 = 500;
 pub mod menu_id {
     /// Open or minimize the main Rustgram window.
     pub const OPEN_OR_MINIMIZE: u32 = 1;
-    /// Mute notifications for 1 hour (or unmute immediately if muted).
-    pub const MUTE_ONE_HOUR: u32 = 2;
     /// Toggle desktop notifications on/off (remembering sound & flash state).
     pub const TOGGLE_NOTIFICATIONS: u32 = 3;
     /// Debug action: simulate an incoming message notification.
@@ -75,10 +75,6 @@ pub enum TrayAction {
     ShowWindow,
     /// Hide / minimize main window to tray.
     HideToTray,
-    /// Mute notifications globally for 1 hour.
-    MuteForOneHour,
-    /// Cancel active 1-hour global mute.
-    UnmuteGlobal,
     /// Toggle desktop notifications on/off (with sound/flash memory).
     ToggleNotifications,
     /// Trigger `"simulate incoming message"` debug action.
@@ -472,7 +468,7 @@ pub struct TrayController {
     passcode_locked: bool,
     last_badge: UnreadBadgeResult,
     last_click_ms: Option<i64>,
-    last_menu_signature: Option<(bool, bool, bool, bool)>,
+    last_menu_signature: Option<(bool, bool, bool)>,
     accounts: Vec<TrayAccountEntry>,
     autostart: Option<AutostartController>,
 }
@@ -520,7 +516,8 @@ impl TrayController {
             app_name: strings::APP_NAME.to_owned(),
             work_mode,
             monochrome,
-            include_debug_simulate_item: true,
+            // A developer tool: only debug builds show it (TGB-3159).
+            include_debug_simulate_item: cfg!(debug_assertions),
             window_active_for_tray: true,
             passcode_locked: false,
             last_badge: UnreadBadgeResult::default(),
@@ -672,11 +669,13 @@ impl TrayController {
         self.last_badge
     }
 
-    /// Builds the tray context menu reflecting current window visibility, 1-hour mute status,
-    /// notification toggle, passcode lock, and quit action.
+    /// Builds the tray context menu like `Tray::rebuildMenu` (`tray.cpp:80-115`): open or
+    /// minimize, the notifications toggle (not while passcode-locked), quit, then the accounts.
+    /// Debug builds add the "Simulate incoming message" developer item after the toggle.
     #[must_use]
     pub fn build_menu(&self, prefs: &NotificationPreferences, now_unix: i64) -> Vec<TrayMenuItem> {
-        let mut items = Vec::with_capacity(7);
+        let _ = now_unix;
+        let mut items = Vec::with_capacity(5);
 
         let open_label = if self.window_active_for_tray {
             tg_lang::tr::lng_minimize_to_tray()
@@ -686,21 +685,6 @@ impl TrayController {
         items.push(TrayMenuItem::action(menu_id::OPEN_OR_MINIMIZE, open_label));
 
         if !self.passcode_locked {
-            let mute_label = if let Some(until) = prefs.global_mute_until_unix
-                && until > now_unix
-            {
-                let mins = ((until - now_unix + 59) / 60).max(1);
-                strings::unmute_minutes_left(mins)
-            } else {
-                strings::MUTE_FOR_ONE_HOUR.to_owned()
-            };
-            items.push(TrayMenuItem::Action {
-                id: menu_id::MUTE_ONE_HOUR,
-                label: mute_label,
-                enabled: true,
-                checked: prefs.is_globally_muted(now_unix),
-            });
-
             let notif_label = if prefs.desktop_notify {
                 tg_lang::tr::lng_disable_notifications_from_tray()
             } else {
@@ -717,10 +701,10 @@ impl TrayController {
                     menu_id::SIMULATE_MESSAGE,
                     strings::SIMULATE_INCOMING_MESSAGE,
                 ));
+                items.push(TrayMenuItem::Separator);
             }
         }
 
-        items.push(TrayMenuItem::Separator);
         items.push(TrayMenuItem::action(
             menu_id::QUIT,
             tg_lang::tr::lng_quit_from_tray(),
@@ -729,9 +713,9 @@ impl TrayController {
         items
     }
 
-    /// Drains tray events, applies preference toggles directly where appropriate (including
-    /// `"Mute for 1 hour"` and `toggleSoundNotifications` memory), and returns high-level
-    /// [`TrayAction`]s for the window shell.
+    /// Drains tray events, applies the notifications toggle directly
+    /// (`toggleSoundNotifications` memory), and returns high-level [`TrayAction`]s for the
+    /// window shell.
     pub fn poll_actions(
         &mut self,
         prefs: &mut NotificationPreferences,
@@ -770,16 +754,6 @@ impl TrayController {
                             actions.push(TrayAction::ShowWindow);
                         }
                     }
-                    menu_id::MUTE_ONE_HOUR => {
-                        if prefs.is_globally_muted(now_unix) {
-                            prefs.clear_global_mute();
-                            actions.push(TrayAction::UnmuteGlobal);
-                        } else {
-                            prefs.mute_globally_for(now_unix, MUTE_ONE_HOUR_SECS);
-                            actions.push(TrayAction::MuteForOneHour);
-                        }
-                        self.last_menu_signature = None;
-                    }
                     menu_id::TOGGLE_NOTIFICATIONS => {
                         toggle_notifications_from_tray(prefs);
                         actions.push(TrayAction::ToggleNotifications);
@@ -808,16 +782,12 @@ impl TrayController {
         self.platform.as_ref()
     }
 
-    fn menu_signature(
-        &self,
-        prefs: &NotificationPreferences,
-        now_unix: i64,
-    ) -> (bool, bool, bool, bool) {
+    fn menu_signature(&self, prefs: &NotificationPreferences, now_unix: i64) -> (bool, bool, bool) {
+        let _ = now_unix;
         (
             self.window_active_for_tray,
             self.passcode_locked,
             prefs.desktop_notify,
-            prefs.is_globally_muted(now_unix),
         )
     }
 }

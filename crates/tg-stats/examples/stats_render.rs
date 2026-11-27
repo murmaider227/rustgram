@@ -1,7 +1,7 @@
 //! CLI example rendering a Telegram statistics chart JSON file to a PNG image.
 //!
 //! Usage:
-//! `cargo run -p tg-stats --example render -- <in.json> <out.png> [--type linear|double_linear|bar|stack_bar|stack_linear|pie] [--width 640] [--height 360] [--selected N] [--title "..."] [--dark]`
+//! `cargo run -p tg-stats --example stats_render -- <in.json> <out.png> [--type linear|double_linear|bar|stack_bar|stack_linear|pie] [--width 640] [--height 360] [--selected N] [--title "..."] [--dark]`
 
 use std::env;
 use std::fs;

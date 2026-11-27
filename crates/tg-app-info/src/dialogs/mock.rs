@@ -427,6 +427,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_personal.clone()],
             last_message_id: MsgId(901),
             last_message: "Column thresholds: 260 / 380 / 292 px #notes".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -465,6 +466,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_work.clone()],
             last_message_id: MsgId(902),
             last_message: "Virtualized dialog rows hit 60 FPS with 5,000 chats #perf".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: Some("Jordan".to_owned()),
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -510,6 +512,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_personal.clone(), tag_work.clone()],
             last_message_id: MsgId(903),
             last_message: "Checking the drag-and-drop pin swap animation now.".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -558,6 +561,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_work.clone()],
             last_message_id: MsgId(904),
             last_message: "Did you get a chance to review the PR?".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -602,6 +606,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             last_message_id: MsgId(905),
             last_message: "Milestone 2: dialogs list, folders sidebar, and search #release"
                 .to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -645,6 +650,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: Vec::new(),
             last_message_id: MsgId(906),
             last_message: "Casey replied to your comment in Rust Crate Weekly".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: Some("Casey".to_owned()),
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -689,6 +695,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_personal.clone()],
             last_message_id: MsgId(907),
             last_message: "Sent over the color tokens for Night mode #design".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -727,6 +734,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_work.clone()],
             last_message_id: MsgId(908),
             last_message: "Uploading the benchmark CSV now...".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -765,6 +773,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_work.clone()],
             last_message_id: MsgId(909),
             last_message: "Poll: default horizontal or vertical folder bar?".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: Some("Riley".to_owned()),
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -812,6 +821,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_bots],
             last_message_id: MsgId(910),
             last_message: "Build #412 green: clippy -D warnings & 124 tests passed.".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -850,6 +860,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             folder_tags: vec![tag_personal],
             last_message_id: MsgId(911),
             last_message: "Loved the new compact avatar rail layout!".to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -895,6 +906,7 @@ fn build_featured_dialogs(now: LocalDateTime) -> Vec<DialogItem> {
             last_message_id: MsgId(912),
             last_message: "Windows x64 MSVC artifacts uploaded for branch master #release"
                 .to_owned(),
+            last_message_spoilers: Vec::new(),
             last_sender: None,
             last_message_time: LocalDateTime::new(
                 now.date.year,
@@ -1107,6 +1119,7 @@ fn generate_synthetic_dialog(idx: usize, now: LocalDateTime) -> DialogItem {
         folder_tags,
         last_message_id: MsgId(10_000 + idx as i32),
         last_message: snippet,
+        last_message_spoilers: Vec::new(),
         last_sender,
         last_message_time,
         send_state,
@@ -1197,6 +1210,7 @@ fn build_message_corpus(dialogs: &[DialogItem]) -> Vec<MessageSearchResult> {
                 msg_id: d.last_message_id,
                 sender_name: d.last_sender.clone(),
                 text: d.last_message.clone(),
+                text_spoilers: Vec::new(),
                 time: d.last_message_time,
                 send_state: d.send_state,
                 archived: d.archived,
@@ -1261,6 +1275,7 @@ fn build_message_corpus(dialogs: &[DialogItem]) -> Vec<MessageSearchResult> {
             msg_id,
             sender_name: sender.map(str::to_owned),
             text: text.to_owned(),
+            text_spoilers: Vec::new(),
             time,
             send_state: DialogSendState::None,
             archived: false,

@@ -20,7 +20,8 @@ pub use radial::{
 pub use ripple::{RippleMask, RippleState, clamp_point_to_round_rect, update_and_paint_ripple};
 pub use spoiler::paint_spoiler_particles;
 pub use text_spoiler::{
-    merge_spoiler_rects, paint_text_spoiler, pause_text_spoilers_this_pass, text_spoilers_paused,
+    merge_spoiler_rects, paint_text_spoiler, paint_text_spoiler_selected,
+    pause_text_spoilers_this_pass, split_spoiler_rects, text_spoilers_paused,
 };
 pub use thanos::{
     ThanosEffect, ThanosItem, ThanosParticle, ThanosPolicy, animation_speed_multiplier,

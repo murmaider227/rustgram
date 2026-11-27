@@ -18,8 +18,8 @@ use tg_history::{
     BubbleCornerRounding, BubbleRounding, MessageLayout, ServiceLayout, TextSelection,
 };
 use tg_ui::text::{
-    RichTextOptions, SyntaxHighlightPalette, render_prepared_rich_text,
-    render_prepared_rich_text_with_reveal, render_prepared_text_with_entities,
+    RichTextOptions, SyntaxHighlightPalette, render_prepared_rich_text_selected,
+    render_prepared_text_with_entities,
 };
 use tg_ui::userpic::EmptyUserpic;
 
@@ -1043,6 +1043,7 @@ fn paint_message_element_internal(
                 assets,
                 voice_state,
                 rt,
+                is_selected.then_some(colors.msg_sticker_overlay),
             )
         } else {
             paint_history_media(
@@ -1153,6 +1154,7 @@ fn paint_message_element_internal(
                 layout.has_right_layout,
                 origin,
                 colors.text_fg,
+                is_selected.then_some(colors.msg_sticker_overlay),
             );
         }
         None => {}
@@ -1337,19 +1339,23 @@ fn paint_message_element_internal(
                 }
             }
             PreparedBody::Spans { text: prepared, .. } => {
-                // Paint partial text-selection background rectangles before drawing the text galley.
-                if !selection.is_empty() && !selection.is_full() {
+                // Paint partial text-selection background rectangles before drawing the text
+                // galley; the spoiler cover over them takes the selected colour.
+                let selected_rects = if !selection.is_empty() && !selection.is_full() {
                     let sel_galley =
                         prepared.plain_galley(ui, &style, &text_pal, colors.text_fg, body_wrap);
-                    for sr in char_range_rects(
+                    char_range_rects(
                         &sel_galley,
                         text_rect.min,
                         usize::from(selection.from),
                         usize::from(selection.to),
-                    ) {
-                        ui.painter()
-                            .rect_filled(sr, CornerRadius::same(2), colors.text_select_bg);
-                    }
+                    )
+                } else {
+                    Vec::new()
+                };
+                for sr in &selected_rects {
+                    ui.painter()
+                        .rect_filled(*sr, CornerRadius::same(2), colors.text_select_bg);
                 }
 
                 // Drag-select sensing over the text rect. It is registered below the text: a
@@ -1365,27 +1371,17 @@ fn paint_message_element_internal(
                 let mut clicked_link = None;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
                     let id = Id::unique(("tg_msg_text", msg.id.0));
-                    let resp = match spoiler_reveal {
-                        Some(reveal) => render_prepared_rich_text_with_reveal(
-                            ui,
-                            id,
-                            prepared,
-                            &style,
-                            &text_pal,
-                            colors.text_fg,
-                            body_wrap,
-                            reveal,
-                        ),
-                        None => render_prepared_rich_text(
-                            ui,
-                            id,
-                            prepared,
-                            &style,
-                            &text_pal,
-                            colors.text_fg,
-                            body_wrap,
-                        ),
-                    };
+                    let resp = render_prepared_rich_text_selected(
+                        ui,
+                        id,
+                        prepared,
+                        &style,
+                        &text_pal,
+                        colors.text_fg,
+                        body_wrap,
+                        spoiler_reveal,
+                        &selected_rects,
+                    );
                     clicked_link = resp.clicked_link;
                     spoilers_clicked = resp.spoiler_toggled;
                 });

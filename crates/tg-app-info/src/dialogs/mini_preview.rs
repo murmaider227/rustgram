@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Color32, ColorImage, CornerRadius, FontId, Id, Painter, Pos2, Rect, TextureHandle, Vec2,
 };
@@ -292,17 +291,32 @@ pub fn paint_preview_line(
     } else {
         body.len()
     };
-    let mut job = LayoutJob::default();
-    let (head, tail) = body.split_at(split);
-    if !head.is_empty() {
-        job.append(head, 0.0, TextFormat::simple(font.clone(), fg.service));
-    }
-    if !tail.is_empty() {
-        job.append(tail, 0.0, TextFormat::simple(font.clone(), fg.text));
-    }
-    if job.sections.is_empty() {
+    if body.is_empty() {
         return;
     }
+    // A stripped notification marker moves the text's spoilers with it.
+    let shift = item.last_message.len() - text.len();
+    let spoilers: Vec<std::ops::Range<usize>> = item
+        .last_message_spoilers
+        .iter()
+        .filter(|r| r.start >= shift)
+        .map(|r| r.start - shift..r.end - shift)
+        .collect();
+    let spoilers = tg_ui::spoiler_line::spoilers_in_cut(text, &body, &spoilers);
+    let (job, hidden) = tg_ui::spoiler_line::spoiler_line_job(
+        &body,
+        split,
+        &spoilers,
+        font.clone(),
+        fg.service,
+        fg.text,
+        f32::INFINITY,
+    );
     let galley = painter.layout_job(job);
-    painter.galley(Pos2::new(x, line_top), galley, fg.text);
+    let line = tg_ui::spoiler_line::SpoilerLine {
+        spoilers: tg_ui::spoiler_line::hidden_glyph_rects(&galley, &hidden),
+        galley,
+    };
+    // `dialogsTextPalette.spoilerFg` is the row's text colour in each state.
+    line.paint(painter, Pos2::new(x, line_top), fg.text, fg.text);
 }

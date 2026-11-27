@@ -57,6 +57,8 @@ pub use downloads::{MSG_FILE_OVER_DURATION_SECS, MediaDownloadAction, PhotoLink}
 mod tests_decode;
 #[cfg(test)]
 mod tests_photo_radial;
+#[cfg(test)]
+pub(crate) mod tests_tgb3138_colored;
 
 use asset_lru::{AssetLru, TexturePool, texture_bytes};
 use decode_pool::{DecodeJob, DecodeOutput, DecodeQueue, LottieFrameKey};
@@ -701,9 +703,9 @@ pub struct HistoryMediaRuntime {
     lottie_size_frames: AssetLru<LottieFrameKey, TextureHandle>,
     lottie_rendering: HashSet<LottieFrameKey>,
     /// `(sticker_id, size_px)` whose remaining steps were queued for background rendering.
-    lottie_prefetched: HashSet<(u64, u32)>,
+    lottie_prefetched: HashSet<(u64, u32, Option<Color32>)>,
     /// Last frame painted per `(sticker_id, size_px)`, shown while the current step renders.
-    lottie_last_shown: HashMap<(u64, u32), TextureHandle>,
+    lottie_last_shown: HashMap<(u64, u32, Option<Color32>), TextureHandle>,
     /// Evicted Lottie frame textures, refilled for new frames of the same size.
     lottie_texture_pool: TexturePool,
     /// Background decode workers (photos, video thumbnails, Lottie).
@@ -1117,7 +1119,7 @@ impl HistoryMediaRuntime {
             }
             DecodeOutput::LottieFrame { key, image } => {
                 self.lottie_rendering.remove(&key);
-                let (sticker_id, size_bucket, step_idx) = key;
+                let (sticker_id, size_bucket, step_idx, overlay) = key;
                 let size = texture_bytes(image.size);
                 let texture = match self.lottie_texture_pool.take(image.size) {
                     Some(mut reused) => {
@@ -1125,7 +1127,10 @@ impl HistoryMediaRuntime {
                         reused
                     }
                     None => ctx.load_texture(
-                        format!("tg_lottie_{sticker_id}_{size_bucket}_{step_idx}"),
+                        format!(
+                            "tg_lottie_{sticker_id}_{size_bucket}_{step_idx}{}",
+                            if overlay.is_some() { "_selected" } else { "" }
+                        ),
                         image,
                         TextureOptions::LINEAR,
                     ),
@@ -1761,13 +1766,38 @@ impl HistoryMediaRuntime {
         time_secs: f64,
         render_px: u32,
     ) -> LottieFrameState {
+        self.lottie_frame_colored(
+            ctx,
+            msg_id,
+            sticker_id,
+            lottie_json,
+            time_secs,
+            render_px,
+            None,
+        )
+    }
+
+    /// [`Self::lottie_frame_per_size`] with the frames coloured with `overlay`: a selected
+    /// message's sticker gets `msgStickerOverlay` (`Sticker::paintLottie` asks its frames
+    /// `.colored`), cached apart from the plain frames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lottie_frame_colored(
+        &mut self,
+        ctx: &egui::Context,
+        msg_id: MsgId,
+        sticker_id: u64,
+        lottie_json: &str,
+        time_secs: f64,
+        render_px: u32,
+        overlay: Option<Color32>,
+    ) -> LottieFrameState {
         self.mark_visible(msg_id);
         self.pump_decoded(ctx);
         // Quantize render size to 16px buckets so each size has its own crisp cached frames.
         let size_bucket = render_px.clamp(32, 256).div_ceil(16) * 16;
         let last_shown = |rt: &Self| {
             rt.lottie_last_shown
-                .get(&(sticker_id, size_bucket))
+                .get(&(sticker_id, size_bucket, overlay))
                 .cloned()
                 .map_or(LottieFrameState::Pending, |texture| {
                     LottieFrameState::Ready {
@@ -1823,10 +1853,10 @@ impl HistoryMediaRuntime {
             (0, false)
         };
 
-        let key = (sticker_id, size_bucket, step_idx);
+        let key = (sticker_id, size_bucket, step_idx, overlay);
         if let Some(tex) = self.lottie_size_frames.get(&key).cloned() {
             self.lottie_last_shown
-                .insert((sticker_id, size_bucket), tex.clone());
+                .insert((sticker_id, size_bucket, overlay), tex.clone());
             return LottieFrameState::Ready {
                 texture: tex,
                 animated: still_animating,
@@ -1839,10 +1869,12 @@ impl HistoryMediaRuntime {
         // newest job (the step needed now) is picked up before them.
         if self.decode.is_background()
             && still_animating
-            && self.lottie_prefetched.insert((sticker_id, size_bucket))
+            && self
+                .lottie_prefetched
+                .insert((sticker_id, size_bucket, overlay))
         {
             for step in (0..total_steps).rev().filter(|&step| step != step_idx) {
-                let other = (sticker_id, size_bucket, step);
+                let other = (sticker_id, size_bucket, step, overlay);
                 if !self.lottie_size_frames.contains(&other) && self.lottie_rendering.insert(other)
                 {
                     self.run_decode(
@@ -1868,7 +1900,7 @@ impl HistoryMediaRuntime {
         }
         if let Some(tex) = self.lottie_size_frames.get(&key).cloned() {
             self.lottie_last_shown
-                .insert((sticker_id, size_bucket), tex.clone());
+                .insert((sticker_id, size_bucket, overlay), tex.clone());
             return LottieFrameState::Ready {
                 texture: tex,
                 animated: still_animating,

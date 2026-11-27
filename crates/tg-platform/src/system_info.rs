@@ -396,6 +396,23 @@ pub fn idle_time() -> Option<Duration> {
     }
 }
 
+/// Lines one mouse wheel notch scrolls when the system does not say (Qt's and Windows' default).
+pub const DEFAULT_WHEEL_SCROLL_LINES: u32 = 3;
+
+/// Lines one mouse wheel notch scrolls, from the system setting (`SPI_GETWHEELSCROLLLINES`,
+/// what Qt's `QApplication::wheelScrollLines()` reads on Windows); [`DEFAULT_WHEEL_SCROLL_LINES`]
+/// elsewhere. "One screen at a time" (`WHEEL_PAGESCROLL`) comes back as a very large number.
+pub fn wheel_scroll_lines() -> u32 {
+    #[cfg(windows)]
+    {
+        win_sys::wheel_scroll_lines().unwrap_or(DEFAULT_WHEEL_SCROLL_LINES)
+    }
+    #[cfg(not(windows))]
+    {
+        DEFAULT_WHEEL_SCROLL_LINES
+    }
+}
+
 /// Check whether Windows dark mode for apps is enabled (`AppsUseLightTheme == 0`).
 ///
 /// Returns `None` on pre-1809 Windows, when High Contrast mode is active, or if unavailable.
@@ -703,11 +720,11 @@ mod win_sys {
     use windows::Win32::UI::WindowsAndMessaging::{
         CREATESTRUCTW, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow,
         DispatchMessageW, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, MSG,
-        PostMessageW, PostQuitMessage, RegisterClassExW, SPI_GETHIGHCONTRAST, SW_SHOWNORMAL,
-        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowLongPtrW,
-        SystemParametersInfoW, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WDA_NONE,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST,
-        WNDCLASSEXW,
+        PostMessageW, PostQuitMessage, RegisterClassExW, SPI_GETHIGHCONTRAST,
+        SPI_GETWHEELSCROLLLINES, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SetWindowDisplayAffinity, SetWindowLongPtrW, SystemParametersInfoW, TranslateMessage,
+        WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WDA_NONE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+        WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST, WNDCLASSEXW,
     };
     use windows::core::{BOOL, PCSTR, PCWSTR, PWSTR};
 
@@ -863,6 +880,21 @@ mod win_sys {
         let ticks32 = unsafe { GetTickCount() };
         let elapsed_ms = u64::from(ticks32.wrapping_sub(lii.dwTime));
         Some(Duration::from_millis(elapsed_ms))
+    }
+
+    pub(crate) fn wheel_scroll_lines() -> Option<u32> {
+        let mut lines: u32 = 0;
+        // SAFETY: SPI_GETWHEELSCROLLLINES writes one UINT into `lines`.
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETWHEELSCROLLLINES,
+                0,
+                Some((&mut lines as *mut u32).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        }
+        .ok()?;
+        Some(lines)
     }
 
     fn is_high_contrast_enabled() -> bool {

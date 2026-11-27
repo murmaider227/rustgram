@@ -847,15 +847,30 @@ pub fn paint_pinned_bar(
             &tg_ui::tg_style::DefaultPaletteResolver,
         );
     }
-    let preview_galley = ui.painter().layout_no_wrap(
-        preview_text.to_owned(),
+    // `MessageBar` draws the text with `.spoiler` (`message_bar.cpp:430-441`): the spoiler
+    // parts stay hidden under the cover in `defaultTextPalette.spoilerFg` (`msgInDateFg`).
+    let shift = current.preview.len() - preview_text.len();
+    let spoilers: Vec<std::ops::Range<usize>> = current
+        .preview_spoilers
+        .iter()
+        .filter(|r| r.start >= shift)
+        .map(|r| r.start - shift..r.end - shift)
+        .collect();
+    let preview_line = tg_ui::spoiler_line::layout_spoiler_line(
+        ui.painter(),
+        preview_text,
+        0,
+        &spoilers,
         FontId::proportional(12.5),
         colors.sub_text_fg,
-    );
-    preview_clip.galley(
-        Pos2::new(preview_x, rect.top() + 24.0),
-        preview_galley,
         colors.sub_text_fg,
+        f32::INFINITY,
+    );
+    preview_line.paint(
+        &preview_clip,
+        Pos2::new(preview_x, rect.top() + 24.0),
+        colors.sub_text_fg,
+        colors.msg_in_date_fg,
     );
 
     if click_resp

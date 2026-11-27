@@ -1060,6 +1060,7 @@ impl MockSessionState {
             folder_tags,
             last_message_id,
             last_message,
+            last_message_spoilers: Vec::new(),
             last_sender,
             last_message_time: peer.last_message_time,
             send_state,
@@ -2953,6 +2954,7 @@ impl DialogsBackend for SharedSessionHandle {
                             msg_id: m.id,
                             sender_name: peer.kind.is_group().then(|| m.sender_name.clone()),
                             text: m.preview_snippet(),
+                            text_spoilers: Vec::new(),
                             time: LocalDateTime::from_unix_utc(i64::from(m.date_unix)),
                             send_state: match (
                                 m.outgoing && peer.kind != InfoPeerKind::SavedMessages,
@@ -3895,6 +3897,7 @@ impl HistoryBackend for SharedSessionHandle {
                     msg_id: m.id,
                     sender_name: m.sender_name.clone(),
                     preview: m.preview_snippet(),
+                    preview_spoilers: Vec::new(),
                 })
             })
             .collect()

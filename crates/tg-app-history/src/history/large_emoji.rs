@@ -339,22 +339,7 @@ pub fn outlined_emoji_image(emoji: EmojiRef, side: u32, outline: u32) -> Option<
     ))
 }
 
-/// `Images::Colored`: lays `add` over the image where it is opaque (a selected sticker or
-/// large emoji gets `msgStickerOverlay`), in tdesktop's fixed-point arithmetic on premultiplied
-/// pixels. Alpha is kept.
-pub fn colored(image: &mut ColorImage, add: Color32) {
-    let [r, g, b, ca] = add.to_srgba_unmultiplied().map(u32::from);
-    let (cr, cg, cb) = (r * (ca + 1), g * (ca + 1), b * (ca + 1));
-    let ra = (0x100 - ca) * 0x100;
-    for px in &mut image.pixels {
-        let [pr, pg, pb, pa] = px.to_array().map(u32::from);
-        let a = pa + 1;
-        // Each sum is at most 0x100 * 0xFF * 0x100 + 0x100 * 0xFF * 0x100 < 2^25, and the
-        // result after `>> 16` is at most 0xFF.
-        let mix = |p: u32, c: u32| ((ra * p + a * c) >> 16).min(0xFF) as u8;
-        *px = Color32::from_rgba_premultiplied(mix(pr, cr), mix(pg, cg), mix(pb, cb), pa as u8);
-    }
-}
+pub use tg_ui::colored::colored;
 
 /// What a large emoji texture is: the emoji, its pixel side and outline, and the overlay it is
 /// coloured with when the message is selected.
@@ -458,7 +443,7 @@ pub fn paint_large_emoji(
                     Pos2::new(snap(x + skip), snap(row.top() + skip)),
                     egui::vec2(outer, outer),
                 );
-                paint_custom(ctx, painter, id, rect, text_color);
+                paint_custom(ctx, painter, id, rect, text_color, overlay);
             }
         }
         x += step;
@@ -467,7 +452,17 @@ pub fn paint_large_emoji(
 
 /// Paints the custom emoji `id` into `rect` from the shared registry once its document is
 /// loaded (the live session's custom emoji loader registers it), animated.
-pub fn paint_custom(ctx: &Context, painter: &Painter, id: &str, rect: Rect, text_color: Color32) {
+///
+/// A selected message passes `msgStickerOverlay` as `overlay` (`LargeEmoji::paintCustom` /
+/// `CustomEmoji::paintCustom` colour the frame when `context.selected()`).
+pub fn paint_custom(
+    ctx: &Context,
+    painter: &Painter,
+    id: &str,
+    rect: Rect,
+    text_color: Color32,
+    overlay: Option<Color32>,
+) {
     if !tg_ui::custom_emoji::has_registered_custom_emoji(id) {
         return;
     }
@@ -477,13 +472,17 @@ pub fn paint_custom(ctx: &Context, painter: &Painter, id: &str, rect: Rect, text
         painter,
         id,
         rect,
-        tg_ui::custom_emoji::CustomEmojiPaintContext::playing(time, text_color),
+        tg_ui::custom_emoji::CustomEmojiPaintContext {
+            overlay,
+            ..tg_ui::custom_emoji::CustomEmojiPaintContext::playing(time, text_color)
+        },
     );
 }
 
 /// Paints a message of only custom emoji (`CustomEmoji::draw`) in `media_rect` (element
 /// coordinates, `origin` is the element's top-left on screen): the lines wrapped to the media
 /// width, each emoji a square of the side its count gives.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_only_custom(
     ctx: &Context,
     painter: &Painter,
@@ -492,6 +491,7 @@ pub fn paint_only_custom(
     has_right_layout: bool,
     origin: Pos2,
     text_color: Color32,
+    overlay: Option<Color32>,
 ) {
     let input = tg_history::CustomEmojiInput {
         lines: lines.iter().map(Vec::len).collect(),
@@ -507,7 +507,7 @@ pub fn paint_only_custom(
             origin + egui::vec2(cell.x as f32, cell.y as f32),
             egui::vec2(cell.width as f32, cell.height as f32),
         );
-        paint_custom(ctx, painter, id, rect, text_color);
+        paint_custom(ctx, painter, id, rect, text_color, overlay);
     }
 }
 

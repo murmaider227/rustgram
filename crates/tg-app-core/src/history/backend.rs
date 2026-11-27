@@ -1188,6 +1188,9 @@ pub struct PinnedMessageSummary {
     pub sender_name: String,
     /// Preview snippet text.
     pub preview: String,
+    /// Byte ranges of `preview` under a spoiler, drawn hidden (`MessageBar` draws its text
+    /// with `.spoiler`).
+    pub preview_spoilers: Vec<std::ops::Range<usize>>,
 }
 
 /// Optional contact status action banner below the top bar (`history_view_contact_status.cpp`).

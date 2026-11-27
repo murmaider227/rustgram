@@ -105,6 +105,12 @@ pub fn apply(ctx: &egui::Context, config_scale: i32) {
     let zoom = target / native;
     // tdesktop has no keyboard zoom of the whole window; egui's Ctrl +/- would fight this.
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
+    // A wheel notch scrolls as far as in tdesktop's `Ui::ScrollArea` (TGB-3161).
+    static WHEEL_LINES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    tg_ui::wheel::install_wheel_step(
+        ctx,
+        *WHEEL_LINES.get_or_init(tg_platform::system_info::wheel_scroll_lines),
+    );
     if (ctx.zoom_factor() - zoom).abs() > 1e-4 {
         ctx.set_zoom_factor(zoom);
     }
@@ -279,5 +285,24 @@ mod tests {
         run(&ctx, input, |_| {});
         assert!((ctx.zoom_factor() - 1.0).abs() < 1e-6);
         assert!((ctx.pixels_per_point() - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_sets_the_wheel_step_of_a_qt_scroll_area() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(1.0);
+        run(&ctx, input, |_| {});
+        apply(&ctx, SCALE_AUTO);
+        // `wheelScrollLines` (3 by default) × `QScrollArea` single step 20 (TGB-3161).
+        let lines = tg_platform::system_info::wheel_scroll_lines();
+        assert_eq!(
+            ctx.options(|o| o.input_options.line_scroll_speed),
+            lines.min(100) as f32 * 20.0
+        );
     }
 }

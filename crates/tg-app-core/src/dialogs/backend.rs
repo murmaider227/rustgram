@@ -226,6 +226,9 @@ pub struct DialogItem {
     pub last_message_id: MsgId,
     /// Preview text of the latest message.
     pub last_message: String,
+    /// Byte ranges of `last_message` under a spoiler, drawn hidden under the particle cover
+    /// (`dialogsTextPalette.spoilerFg`).
+    pub last_message_spoilers: Vec<std::ops::Range<usize>>,
     /// Optional sender name prefix for group chats.
     pub last_sender: Option<String>,
     /// Local timestamp of the latest message.
@@ -652,6 +655,8 @@ pub struct MessageSearchResult {
     pub sender_name: Option<String>,
     /// Message text snippet containing the match.
     pub text: String,
+    /// Byte ranges of `text` under a spoiler, drawn hidden like in the chat list.
+    pub text_spoilers: Vec<std::ops::Range<usize>>,
     /// Message timestamp.
     pub time: LocalDateTime,
     /// Delivery ticks drawn before the time for outgoing messages.

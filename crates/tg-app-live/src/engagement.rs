@@ -1061,26 +1061,10 @@ pub(crate) fn unread_things_counts(
                 poll_votes: h.unread_poll_votes_count,
             })
     });
-
-    let state = state_for_live(live);
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    UnreadThingsCounts {
-        mentions: guard
-            .unread_mentions
-            .get(&scope)
-            .and_then(|s| s.count)
-            .unwrap_or(session_counts.mentions),
-        reactions: guard
-            .unread_reactions
-            .get(&scope)
-            .and_then(|s| s.count)
-            .unwrap_or(session_counts.reactions),
-        poll_votes: guard
-            .unread_poll_votes
-            .get(&scope)
-            .and_then(|s| s.count)
-            .unwrap_or(session_counts.poll_votes),
-    }
+    // The session's counters are the one count per thread (`thread->unreadMentions().count()`):
+    // a loaded page and "mark all read" write theirs into them, and new messages add to them.
+    // A count kept from the last page would hide a mention that arrives later (TGB-3161).
+    session_counts
 }
 
 fn clear_local_unread_things(live: &LiveSession, scope: UnreadThingsScope, kind: UnreadThingsKind) {

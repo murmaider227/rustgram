@@ -382,6 +382,7 @@ pub fn paint_history_media(
         assets,
         voice_state,
         None,
+        None,
     )
 }
 
@@ -403,6 +404,7 @@ pub fn paint_history_media_with_runtime(
     assets: &mut MediaAssetCache,
     voice_state: &mut VoicePlaybackState,
     runtime: &mut HistoryMediaRuntime,
+    sticker_overlay: Option<Color32>,
 ) -> Option<MediaInteraction> {
     paint_history_media_internal(
         ui,
@@ -418,6 +420,7 @@ pub fn paint_history_media_with_runtime(
         assets,
         voice_state,
         Some(runtime),
+        sticker_overlay,
     )
 }
 
@@ -436,6 +439,7 @@ fn paint_history_media_internal(
     assets: &mut MediaAssetCache,
     voice_state: &mut VoicePlaybackState,
     runtime: Option<&mut HistoryMediaRuntime>,
+    sticker_overlay: Option<Color32>,
 ) -> Option<MediaInteraction> {
     match media {
         HistoryMedia::Photo(photo) => {
@@ -469,7 +473,9 @@ fn paint_history_media_internal(
             voice_state,
             runtime,
         ),
-        HistoryMedia::Sticker(sticker) => paint_sticker(ui, msg_id, sticker, rect, assets, runtime),
+        HistoryMedia::Sticker(sticker) => {
+            paint_sticker(ui, msg_id, sticker, rect, assets, runtime, sticker_overlay)
+        }
         HistoryMedia::Poll(poll) => paint_poll(ui, msg_id, poll, rect, outgoing, colors),
         HistoryMedia::Location(loc) => paint_location(ui, msg_id, loc, rect, colors),
         HistoryMedia::Contact(contact) => paint_contact(ui, msg_id, contact, rect, colors),
@@ -1812,6 +1818,8 @@ fn paint_round_video_transcribe_overlay(
     None
 }
 
+/// Paints a sticker; a selected message passes `msgStickerOverlay` as `overlay`
+/// (`Sticker::paintLottie` / `paintPixmap` with `context.selected()`).
 fn paint_sticker(
     ui: &mut Ui,
     msg_id: MsgId,
@@ -1819,6 +1827,7 @@ fn paint_sticker(
     rect: Rect,
     assets: &mut MediaAssetCache,
     mut runtime: Option<&mut HistoryMediaRuntime>,
+    overlay: Option<Color32>,
 ) -> Option<MediaInteraction> {
     let time = ui.ctx().input(|i| i.time);
     let now_ms = (time * 1000.0).max(0.0) as i64;
@@ -1868,13 +1877,14 @@ fn paint_sticker(
     // 2. Animated Lottie sticker cached per size via `HistoryMediaRuntime` (`tg-lottie`),
     //    parsed and rasterised on the decode workers.
     if !painted && let Some(rt) = runtime.as_deref_mut() {
-        match rt.lottie_frame_per_size(
+        match rt.lottie_frame_colored(
             ui.ctx(),
             msg_id,
             sticker.sticker_id,
             &sticker.lottie_json,
             time,
             render_px,
+            overlay,
         ) {
             LottieFrameState::Ready { texture, animated } => {
                 ui.painter().image(

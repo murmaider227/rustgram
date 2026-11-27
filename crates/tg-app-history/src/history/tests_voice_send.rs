@@ -7,8 +7,15 @@
 //! The recorder runs on its synthetic capture source: unit tests never open the microphone.
 //! The server side is a `FakeRpcClient` answering with the layer-233 shapes the real server
 //! sends (no network).
+//!
+//! TGB-3033 / TGB-3168: the upload and `messages.sendMedia` run in the background. Releasing
+//! the mic puts the voice message in the chat at once as a local message with the clock
+//! (`ApiWrap::sendVoiceMessage` -> `sendFile` adds the item before `FileLoadTask` runs); the
+//! server's answer replaces it, or marks it failed and shows the error, on a later frame.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use egui::{Event, Modifiers, PointerButton, Pos2, Vec2};
 use egui_kittest::kittest::Queryable;
@@ -16,10 +23,11 @@ use egui_kittest::{Harness, HarnessBuilder};
 use tg_api::rpc::RpcError;
 use tg_api::{DcId, InvocationError, RpcClient};
 use tg_app_core::core_types::erased_rpc::ErasedRpcClient;
+use tg_app_core::history::backend::HistoryMessage;
 use tg_app_core::stand_in::strings::EnglishStrings;
 use tg_app_core::stand_in::theme::Palette;
 use tg_app_core::stand_in::types::PeerId;
-use tg_app_live::convert::from_data_peer;
+use tg_app_live::convert::{from_data_peer, to_data_msg};
 use tg_app_live::session::LiveSession;
 use tg_data::{PeerId as DataPeerId, PeerUpdateFlags, User, UserId as DataUserId};
 use tg_media::audio::waveform_decode_5bit;
@@ -339,13 +347,37 @@ fn sent_voice_updates(send: &tl_fns::messages::SendMedia) -> tl_enums::Updates {
     })
 }
 
-/// The server: every file part is accepted; `messages.sendMedia` answers with the new message.
-fn accept_uploads_and_sends(fake: &FakeRpcClient) {
-    fake.respond_with(Arc::new(|ctor, raw| {
+/// Longest the fake server holds `messages.sendMedia` when the test never opens it.
+const MAX_HOLD: Duration = Duration::from_secs(10);
+
+/// A gate the fake server waits on before it answers `messages.sendMedia`, like a slow server.
+type ServerGate = Arc<AtomicBool>;
+
+fn closed_gate() -> ServerGate {
+    Arc::new(AtomicBool::new(false))
+}
+
+fn open_gate() -> ServerGate {
+    Arc::new(AtomicBool::new(true))
+}
+
+fn wait_for_gate(gate: &AtomicBool) {
+    let started = Instant::now();
+    while !gate.load(Ordering::Acquire) && started.elapsed() < MAX_HOLD {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The server: every file part is accepted; `messages.sendMedia` answers with the new message
+/// once `gate` is open.
+fn accept_uploads_and_sends(fake: &FakeRpcClient, gate: &ServerGate) {
+    let gate = Arc::clone(gate);
+    fake.respond_with(Arc::new(move |ctor, raw| {
         if ctor == tl_fns::upload::SaveFilePart::CONSTRUCTOR_ID {
             return Some(Ok(true.to_bytes()));
         }
         if ctor == tl_fns::messages::SendMedia::CONSTRUCTOR_ID {
+            wait_for_gate(&gate);
             let send = tl_fns::messages::SendMedia::from_bytes(raw).ok()?;
             return Some(Ok(sent_voice_updates(&send).to_bytes()));
         }
@@ -353,13 +385,106 @@ fn accept_uploads_and_sends(fake: &FakeRpcClient) {
     }));
 }
 
+/// The local voice messages in the chat (client ids: not confirmed by the server).
+fn local_messages(st: &VoiceChat) -> Vec<&HistoryMessage> {
+    st.widget
+        .inner()
+        .messages()
+        .iter()
+        .filter(|m| to_data_msg(m.id).is_client())
+        .collect()
+}
+
+/// The one pending voice bubble: a local message with the clock, the recording it carries,
+/// and no error. Returns its id.
+fn pending_voice_bubble(st: &VoiceChat, when: &str) -> tg_app_core::stand_in::types::MsgId {
+    assert!(!st.widget.compose.voice_recorder.is_active());
+    assert_eq!(
+        st.widget.active_toast(),
+        None,
+        "no error while sending ({when})"
+    );
+    let local = local_messages(st);
+    assert_eq!(local.len(), 1, "one pending bubble ({when}): {local:?}");
+    let pending = local[0];
+    assert!(
+        pending.is_sending,
+        "the pending bubble shows the clock ({when})"
+    );
+    assert!(!pending.extra.send_failed);
+    assert!(
+        matches!(&pending.media, Some(HistoryMedia::Voice(v)) if !v.waveform_5bit.is_empty()),
+        "the pending bubble shows the recording ({when}): {:?}",
+        pending.media
+    );
+    assert!(
+        st.widget
+            .inner()
+            .messages()
+            .iter()
+            .all(|m| m.id.0 != SENT_ID),
+        "no server message before the server answers ({when})"
+    );
+    pending.id
+}
+
+/// Checks the frame right after the release and a few more frames while the server still holds
+/// the send: the voice message is in the chat at once as one pending bubble and keeps showing
+/// the recording. Before TGB-3168 the next history drain replaced it with the session's local
+/// message, which has no media: an empty bubble. Returns its id.
+fn assert_pending_voice_bubble(
+    harness: &mut Harness<'_, VoiceChat>,
+) -> tg_app_core::stand_in::types::MsgId {
+    let id = pending_voice_bubble(harness.state(), "the frame of the release");
+    for _ in 0..5 {
+        harness.step();
+    }
+    assert_eq!(
+        pending_voice_bubble(harness.state(), "while the server holds the send"),
+        id
+    );
+    id
+}
+
+/// Opens the server gate, waits for the background send and draws frames until `done`.
+fn answer_and_draw_until(
+    harness: &mut Harness<'_, VoiceChat>,
+    gate: &ServerGate,
+    done: impl Fn(&VoiceChat) -> bool,
+) {
+    gate.store(true, Ordering::Release);
+    assert!(
+        harness
+            .state()
+            .live
+            .wait_media_sends(Duration::from_secs(15)),
+        "the background send finishes"
+    );
+    for _ in 0..20 {
+        if done(harness.state()) {
+            return;
+        }
+        harness.step();
+    }
+}
+
 #[test]
 fn holding_the_mic_sends_the_recorded_ogg_with_duration_and_waveform() {
     let fake = FakeRpcClient::new();
-    accept_uploads_and_sends(&fake);
+    let gate = closed_gate();
+    accept_uploads_and_sends(&fake, &gate);
     let mut harness = start_chat(&fake);
 
     hold_mic(&mut harness, 2.5);
+    let pending_id = assert_pending_voice_bubble(&mut harness);
+
+    answer_and_draw_until(&mut harness, &gate, |st| {
+        st.widget
+            .inner()
+            .messages()
+            .iter()
+            .any(|m| m.id.0 == SENT_ID)
+    });
 
     // The recorded file itself was uploaded: an Ogg stream with an Opus head.
     let parts = fake.recorded_of::<tl_fns::upload::SaveFilePart>();
@@ -417,17 +542,27 @@ fn holding_the_mic_sends_the_recorded_ogg_with_duration_and_waveform() {
         "the waveform follows the recorded signal"
     );
 
-    // The confirmed message is in the chat as a voice message, with no error shown.
+    // The confirmed message replaced the pending one: exactly one voice message, no local
+    // message left, no clock, no error.
     let st = harness.state();
     assert_eq!(st.widget.active_toast(), None);
     assert!(!st.widget.compose.voice_recorder.is_active());
-    let sent = st
+    assert!(
+        local_messages(st).is_empty(),
+        "the pending bubble {pending_id:?} is replaced, not kept next to the sent one"
+    );
+    let voices: Vec<&HistoryMessage> = st
         .widget
         .inner()
         .messages()
         .iter()
-        .find(|m| m.id.0 == SENT_ID)
-        .expect("the sent voice message is in the chat");
+        .filter(|m| matches!(m.media, Some(HistoryMedia::Voice(_))))
+        .collect();
+    assert_eq!(voices.len(), 1, "one voice message in the chat: {voices:?}");
+    let sent = voices[0];
+    assert_eq!(sent.id.0, SENT_ID, "the sent voice message is in the chat");
+    assert!(!sent.is_sending);
+    assert!(!sent.extra.send_failed);
     match &sent.media {
         Some(HistoryMedia::Voice(voice)) => {
             assert_eq!(voice.duration_secs, audio.duration as u32);
@@ -440,11 +575,14 @@ fn holding_the_mic_sends_the_recorded_ogg_with_duration_and_waveform() {
 #[test]
 fn a_failed_voice_send_is_shown_not_swallowed() {
     let fake = FakeRpcClient::new();
-    fake.respond_with(Arc::new(|ctor, _raw| {
+    let gate = closed_gate();
+    let server_gate = Arc::clone(&gate);
+    fake.respond_with(Arc::new(move |ctor, _raw| {
         if ctor == tl_fns::upload::SaveFilePart::CONSTRUCTOR_ID {
             return Some(Ok(true.to_bytes()));
         }
         if ctor == tl_fns::messages::SendMedia::CONSTRUCTOR_ID {
+            wait_for_gate(&server_gate);
             return Some(Err(InvocationError::Rpc(RpcError::new(
                 400,
                 "VOICE_MESSAGES_FORBIDDEN",
@@ -455,16 +593,37 @@ fn a_failed_voice_send_is_shown_not_swallowed() {
     let mut harness = start_chat(&fake);
 
     hold_mic(&mut harness, 2.0);
+    let pending_id = assert_pending_voice_bubble(&mut harness);
+
+    answer_and_draw_until(&mut harness, &gate, |st| st.widget.active_toast().is_some());
 
     assert_eq!(
         fake.recorded_of::<tl_fns::messages::SendMedia>().len(),
         1,
-        "the voice message was sent"
+        "the voice message was sent once"
     );
     // `sendMessageFail`'s fallback shows the error type.
     assert_eq!(
         harness.state().widget.active_toast(),
         Some("VOICE_MESSAGES_FORBIDDEN")
+    );
+    // The bubble stays in the chat marked failed (tdesktop keeps a failed item for a resend).
+    let st = harness.state();
+    let failed = st
+        .widget
+        .inner()
+        .messages()
+        .iter()
+        .find(|m| m.id == pending_id)
+        .expect("the failed voice message stays in the chat");
+    assert!(failed.extra.send_failed, "the bubble is marked failed");
+    assert!(matches!(failed.media, Some(HistoryMedia::Voice(_))));
+    assert!(
+        st.widget
+            .inner()
+            .messages()
+            .iter()
+            .all(|m| m.id.0 != SENT_ID)
     );
 }
 
@@ -473,7 +632,7 @@ fn a_hold_shorter_than_a_second_sends_nothing() {
     // tdesktop's capture returns no bytes under one second (`kCaptureFrequency` samples) and
     // `VoiceRecordBar::stopRecording` discards the empty result.
     let fake = FakeRpcClient::new();
-    accept_uploads_and_sends(&fake);
+    accept_uploads_and_sends(&fake, &open_gate());
     let mut harness = start_chat(&fake);
 
     hold_mic(&mut harness, 0.3);
@@ -546,7 +705,7 @@ fn no_microphone_refuses_to_record_instead_of_recording_a_tone() {
 #[test]
 fn pressing_the_mic_without_a_microphone_shows_the_capture_problem() {
     let fake = FakeRpcClient::new();
-    accept_uploads_and_sends(&fake);
+    accept_uploads_and_sends(&fake, &open_gate());
     let mut harness = start_chat(&fake);
     harness.state_mut().widget.compose.voice_recorder =
         VoiceRecorderController::without_microphone();

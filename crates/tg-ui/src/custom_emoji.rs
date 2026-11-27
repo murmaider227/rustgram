@@ -181,6 +181,9 @@ pub struct CustomEmojiPaintContext {
     pub force_last_frame: bool,
     /// Surrounding text foreground color (used when `text_color_tinted == true`).
     pub text_color: Color32,
+    /// `Images::Colored` over the frame: `msgStickerOverlay` for a selected message's large or
+    /// custom-emoji-only emoji (`CustomEmoji::paintCustom` with `context.selected()`).
+    pub overlay: Option<Color32>,
 }
 
 impl CustomEmojiPaintContext {
@@ -193,6 +196,7 @@ impl CustomEmojiPaintContext {
             force_first_frame: false,
             force_last_frame: false,
             text_color,
+            overlay: None,
         }
     }
 }
@@ -501,8 +505,8 @@ struct Recent<T> {
     last_used: u64,
 }
 
-/// `(frame_index, size_px)` of a cached frame or texture.
-type FrameKey = (usize, u32);
+/// `(frame_index, size_px, overlay)` of a cached frame or texture.
+type FrameKey = (usize, u32, Option<Color32>);
 
 /// A registered emoji with the frames and textures made from it.
 struct EmojiEntry {
@@ -636,7 +640,8 @@ impl CustomEmojiRenderer {
         if !matches!(entry.loaded, LoadedEmoji::Lottie { .. }) {
             return entry.loaded.decode(slot, px);
         }
-        let key = (slot.index, px);
+        // The decoded frames are kept uncoloured; only textures carry the overlay.
+        let key = (slot.index, px, None);
         if let Some(cached) = entry.frames.get_mut(&key) {
             cached.last_used = now;
             return Some(cached.value.clone());
@@ -684,12 +689,15 @@ impl CustomEmojiRenderer {
         let Some(slot) = entry.loaded.slot(paint_ctx) else {
             return false;
         };
-        let key = (slot.index, px);
+        let key = (slot.index, px, paint_ctx.overlay);
         let tex_id = if let Some(texture) = entry.textures.get_mut(&key) {
             texture.last_used = now;
             texture.value.id()
         } else {
-            let image = entry.loaded.color_image(slot, px);
+            let mut image = entry.loaded.color_image(slot, px);
+            if let Some(add) = paint_ctx.overlay {
+                crate::colored::colored(&mut image, add);
+            }
             if self.cached_texture_count() >= MAX_RENDERER_FRAME_CACHE {
                 evict_least_recent(
                     &mut self.emoji,
@@ -697,7 +705,15 @@ impl CustomEmojiRenderer {
                     RENDERER_CACHE_KEEP,
                 );
             }
-            let name = format!("tg_custom_emoji_{document_id}_{}_{px}", slot.index);
+            let name = format!(
+                "tg_custom_emoji_{document_id}_{}_{px}{}",
+                slot.index,
+                if paint_ctx.overlay.is_some() {
+                    "_selected"
+                } else {
+                    ""
+                }
+            );
             let texture = ctx.load_texture(name, image, TextureOptions::LINEAR);
             let id = texture.id();
             if let Some(entry) = self.emoji.get_mut(document_id) {
@@ -885,6 +901,7 @@ mod tests {
                     force_first_frame: false,
                     force_last_frame: false,
                     text_color: Color32::WHITE,
+                    overlay: None,
                 },
             )
             .expect("paused frame");
@@ -900,6 +917,7 @@ mod tests {
                     force_first_frame: false,
                     force_last_frame: true,
                     text_color: Color32::WHITE,
+                    overlay: None,
                 },
             )
             .expect("paused last frame");

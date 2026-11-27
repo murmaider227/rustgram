@@ -239,6 +239,7 @@ fn parity_search(rows: &[DialogItem]) -> SearchResults {
             msg_id: tg_app::stand_in::types::MsgId(id),
             sender_name: sender.map(str::to_owned),
             text: text.to_owned(),
+            text_spoilers: Vec::new(),
             time,
             send_state: TICKS[usize::from(peer.special != SpecialRowKind::SavedMessages)], // after-only
             archived: false,

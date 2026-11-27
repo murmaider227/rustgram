@@ -199,6 +199,8 @@ mod tests_storage_wiring;
 #[cfg(test)]
 mod tests_stories_channels_conformance;
 #[cfg(test)]
+mod tests_tgb3136_row_spoilers;
+#[cfg(test)]
 mod tests_todo_service_updates;
 #[cfg(test)]
 mod tests_transcribe;
@@ -210,6 +212,8 @@ mod tests_uip4_f;
 mod tests_uip_f;
 #[cfg(test)]
 mod tests_unified_pts;
+#[cfg(test)]
+mod tests_unread_badges;
 #[cfg(test)]
 mod tests_upload;
 #[cfg(test)]

@@ -15,7 +15,6 @@
 //! keeps one `ReplyPreview` on the photo or document.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use egui::{Color32, ColorImage, CornerRadius, FontId, Pos2, Rect, TextureHandle, Ui, Vec2};
@@ -473,13 +472,7 @@ fn paint_reply_thumb_image(
 }
 
 /// One laid-out line of a reply header's text.
-pub struct ReplyTextLine {
-    /// The line, its spoiler glyphs transparent.
-    pub galley: Arc<egui::Galley>,
-    /// Where the hidden spoiler glyphs are, relative to the galley's top-left, one rectangle
-    /// per run; the particle cover is drawn over them.
-    pub spoilers: Vec<Rect>,
-}
+pub type ReplyTextLine = tg_ui::spoiler_line::SpoilerLine;
 
 /// One elided line of the reply text: its first `colored_len` bytes in `colored`
 /// (`Ui::Text::Colorized`, drawn with the reply palette's link colour), the rest in `plain`,
@@ -498,113 +491,24 @@ pub fn reply_text_line(
     max_w: f32,
 ) -> ReplyTextLine {
     let text = text.replace('\n', " ");
-    let (job, hidden) = reply_text_job(&text, colored_len, spoilers, font, colored, plain, max_w);
-    let galley = ui.painter().layout_job(job);
-    let spoilers = if hidden.is_empty() {
-        Vec::new()
-    } else {
-        hidden_glyph_rects(&galley, &hidden)
-    };
-    ReplyTextLine { galley, spoilers }
-}
-
-/// The layout job of one reply line and, per char of `text`, whether it is hidden (a spoiler).
-fn reply_text_job(
-    text: &str,
-    colored_len: usize,
-    spoilers: &[std::ops::Range<usize>],
-    font: FontId,
-    colored: Color32,
-    plain: Color32,
-    max_w: f32,
-) -> (egui::text::LayoutJob, Vec<bool>) {
-    let floor = |mut at: usize| {
-        at = at.min(text.len());
-        while !text.is_char_boundary(at) {
-            at -= 1;
-        }
-        at
-    };
-    let split = floor(colored_len);
-    let ranges: Vec<std::ops::Range<usize>> = spoilers
-        .iter()
-        .map(|r| floor(r.start)..floor(r.end))
-        .filter(|r| r.start < r.end)
-        .collect();
-    let mut cuts: Vec<usize> = vec![0, split, text.len()];
-    cuts.extend(ranges.iter().flat_map(|r| [r.start, r.end]));
-    cuts.sort_unstable();
-    cuts.dedup();
-    let mut job = egui::text::LayoutJob::default();
-    let mut hidden = Vec::new();
-    let any_hidden = !ranges.is_empty();
-    for pair in cuts.windows(2) {
-        let (start, end) = (pair[0], pair[1]);
-        if start >= end {
-            continue;
-        }
-        let spoiler = ranges.iter().any(|r| r.start <= start && end <= r.end);
-        let color = if spoiler {
-            Color32::TRANSPARENT
-        } else if start < split {
-            colored
-        } else {
-            plain
-        };
-        if any_hidden {
-            hidden.extend(std::iter::repeat_n(
-                spoiler,
-                text[start..end].chars().count(),
-            ));
-        }
-        job.append(
-            &text[start..end],
-            0.0,
-            egui::TextFormat::simple(font.clone(), color),
-        );
-    }
-    job.wrap.max_width = max_w.max(1.0);
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    job.wrap.overflow_character = Some('\u{2026}');
-    (job, hidden)
-}
-
-/// Rectangles of the glyphs of the chars marked in `hidden`, one per run of neighbouring
-/// glyphs. The line has no line breaks, so its glyphs are its chars in order, then the
-/// elision mark of a cut line, which is past `hidden` and never covered.
-fn hidden_glyph_rects(galley: &egui::Galley, hidden: &[bool]) -> Vec<Rect> {
-    let mut rects: Vec<Rect> = Vec::new();
-    let mut char_index = 0usize;
-    for placed in &galley.rows {
-        let row = &placed.row;
-        let count = row.glyphs.len();
-        let mut run: Option<Rect> = None;
-        for (i, glyph) in row.glyphs.iter().enumerate() {
-            let elision = galley.elided && i + 1 == count;
-            let is_hidden = !elision && hidden.get(char_index).copied().unwrap_or(false);
-            char_index += 1;
-            if !is_hidden {
-                rects.extend(run.take());
-                continue;
-            }
-            let rect = Rect::from_min_max(
-                Pos2::new(placed.pos.x + glyph.pos.x, placed.pos.y),
-                Pos2::new(
-                    placed.pos.x + glyph.pos.x + glyph.advance_width,
-                    placed.pos.y + row.size.y,
-                ),
-            );
-            run = Some(run.map_or(rect, |r| r.union(rect)));
-        }
-        rects.extend(run);
-    }
-    rects
+    tg_ui::spoiler_line::layout_spoiler_line(
+        ui.painter(),
+        &text,
+        colored_len,
+        spoilers,
+        font,
+        colored,
+        plain,
+        max_w,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use tg_ui::spoiler_line::{hidden_glyph_rects, spoiler_line_job as reply_text_job};
 
     fn layout(
         text: &str,

@@ -21,7 +21,7 @@ use super::{
     layout_text_with_entities_expanded, split_legacy_segments, spoiler_reveal_progress,
 };
 use crate::custom_emoji::{CustomEmojiRenderer, has_registered_custom_emoji};
-use crate::effects::{merge_spoiler_rects, paint_text_spoiler};
+use crate::effects::{merge_spoiler_rects, paint_text_spoiler_selected};
 use crate::style::{QuoteStyle, TextPalette, TextStyle};
 
 thread_local! {
@@ -378,6 +378,7 @@ pub fn render_prepared_rich_text(
         base_color,
         max_width,
         None,
+        &[],
     )
 }
 
@@ -406,6 +407,36 @@ pub fn render_prepared_rich_text_with_reveal(
         base_color,
         max_width,
         Some(reveal),
+        &[],
+    )
+}
+
+/// [`render_prepared_rich_text_with_reveal`] (or the self-kept spoiler state with `reveal`
+/// `None`) for text of which the `selected` screen rectangles are selected: the spoiler cover
+/// over them is drawn in `palette.select_spoiler_fg` (`Renderer::pushSpoilerRange`).
+#[allow(clippy::too_many_arguments)]
+pub fn render_prepared_rich_text_selected(
+    ui: &mut Ui,
+    id: Id,
+    prepared: &mut PreparedRichText,
+    style: &TextStyle,
+    palette: &TextPalette,
+    base_color: Color32,
+    max_width: f32,
+    reveal: Option<f32>,
+    selected: &[Rect],
+) -> RichTextResponse {
+    render_rich_text_cached(
+        ui,
+        id,
+        &prepared.rich,
+        &mut prepared.cache,
+        style,
+        palette,
+        base_color,
+        max_width,
+        reveal,
+        selected,
     )
 }
 
@@ -420,6 +451,7 @@ pub(super) fn render_rich_text_cached(
     base_color: Color32,
     max_width: f32,
     external_reveal: Option<f32>,
+    selected: &[Rect],
 ) -> RichTextResponse {
     let reveal_id = id.with("_tg_spoiler_revealed_at");
     let hover_link_id = id.with("_tg_hover_link");
@@ -580,12 +612,14 @@ pub(super) fn render_rich_text_cached(
                     fade.galley(rect.min, Arc::clone(&revealed_galley), base_color);
                 }
             }
-            paint_text_spoiler(
+            paint_text_spoiler_selected(
                 ui.ctx(),
                 ui.painter(),
                 spoiler_rects,
+                selected,
                 rect.min,
                 palette.spoiler_fg,
+                palette.select_spoiler_fg,
                 1.0 - reveal,
             );
         }
@@ -805,6 +839,7 @@ mod tests {
     use tg_text::utf16_len;
 
     use super::*;
+    use crate::effects::paint_text_spoiler;
     use crate::fonts::register_tdesktop_fonts;
     use crate::text::{build_layout_job, render_rich_text, render_text_with_entities};
 

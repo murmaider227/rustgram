@@ -153,6 +153,25 @@ fn a_voice_send_shows_its_pending_bubble_at_once_and_becomes_the_server_message(
             .any(|u| matches!(u, HistoryLiveUpdate::LocalMessageSent { .. })),
         "nothing is sent while the upload is held: {updates:?}"
     );
+    // The drain reports the stored local message; the view puts it in place of the bubble, so
+    // it must carry the media too (TGB-3168: it came without, an empty bubble).
+    let drained_local: Vec<_> = updates
+        .iter()
+        .filter_map(|u| match u {
+            HistoryLiveUpdate::MessageAdded(m) | HistoryLiveUpdate::MessageEdited(m)
+                if m.id == pending.id =>
+            {
+                Some(m)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        drained_local
+            .iter()
+            .all(|m| matches!(m.media, Some(HistoryMedia::Voice(_)))),
+        "the drained local message shows the voice message: {drained_local:?}"
+    );
 
     open.store(true, Ordering::Release);
     assert!(live.wait_media_sends(TEST_TIMEOUT));
@@ -215,6 +234,23 @@ fn a_failed_media_send_marks_the_pending_bubble_failed() {
     });
     let (local_id, error) = failed.expect("the bubble is marked failed");
     assert_eq!(local_id, pending.id);
+    let drained_local: Vec<_> = updates
+        .iter()
+        .filter_map(|u| match u {
+            HistoryLiveUpdate::MessageAdded(m) | HistoryLiveUpdate::MessageEdited(m)
+                if m.id == pending.id =>
+            {
+                Some(m)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        drained_local
+            .iter()
+            .all(|m| matches!(m.media, Some(HistoryMedia::Document(_)))),
+        "the drained failed message keeps its file: {drained_local:?}"
+    );
     assert!(
         error
             .as_deref()
@@ -231,6 +267,176 @@ fn a_failed_media_send_marks_the_pending_bubble_failed() {
         .expect("the failed bubble stays");
     assert!(shown.extra.send_failed);
     assert!(matches!(shown.media, Some(HistoryMedia::Document(_))));
+
+    h.shutdown();
+}
+
+/// Two files sent one after the other reach the server in that order, also when the first one
+/// uploads longer: tdesktop's `Uploader::maybeFinishFront` finishes files in queue order and
+/// each `messages.sendMedia` goes `afterRequest` the chat's previous send. Before the fix every
+/// background send ran on its own, and the second file overtook the first one still uploading:
+/// the first bubble got the later server id.
+#[test]
+fn media_sent_one_after_another_reach_the_server_in_that_order() {
+    let h = UploadTestHarness::start();
+    let open = Arc::new(AtomicBool::new(false));
+    let next_id = Arc::new(std::sync::atomic::AtomicI32::new(SERVER_MSG_ID));
+    {
+        let open = Arc::clone(&open);
+        let next_id = Arc::clone(&next_id);
+        let (self_uid, bob_uid) = (h.self_uid, h.bob_uid);
+        h.fake.set_dynamic_handler(Arc::new(move |ctor, raw| {
+            if ctor == tl_fns::upload::SaveFilePart::CONSTRUCTOR_ID {
+                let part = tl_fns::upload::SaveFilePart::from_bytes(raw).ok()?;
+                if part.bytes.starts_with(b"%FIRST") {
+                    hold_until(&open);
+                }
+                return Some(Ok(true.to_bytes()));
+            }
+            if ctor == tl_fns::messages::SendMedia::CONSTRUCTOR_ID {
+                let id = next_id.fetch_add(1, Ordering::AcqRel);
+                let upd = make_updates_with_messages(vec![synthetic_tl_message(
+                    id, bob_uid, self_uid, true, "",
+                )]);
+                return Some(Ok(upd.to_bytes()));
+            }
+            None
+        }));
+    }
+    let mut live = h.live.clone();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let document = |name: &str, head: &[u8]| {
+        let path = tmp.path().join(name);
+        let mut bytes = head.to_vec();
+        bytes.extend(synth_bytes(2_000, 0x41));
+        std::fs::write(&path, &bytes).expect("write file");
+        SendMessageExtended {
+            media: Some(HistoryMedia::Document(DocumentAttachment {
+                file_name: path.to_string_lossy().into_owned(),
+                size_bytes: bytes.len() as u64,
+                mime_type: "application/pdf".to_owned(),
+                thumb_rgb: None,
+            })),
+            ..SendMessageExtended::default()
+        }
+    };
+
+    let first = send_without_waiting(&mut live, h.bob_peer, document("first.pdf", b"%FIRST"));
+    let second = send_without_waiting(&mut live, h.bob_peer, document("second.pdf", b"%SECOND"));
+
+    // The second file is ready long before the first one: it must still wait.
+    let sends = || {
+        h.fake
+            .recorded_calls_of(tl_fns::messages::SendMedia::CONSTRUCTOR_ID)
+    };
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline && sends().is_empty() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        sends().is_empty(),
+        "nothing is sent while the first file uploads"
+    );
+
+    open.store(true, Ordering::Release);
+    assert!(live.wait_media_sends(TEST_TIMEOUT));
+    let updates = drain_until(&mut live, h.bob_peer, |all| {
+        all.iter()
+            .filter(|u| matches!(u, HistoryLiveUpdate::LocalMessageSent { .. }))
+            .count()
+            == 2
+    });
+
+    let names: Vec<String> = sends()
+        .iter()
+        .filter_map(|raw| tl_fns::messages::SendMedia::from_bytes(raw).ok())
+        .filter_map(|send| match send.media {
+            tl_enums::InputMedia::UploadedDocument(doc) => {
+                doc.attributes.into_iter().find_map(|a| match a {
+                    tl_enums::DocumentAttribute::Filename(f) => Some(f.file_name),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["first.pdf", "second.pdf"], "server order");
+    let sent: Vec<(MsgId, MsgId)> = updates
+        .iter()
+        .filter_map(|u| match u {
+            HistoryLiveUpdate::LocalMessageSent { local_id, message } => {
+                Some((*local_id, message.id))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        sent.contains(&(first.id, MsgId(SERVER_MSG_ID))),
+        "the first bubble gets the first server id: {sent:?}"
+    );
+    assert!(
+        sent.contains(&(second.id, MsgId(SERVER_MSG_ID + 1))),
+        "the second bubble gets the next one: {sent:?}"
+    );
+
+    h.shutdown();
+}
+
+/// A file cancelled while it waits for the one before it is removed without an error and never
+/// sent; the file before it is still sent, and the queue does not stall.
+#[test]
+fn a_media_send_cancelled_while_queued_is_dropped_and_the_queue_goes_on() {
+    let h = UploadTestHarness::start();
+    let open = Arc::new(AtomicBool::new(false));
+    serve_held_upload(&h, &open, None);
+    let mut live = h.live.clone();
+
+    let first = send_without_waiting(&mut live, h.bob_peer, voice_request());
+    let queued = send_without_waiting(&mut live, h.bob_peer, voice_request());
+    let uploads = HistoryBackend::pending_media_uploads(&live, h.bob_peer);
+    assert_eq!(uploads.len(), 2, "both files show in the uploads bar");
+    let newest = uploads
+        .iter()
+        .map(|u| u.upload_id)
+        .max()
+        .expect("two uploads");
+    assert!(HistoryBackend::cancel_media_upload(&mut live, newest));
+    open.store(true, Ordering::Release);
+
+    assert!(live.wait_media_sends(TEST_TIMEOUT));
+    let updates = drain_until(&mut live, h.bob_peer, |all| {
+        all.iter()
+            .any(|u| matches!(u, HistoryLiveUpdate::LocalMessageSent { .. }))
+            && all
+                .iter()
+                .any(|u| matches!(u, HistoryLiveUpdate::MessagesDeleted(_)))
+    });
+    assert!(
+        updates.iter().any(|u| matches!(
+            u,
+            HistoryLiveUpdate::LocalMessageSent { local_id, .. } if *local_id == first.id
+        )),
+        "the first file is sent: {updates:?}"
+    );
+    assert!(
+        updates.iter().any(
+            |u| matches!(u, HistoryLiveUpdate::MessagesDeleted(ids) if ids.contains(&queued.id))
+        ),
+        "the cancelled file is removed: {updates:?}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|u| matches!(u, HistoryLiveUpdate::LocalMessageFailed { .. })),
+        "a cancel is not a failure: {updates:?}"
+    );
+    assert_eq!(
+        h.fake
+            .recorded_calls_of(tl_fns::messages::SendMedia::CONSTRUCTOR_ID)
+            .len(),
+        1,
+        "only the first file is sent"
+    );
 
     h.shutdown();
 }

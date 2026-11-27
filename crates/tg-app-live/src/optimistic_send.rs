@@ -25,6 +25,7 @@ use tg_data::{
     PeerId as DataPeerId, ReplyInfo, Session,
 };
 use tg_tl::enums as tl_enums;
+use tokio::sync::oneshot;
 
 use tg_app_core::history::backend::{HistoryLiveUpdate, HistoryMedia, HistoryMessage};
 
@@ -75,6 +76,9 @@ pub(crate) struct OptimisticSends {
     local_media: Arc<Mutex<HashMap<DataFullMsgId, HistoryMedia>>>,
     /// Media sends whose upload or `messages.sendMedia` is still running.
     media_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Ends when the last media send queued so far has finished: the next one starts after
+    /// it (TGB-3168).
+    media_queue_tail: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
 }
 
 impl Default for OptimisticSends {
@@ -86,6 +90,7 @@ impl Default for OptimisticSends {
             resolved: Arc::new(Mutex::new(Vec::new())),
             local_media: Arc::new(Mutex::new(HashMap::new())),
             media_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            media_queue_tail: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -112,11 +117,27 @@ impl OptimisticSends {
             .next_local_msg_id()
     }
 
-    /// Counts a media send that starts running in the background; the guard ends it.
+    /// Counts a media send that starts running in the background and gives it the next place
+    /// in the media queue; dropping the guard ends it and lets the next one run.
+    ///
+    /// tdesktop's `Uploader` finishes files in queue order (`maybeFinishFront`) and each
+    /// `messages.sendMedia` goes `afterRequest` the previous send of the chat, so files sent
+    /// one after another arrive in that order. Here each send waits for the one queued before
+    /// it ([`MediaSendGuard::previous`]); the upload of the next file starts after that.
     pub(crate) fn begin_media_send(&self) -> MediaSendGuard {
         self.media_in_flight
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        MediaSendGuard(Arc::clone(&self.media_in_flight))
+        let (done, tail) = oneshot::channel();
+        let previous = self
+            .media_queue_tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(tail);
+        MediaSendGuard {
+            in_flight: Arc::clone(&self.media_in_flight),
+            previous,
+            _done: done,
+        }
     }
 
     /// Media sends still running in the background.
@@ -150,6 +171,7 @@ impl OptimisticSends {
     }
 
     /// Gives the local media messages of `peer` in `messages` the media they are sending.
+    /// `messages` may be in any order (a history slice, or the messages a drain reports).
     pub(crate) fn attach_local_media(&self, peer: DataPeerId, messages: &mut [HistoryMessage]) {
         let media = self
             .local_media
@@ -158,10 +180,10 @@ impl OptimisticSends {
         if media.is_empty() {
             return;
         }
-        for message in messages.iter_mut().rev() {
+        for message in messages.iter_mut() {
             let id = to_data_msg(message.id);
             if !id.is_client() {
-                break;
+                continue;
             }
             if message.media.is_none()
                 && let Some(shown) = media.get(&DataFullMsgId::new(peer, id))
@@ -253,12 +275,32 @@ impl OptimisticSends {
     }
 }
 
-/// Ends one background media send of [`OptimisticSends::begin_media_send`] when dropped.
-pub(crate) struct MediaSendGuard(Arc<std::sync::atomic::AtomicUsize>);
+/// One background media send of [`OptimisticSends::begin_media_send`]: dropping it ends the
+/// send and lets the next queued one start (also when the send failed or never ran).
+pub(crate) struct MediaSendGuard {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    previous: Option<oneshot::Receiver<()>>,
+    /// Never sent: dropping it wakes the next send.
+    _done: oneshot::Sender<()>,
+}
+
+impl MediaSendGuard {
+    /// Resolves when the media send queued before this one has finished.
+    pub(crate) fn previous(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let previous = self.previous.take();
+        async move {
+            if let Some(previous) = previous {
+                // The sender is dropped, never sent: either way the previous send is over.
+                let _ = previous.await;
+            }
+        }
+    }
+}
 
 impl Drop for MediaSendGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

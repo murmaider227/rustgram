@@ -1779,6 +1779,7 @@ impl HistoryBackend for MockHistoryStore {
                         msg_id: m.id,
                         sender_name: m.sender_name.clone(),
                         preview: m.preview_snippet(),
+                        preview_spoilers: Vec::new(),
                     })
             })
             .collect()

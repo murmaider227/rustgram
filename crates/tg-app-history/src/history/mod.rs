@@ -75,6 +75,9 @@ mod sections_screenshot;
 mod sections_tests;
 #[cfg(test)]
 mod snap_w7_delete;
+// GPU render snapshots: Windows only (the Linux runner has no adapter).
+#[cfg(all(test, windows))]
+mod snap_w9_chatui;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -131,6 +134,8 @@ mod tests_spoiler_state;
 mod tests_tgb2971_pull;
 #[cfg(test)]
 mod tests_tgb3012_name_colors;
+#[cfg(test)]
+mod tests_tgb3161_corner_buttons;
 #[cfg(test)]
 mod tests_transcribe_failure_snap;
 #[cfg(test)]

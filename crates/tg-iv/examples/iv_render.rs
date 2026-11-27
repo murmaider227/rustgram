@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //! ```text
-//! cargo run -p tg-iv --example render -- out.html
+//! cargo run -p tg-iv --example iv_render -- out.html
 //! ```
 
 use std::env;
@@ -422,7 +422,7 @@ fn build_sample_page() -> Page {
 fn main() {
     let mut args = env::args().skip(1);
     let Some(out_path) = args.next() else {
-        eprintln!("Usage: cargo run -p tg-iv --example render -- <output.html>");
+        eprintln!("Usage: cargo run -p tg-iv --example iv_render -- <output.html>");
         process::exit(2);
     };
 

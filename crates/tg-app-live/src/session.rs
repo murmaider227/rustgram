@@ -33,6 +33,7 @@ use tracing::{debug, warn};
 
 use crate::bridge::{LiveBridgeState, LiveRuntimeBridge};
 use crate::convert::{
+    all_chats_dialog_folder, all_chats_folder_unread, app_unread_badge_state,
     chat_filter_to_dialog_folder, chat_filter_to_settings_folder, dialog_entry_from_session,
     dialog_item_from_session, draft_from_history, from_data_msg, from_data_peer,
     history_messages_ordered, history_typing_to_send_progress, known_peer_ids,
@@ -1728,7 +1729,7 @@ impl Backend for LiveSession {
                 id: FilterId::ALL,
                 title: "All Chats".to_owned(),
                 icon_glyph: "All".to_owned(),
-                unread_count: s.total_unread_badge().unread_counter.max(0) as u32,
+                unread_count: all_chats_folder_unread(s).unread_chats,
             }];
             for filter in s.filters().list() {
                 let df = chat_filter_to_dialog_folder(filter, s);
@@ -1989,17 +1990,7 @@ impl DialogsBackend for LiveSession {
     fn chat_folders(&self) -> Vec<DialogChatFolder> {
         self.ensure_filters_loaded();
         self.read_session(|session| {
-            let mut out = vec![DialogChatFolder {
-                id: FilterId::ALL,
-                title: "All Chats".to_owned(),
-                icon: tg_app_core::dialogs::backend::FolderIconKind::All,
-                color_index: 5,
-                unread: tg_app_core::dialogs::backend::FolderUnreadState {
-                    unread_chats: session.total_unread_badge().unread_counter.max(0) as u32,
-                    muted_chats: 0,
-                },
-                locked: false,
-            }];
+            let mut out = vec![all_chats_dialog_folder(session)];
             for filter in session.filters().list() {
                 out.push(chat_filter_to_dialog_folder(filter, session));
             }
@@ -3455,16 +3446,21 @@ impl HistoryBackend for LiveSession {
         if data_max.0 <= 0 {
             return;
         }
-        // Like `Data::Histories::readInboxTill` (`data/data_histories.cpp:273-284`): the local
-        // read state changes now, `messages.readHistory` goes out without the UI waiting for it.
-        // The runtime applies the same read again when the request is answered.
+        // Like `Data::Histories::readInboxTill` (`data/data_histories.cpp:260-352`): when the
+        // still-unread count is known locally, the read state changes now; otherwise it waits for
+        // the server. `messages.readHistory` goes out without the UI waiting for it, and the
+        // runtime applies the read again when it is answered (asking for the dialog entry when
+        // the count is still unknown).
         self.write_session(|s| {
-            let still_unread = s
+            let reads_to_top = s
                 .history(data_peer)
                 .and_then(|h| h.top_message_id)
-                .filter(|&top| data_max >= top)
-                .map(|_| 0);
-            s.mark_inbox_read(data_peer, data_max, still_unread);
+                .is_some_and(|top| data_max >= top);
+            if reads_to_top {
+                s.mark_inbox_read(data_peer, data_max, Some(0));
+            } else {
+                s.read_inbox_till_local(data_peer, data_max);
+            }
         });
         let rt = Arc::clone(&self.runtime);
         self.ui_rpc.push(async move {
@@ -7164,39 +7160,7 @@ impl NotifyBackend for LiveSession {
     }
 
     fn unread_state(&self) -> UnreadBadgeState {
-        let now = now_unix_i32();
-        self.read_session(|s| {
-            let mut state = UnreadBadgeState::default();
-            for &key in s.main_dialogs() {
-                let DialogKey::History(pid) = key else {
-                    continue;
-                };
-                let Some(h) = s.history(pid) else {
-                    continue;
-                };
-                let count = h.unread_count.unwrap_or(0).max(0) as u32;
-                let muted = h.muted || s.peer(pid).is_some_and(|p| p.common().notify.is_muted(now));
-                if count > 0 {
-                    state.messages = state.messages.saturating_add(count);
-                    state.chats = state.chats.saturating_add(1);
-                    if muted {
-                        state.messages_muted = state.messages_muted.saturating_add(count);
-                        state.chats_muted = state.chats_muted.saturating_add(1);
-                    }
-                } else if h.unread_mark {
-                    state.marks = state.marks.saturating_add(1);
-                    if muted {
-                        state.marks_muted = state.marks_muted.saturating_add(1);
-                    }
-                }
-                if h.unread_mentions_count > 0 {
-                    state.mentions = state
-                        .mentions
-                        .saturating_add(h.unread_mentions_count as u32);
-                }
-            }
-            state
-        })
+        self.read_session(app_unread_badge_state)
     }
 
     fn peer_info(&self, peer_id: PeerId) -> Option<NotifyPeerInfo> {
@@ -7678,6 +7642,10 @@ impl LiveSession {
     /// Adds the caches a live-arrived message shows with (translations, rich messages, widgets,
     /// dice, reply targets).
     fn decorate_live_messages(&mut self, peer_id: PeerId, batch: &mut [HistoryMessage]) {
+        // A local media message holds only its caption in the session: the view puts this
+        // message in place of the pending bubble, so it carries the media being sent
+        // (TGB-3168).
+        self.sends.attach_local_media(to_data_peer(peer_id), batch);
         self.decorate_cached_translations(peer_id, batch);
         crate::rich_message::attach_cached_rich_messages(self.runtime.session(), batch);
         crate::widgets::attach_cached_widget_states(self.runtime.session(), batch);

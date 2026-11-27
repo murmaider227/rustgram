@@ -49,6 +49,7 @@ use tg_app_core::notifications::backend::{
     IncomingMessageNotification, ItemNotificationType, NotificationMediaKind, NotifyPeerInfo,
     TextSpoilerRange,
 };
+use tg_app_core::notifications::settings::UnreadBadgeState;
 use tg_app_core::settings::backend::{
     ActiveSession, Birthday as SettingsBirthday, ChatFolder as SettingsChatFolder, FolderIcon,
     NotifyScope, PeerRef, PrivacyKey, PrivacyOption, PrivacyRule, ProfileInfo, ScopeNotifySettings,
@@ -984,7 +985,7 @@ pub fn dialog_item_from_session(
     let top_msg = loaded_top.filter(|msg| !displays_nothing(msg));
     let (last_message_id, last_message, last_sender, last_message_time, send_state) =
         if let Some(msg) = top_msg {
-            let preview = crate::preview_text::message_preview_text(session, msg);
+            let preview = crate::preview_text::message_preview(session, msg);
             let sender = crate::preview_text::preview_sender(session, msg);
             let send_state = message_send_state(session, msg);
             (
@@ -1001,7 +1002,7 @@ pub fn dialog_item_from_session(
                 } else {
                     history.top_message_id.map_or(MsgId(0), from_data_msg)
                 },
-                String::new(),
+                crate::preview_text::PreviewText::default(),
                 None,
                 unix_to_local_datetime(history.chat_list_time_id),
                 DialogSendState::None,
@@ -1064,7 +1065,8 @@ pub fn dialog_item_from_session(
         folders,
         folder_tags,
         last_message_id,
-        last_message,
+        last_message: last_message.text,
+        last_message_spoilers: last_message.spoilers,
         last_sender,
         last_message_time,
         send_state,
@@ -3542,10 +3544,61 @@ pub fn chat_filter_to_dialog_folder(filter: &ChatFilter, session: &Session) -> D
         title: filter.title.text.clone(),
         icon,
         color_index: filter.color_index.unwrap_or(5) % 7,
-        unread: FolderUnreadState {
-            unread_chats: (unread_state.chats + unread_state.marks).max(0) as u32,
-            muted_chats: (unread_state.chats_muted + unread_state.marks_muted).max(0) as u32,
-        },
+        unread: folder_unread_from_state(&unread_state),
+        locked: false,
+    }
+}
+
+/// A folder tab's unread chats: chats with unread messages plus chats marked unread, and how
+/// many of them are muted (`ui/widgets/chat_filters_tabs_strip.cpp:244-249`,
+/// `window/window_filters_menu.cpp:633-638`). Folder tabs count chats whatever the "count
+/// unread messages" setting says.
+#[must_use]
+pub fn folder_unread_from_state(state: &tg_data::UnreadState) -> FolderUnreadState {
+    FolderUnreadState {
+        unread_chats: state.chats.saturating_add(state.marks).max(0) as u32,
+        muted_chats: state.chats_muted.saturating_add(state.marks_muted).max(0) as u32,
+    }
+}
+
+/// The "All chats" tab's unread chats: the main list without the archive
+/// (`Data::UnreadStateValue` for filter 0 -> `MainListMapUnreadState`,
+/// `data/data_unread_value.cpp:32-53`). Archived chats never enter Rustgram's main list
+/// unread state, so nothing is subtracted.
+#[must_use]
+pub fn all_chats_folder_unread(session: &Session) -> FolderUnreadState {
+    folder_unread_from_state(&session.main_list().unread_state())
+}
+
+/// The unread state behind the app's tray and taskbar badge: the main list with the archive
+/// counted as muted chats (`Data::Session::unreadBadge` uses `_chatsList.unreadState()`, which
+/// holds the archive folder entry, `data/data_session.cpp:3668-3687`;
+/// `Folder::chatListUnreadState`, `data/data_folder.cpp:386-388`). `mentions` counts chats with
+/// unread mentions, like `Dialogs::UnreadState::mentions`.
+#[must_use]
+pub fn app_unread_badge_state(session: &Session) -> UnreadBadgeState {
+    let state = session.main_list().unread_state() + session.archive().unread_state();
+    let count = |n: i32| n.max(0) as u32;
+    UnreadBadgeState {
+        messages: count(state.messages),
+        messages_muted: count(state.messages_muted),
+        chats: count(state.chats),
+        chats_muted: count(state.chats_muted),
+        marks: count(state.marks),
+        marks_muted: count(state.marks_muted),
+        mentions: count(state.mentions),
+    }
+}
+
+/// The "All chats" tab of the folder strip and sidebar, with [`all_chats_folder_unread`].
+#[must_use]
+pub fn all_chats_dialog_folder(session: &Session) -> DialogChatFolder {
+    DialogChatFolder {
+        id: FilterId::ALL,
+        title: "All Chats".to_owned(),
+        icon: FolderIconKind::All,
+        color_index: 5,
+        unread: all_chats_folder_unread(session),
         locked: false,
     }
 }

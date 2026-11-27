@@ -36,7 +36,7 @@ use crate::custom_emoji::{
     CustomEmojiPaintContext, CustomEmojiRenderer, has_registered_custom_emoji,
     paint_registered_custom_emoji,
 };
-use crate::effects::{merge_spoiler_rects, paint_text_spoiler};
+use crate::effects::merge_spoiler_rects;
 use crate::fonts::font_id_for_flags;
 use crate::icons::paint_style_icon;
 use crate::style::{LinkUnderline, QuoteStyle, TextPalette, TextStyle, px};
@@ -47,8 +47,9 @@ mod spoiler_tests;
 
 pub use prepared::{
     PreparedEntityText, PreparedRichText, fonts_epoch, note_text_preparation,
-    render_prepared_rich_text, render_prepared_rich_text_with_reveal,
-    render_prepared_text_with_entities, text_preparation_count,
+    render_prepared_rich_text, render_prepared_rich_text_selected,
+    render_prepared_rich_text_with_reveal, render_prepared_text_with_entities,
+    text_preparation_count,
 };
 
 // ---------------------------------------------------------------------------
@@ -487,6 +488,7 @@ pub fn render_rich_text(
         base_color,
         max_width,
         None,
+        &[],
     )
 }
 
@@ -2170,6 +2172,7 @@ fn render_entity_text_cached(
                 force_first_frame: false,
                 force_last_frame: false,
                 text_color: options.base_color,
+                overlay: None,
             };
             for (ce_idx, er) in animated_custom_emojis {
                 let doc_id = &laid.custom_emojis[ce_idx].document_id;
@@ -2206,12 +2209,24 @@ fn render_entity_text_cached(
                 .iter()
                 .map(|r| r.translate(offset))
                 .collect();
-            paint_text_spoiler(
+            // The selected part of the cover is drawn in `selectSpoilerFg`
+            // (`Renderer::pushSpoilerRange`).
+            let selected: Vec<Rect> = if out.selection.is_empty() {
+                Vec::new()
+            } else {
+                laid.selection_rects(out.selection)
+                    .into_iter()
+                    .map(|r| r.translate(offset))
+                    .collect()
+            };
+            crate::effects::paint_text_spoiler_selected(
                 ui.ctx(),
                 painter,
                 &rects,
+                &selected,
                 origin,
                 palette.spoiler_fg,
+                palette.select_spoiler_fg,
                 1.0 - reveal,
             );
         }

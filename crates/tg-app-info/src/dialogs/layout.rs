@@ -42,7 +42,7 @@ use crate::dialogs::backend::{
 };
 use crate::dialogs::emoji_status;
 use crate::dialogs::mini_preview::{PreviewLineColors, paint_preview_line};
-use crate::dialogs::search_snippet::message_search_snippet;
+use crate::dialogs::search_snippet::message_search_snippet_with_spoilers;
 use tg_app_core::stand_in::theme::Palette;
 use tg_ui::widgets::media_marker::{paint_media_marker, split_media_marker};
 
@@ -1450,7 +1450,16 @@ pub fn paint_message_search_row(
     } else {
         sender
     };
-    let mut snippet = message_search_snippet(inline_sender, msg_text, query);
+    // A stripped media marker moves the text's spoilers with it.
+    let shift = msg.text.len() - msg_text.len();
+    let spoilers: Vec<Range<usize>> = msg
+        .text_spoilers
+        .iter()
+        .filter(|r| r.start >= shift)
+        .map(|r| r.start - shift..r.end - shift)
+        .collect();
+    let mut snippet =
+        message_search_snippet_with_spoilers(inline_sender, msg_text, &spoilers, query);
     // Caption-less media ("Photo") and service text are drawn in `dialogsTextFgService`.
     if let Some(preview) = media {
         let has_images =
@@ -1470,9 +1479,20 @@ pub fn paint_message_search_row(
         (clip_rect.right() - x).max(1.0),
     );
     let galley = clipped.layout_job(job);
-    clipped.galley(
-        Pos2::new(x, clip_rect.center().y - galley.size().y * 0.5),
+    let hidden = snippet.hidden_chars();
+    let line = tg_ui::spoiler_line::SpoilerLine {
+        spoilers: if hidden.is_empty() {
+            Vec::new()
+        } else {
+            tg_ui::spoiler_line::hidden_glyph_rects(&galley, &hidden)
+        },
         galley,
+    };
+    // `dialogsTextPalette.spoilerFg` is the row's text colour.
+    line.paint(
+        &clipped,
+        Pos2::new(x, clip_rect.center().y - line.galley.size().y * 0.5),
+        sub_fg,
         sub_fg,
     );
 }

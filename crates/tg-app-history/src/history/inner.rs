@@ -1913,8 +1913,10 @@ impl HistoryInnerWidget {
         } else if !was_at_bottom && is_unread_incoming && self.list.unread_bar_index.is_none() {
             self.list.set_unread_bar(Some(inserted_idx));
         }
+        // Each unread arrival counts (`History::addNewMessage`, `history.cpp:1717-1723`); the
+        // session's own count replaces this one with the `UnreadChanged` that follows.
         if is_unread_incoming {
-            self.unread_count = self.unread_count.max(1);
+            self.unread_count = self.unread_count.saturating_add(1);
         }
         if (was_at_bottom || is_outgoing) && self.messages.len() > MAX_LOADED_AT_BOTTOM {
             self.unload_oldest_messages(KEEP_LOADED_AFTER_UNLOAD);

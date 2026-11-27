@@ -16,6 +16,7 @@ pub use tg_theme;
 
 pub mod anim;
 pub mod clipboard;
+pub mod colored;
 pub mod custom_emoji;
 pub mod effects;
 pub mod elide;
@@ -29,6 +30,7 @@ pub mod peer_color;
 pub mod platform;
 #[cfg(any(test, feature = "soft-raster"))]
 pub mod soft_raster;
+pub mod spoiler_line;
 pub mod stand_in;
 pub mod style;
 pub mod text;
@@ -37,6 +39,7 @@ pub mod toast;
 pub mod unread_badge;
 pub mod userpic;
 pub mod userpic_images;
+pub mod wheel;
 pub mod widgets;
 
 /// Apply Telegram Desktop visuals and bundled Open Sans / Hack fonts to an `egui::Context`.

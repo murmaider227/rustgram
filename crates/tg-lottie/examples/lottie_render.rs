@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //! ```text
-//! cargo run -p tg-lottie --example render -- in.json out.png frame [--size WxH]
+//! cargo run -p tg-lottie --example lottie_render -- in.json out.png frame [--size WxH]
 //! ```
 
 use std::env;

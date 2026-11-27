@@ -323,6 +323,7 @@ fn dialog_item_from_stand_in(entry: &DialogEntry) -> DialogItem {
         folder_tags: Vec::new(),
         last_message_id: MsgId(1),
         last_message: entry.last_message.clone(),
+        last_message_spoilers: Vec::new(),
         last_sender: entry.last_sender.clone(),
         last_message_time: MOCK_NOW,
         send_state: if entry.peer.is_saved_messages {
