@@ -85,7 +85,52 @@ impl StartupPrefs {
 /// Returns the compiled-in application SemVer parsed from `CARGO_PKG_VERSION`.
 #[must_use]
 pub fn current_app_version() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| Version::new(0, 1, 0))
+    // Release builds get their version (e.g. 0.1.0-alpha.3) from `tg-xtask dist` through
+    // RUSTGRAM_VERSION; the crate version alone would make every alpha think it is 0.1.0 and refuse
+    // the next 0.1.0-alpha.N update.
+    app_version_from(option_env!("RUSTGRAM_VERSION"), env!("CARGO_PKG_VERSION"))
+}
+
+/// The release version when one was set at build time, otherwise the crate version.
+pub fn app_version_from(release: Option<&str>, crate_version: &str) -> Version {
+    release
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| Version::parse(v.trim_start_matches('v')).ok())
+        .or_else(|| Version::parse(crate_version).ok())
+        .unwrap_or_else(|| Version::new(0, 1, 0))
+}
+
+#[cfg(test)]
+mod app_version_tests {
+    use super::*;
+
+    #[test]
+    fn release_builds_use_the_release_version() {
+        let v = app_version_from(Some("0.1.0-alpha.3"), "0.1.0");
+        assert_eq!(v, Version::parse("0.1.0-alpha.3").expect("version"));
+        assert!(v.is_prerelease());
+        assert_eq!(
+            app_version_from(Some("v0.2.0"), "0.1.0"),
+            Version::parse("0.2.0").expect("version")
+        );
+    }
+
+    #[test]
+    fn dev_builds_fall_back_to_the_crate_version() {
+        assert_eq!(
+            app_version_from(None, "0.1.0"),
+            Version::parse("0.1.0").expect("version")
+        );
+        assert_eq!(
+            app_version_from(Some("  "), "0.1.0"),
+            Version::parse("0.1.0").expect("version")
+        );
+        assert_eq!(
+            app_version_from(Some("not a version"), "0.1.0"),
+            Version::parse("0.1.0").expect("version")
+        );
+    }
 }
 
 /// High-level update state readable by the Main Menu and Settings > Advanced.

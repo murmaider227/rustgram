@@ -189,7 +189,7 @@ impl<C: HttpClient> UpdateStateMachine<C> {
     /// Updates user preferences (`auto_update`, `allow_beta`) at runtime.
     pub fn set_preferences(&mut self, auto_update: bool, allow_beta: bool) {
         self.auto_update = auto_update;
-        self.config.allow_beta = allow_beta;
+        self.config.allow_beta = effective_allow_beta(allow_beta, &self.config.current_version);
         if !self.disabled_by_cli && !matches!(self.state, UpdateState::Ready { .. }) {
             if !auto_update
                 && matches!(self.state, UpdateState::Idle | UpdateState::UpToDate { .. })
@@ -549,7 +549,7 @@ impl UpdateController {
         let current_version = current_app_version();
         let disabled_by_cli = parsed_args.no_update;
         let auto_update = prefs.auto_update;
-        let allow_beta = prefs.install_beta;
+        let allow_beta = effective_allow_beta(prefs.install_beta, &current_version);
         let last_check_unix = prefs.last_update_check_unix;
 
         let launch_context = Some(UpdateLaunchContext {
@@ -847,8 +847,32 @@ fn current_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// A pre-release build always accepts pre-release updates, like tdesktop's
+/// `gInstallBetaVersion = AppBetaVersion`: otherwise an alpha whose "install beta versions" switch
+/// was never turned on would never see the next alpha.
+fn effective_allow_beta(install_beta_pref: bool, current: &tg_updater::version::Version) -> bool {
+    install_beta_pref || current.is_prerelease()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prerelease_builds_take_prereleases_even_with_the_switch_off() {
+        let alpha2 = tg_updater::version::Version::parse("0.1.0-alpha.2").expect("version");
+        let alpha3 = tg_updater::version::Version::parse("0.1.0-alpha.3").expect("version");
+        let stable = tg_updater::version::Version::parse("0.1.0").expect("version");
+        assert!(effective_allow_beta(false, &alpha2));
+        assert!(tg_updater::version::channel_allows_update(
+            &alpha2,
+            &alpha3,
+            tg_updater::version::UpdateChannel::Beta,
+            effective_allow_beta(false, &alpha2),
+        ));
+        // A stable build keeps following the user's switch.
+        assert!(!effective_allow_beta(false, &stable));
+        assert!(effective_allow_beta(true, &stable));
+    }
+
     use super::*;
 
     #[test]
