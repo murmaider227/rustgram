@@ -1563,39 +1563,40 @@ Each scenario names what must be visible afterwards and the tdesktop source it f
 
 ## Results
 
-Walk of 2026-11-27 on Rustgram `de63bc2a` against Telegram Desktop 7.4.6 (92 scenarios, 76 min). pass: 20, FAIL: 8, blocked: 18, needs a look: 46.
+OB rows: walk of 2026-11-28 on Rustgram `0ddb18c0` against Telegram Desktop 7.4.6 (29 scenarios, one pass of 36 min plus a 17 min re-run of 11; every "needs a look" pair judged by hand). pass: 9, FAIL: 11, blocked: 9.
+EV rows: walk of 2026-11-27 on Rustgram `de63bc2a` (63 scenarios).
 
 | Id | Scenario | Result | Note |
 |---|---|---|---|
-| OB-01 | Stories tooltip closes on its x | blocked | not run: needs runner work (text not on screen: Click here to view) |
+| OB-01 | Stories tooltip closes on its x | blocked | no tooltip in Rustgram on this login (dismissed in an earlier walk, the choice is saved); the official copy shows it |
 | OB-02 | "is typing" appears when B types and goes away 6 s after B stops | pass |  |
-| OB-03 | "is typing" goes away at once when B cancels typing | pass |  |
+| OB-03 | "is typing" goes away at once when B cancels typing | blocked | pass 1: the other side's window did not open the chat; re-run: a click on the search result was lost in Rustgram (passed on 2026-11-27) |
 | OB-04 | "is typing" goes away when B's message arrives | pass |  |
-| OB-05 | Own userpic next to own messages in a group at a wide window | needs a look | reference client did not pass either: text for samecol not on screen (^Styles) |
-| OB-06 | The "@" mentions button and its counter go away after the mention is read | FAIL | badge corner (badge pixels 0) (TGB-3161, TGB-3125) |
+| OB-05 | Own userpic next to own messages in a group at a wide window | FAIL | the run of own messages is not reachable by scrolling (history gap, TGB-3176) |
+| OB-06 | The "@" mentions button and its counter go away after the mention is read | blocked | re-run pair: scroll-down counter 1 in both clients, gone after reading; neither client showed the "@" button; the corner check read the profile column (TGB-3186) |
 | OB-07 | The reactions corner button and its counter go away after the reaction is seen | blocked | not run: reactions by the other side need a second Rustgram-readable account (TGB-3158) |
-| OB-08 | A custom sticker shows, fills its box, and a click opens its set | needs a look | reference client did not pass either: nobadge history 2500 |
-| OB-09 | Closing the main window keeps the app in the tray; a tray click brings it back | FAIL | tray menu has no debug items (TGB-3159) |
+| OB-08 | A custom sticker shows, fills its box, and a click opens its set | FAIL | the stickers are not reachable by scrolling (history gap, TGB-3176) |
+| OB-09 | Closing the main window keeps the app in the tray; a tray click brings it back | FAIL | tray menu still has "Simulate incoming message" (TGB-3159); hide to tray, tray click, Quit and Ctrl+Q work; the icon is the monochrome app logo (tdesktop default) |
 | OB-10 | "Restart to update" never offers an older or equal version | pass |  |
-| OB-11 | Stories sit as userpics inside the search field, not in a separate row | needs a look |  |
-| OB-12 | Spoiler text stays hidden until clicked | FAIL | message not reachable by scrolling: ^Styles (history gap, TGB-3176) |
-| OB-13 | Text styles and emoji look like tdesktop | FAIL | message not reachable by scrolling: ^Styles (history gap, TGB-3176) |
-| OB-14 | Deleting a message plays the delete effect and removes it | needs a look | reference client did not pass either: text not on screen: ^Delete$ |
-| OB-15 | Sender name colours in a group match tdesktop | FAIL | message not reachable by scrolling: ^Styles (history gap, TGB-3176) |
-| OB-16 | Reactions show on old messages deep in a long chat | needs a look |  |
-| OB-17 | Saved Messages bubble looks like tdesktop | needs a look |  |
-| OB-18 | Recording and sending a voice message | needs a look |  |
-| OB-19 | Copy Text from the context menu puts the message text on the clipboard | needs a look | reference client did not pass either: text not on screen: ^Copy Text |
-| OB-20 | Selected text is copied with Ctrl+C | blocked | not run: needs runner work (text to select not on screen) |
-| OB-21 | Channel post reactions are emoji, never raw ids | needs a look |  |
-| OB-22 | Video plays without glitches | needs a look | reference client did not pass either: message not reachable by scrolling up: ^A short video |
-| OB-23 | Voice message bubble: waveform and duration | needs a look | reference client did not pass either: message not reachable by scrolling up: ^Notes as a file |
-| OB-24 | Gaps between grouped messages and the admin rank | FAIL | message not reachable by scrolling up: ^And a third one (history gap, TGB-3176) |
-| OB-25 | The scrollbar thumb is at the bottom when the history is at the bottom | needs a look |  |
-| OB-26 | Photo viewer is full screen over the taskbar | needs a look | reference client did not pass either: message not reachable by scrolling up: ^Three photos from the trip |
-| OB-27 | A tall photo keeps its aspect ratio | needs a look | reference client did not pass either: message not reachable by scrolling up: ^Three photos from the trip |
-| OB-28 | Userpic circles are smooth | needs a look |  |
-| OB-29 | No link preview card for an internal t.me/c link | needs a look |  |
+| OB-11 | Stories sit as userpics inside the search field, not in a separate row | pass | judged from the pair; the userpic shows "SM" instead of the account's initials (TGB-3205) |
+| OB-12 | Spoiler text stays hidden until clicked | FAIL | the styles message is not reachable by scrolling (history gap, TGB-3176) |
+| OB-13 | Text styles and emoji look like tdesktop | FAIL | the styles message is not reachable by scrolling (history gap, TGB-3176) |
+| OB-14 | Deleting a message plays the delete effect and removes it | pass | judged from the pair: the message goes with the dust effect; the check saw the official client's copy (both post as one account) |
+| OB-15 | Sender name colours in a group match tdesktop | FAIL | the styles message is not reachable by scrolling (history gap, TGB-3176) |
+| OB-16 | Reactions show on old messages deep in a long chat | blocked | line 003 shows its fire reaction with the reactor's userpic; neither client reached line 040 |
+| OB-17 | Saved Messages bubble looks like tdesktop | pass | judged from the pair; time and ticks are grey where tdesktop tints them blue |
+| OB-18 | Recording and sending a voice message | blocked | the hold landed on the profile column (TGB-3186); the official client started recording |
+| OB-19 | Copy Text from the context menu puts the message text on the clipboard | blocked | Rustgram's seek did not reach the newest message of the private chat; the official client had no Copy Text item |
+| OB-20 | Selected text is copied with Ctrl+C | blocked | Rustgram's seek did not reach the newest message of the private chat; the official clipboard stayed empty |
+| OB-21 | Channel post reactions are emoji, never raw ids | pass | judged from the pair: emoji chips with counts like the official client (link card differs: TGB-3206) |
+| OB-22 | Video plays without glitches | FAIL | the video is not reachable by scrolling (history gap, TGB-3176) |
+| OB-23 | Voice message bubble: waveform and duration | FAIL | the voice message is not reachable by scrolling (history gap, TGB-3176) |
+| OB-24 | Gaps between grouped messages and the admin rank | FAIL | the three-message run is not reachable by scrolling (history gap, TGB-3176) |
+| OB-25 | The scrollbar thumb is at the bottom when the history is at the bottom | blocked | Rustgram showed no scrollbar thumb to judge; the official thumb sits at the bottom |
+| OB-26 | Photo viewer is full screen over the taskbar | FAIL | the album is not reachable by scrolling (history gap, TGB-3176) |
+| OB-27 | A tall photo keeps its aspect ratio | FAIL | the album is not reachable by scrolling (history gap, TGB-3176) |
+| OB-28 | Userpic circles are smooth | pass | judged from the pair |
+| OB-29 | No link preview card for an internal t.me/c link | pass | judged from the pair |
 | EV-01 | Start: the chat list shows the account's chats | pass |  |
 | EV-02 | Pinned chat stays on top of the list | pass |  |
 | EV-03 | Folders: the Walk folder shows only its chats | pass |  |
@@ -1666,6 +1667,15 @@ All three clients ran as test account B on their own logins; the "other side" (o
 its own official client window. "needs a look" means the official client failed the same check (so the check
 is in doubt) or only a person can judge the pair; most of them come from runner limits listed below, not
 from Rustgram.
+
+OB walk of 2026-11-28 (master `0ddb18c0`): the official copy stopped opening chats after OB-16 in the first pass, so
+OB-02, 03, 04, 06, 14, 17, 19, 20, 21, 25 and 29 were played again on fresh clients; the later verdict counts. Still failing:
+TGB-3176 (history gap: 10 scenarios cannot reach their message), TGB-3159 (tray debug item), TGB-3186 (the profile column
+stays open in every Rustgram shot and covers the corner buttons and the mic). Passing: TGB-3122 (close to tray),
+TGB-3123 (tray icon), TGB-3128 ("typing": OB-02 and OB-04). New: TGB-3205 (own story initials), TGB-3206 (link card
+without photo and Instant View). Runner limits seen: both clients post as one account, so OB-14's check finds the other
+client's copy; the other side's fillers pile up in the supergroup (the walk account may not delete them); the seek
+for "History line 040" ended near line 300 in both clients without reporting a failure.
 
 Issues from this walk: TGB-3176 (history gap when scrolling a group up), TGB-3186 (profile column does not
 close on its x), TGB-3159 (tray menu debug entries), TGB-3160 (unread badges), TGB-3161 (corner "@" and

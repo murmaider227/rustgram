@@ -698,25 +698,11 @@ fn new_message_replying_to_an_old_one_repaints_when_the_target_arrives() {
     });
     let _ = live.load_slice_around(peer, MsgId::SHOW_AT_END, 50, 0);
 
-    // A new incoming message (as an update would insert it) replying to message 5.
-    let incoming = tl_message(
-        1001,
-        tl_peer.clone(),
-        PEER_ID,
-        "re ancient",
-        Some(Reply {
-            to: 5,
-            ..Reply::default()
-        }),
-    );
-    live.write_session(|s| {
-        let self_id = s.self_user_id();
-        if let Some(m) = message_from_tl(&incoming, self_id) {
-            s.insert_message(m);
-        }
-    });
-    live.bridge_state()
-        .record_message_added(DataPeerId(peer.0), tg_data::MsgId(1001));
+    // A new incoming message (as an update would insert it) replying to message 5. The session
+    // announces it itself (`MessageUpdated { NEW_ADDED }` -> the bridge's `record_message_added`);
+    // a second announcement by hand could land after the target and fold its repaint into an add
+    // (TGB-3129, see the next test).
+    insert_reply_to_ancient(&live);
 
     let mut added_header = None;
     assert!(wait_until(|| {
@@ -734,6 +720,97 @@ fn new_message_replying_to_an_old_one_repaints_when_the_target_arrives() {
     let edited = wait_for_edits(&mut live, peer, &[1001]);
     assert_eq!(
         reply_of(&edited, 1001),
+        ("Peer Two".to_owned(), "ancient".to_owned(), None)
+    );
+    assert_eq!(rpc.calls::<tl_fns::channels::GetMessages>().len(), 1);
+}
+
+/// Inserts message 1001 of the group, a reply to message 5 that is not loaded.
+fn insert_reply_to_ancient(live: &LiveSession) {
+    let incoming = tl_message(
+        1001,
+        tl_group_peer(),
+        PEER_ID,
+        "re ancient",
+        Some(Reply {
+            to: 5,
+            ..Reply::default()
+        }),
+    );
+    live.write_session(|s| {
+        let self_id = s.self_user_id();
+        if let Some(m) = message_from_tl(&incoming, self_id) {
+            s.insert_message(m);
+        }
+    });
+}
+
+/// TGB-3129 / TGB-3169: a message announced again as added after the view showed it, while its
+/// reply target is in flight, gets the target's repaint folded into that pending add
+/// (`LiveBridgeState::record_message_edited` skips ids in `added`). The repaint is not lost: the
+/// add is built from the session when drained, so it carries the target, and the view applies an
+/// add of a shown message in place (`HistoryInner::apply_live_added_message`).
+#[test]
+fn a_reply_target_landing_behind_a_repeated_add_repaints_through_that_add() {
+    let peer = group_peer();
+    let tl_peer = tl_group_peer();
+    let (rpc, mut live) = build_live(
+        DataPeerId(peer.0),
+        vec![tl_message(1000, tl_peer.clone(), PEER_ID, "recent", None)],
+    );
+    // The answer for message 5 waits until the test lets it go.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let answer_peer = tl_peer.clone();
+    rpc.set_handler(move |ctor, _| {
+        (ctor == tl_fns::channels::GetMessages::CONSTRUCTOR_ID).then(|| {
+            if let Ok(rx) = release_rx.lock() {
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+            }
+            channel_messages(
+                vec![tl_message(5, answer_peer.clone(), PEER_ID, "ancient", None)],
+                Vec::new(),
+            )
+        })
+    });
+    let _ = live.load_slice_around(peer, MsgId::SHOW_AT_END, 50, 0);
+    insert_reply_to_ancient(&live);
+
+    let mut added_header = None;
+    assert!(wait_until(|| {
+        for update in live.drain_history_updates(peer) {
+            if let HistoryLiveUpdate::MessageAdded(m) = update {
+                added_header = m.reply.clone();
+            }
+        }
+        added_header.is_some()
+    }));
+    assert_eq!(
+        added_header.map(|r| r.preview_text),
+        Some(tg_lang::tr::lng_profile_loading())
+    );
+    // The request for message 5 is in flight; the message is announced as added once more.
+    assert!(wait_until(|| {
+        rpc.calls::<tl_fns::channels::GetMessages>().len() == 1
+    }));
+    live.bridge_state()
+        .record_message_added(DataPeerId(peer.0), tg_data::MsgId(1001));
+    let _ = release_tx.send(());
+    assert!(wait_until(|| crate::reply_targets::flushes_done(&live) == 1));
+
+    // The repaint was folded into the pending add: one `MessageAdded`, no `MessageEdited`.
+    let updates = live.drain_history_updates(peer);
+    let mut added = Vec::new();
+    for update in updates {
+        match update {
+            HistoryLiveUpdate::MessageAdded(m) => added.push(*m),
+            HistoryLiveUpdate::MessageEdited(m) => panic!("unexpected edit of {:?}", m.id),
+            _ => {}
+        }
+    }
+    assert_eq!(added.len(), 1, "one add of message 1001");
+    assert_eq!(
+        reply_of(&added, 1001),
         ("Peer Two".to_owned(), "ancient".to_owned(), None)
     );
     assert_eq!(rpc.calls::<tl_fns::channels::GetMessages>().len(), 1);

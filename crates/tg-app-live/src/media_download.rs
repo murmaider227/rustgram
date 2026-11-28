@@ -35,6 +35,7 @@ pub fn start(live: &LiveSession, peer_id: PeerId, msg_id: MsgId) {
     };
     live.media_cache().start_media_download_for_message(
         &msg,
+        Some(live.runtime().session()),
         live.runtime().rpc(),
         live.runtime().tokio_handle(),
         live.bridge_state(),

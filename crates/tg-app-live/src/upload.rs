@@ -361,6 +361,8 @@ pub struct AlbumUploadItem {
     pub caption: Option<TextWithEntities>,
 }
 
+mod album_queue;
+
 // ============================================================================
 // Per-session state registry (keeps LiveSession struct untouched for clean merges)
 // ============================================================================
@@ -2577,8 +2579,8 @@ impl LiveSession {
 // Delegation entry points called by `live/session.rs`
 // ============================================================================
 
-/// Sends one uploaded attachment from the compose box: at once with a pending bubble
-/// (TGB-3033), except scheduled sends, which wait for the server as before.
+/// Sends one uploaded attachment from the compose box without waiting: with a pending bubble
+/// (TGB-3033), or for a scheduled send into the scheduled section (TGB-3130).
 fn send_single_media(
     shown: HistoryMedia,
     live: &mut LiveSession,
@@ -2587,7 +2589,7 @@ fn send_single_media(
     opts: SendMediaOptions,
 ) -> Result<HistoryMessage, String> {
     if opts.schedule_date.is_some() {
-        live.send_uploaded_media(peer_id, media, opts)
+        live.send_scheduled_media_queued(peer_id, media, opts, shown)
     } else {
         live.send_uploaded_media_queued(peer_id, media, opts, shown)
     }
@@ -2785,6 +2787,29 @@ pub(super) fn send_history_media_extended(
                     item.stripped_thumb.as_deref(),
                 )?;
                 let name = file_basename(&item.label, "album_item.jpg");
+                let size_bytes = bytes.len() as u64;
+                let shown = match item.video_duration_secs {
+                    Some(duration_secs) => {
+                        HistoryMedia::Video(tg_app_core::history::backend::VideoAttachment {
+                            width: item.width,
+                            height: item.height,
+                            duration_secs,
+                            size_bytes,
+                            is_gif: false,
+                            stripped_thumb: item.stripped_thumb.clone(),
+                            fallback_rgb: item.fallback_rgb,
+                            file_name: item.label.clone(),
+                        })
+                    }
+                    None => HistoryMedia::Photo(tg_app_core::history::backend::PhotoAttachment {
+                        width: item.width,
+                        height: item.height,
+                        stripped_thumb: item.stripped_thumb.clone(),
+                        fallback_rgb: item.fallback_rgb,
+                        file_name: item.label.clone(),
+                        size_bytes,
+                    }),
+                };
                 let media = if let Some(dur) = item.video_duration_secs {
                     OutgoingMedia::Video {
                         bytes,
@@ -2809,15 +2834,13 @@ pub(super) fn send_history_media_extended(
                         ttl_seconds: None,
                     }
                 };
-                upload_items.push(AlbumUploadItem {
+                upload_items.push(album_queue::QueuedAlbumItem {
                     media,
                     caption: None,
+                    shown,
                 });
             }
-            let sent = live.send_album(peer_id, upload_items, opts)?;
-            sent.into_iter()
-                .next()
-                .ok_or_else(|| "album send returned no messages".to_owned())
+            live.send_album_queued(peer_id, upload_items, opts)
         }
         HistoryMedia::Location(loc) => {
             live.send_uploaded_media(peer_id, OutgoingMedia::Location(loc), opts)

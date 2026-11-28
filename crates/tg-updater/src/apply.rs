@@ -385,11 +385,13 @@ pub fn refuse_stale_staged_update(
     })
 }
 
-/// Removes `tupdates/ready`, `tupdates/temp`, and `tupdates` (if empty).
+/// Removes `tupdates/ready`, `tupdates/temp`, the startup-attempt record, and `tupdates` (if
+/// empty).
 pub fn clear_tupdates(working_dir: &Path) {
     let tupdates = working_dir.join(TUPDATES_DIR_NAME);
     let _ = fs::remove_dir_all(tupdates.join("ready"));
     let _ = fs::remove_dir_all(tupdates.join("temp"));
+    crate::startup_attempt::clear_startup_attempt(working_dir);
     let _ = fs::remove_dir(&tupdates);
 }
 
@@ -682,7 +684,9 @@ fn copy_with_retry(
 ///    ([`refuse_stale_staged_update`]): then nothing is installed, the app is still relaunched,
 ///    and [`UpdateError::NotNewer`] is returned.
 /// 3. Updates the Windows Uninstall registry version if an update succeeded.
-/// 4. Relaunches `rustgram.exe` with `-noupdate` + forwarded flags unless `-justupdate` is set.
+/// 4. Relaunches `rustgram.exe` with `-noupdate` + forwarded flags unless `-justupdate` is set,
+///    also when the install failed (the copy error is returned after the relaunch), so an update
+///    that cannot be installed never keeps the app from starting.
 pub fn run_updater(
     args: &UpdaterArgs,
     working_dir: &Path,
@@ -731,22 +735,29 @@ pub fn run_updater_with_policy(
         None
     };
 
-    let mut outcome = if args.need_update && refusal.is_none() {
-        apply_staged_update_with_policy(
+    let not_applied = ApplyOutcome {
+        updated: false,
+        installed_version: None,
+        files_replaced: 0,
+        relaunched: false,
+    };
+    let (mut outcome, apply_error) = if args.need_update && refusal.is_none() {
+        match apply_staged_update_with_policy(
             working_dir,
             install_dir,
             &args.exe_name,
             UPDATER_EXE_NAME,
             args.write_protected_dir.is_some(),
             policy,
-        )?
-    } else {
-        ApplyOutcome {
-            updated: false,
-            installed_version: None,
-            files_replaced: 0,
-            relaunched: false,
+        ) {
+            Ok(outcome) => (outcome, None),
+            Err(err) => {
+                tracing::error!(%err, "Could not install the staged update; relaunching the app");
+                (not_applied, Some(err))
+            }
         }
+    } else {
+        (not_applied, None)
     };
 
     if outcome.updated
@@ -755,13 +766,21 @@ pub fn run_updater_with_policy(
         update_uninstall_registry(version_str, install_dir);
     }
 
-    if !args.just_update {
+    // A failed install still starts the installed app, with `-noupdate` so it does not try again
+    // (`updater_win.cpp:770-829` runs `ShellExecute` whatever `update()` returned).
+    let relaunched = if args.just_update {
+        Ok(())
+    } else {
         let target_exe = install_dir.join(&args.exe_name);
         let relaunch_args = build_relaunch_args(args);
-        launcher.launch(&target_exe, &relaunch_args, install_dir)?;
-        outcome.relaunched = true;
-    }
+        launcher.launch(&target_exe, &relaunch_args, install_dir)
+    };
+    outcome.relaunched = !args.just_update && relaunched.is_ok();
 
+    if let Some(err) = apply_error {
+        return Err(err);
+    }
+    relaunched?;
     match refusal {
         Some(err) => Err(err),
         None => Ok(outcome),

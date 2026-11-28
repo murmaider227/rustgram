@@ -75,6 +75,9 @@ struct ReplyTargetsStore {
     listener_started: bool,
     /// Target -> messages whose reply header shows it (`registerDependentMessage`).
     dependents: HashMap<Target, HashSet<FullMsgId>>,
+    /// Flushes whose repaints are recorded (tests wait for it instead of for time).
+    #[cfg(test)]
+    flushes_done: u64,
 }
 
 impl ReplyTargetsStore {
@@ -420,7 +423,23 @@ fn schedule_flush(live: &LiveSession, store: Arc<Mutex<ReplyTargetsStore>>) {
             }
             bridge.notify_ui();
         }
+        #[cfg(test)]
+        {
+            store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .flushes_done += 1;
+        }
     });
+}
+
+/// How many reply target requests of `live` have finished and recorded their repaints.
+#[cfg(test)]
+pub(crate) fn flushes_done(live: &LiveSession) -> u64 {
+    store_for(live.bridge_state())
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .flushes_done
 }
 
 /// One request with the targets it answers: a channel box (`channels.getMessages`), the common

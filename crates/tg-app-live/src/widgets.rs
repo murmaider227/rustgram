@@ -728,6 +728,17 @@ pub fn record_widget_updates_from_batch(
     session: &Arc<RwLock<Session>>,
     updates: &tl_enums::Updates,
 ) -> bool {
+    let self_uid = session_self_uid(session);
+    record_widget_updates_from_batch_for_self(session, updates, self_uid)
+}
+
+/// [`record_widget_updates_from_batch`] for callers that already hold `self_uid`; it never
+/// locks the session, so it is safe while another task writes it.
+pub fn record_widget_updates_from_batch_for_self(
+    session: &Arc<RwLock<Session>>,
+    updates: &tl_enums::Updates,
+    self_uid: i64,
+) -> bool {
     let mut changed = false;
     let mut handle = |upd: &tl_enums::Update| match upd {
         tl_enums::Update::MessageWidgetData(w) => {
@@ -736,16 +747,16 @@ pub fn record_widget_updates_from_batch(
             }
         }
         tl_enums::Update::NewMessage(u) => {
-            changed |= record_widget_from_tl_message(session, &u.message);
+            changed |= record_widget_from_tl_message(session, &u.message, self_uid);
         }
         tl_enums::Update::NewChannelMessage(u) => {
-            changed |= record_widget_from_tl_message(session, &u.message);
+            changed |= record_widget_from_tl_message(session, &u.message, self_uid);
         }
         tl_enums::Update::EditMessage(u) => {
-            changed |= record_widget_from_tl_message(session, &u.message);
+            changed |= record_widget_from_tl_message(session, &u.message, self_uid);
         }
         tl_enums::Update::EditChannelMessage(u) => {
-            changed |= record_widget_from_tl_message(session, &u.message);
+            changed |= record_widget_from_tl_message(session, &u.message, self_uid);
         }
         _ => {}
     };
@@ -766,9 +777,28 @@ pub fn record_widget_updates_from_batch(
     changed
 }
 
+/// Waits for a writer instead of giving up: without `self_uid` an incoming DM's widget would be
+/// keyed under the user's own chat.
+fn session_self_uid(session: &Arc<RwLock<Session>>) -> i64 {
+    let self_uid = |s: &Session| s.self_user_id().0 as i64;
+    if let Ok(guard) = session.try_read() {
+        return self_uid(&guard);
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return self_uid(&session.blocking_read());
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| self_uid(&session.blocking_read()))
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 fn record_widget_from_tl_message(
     session: &Arc<RwLock<Session>>,
     tl_msg: &tl_enums::Message,
+    self_uid: i64,
 ) -> bool {
     let tl_enums::Message::Message(m) = tl_msg else {
         return false;
@@ -778,10 +808,6 @@ fn record_widget_from_tl_message(
     };
     // Incoming 1:1 DMs carry `peer_id = PeerUser(self)` and `from_id = PeerUser(sender)`;
     // resolve the chat peer identically to `tg_api::convert` / `live/rich_message.rs:167-187`.
-    let self_uid = session
-        .try_read()
-        .map(|s| s.self_user_id().0 as i64)
-        .unwrap_or(0);
     let peer_id = match &m.peer_id {
         tl_enums::Peer::User(u)
             if !m.out

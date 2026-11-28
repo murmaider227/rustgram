@@ -12,6 +12,7 @@ pub mod github;
 pub mod install_files;
 pub mod launch;
 pub mod package;
+pub mod startup_attempt;
 pub mod version;
 
 use ed25519_dalek::VerifyingKey;

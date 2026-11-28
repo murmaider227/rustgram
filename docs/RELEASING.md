@@ -22,6 +22,12 @@ published releases.
   update. From v0.2.0-alpha.4 `rustgram-updater.exe` also refuses such a package: it installs nothing,
   deletes it, exits with code 1 and starts the installed version again. It compares with the version
   the app passes (`-appversion`), else with the installed `rustgram.exe`'s product version.
+- A staged update that is newer is installed at the next start, like tdesktop: instead of opening,
+  Rustgram starts `rustgram-updater.exe` (the same way as "Restart to update") and exits, and the
+  updater starts the new version (TGB-3187; releases up to v0.2.0-alpha.6 install only on the
+  button). `-noupdate` skips this. If the install fails, the updater still starts the installed
+  version with `-noupdate`, and the next start does not try that version again
+  (`tupdates/startup_attempt`); the menu keeps offering "Restart to update".
 
 ## The rules the workflow enforces
 
@@ -229,7 +235,8 @@ others), so a copy that installed it shows "avutil-61.dll was not found" and doe
   profile is not touched. The new version deletes the old FFmpeg DLLs at its first start.
 - **v0.2.0-alpha.4 downloaded but not installed** (the menu says "New version is ready ·
   v0.2.0-alpha.4"): do not restart for it. Quit Rustgram, delete the `tupdates` folder in the working
-  folder and start it again; it then downloads the newest release. A staged update is installed only
-  by "Restart to update" (TGB-3187), so it stays harmless until then.
+  folder and start it again; it then downloads the newest release. The releases that could have
+  staged it (up to v0.2.0-alpha.6) install a staged update only by "Restart to update", so it stays
+  harmless until then.
 - Every other copy updates to v0.2.0-alpha.5 or later by itself: from v0.2.0-alpha.5 the package
   carries every runtime file, and the release workflow tests the update from the previous release.

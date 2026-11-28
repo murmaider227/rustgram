@@ -80,3 +80,8 @@ zip = { version = "9.8", default-features = false, features = ["deflate"] }
 [[bin]]
 name = "rustgram"
 path = "src/main.rs"
+
+# Also acts as the new version the updater installs and starts, so it needs its own `main`.
+[[test]]
+name = "e2e_tgb3187_startup_update"
+harness = false

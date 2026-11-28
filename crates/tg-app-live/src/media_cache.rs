@@ -1112,10 +1112,12 @@ impl LiveMediaCache {
     }
 
     /// Starts (or restarts after a cancel) the download of `msg`'s photo or voice file without
-    /// blocking; a file already cached or downloading is left alone.
+    /// blocking; a file already cached or downloading is left alone. With `session` (the live
+    /// session) an expired `file_reference` is fetched again from `msg` (TGB-3192).
     pub fn start_media_download_for_message<C: RpcClient + Clone + 'static>(
         &self,
         msg: &Message,
+        session: Option<&Arc<tokio::sync::RwLock<tg_data::Session>>>,
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
@@ -1125,7 +1127,18 @@ impl LiveMediaCache {
         };
         if let Some((key, tag, resolved)) = Self::download_target(media) {
             self.resume_download(&key);
-            let _ = self.fetch_nonblocking(key, tag, resolved, rpc, handle, bridge);
+            let refresh = session
+                .filter(|_| !is_paid_media(media))
+                .map(|session| RefreshOrigin::message(session, msg));
+            let _ = self.fetch_nonblocking_from(
+                key,
+                tag,
+                resolved,
+                refresh.as_ref(),
+                rpc,
+                handle,
+                bridge,
+            );
         }
     }
 
@@ -1246,8 +1259,10 @@ impl LiveMediaCache {
         self.inline_media_descriptor_refreshing(msg, photo_autoload, None, rpc, handle, bridge)
     }
 
-    /// [`Self::inline_media_descriptor_for_message_with`] whose sticker download asks the server
-    /// for `msg` again when its `file_reference` expired (`session` is the live session).
+    /// [`Self::inline_media_descriptor_for_message_with`] whose downloads ask the server for
+    /// `msg` again when a `file_reference` expired (`session` is the live session): the photo,
+    /// a document's thumbnail, a GIF, a round video, a sticker, and the same in a link preview
+    /// or a game (`Data::FileOriginMessage`, TGB-3126 / TGB-3192).
     pub fn inline_media_descriptor_refreshing<C: RpcClient + Clone + 'static>(
         &self,
         msg: &Message,
@@ -1275,26 +1290,40 @@ impl LiveMediaCache {
     ) -> Option<InlineMediaDescriptor> {
         match media {
             MessageMedia::Photo(photo) => {
-                Some(self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge))
+                Some(self.descriptor_for_photo(photo, photo_autoload, refresh, rpc, handle, bridge))
             }
             MessageMedia::Document(doc) => {
                 self.descriptor_for_document(doc, photo_autoload, refresh, rpc, handle, bridge)
             }
             MessageMedia::WebPage(wp) => {
                 if let Some(ref photo) = wp.photo {
-                    Some(self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge))
+                    Some(self.descriptor_for_photo(
+                        photo,
+                        photo_autoload,
+                        refresh,
+                        rpc,
+                        handle,
+                        bridge,
+                    ))
                 } else if let Some(ref doc) = wp.document {
-                    self.descriptor_for_document(doc, photo_autoload, None, rpc, handle, bridge)
+                    self.descriptor_for_document(doc, photo_autoload, refresh, rpc, handle, bridge)
                 } else {
                     None
                 }
             }
             MessageMedia::Game(game) => {
                 if let Some(ref doc) = game.document {
-                    self.descriptor_for_document(doc, photo_autoload, None, rpc, handle, bridge)
+                    self.descriptor_for_document(doc, photo_autoload, refresh, rpc, handle, bridge)
                 } else {
                     game.photo.as_ref().map(|photo| {
-                        self.descriptor_for_photo(photo, photo_autoload, rpc, handle, bridge)
+                        self.descriptor_for_photo(
+                            photo,
+                            photo_autoload,
+                            refresh,
+                            rpc,
+                            handle,
+                            bridge,
+                        )
                     })
                 }
             }
@@ -1338,6 +1367,7 @@ impl LiveMediaCache {
         &self,
         photo: &PhotoData,
         photo_autoload: bool,
+        refresh: Option<&RefreshOrigin>,
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
@@ -1356,10 +1386,11 @@ impl LiveMediaCache {
                 ..InlineMediaDescriptor::default()
             };
         }
-        let photo_load = photo_load_state(self.fetch_nonblocking(
+        let photo_load = photo_load_state(self.fetch_nonblocking_from(
             key,
             MediaCacheTag::Photo,
             resolved,
+            refresh,
             rpc,
             handle,
             bridge,
@@ -1391,7 +1422,7 @@ impl LiveMediaCache {
             DocumentKind::Gif => {
                 let resolved = document_to_location(doc);
                 let key = document_cache_key(resolved.dc_id, doc.id.0);
-                match self.fetch_or_spawn(
+                match self.fetch(
                     key,
                     MediaCacheTag::Video,
                     resolved,
@@ -1399,6 +1430,8 @@ impl LiveMediaCache {
                     rpc,
                     handle,
                     bridge,
+                    ReadMode::Blocking,
+                    refresh,
                 ) {
                     CacheFetchState::Ready(bytes) => {
                         desc.video_data = Some(InlineDocumentData::Bytes(bytes.to_vec()));
@@ -1406,7 +1439,7 @@ impl LiveMediaCache {
                     CacheFetchState::Loading { .. }
                     | CacheFetchState::Pending
                     | CacheFetchState::Skipped => {
-                        self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
+                        self.populate_doc_thumb(doc, &mut desc, refresh, rpc, handle, bridge);
                     }
                 }
                 Some(desc)
@@ -1417,7 +1450,7 @@ impl LiveMediaCache {
                 if let Some(video_bytes) = self.get_blob(&full_key) {
                     desc.video_data = Some(InlineDocumentData::Bytes(video_bytes));
                 }
-                self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
+                self.populate_doc_thumb(doc, &mut desc, refresh, rpc, handle, bridge);
                 if desc.video_data.is_some() || desc.photo_load.is_some() || desc.has_spoiler {
                     Some(desc)
                 } else {
@@ -1442,7 +1475,7 @@ impl LiveMediaCache {
                         } else {
                             VoiceLoadState::NotLoaded
                         });
-                        self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
+                        self.populate_doc_thumb(doc, &mut desc, refresh, rpc, handle, bridge);
                     }
                 }
                 Some(desc)
@@ -1451,7 +1484,7 @@ impl LiveMediaCache {
                 let resolved = document_to_location(doc);
                 let ext = resolved.ext_hint.clone().or_else(|| Some("mp4".to_owned()));
                 let key = document_cache_key(resolved.dc_id, doc.id.0);
-                match self.fetch_or_spawn(
+                match self.fetch(
                     key,
                     MediaCacheTag::Voice,
                     resolved,
@@ -1459,6 +1492,8 @@ impl LiveMediaCache {
                     rpc,
                     handle,
                     bridge,
+                    ReadMode::Blocking,
+                    refresh,
                 ) {
                     CacheFetchState::Ready(bytes) => {
                         desc.video_data = Some(InlineDocumentData::Bytes(bytes.to_vec()));
@@ -1468,7 +1503,7 @@ impl LiveMediaCache {
                     CacheFetchState::Loading { .. }
                     | CacheFetchState::Pending
                     | CacheFetchState::Skipped => {
-                        self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
+                        self.populate_doc_thumb(doc, &mut desc, refresh, rpc, handle, bridge);
                     }
                 }
                 Some(desc)
@@ -1505,7 +1540,7 @@ impl LiveMediaCache {
                     desc.audio_bytes = Some(bytes);
                     desc.audio_ext = ext;
                 }
-                self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
+                self.populate_doc_thumb(doc, &mut desc, refresh, rpc, handle, bridge);
                 Some(desc)
             }
             DocumentKind::AnimatedSticker => {
@@ -1558,7 +1593,7 @@ impl LiveMediaCache {
                 Some(desc)
             }
             DocumentKind::File | DocumentKind::WallPaper => {
-                self.populate_doc_thumb(doc, &mut desc, rpc, handle, bridge);
+                self.populate_doc_thumb(doc, &mut desc, refresh, rpc, handle, bridge);
                 if desc.photo_load.is_some() || desc.has_spoiler {
                     Some(desc)
                 } else {
@@ -1572,6 +1607,7 @@ impl LiveMediaCache {
         &self,
         doc: &DocumentData,
         desc: &mut InlineMediaDescriptor,
+        refresh: Option<&RefreshOrigin>,
         rpc: &C,
         handle: &Handle,
         bridge: &Arc<LiveBridgeState>,
@@ -1586,10 +1622,11 @@ impl LiveMediaCache {
             _ => "m",
         };
         let key = document_thumb_cache_key(thumb_loc.dc_id, doc.id.0, thumb_size);
-        desc.photo_load = photo_load_state(self.fetch_nonblocking(
+        desc.photo_load = photo_load_state(self.fetch_nonblocking_from(
             key,
             MediaCacheTag::Photo,
             thumb_loc,
+            refresh,
             rpc,
             handle,
             bridge,
@@ -1725,6 +1762,11 @@ impl LiveMediaCache {
 
 /// Maps a cache lookup to the photo state the history paints: a pending disk read paints like
 /// no state at all (blurred thumbnail) but is re-polled like a download.
+/// Paid media and invoice media keep downloading without a refresh origin, as before TGB-3192.
+fn is_paid_media(media: &MessageMedia) -> bool {
+    matches!(media, MessageMedia::PaidMedia(_) | MessageMedia::Invoice(_))
+}
+
 fn photo_load_state(state: CacheFetchState) -> Option<PhotoLoadState> {
     match state {
         CacheFetchState::Ready(bytes) => Some(PhotoLoadState::Ready { bytes }),

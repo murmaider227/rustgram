@@ -1533,7 +1533,11 @@ impl LiveSession {
             updates,
             self_uid,
         );
-        crate::widgets::record_widget_updates_from_batch(self.runtime.session(), updates);
+        crate::widgets::record_widget_updates_from_batch_for_self(
+            self.runtime.session(),
+            updates,
+            self_uid,
+        );
         crate::history_sections::apply_updates_for_live_session(self, updates);
         crate::chat_l233::apply_updates_for_live_session(self, updates);
         self.bridge.state().notify_ui();

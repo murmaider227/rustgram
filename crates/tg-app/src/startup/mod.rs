@@ -20,6 +20,7 @@ pub mod profile_paths;
 pub mod profiler;
 pub mod scale_restart;
 pub mod smoke_test;
+pub mod startup_update;
 pub use crate::core_types::restore_windows;
 pub mod updater;
 
@@ -35,6 +36,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::app::{AppConfig, run_app};
+use startup_update::StartupUpdateDecision;
 
 pub use crash_window::{CrashRecoveryAction, CrashRecoveryState, CrashSummary};
 pub use icon::{APP_ICON_SVG, DEFAULT_WINDOW_ICON_SIZE, load_window_icon};
@@ -106,7 +108,8 @@ impl std::fmt::Debug for StartupContext {
 /// 3. Initialize `tg-core` file logger in the resolved working dir + tracing console layer.
 /// 4. Set Windows `AppUserModelID` (`"Rustgram"` or `"Rustgram.<hash>"`).
 /// 5. Acquire single-instance mutex + named pipe via `tg-platform`, forwarding arguments and
-///    exiting immediately if another instance is already running.
+///    exiting immediately if another instance is already running; then install a ready update
+///    instead of starting, unless `-noupdate` ([`startup_update`]).
 /// 6. Promote `log_startN.txt` -> `log.txt`, validate Start-menu shortcut, and register
 ///    `tg://` / `tonsite://` on first run if allowed.
 /// 7. Initialize `tg-core` crash handler + panic hook and detect previous unclean shutdowns.
@@ -251,6 +254,23 @@ pub fn run_from_cli() -> anyhow::Result<()> {
         }
         (None, ActivationQueue::new())
     };
+
+    // A ready update is installed instead of starting the app (`core/sandbox.cpp:470`, TGB-3187).
+    let running_version = current_app_version();
+    let startup_update = startup_update::install_ready_update_at_start(
+        &exe_path,
+        &working_dir,
+        plan.resolved_working_dir.is_custom,
+        &plan.parsed_args,
+        &running_version,
+    );
+    let stop_for_e2e =
+        startup_update::record_for_e2e_and_stop(&plan, &startup_update, &running_version);
+    if stop_for_e2e || matches!(startup_update, StartupUpdateDecision::Install(_)) {
+        drop(single_instance_guard);
+        log_manager.finish();
+        return Ok(());
+    }
 
     // Start-menu shortcut validation + first-run `tg://` / `tonsite://` registration.
     profiler::mark("single_instance");

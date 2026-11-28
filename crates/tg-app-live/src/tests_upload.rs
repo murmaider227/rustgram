@@ -751,7 +751,9 @@ fn send_media_supports_all_media_kinds_caption_entities_reply_silent_and_schedul
         },
     )
     .expect("send photo via HistoryBackend::send_message_extended");
-    assert_eq!(sent_photo.id, MsgId(400));
+    // TGB-3130: a scheduled send returns at once and goes in the media queue.
+    assert!(sent_photo.is_sending);
+    assert_eq!(sent_photo.extra.scheduled_date, Some(NOW_SECS + 3600));
 
     // 2b. Document (force_file = true).
     let doc_path = tmp.path().join("spec.pdf");
@@ -1179,6 +1181,8 @@ fn album_upload_uses_upload_media_then_send_multi_media_with_caption_entities() 
         },
     )
     .expect("send album via HistoryBackend::send_message_extended");
+    // TGB-3130: the album is sent in the background.
+    assert!(live.wait_media_sends(TEST_TIMEOUT));
     assert_eq!(
         h.fake
             .recorded_calls_of(tl_fns::messages::SendMultiMedia::CONSTRUCTOR_ID)
@@ -1955,3 +1959,7 @@ fn a_sent_voice_message_is_in_the_media_cache_without_a_download() {
 #[path = "tests_media_send_pending.rs"]
 #[cfg(test)]
 mod tests_media_send_pending;
+
+#[path = "tests_album_send_pending.rs"]
+#[cfg(test)]
+mod tests_album_send_pending;

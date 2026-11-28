@@ -1,0 +1,340 @@
+# Feature index for docs/CODEMAP.md (read by tools/codemap/gen.py).
+#
+# One [[feature]] per name an agent is likely to search for:
+#   name     the heading; `aka` adds other names to it, so a search for them lands here too
+#   terms    word prefixes matched against each file's path, `//!` module doc and public item
+#            names; case, `_` and CamelCase do not matter ("sticker set" matches
+#            `sticker_set_box.rs` and `StickerSetBox`); a path hit counts most
+#   symbols  function names: the map lists the files that define them and the source files
+#            that call them (use the backend trait methods: they lead to the trait, the live
+#            implementation, the mocks and the UI caller in one line)
+#   paths    repo-relative files that must be listed (pinned)
+#   min_score  drop weaker matches (default 3)
+#
+# To extend: add a block, run `python -I -X utf8 tools/codemap/gen.py`, read the new section of
+# docs/CODEMAP.md, tune terms or pin a path until the files are the right ones, commit both files.
+# Keep it to features people name; per-file detail belongs in the file's `//!` doc.
+
+# ---- chat view (history)
+
+[[feature]]
+name = "message bubble"
+aka = ["message element", "history_view_message"]
+terms = ["bubble", "message element", "history view message"]
+
+[[feature]]
+name = "voice bubble"
+aka = ["voice message", "audio message", "waveform"]
+terms = ["voice", "waveform"]
+
+[[feature]]
+name = "round video message"
+aka = ["video message", "round video"]
+terms = ["round video", "video message", "round"]
+
+[[feature]]
+name = "inline media in messages"
+aka = ["photo in bubble", "album", "thumbnails"]
+terms = ["inline media", "album", "photo frame", "thumbnail"]
+symbols = ["start_media_download", "inline_media_descriptor"]
+
+[[feature]]
+name = "history paging"
+aka = ["load more messages", "history slice", "scroll loading"]
+terms = ["history paging", "history pagination", "load slice", "get history", "preload", "history slice", "scroll anchor"]
+symbols = ["load_slice_before", "try_load_slice_before", "load_slice_around", "try_load_slice_after"]
+
+[[feature]]
+name = "composer"
+aka = ["message field", "input field", "send button"]
+terms = ["compose", "message field", "input field", "send button"]
+
+[[feature]]
+name = "sending messages"
+aka = ["optimistic send", "pending message", "clock icon"]
+terms = ["optimistic send", "send message", "pending", "send flight"]
+symbols = ["send_message", "send_message_extended"]
+
+[[feature]]
+name = "media upload"
+aka = ["send photo", "send file", "album upload"]
+terms = ["upload", "send media", "media prepare"]
+symbols = ["pending_media_uploads", "cancel_media_upload"]
+
+[[feature]]
+name = "media download and cache"
+aka = ["file reference", "media cache"]
+terms = ["download", "media cache", "file reference", "file origin"]
+symbols = ["start_media_download", "open_media_stream"]
+
+[[feature]]
+name = "replies"
+aka = ["reply header", "reply preview", "quote"]
+terms = ["reply header", "reply preview", "reply target", "replied", "quote"]
+
+[[feature]]
+name = "reactions"
+aka = ["reaction pills", "paid reaction"]
+terms = ["reaction"]
+symbols = ["toggle_reaction"]
+
+[[feature]]
+name = "forwarding"
+terms = ["forward"]
+symbols = ["forward_messages", "forward_messages_with_options"]
+
+[[feature]]
+name = "deleting messages"
+aka = ["delete box", "delete for everyone"]
+terms = ["delete messages", "delete box", "delete"]
+symbols = ["delete_messages"]
+
+[[feature]]
+name = "marking read"
+aka = ["read receipts", "read history", "outbox read"]
+terms = ["mark read", "marking read", "read history", "read receipt", "read gate"]
+symbols = ["mark_history_read"]
+
+[[feature]]
+name = "pinned messages"
+terms = ["pinned message", "pin bar", "pinned"]
+symbols = ["pinned_messages", "pin_message"]
+
+[[feature]]
+name = "polls"
+terms = ["poll"]
+symbols = ["vote_poll"]
+
+[[feature]]
+name = "forum topics and threads"
+aka = ["comments", "replies section", "topics"]
+terms = ["forum", "topic", "replies section", "discussion"]
+symbols = ["forum_topics"]
+
+[[feature]]
+name = "scheduled messages"
+terms = ["scheduled"]
+symbols = ["scheduled_messages"]
+
+[[feature]]
+name = "drafts"
+terms = ["draft"]
+symbols = ["save_draft", "load_draft"]
+
+[[feature]]
+name = "typing indicator"
+aka = ["send action"]
+terms = ["typing", "send action"]
+symbols = ["send_typing"]
+
+[[feature]]
+name = "message text and entities"
+aka = ["spoiler", "links in text", "markdown"]
+terms = ["entities", "spoiler", "text entity", "marked text"]
+
+[[feature]]
+name = "link preview"
+aka = ["web page preview"]
+terms = ["link preview", "web page"]
+
+[[feature]]
+name = "bot keyboards"
+aka = ["inline keyboard", "reply keyboard", "bot commands", "inline bots"]
+terms = ["keyboard", "inline bot", "bot command", "inline results"]
+
+[[feature]]
+name = "custom emoji"
+terms = ["custom emoji"]
+
+[[feature]]
+name = "chat top bar and peer menu"
+aka = ["three dots menu", "chat header"]
+terms = ["peer menu", "top bar", "three dots"]
+symbols = ["peer_menu_caps"]
+
+# ---- chat list (dialogs)
+
+[[feature]]
+name = "chat list"
+aka = ["dialogs list", "dialog row", "chats list"]
+terms = ["dialogs", "chat list", "dialog row", "chats list"]
+symbols = ["dialog_slice"]
+
+[[feature]]
+name = "unread counter"
+aka = ["unread badge", "unread count"]
+terms = ["unread"]
+
+[[feature]]
+name = "chat folders"
+aka = ["filters", "folder tabs"]
+terms = ["folder", "chat filter"]
+symbols = ["chat_folders"]
+
+[[feature]]
+name = "search"
+aka = ["global search", "in-chat search"]
+terms = ["search"]
+symbols = ["search_dialogs", "search_chat_messages"]
+
+[[feature]]
+name = "archive"
+terms = ["archive"]
+symbols = ["toggle_archive"]
+
+# ---- panels, boxes, other screens
+
+[[feature]]
+name = "sticker set box"
+aka = ["sticker pack box", "add stickers"]
+terms = ["sticker set", "sticker pack", "stickers box"]
+
+[[feature]]
+name = "emoji, sticker and GIF panel"
+aka = ["tabbed selector", "emoji picker"]
+terms = ["tabbed", "emoji list", "stickers list", "gifs list", "emoji panel"]
+
+[[feature]]
+name = "profile and peer info"
+aka = ["user info", "group info", "info section"]
+terms = ["profile", "peer info", "info wrap", "info section"]
+paths = ["crates/tg-app-info/src/info/cover.rs", "crates/tg-app-info/src/info/mod.rs"]
+
+[[feature]]
+name = "media viewer"
+aka = ["photo viewer", "video player overlay", "picture in picture"]
+terms = ["media viewer", "overlay", "pip", "video playback"]
+
+[[feature]]
+name = "music player"
+aka = ["audio player", "playlist"]
+terms = ["audio player", "player bar", "playlist", "music"]
+
+[[feature]]
+name = "notifications"
+aka = ["desktop notifications", "toast", "notification sound"]
+terms = ["notification", "notify"]
+
+[[feature]]
+name = "tray menu"
+aka = ["system tray", "tray icon"]
+terms = ["tray"]
+
+[[feature]]
+name = "settings"
+aka = ["settings sections", "privacy settings"]
+terms = ["settings section", "settings page", "main page", "privacy"]
+paths = ["crates/tg-app-settings/src/settings/mod.rs", "crates/tg-app-settings/src/settings/main_page.rs"]
+
+[[feature]]
+name = "themes and night mode"
+aka = ["palette", "chat background", "wallpaper"]
+terms = ["theme", "night", "palette", "background"]
+
+[[feature]]
+name = "login"
+aka = ["intro", "phone code", "QR login", "2FA password"]
+terms = ["intro", "login", "qr", "auth"]
+
+[[feature]]
+name = "calls"
+aka = ["voice chat", "group call", "video call"]
+terms = ["call", "group call", "voip"]
+
+[[feature]]
+name = "stories"
+terms = ["story", "stories"]
+
+[[feature]]
+name = "mini apps and instant view"
+aka = ["webview", "bot web app", "instant view"]
+terms = ["webview", "mini app", "instant view", "web app"]
+
+[[feature]]
+name = "payments, stars and gifts"
+aka = ["checkout", "star gifts", "premium"]
+terms = ["payment", "stars", "gift", "checkout", "premium"]
+
+# ---- app shell, session, platform
+
+[[feature]]
+name = "main window"
+aka = ["window controller", "layers", "adaptive layout"]
+terms = ["main window", "window controller", "main widget", "layer stack", "adaptive layout"]
+
+[[feature]]
+name = "deep links"
+aka = ["tg:// links", "t.me links"]
+terms = ["deep link", "local url", "tg url"]
+
+[[feature]]
+name = "updates and gaps"
+aka = ["pts", "getDifference", "update loop"]
+terms = ["updates", "pts", "get difference", "gap", "updates state"]
+min_score = 4
+
+[[feature]]
+name = "live session"
+aka = ["LiveSession", "backend traits", "RPC"]
+terms = ["live session", "session runtime", "live runtime bridge"]
+paths = ["crates/tg-app-live/src/session.rs", "crates/tg-app-live/src/bridge.rs", "crates/tg-app-live/src/lib.rs"]
+
+[[feature]]
+name = "mock session"
+aka = ["demo data", "fake backend", "test fixtures"]
+terms = ["mock session", "mock", "fake rpc", "fake"]
+paths = ["crates/tg-app-window/src/mock_session.rs"]
+
+[[feature]]
+name = "startup and command line"
+aka = ["workdir", "single instance", "launcher"]
+terms = ["startup", "command line", "workdir", "launcher", "ipc"]
+
+[[feature]]
+name = "self-update"
+aka = ["updater", "restart to update"]
+terms = ["updater", "update checker", "self update"]
+
+[[feature]]
+name = "multiple accounts"
+aka = ["account switch", "add account"]
+terms = ["multi account", "account switch", "accounts"]
+
+[[feature]]
+name = "proxy and connection state"
+aka = ["connecting widget", "MTProxy"]
+terms = ["proxy", "connecting", "connection"]
+
+[[feature]]
+name = "language packs and translation"
+aka = ["lang pack", "translate messages"]
+terms = ["lang", "translat"]
+
+[[feature]]
+name = "passcode lock"
+aka = ["local passcode", "lock screen"]
+terms = ["passcode", "lock screen", "lock widget", "locked"]
+
+[[feature]]
+name = "data export"
+terms = ["export"]
+
+[[feature]]
+name = "userpics"
+aka = ["avatars", "profile photos"]
+terms = ["userpic", "avatar", "profile photo"]
+
+[[feature]]
+name = "business"
+aka = ["quick replies", "working hours", "chatbots"]
+terms = ["business", "quick replies", "working hours"]
+
+[[feature]]
+name = "statistics"
+aka = ["channel stats", "boosts"]
+terms = ["statistics", "stats", "boost"]
+
+[[feature]]
+name = "wallet"
+aka = ["TON"]
+terms = ["wallet", "ton"]

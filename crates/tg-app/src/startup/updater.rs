@@ -424,7 +424,7 @@ pub fn build_updater_launch_plan(
 
 /// [`build_updater_launch_plan`] that also passes the running version as `-appversion`, so the
 /// updater refuses a staged package that is not newer (TGB-3117).
-fn build_updater_launch_plan_for_version(
+pub(crate) fn build_updater_launch_plan_for_version(
     exe_path: &Path,
     working_dir: &Path,
     is_custom_workdir: bool,

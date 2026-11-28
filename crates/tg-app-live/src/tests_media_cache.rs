@@ -1785,6 +1785,7 @@ fn live_inline_gif_video_sticker_static_sticker_audio_and_reopened_tgs_disk_cach
     );
 }
 
+mod file_reference_refresh;
 mod round_on_demand;
 mod sticker_file;
 mod wave4_downloads;

@@ -38,8 +38,8 @@ use crate::LiveSession;
 use crate::convert::now_unix_i32;
 use crate::rich_message::{fetch_rich_message_live, get_cached_rich_message};
 use crate::widgets::{
-    record_widget_updates_from_batch, widget_edit_shared_data_live, widget_query_typed_live,
-    widgets_state_for_session,
+    record_widget_updates_from_batch, record_widget_updates_from_batch_for_self,
+    widget_edit_shared_data_live, widget_query_typed_live, widgets_state_for_session,
 };
 use tg_app_core::core_types::dto::compose_ai::{
     AiComposeToneRef, ComposeAiBackend, ComposeRichAiRequest, TranslateRichMessageRequest,
@@ -1405,4 +1405,100 @@ fn tg_tgw_live_widget_query_poll_edit_and_incoming_dm_conformance() {
         ))
         .is_some()
     }));
+}
+
+fn incoming_widget_dm_batch(msg_id: i32, self_uid: i64, sender_uid: i64) -> tl_enums::Updates {
+    tl_enums::Updates::UpdateShort(tl_types::UpdateShort {
+        update: tl_enums::Update::NewMessage(tl_types::UpdateNewMessage {
+            message: synthetic_message(
+                msg_id,
+                self_uid,
+                sender_uid,
+                false,
+                now_unix_i32(),
+                "",
+                Some(tl_enums::MessageMedia::Widget(
+                    tl_types::MessageMediaWidget {
+                        is_copy: false,
+                        can_query: true,
+                        background_query: false,
+                        width: 320,
+                        height: 180,
+                        payload: pack_payload_zlib(b"<p>poll</p>"),
+                        public_data: Some(r#"{"v":1}"#.to_owned()),
+                        public_data_hash: Some(7),
+                        chat_data: None,
+                        widget_id: None,
+                    },
+                )),
+                None,
+            ),
+            pts: 1,
+            pts_count: 1,
+        }),
+        date: now_unix_i32(),
+    })
+}
+
+fn widget_keys_for(session: &Arc<tokio::sync::RwLock<tg_data::Session>>) -> Vec<(PeerId, MsgId)> {
+    let st_arc = widgets_state_for_session(session);
+    let st = st_arc.lock().expect("lock widget state");
+    st.message_states.keys().copied().collect()
+}
+
+/// A background task holding the session write lock (update pump, dialog loader) must not make
+/// an incoming DM's widget land under `self_uid`, i.e. in Saved Messages instead of the sender's
+/// chat. CI hit this in `tg_tgw_live_widget_query_poll_edit_and_incoming_dm_conformance`.
+#[test]
+fn incoming_dm_widget_keyed_under_sender_while_session_is_write_locked() {
+    let self_uid = 730_001i64;
+    let sender_uid = 730_002i64;
+    let session = Arc::new(tokio::sync::RwLock::new(tg_data::Session::new(
+        DataUserId::from_tl(self_uid),
+    )));
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = {
+        let session = Arc::clone(&session);
+        std::thread::spawn(move || {
+            let guard = session.blocking_write();
+            locked_tx.send(()).expect("signal write lock held");
+            std::thread::sleep(Duration::from_millis(150));
+            drop(guard);
+        })
+    };
+    locked_rx.recv().expect("writer holds the session lock");
+
+    assert!(record_widget_updates_from_batch(
+        &session,
+        &incoming_widget_dm_batch(9_001, self_uid, sender_uid),
+    ));
+    writer.join().expect("writer thread");
+
+    assert_eq!(
+        widget_keys_for(&session),
+        vec![(PeerId::from_user(sender_uid as u64), MsgId(9_001))],
+        "incoming DM widget must be keyed under sender peer_id, not self_uid"
+    );
+}
+
+/// `LiveSession::apply_updates_side_caches` passes the `self_uid` it already read, so recording
+/// never waits on the session lock (here the caller itself holds the write guard).
+#[test]
+fn incoming_dm_widget_with_known_self_uid_never_locks_the_session() {
+    let self_uid = 730_011i64;
+    let sender_uid = 730_012i64;
+    let session = Arc::new(tokio::sync::RwLock::new(tg_data::Session::new(
+        DataUserId::from_tl(self_uid),
+    )));
+    let guard = session.blocking_write();
+    assert!(record_widget_updates_from_batch_for_self(
+        &session,
+        &incoming_widget_dm_batch(9_002, self_uid, sender_uid),
+        self_uid,
+    ));
+    drop(guard);
+    assert_eq!(
+        widget_keys_for(&session),
+        vec![(PeerId::from_user(sender_uid as u64), MsgId(9_002))]
+    );
 }
